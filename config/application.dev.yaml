@@ -1,0 +1,163 @@
+# =============================================================================
+# EKBS 开发机配置（对应 01 §7 的 /opt/ekbs/etc/application.yaml）
+# -----------------------------------------------------------------------------
+# 本文件**只用于开发机**，与生产配置的差异仅有两类，且都以「开发」注释标出：
+#   ① 目录：data_dir / log_dir / database.path 指向仓库内 var/，不碰 /opt 与 /data
+#       （生产：/opt/ekbs/log、/data/ekbs、/data/ekbs/index/ekbs.db）
+#   ② 模型 provider：用 mock 让全链路离线可跑；拿到云端 key 后按注释一行切回 dashscope
+#
+# 【密钥纪律】本文件是**非敏感**配置：任何 key / secret / token 都不得写在这里。
+#   ekbs/config.py 会做反向检查，发现密钥类键名即报错退出（04 §2.6）。
+#   云端 key 放 ~/.ekbs/secrets.env（权限 600），或开发机上用环境变量注入。
+# =============================================================================
+
+app:
+  name: ekbs
+  env: dev                 # 开发
+  timezone: Asia/Shanghai
+  log_dir: var/log         # 开发（生产 /opt/ekbs/log）
+  data_dir: var            # 开发（生产 /data/ekbs）
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  # 必须为 1：权限缓存的进程内 L1 靠同进程同步失效（04 §1.5 / §7.2）
+  workers: 1
+
+database:
+  path: var/index/ekbs.db  # 开发（生产 /data/ekbs/index/ekbs.db）
+  wal: true
+
+# ---------- 检索链路参数（对应 00 §2.1；数值与生产一致，改的是 provider 不是参数）----------
+retrieval:
+  dense_top_k: 30
+  sparse_top_k: 30
+  rrf_k: 60
+  rerank:
+    enabled: true
+    provider: mock         # 开发（生产 dashscope / gte-rerank-v2）
+    model: mock-rerank-v1
+    top_n: 15
+    keep: 5
+    min_score: 0.30
+  parent_expand: true
+  # 查询改写（00 §2.1 的第一步，多轮对话时启用）；策略：off | heuristic | llm
+  # heuristic：当前问题含指代或过短时并入上一轮问题；llm：用云端模型按模板改写成自包含查询
+  query_rewrite:
+    strategy: heuristic
+  cache:
+    backend: memory+sqlite
+    l1_size: 2000
+    query_embedding_ttl: 86400
+    retrieve_ttl: 1800
+    answer_ttl: 3600
+
+# ---------- 云端模型 ----------
+models:
+  embed:
+    provider: mock         # 开发（生产 dashscope / text-embedding-v4）
+    model: mock-embed-v1
+    dim: 1024
+    # ⚠️ 10 而非 01 §7 写的 20：text-embedding-v4 单请求上限就是 10 条，
+    #    传 20 会得到 400 batch size is invalid（已核实官方文档，见 docs/spec/40-cloud-models.md）。
+    batch_size: 10
+    timeout_s: 30
+    max_retries: 3
+  llm:
+    provider: mock         # 开发（生产 dashscope / qwen-max）
+    model: mock-llm-v1
+    temperature: 0.1
+    top_p: 0.8
+    max_tokens: 2048
+    timeout_s: 120
+    max_retries: 2
+    fallback:              # 主模型不可用时启用（00 §2.3）；开发环境无 fallback
+      provider: ""
+      model: ""
+
+# ---------- 解析 ----------
+parse:
+  engine: mineru
+  max_file_mb: 500
+  timeout_s: 1800
+  worker_concurrency: 1
+  keep_tmp_days: 7
+
+# ---------- 权限 ----------
+permission:
+  default_level: 2
+  l4_enabled: false
+  l3_ingest_enabled: false
+  policy_cache_ttl: 300
+  # 合规闸（00 §7）：云端嵌入 = 全量语料出网。书面确认前保持 false，仅允许合成语料。
+  corpus_egress_ack: false
+  corpus_egress_ack_ticket: ""
+  # dept_code → 钉钉部门 ID 列表 的映射。见 docs/spec/10 的 O6-1 / K1：
+  # 权威方案未定义该映射存在哪里，本骨架先由配置承载（不新增 Schema）。
+  # ⚠️ 必须放在**配置**里而不是进程内存里：入库（worker）、路由（api）是两个进程，
+  #    内存态映射会让同一部门在不同进程里解析出不同的分片名（实测踩过：kb_hr_L2 vs kb_102_L2）。
+  #    O6-1 定稿后应迁到权威位置，并同步方案文档。
+  dept_code_map:
+    hr: ["102"]
+    finance: ["103"]
+
+# ---------- 钉钉（开发环境关闭；凭据走 secrets.env）----------
+dingtalk:
+  stream_enabled: false    # 开发：不连钉钉 Stream，adapter 不启动
+  per_user_session: true
+  rate_limit_per_user_per_min: 20
+  max_reply_chars: 3500
+  reconnect_backoff_seconds: [3, 5, 10, 20, 30]
+  heartbeat_ping_seconds: 60
+  ack_timeout_seconds: 10
+  robot_code: "dingdevplaceholder"
+  openapi:
+    base_url: "https://api.dingtalk.com"
+    legacy_base_url: "https://oapi.dingtalk.com"
+    connect_timeout: 3.0
+    read_timeout: 5.0
+    max_retries: 2
+    token_cache_key: "ekbs:dt:app_token:{app_key}"
+    token_refresh_ahead_seconds: 300
+  card:
+    ai_template_id: "dingdevplaceholder"
+    citation_template_id: "dingdevplaceholder"
+    streaming_enabled: true
+    streaming_chunk_chars: 24
+    streaming_min_interval_ms: 300
+    streaming_max_duration_seconds: 120
+    thinking_text: "正在检索企业知识库…"
+
+adapter:
+  host: 127.0.0.1
+  port: 8100
+  graceful_shutdown_seconds: 30
+  api_base: "http://127.0.0.1:8000"
+  qa_stream_timeout_seconds: 180
+  request_timeout_seconds: 30
+
+session:
+  context_max_turns: 6
+  context_ttl_seconds: 7200
+  group_share_context: false
+
+limits:
+  global_qps: 20
+  per_user_qps: 2
+  per_conversation_qps: 3
+  max_question_chars: 2000
+  max_file_size_mb: 100
+  file_ext_whitelist: [pdf, docx, doc, pptx, ppt, xlsx, xls, txt, md, html, png, jpg, jpeg]
+
+security:
+  allowed_file_mime:
+    - application/pdf
+    - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+    - application/vnd.openxmlformats-officedocument.presentationml.presentation
+    - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+    - text/plain
+    - text/markdown
+    - image/png
+    - image/jpeg
+  sensitive_words_path: "config/sensitive_words.txt"   # 开发（生产 /opt/ekbs/etc/sensitive_words.txt）
+  content_security_enabled: true

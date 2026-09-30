@@ -1,0 +1,90 @@
+# =============================================================================
+# EKBS 依赖清单（macOS 原生部署，固定版本）
+# 安装位置：/opt/ekbs/etc/requirements.txt
+# 安装方式：/opt/ekbs/venv/bin/pip install -r /opt/ekbs/etc/requirements.txt
+# -----------------------------------------------------------------------------
+# 【Python 版本】Python ≥ 3.12
+#   ⚠️ 口径提示：`01-实施步骤与本地部署.md` §3 正文写的是 `brew install python@3.11`
+#      并称「MinerU 与依赖对 3.11 兼容性最好」。本文件按「Python ≥ 3.12」口径编写，
+#      两者的差异已在交付说明中列为文档内部矛盾，落地前需确认；无论如何请固定
+#      **同一个**解释器创建 venv，不要让 3.11/3.12 混用同一份 site-packages。
+#
+# 【Apple Silicon 注意】faiss-cpu 在 arm64 上走 Accelerate 框架（Accelerate.framework
+#   提供的 BLAS/LAPACK），无需手工编译：
+#     · 只装 `faiss-cpu`，**不要装 `faiss-gpu`**（本机无 NVIDIA 卡，且官方未提供
+#       macOS arm64 的 GPU 轮子，装了会拖入 CUDA 依赖并安装失败）；
+#     · 也不要用 conda 的 `faiss-cpu`，混用 conda 与 venv 会让 Accelerate 链接错乱。
+#
+# 【版本口径】
+#   · 标 `[01 §3]` 的行 = `01` §3 原文写了版本，此处照抄（原文用通配，保持通配形式）；
+#   · 标 `待实测确认` 的行 = 文档未给版本，此处给一个可用稳定版本，
+#     **必须在 POC 首周用 `pip install` 实测后回填确定值**（对应 `00` §11 的实测项）。
+#   · 所有版本用 `==` 锁定；升级请成组升级并重跑 deploy/scripts/smoke.sh。
+#
+# 【分组】Web / 数据 / 检索 / 云端模型 / 解析 / 钉钉 / 工具与日志 / 测试
+# =============================================================================
+
+# ---- Web（HTTP 服务与校验）----
+fastapi==0.115.*                 # [01 §3] 主 Web 框架（ekbs-api + 适配器内的免登小实例）
+uvicorn[standard]==0.32.*        # [01 §3] ASGI server；standard 附带 httptools/uvloop 加速
+httpx==0.27.*                    # [01 §3] 异步 HTTP 客户端（云端模型网关、钉钉 OpenAPI、回环调用）
+pydantic==2.*                    # [01 §3] 请求/响应模型与配置校验
+pydantic-settings==2.5.2         # 待实测确认；ekbs/config.py 用 BaseSettings 读 application.yaml + 环境变量
+python-multipart==0.0.12         # 待实测确认；文件上传（FastAPI UploadFile 必需）
+pyjwt[crypto]==2.9.0             # 待实测确认；JWT 签发/校验（EKBS_JWT_SECRET）。01/04 未指定具体库，此处选 PyJWT
+
+# 可选：仅在管理台保留「本地口令登录」时才需要；H5 走钉钉免登，不落地口令
+# passlib[bcrypt]==1.7.4         # 待实测确认；如确定无本地口令登录，此依赖可整行删除
+
+# ---- 数据（SQLite / ORM / 调度）----
+sqlalchemy[asyncio]==2.0.36      # 待实测确认；04 全程使用 SQLAlchemy 2.0 AsyncSession（不是裸 sqlite3）
+aiosqlite==0.20.0                # 待实测确认；04 §5.1 的 ekbs/db.py：aiosqlite 连接池 + PRAGMA + session_scope
+PyYAML==6.0.2                    # [01 §3 pyyaml] application.yaml 解析
+apscheduler==3.10.4              # 待实测确认；04 §7.1.4 调度作业注册表（AsyncIOScheduler）
+python-dotenv==1.0.1             # [01 §3] 仅开发机本地加载 .env；生产由 launchd 注入环境变量
+
+# ---- 检索（向量 + 全文 + 分词）----
+faiss-cpu==1.9.0                 # [01 §3] 向量检索；Apple Silicon 走 Accelerate，勿装 faiss-gpu
+numpy==2.1.3                     # 待实测确认；faiss / kNN 数值基础，显式锁定避免与 faiss-cpu 轮子冲突
+jieba==0.42.1                    # [01 §3] 中文分词：写入 FTS5 前预分词 + 查询侧同口径分词
+rank-bm25==0.2.2                 # [01 §3] 备用全文检索（仅当 FTS5 不可用时启用，内存占用更高）
+tiktoken==0.8.0                  # 待实测确认；02 TC-INDEX-004 的本地 token 近似计数（须与云端 usage 校准）
+
+# ---- 云端模型 SDK（出网，见 01 §11 白名单）----
+openai==1.54.4                   # 待实测确认；经 OpenAI 兼容协议调用云端 LLM / 嵌入 / rerank
+dashscope==1.20.14               # 待实测确认；[01 §3 可选] 直接用阿里云 SDK 时启用（默认走 openai 兼容层）
+
+# ---- 解析（MinerU + Office 文档）----
+# [实测修订 2026-09-27] MinerU **不装进应用 venv**，改为独立 venv + CLI 子进程调用。
+#   为什么改：
+#   ① 本仓库的解析器是 **子进程** 调用 `mineru -p … -o …`（见 ekbs/ingest/parser.py），
+#      不 `import mineru`，因此应用 venv 里没有它也能工作；
+#   ② 装进来会把 torch/transformers/ultralytics 等约 2.0 GB 拖进生产 venv
+#      （16 GB 机器上不划算），且实测会在 pip 解析它的依赖树回溯时
+#      去构建 colorlog 的 sdist 而**整单失败**（colorlog 的 setup.py 有循环导入）。
+#   安装方式（与 01 §4 一致）：
+#       python3.12 -m venv /opt/ekbs/mineru-venv
+#       /opt/ekbs/mineru-venv/bin/pip install 'mineru[core]==2.1.10'
+#       export MINERU_MODEL_SOURCE=modelscope        # 实测 HuggingFace 不可达
+#       export EKBS_MINERU_BIN=/opt/ekbs/mineru-venv/bin/mineru
+#   model 权重首次运行下载 2–3 GB（00 §11 的 M1）。
+# mineru[core]==2.1.10
+python-docx==1.1.2               # [01 §3] .docx 解析/兜底
+openpyxl==3.1.5                  # [01 §3] .xlsx
+python-pptx==1.0.2               # [01 §3] .pptx
+Pillow==11.0.0                   # 待实测确认；解析产物中的图片处理与 OCR 前置（01 未显式列出，属传递必需）
+pyahocorasick==2.1.0             # 待实测确认；04 §6.4 敏感词 L1 层 AC 自动机（import ahocorasick），支持热加载
+
+# ---- 钉钉 ----
+dingtalk-stream==0.24.3          # 待实测确认；[01 §3] Stream 长连接 SDK（com.ekbs.dingtalk 的唯一连接来源）
+
+# ---- 工具与日志 ----
+structlog==24.4.0                # [01 §3] 结构化日志（JSON，含 trace_id）
+tenacity==9.0.0                  # [01 §3] 云端 API 重试与指数退避
+
+# ---- 测试（仅开发/测试机需要；生产 venv 可不装）----
+pytest==8.3.4                    # 待实测确认；02 测试方案 L1/L2 用例执行器
+pytest-asyncio==0.24.0           # 待实测确认；02 L1 单元测试要求（异步 fixture / 用例）
+pytest-cov==6.0.0                # 待实测确认；02 §行覆盖 ≥80%（权限模块 ≥95%）的度量工具
+respx==0.21.1                    # 待实测确认；mock httpx：离线复现云端模型/钉钉接口的各种失败路径
+deepdiff==8.0.1                  # 待实测确认；02 TC-INDEX-* 的结构对比（解析产物与结构快照比对）

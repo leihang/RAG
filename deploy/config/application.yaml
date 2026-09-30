@@ -1,0 +1,171 @@
+# =============================================================================
+# EKBS 主配置 —— /opt/ekbs/etc/application.yaml
+# -----------------------------------------------------------------------------
+# 【本文件是**非敏感**配置】
+#   敏感项（各类 API Key、钉钉 AppSecret、JWT 密钥、内部回环 Token）**一律不写在这里**，
+#   它们只存在于 ~/.ekbs/secrets.env（权限 600，见 deploy/config/secrets.env.example），
+#   由 launchd 的 `zsh -lc 'set -a; source …; set +a; exec …'` 在进程启动时注入。
+#   ekbs/config.py 对 application.yaml 做反向检查：一旦发现密钥类键名即直接报错退出
+#   （04 §2.6）。因此不要在本文件里用 ${VAR} 占位 —— 那只会诱导后人填明文。
+#
+# 【权威来源】
+#   app / server / database / retrieval / models / parse / permission 段与 dingtalk 段原有键：
+#       01-实施步骤与本地部署.md §7（逐字）
+#   dingtalk 段补齐键 + adapter / session / limits / security 段：
+#       04-钉钉接入方案.md §5.2（逐字）
+#
+# 【生效方式】改本文件后需重启对应进程：
+#   launchctl kickstart -k gui/$(id -u)/com.ekbs.api   （其余服务同理，见 01 §16）
+# =============================================================================
+
+app:
+  name: ekbs
+  env: pilot
+  timezone: Asia/Shanghai
+  log_dir: /opt/ekbs/log
+  data_dir: /data/ekbs
+
+server:
+  host: 127.0.0.1          # 仅本机监听；对外由反向代理（§9）
+  port: 8000
+  # 必须为 1：权限缓存的进程内 L1 靠同进程同步失效，多 worker 会出现 ≤300s 的旧权限窗口。
+  # 详细理由与多进程逃生通道见 04 §1.5 与 04 §4.6。CPU 并行由 asyncio.to_thread + FAISS 承担。
+  workers: 1
+
+database:
+  path: /data/ekbs/index/ekbs.db
+  wal: true
+
+# ---------- 检索链路参数（对应 00 §2.1）----------
+retrieval:
+  dense_top_k: 30
+  sparse_top_k: 30
+  rrf_k: 60
+  rerank:
+    enabled: true          # 开关；实测后可关闭
+    provider: dashscope
+    # 2026-09-27 依实测定稿（原 gte-rerank-v2：官方公告 2026-05-30 下线且命名有歧义）
+    model: qwen3.7-text-rerank
+    top_n: 15              # 输入候选数（原 30 已减半）
+    keep: 5                # 输出条数
+    # 三带实测校准（语料内可答 0.926~0.991 ／ 域内无答案 0.108~0.391 ／ 域外 0.002~0.020），
+    # 取 ①② 空隙几何中点 0.60。原 0.30 落在「域内无答案」带内部 → 会误答。真实语料须重校。
+    min_score: 0.60        # 低于此分视为无有效命中 → 拒答
+  parent_expand: true
+  cache:
+    # 本栈无 Redis：L1 为进程内 LRU，L2 为 SQLite 表 ekbs_cache（键必须含 perm_fingerprint）
+    backend: memory+sqlite
+    l1_size: 2000                # 进程内 LRU 条目数
+    query_embedding_ttl: 86400   # 查询嵌入缓存（必需项，见 00 §2.3；与权限无关，可全局共享）
+    retrieve_ttl: 1800           # 检索结果缓存（键含 perm_fingerprint，见 00 §3.4）
+    answer_ttl: 3600             # 答案缓存（键含 perm_fingerprint）
+
+# ---------- 云端模型 ----------
+models:
+  embed:
+    provider: dashscope
+    # 2026-09-27 依实测定稿（原 text-embedding-v4）：115ms、0.000125 元/千 token、
+    # RPM 24000（v4 仅 1800）、上下文 128K；维度 1024 与本地备选 bge-m3 同维，便于迁移。
+    model: qwen3.7-text-embedding-flash
+    dim: 1024              # 与本地备选 bge-m3 同维，便于迁移
+    # 单请求上限**按模型不同**：v4/v3=10、本模型=20（已实测）。换模型必须同步改。
+    batch_size: 20
+    timeout_s: 30
+    max_retries: 3
+  llm:
+    provider: dashscope
+    model: qwen-max
+    temperature: 0.1
+    top_p: 0.8
+    max_tokens: 2048
+    timeout_s: 120
+    max_retries: 2
+    fallback:              # 主模型不可用时启用（见 00 §2.3）
+      provider: deepseek
+      model: deepseek-chat
+
+# ---------- 解析 ----------
+parse:
+  engine: mineru
+  max_file_mb: 500
+  timeout_s: 1800
+  worker_concurrency: 1    # 16 GB 机器：解析串行，避免内存峰值叠加
+  keep_tmp_days: 7
+
+# ---------- 权限 ----------
+permission:
+  default_level: 2
+  l4_enabled: false        # 首期 L4 不入库（00 §3.2）
+  l3_ingest_enabled: false # 未落地 C5 前禁止真实 L3 入库（00 C5 / 03 §5.2.1）
+  policy_cache_ttl: 300
+  # 合规闸：云端嵌入 = 全量语料出网。书面确认前保持 false（00 §7）
+  corpus_egress_ack: false
+  corpus_egress_ack_ticket: ""   # 书面确认编号 / 链接，便于审计
+
+# ---------- 钉钉（凭据在 secrets.env）----------
+# 01 §7 原有键 + 04 §5.2 补齐键；本节是 04 §5.2 与 01 §7 的合并结果
+dingtalk:
+  stream_enabled: true
+  per_user_session: true   # 群聊会话按用户隔离（见 04 §5.5）
+  rate_limit_per_user_per_min: 20
+  max_reply_chars: 3500    # 单条回复字符上限；超出则截断并改为卡片分段（04 §5.8）
+  reconnect_backoff_seconds: [3, 5, 10, 20, 30]   # Stream 断线重连退避序列（秒），耗尽后回到首个间隔
+  heartbeat_ping_seconds: 60                      # 应用层心跳间隔；须小于企业代理的空闲超时（01 §11）
+  ack_timeout_seconds: 10                         # 收到消息后必须 ACK 的时限，超时钉钉侧会认定投递失败
+  # robot_code 只在这里定义一处：它是「机器人身份」，不是 HTTP 传输参数，
+  # 因此不放进 openapi 段（04 §6.5 的代码读 settings.dingtalk["robot_code"]）
+  robot_code: "dingxxxxxxxx"               # 机器人编码（非敏感，见 04 §2.6）
+  openapi:
+    base_url: "https://api.dingtalk.com"           # 新版 OpenAPI（卡片、机器人、通讯录 v3）
+    legacy_base_url: "https://oapi.dingtalk.com"   # 旧版 OpenAPI（gettoken、user/getuserinfo）
+    connect_timeout: 3.0
+    read_timeout: 5.0
+    max_retries: 2
+    token_cache_key: "ekbs:dt:app_token:{app_key}"  # access_token 在 ekbs_cache 中的键模板
+    token_refresh_ahead_seconds: 300                # 提前 300s 刷新，避免临界过期
+  card:
+    ai_template_id: "dingxxxxxxxx"        # AI 答案卡片模板 ID（非敏感，见 §2.6）
+    citation_template_id: "dingxxxxxxxx"  # 引用来源卡片模板 ID
+    streaming_enabled: true
+    streaming_chunk_chars: 24        # 累积 24 字符推送一次
+    streaming_min_interval_ms: 300   # 最小推送间隔
+    streaming_max_duration_seconds: 120
+    thinking_text: "正在检索企业知识库…"
+
+# ---------- 钉钉适配器进程（04 §5.2）----------
+adapter:
+  host: 127.0.0.1                    # 仅本机监听；对外由 Caddy 终结 TLS（01 §9）
+  port: 8100
+  graceful_shutdown_seconds: 30      # 优雅退出：等在途消息处理完
+  api_base: "http://127.0.0.1:8000"  # 回环调用 ekbs-api（见 §1.5 跳 (3)）
+  qa_stream_timeout_seconds: 180
+  request_timeout_seconds: 30
+
+# ---------- 多轮会话（04 §5.2；落库表 ekbs_session_ctx，见 01 §5.5）----------
+session:
+  context_max_turns: 6               # 多轮上下文最多保留 6 轮
+  context_ttl_seconds: 7200          # 会话 2 小时过期（按 ekbs_session_ctx.updated_at 判定）
+  group_share_context: false         # 群聊不共享上下文（默认）
+
+# ---------- 限流与输入闸门（04 §5.2）----------
+limits:
+  global_qps: 20
+  per_user_qps: 2
+  per_conversation_qps: 3
+  max_question_chars: 2000
+  max_file_size_mb: 100              # 上传入口闸门；解析侧另有 parse.max_file_mb（01 §7）
+  file_ext_whitelist: [pdf, docx, doc, pptx, ppt, xlsx, xls, txt, md, html, png, jpg, jpeg]
+
+# ---------- 内容安全（04 §5.2 + §6.4）----------
+security:
+  allowed_file_mime:                 # 与 file_ext_whitelist 双重校验：扩展名可伪造，MIME 也要看
+    - application/pdf
+    - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+    - application/vnd.openxmlformats-officedocument.presentationml.presentation
+    - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+    - text/plain
+    - text/markdown
+    - image/png
+    - image/jpeg
+  sensitive_words_path: "/opt/ekbs/etc/sensitive_words.txt"   # L1 敏感词库（pyahocorasick AC 自动机，支持热加载）
+  content_security_enabled: true

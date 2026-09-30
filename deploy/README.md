@@ -1,0 +1,95 @@
+# `deploy/` —— macOS 原生部署产物
+
+> **部署步骤的唯一权威在 [`../01-实施步骤与本地部署.md`](../01-实施步骤与本地部署.md)（§1~§16）。**
+> `deploy/` 是它的**可执行落地**：把文档里的命令、plist、配置、SQL 变成能直接跑的文件。
+> 两者冲突时，以 `01` 为准，并请把 `deploy/` 一起改掉。
+
+---
+
+## 一、文件清单
+
+| 路径 | 行数 | 用途 | 权威来源 |
+|---|---|---|---|
+| `sql/001_init.sql` | 565 | **唯一 Schema**：29 张表 + 8 个索引 + 1 张 FTS5 虚拟表 + 12 个审计触发器 | `01` §5 |
+| `requirements.txt` | 77 | 固定版本的 pip 依赖（分组注释：Web / 数据 / 检索 / 解析 / 测试） | `01` §3 |
+| `config/application.yaml` | 163 | **非敏感**配置模板（server / database / retrieval / models / parse / permission / dingtalk / adapter / session / limits / security） | `01` §7 + `04` §5.2 |
+| `config/secrets.env.example` | 81 | **敏感项**模板（8 项），复制为 `~/.ekbs/secrets.env` 后须 `chmod 600` | `04` §2.6 |
+| `launchd/com.ekbs.api.plist` | 47 | API 服务（`uvicorn ekbs.main:app --workers 1`，127.0.0.1:8000） | `01` §8.1 |
+| `launchd/com.ekbs.dingtalk.plist` | 51 | Stream 适配器（127.0.0.1:8100，`KeepAlive=true`） | `01` §8.1 + `04` §7.1.1 |
+| `launchd/com.ekbs.worker.plist` | 42 | MinerU 解析 worker（常驻轮询 `ekbs_document.status='pending'`，串行） | `00` D13 + `01` §8.2 |
+| `launchd/com.ekbs.scheduler.plist` | 42 | APScheduler 单实例（8 个定时作业） | `00` D13 + `04` §7.1.4 |
+| `scripts/install.sh` | 269 | 一体化安装（**幂等**）：目录树 → 配置 → venv → SQLite → launchd → 备份作业 | `01` §1/§3/§5.7/§7/§8.3/§13 |
+| `scripts/preflight.sh` | 196 | 上线前静态检查（**只读**）：机型/磁盘、目录、Python、plist、配置硬断言、secrets 权限 | `04` §7.2 + `01` §0.1/§1/§3/§8 |
+| `scripts/check-secrets.sh` | 30 | 凭据纪律三条断言（权限 600 / 未被 git 跟踪 / plist 无明文） | `04` §2.6 |
+| `scripts/smoke.sh` | 249 | 冒烟集：SQLite + 表数 + 完整性 + FTS5/JSON1 + FAISS 一致性 + 4 个服务 + 健康端点 + Caddy | `01` §14 + `04` §7.3 |
+| `scripts/backup.sh` | 45 | 本地备份（`.backup` + rsync + 保留 30 天） | `01` §13 |
+| `scripts/release.sh` | 76 | 版本切换与逐个重启（release 目录 + `ln -sfn` + 按序 `kickstart`） | `04` §7.6 |
+
+---
+
+## 二、执行顺序
+
+```bash
+# 0) 先把 secrets 准备好（install.sh 不会替你填密钥）
+mkdir -p ~/.ekbs
+cp deploy/config/secrets.env.example ~/.ekbs/secrets.env
+chmod 600 ~/.ekbs/secrets.env
+vim ~/.ekbs/secrets.env                 # 填入 8 项真实凭证
+
+# 1) 安装（幂等，可重复执行）
+bash deploy/scripts/install.sh
+
+# 2) 上线前检查（只读；必须 0 个 FAIL）
+bash deploy/scripts/preflight.sh
+
+# 3) 冒烟（默认不出网；加 --with-deps / --with-qa 才会真实调用云端）
+bash deploy/scripts/smoke.sh
+bash deploy/scripts/smoke.sh --with-deps        # 额外验证云端三模型与权限红线
+bash deploy/scripts/smoke.sh --with-qa          # 额外做一次真实问答（消耗 token）
+
+# 4) 凭据纪律（CI 与日常巡检都跑）
+bash deploy/scripts/check-secrets.sh
+
+# 5) 备份（建议加进 crontab： 0 2 * * * /opt/ekbs/etc/backup.sh >> /opt/ekbs/log/backup.log 2>&1）
+bash deploy/scripts/backup.sh
+
+# 6) 发版 / 回滚
+bash deploy/scripts/release.sh /opt/ekbs/releases/20260926-1430
+# 回滚：ln -sfn /opt/ekbs/releases/<上一版> /opt/ekbs/app && bash deploy/scripts/release.sh /opt/ekbs/releases/<上一版>
+```
+
+**退出码约定**：`preflight.sh` 与 `smoke.sh` 以 `0` 表示通过、`1` 表示至少一项 FAIL；
+`smoke.sh` 的 `SKIP`（如未配 Caddy 域名）不计入失败。
+
+---
+
+## 三、已在本机验证过的内容
+
+| 验证项 | 命令 | 结果 |
+|---|---|---|
+| SQL 可执行且幂等 | `sqlite3 :memory: < deploy/sql/001_init.sql` | ✅ 通过；**29 张 `ekbs_*` 对象**（+ 5 张 FTS5 影子表，共 34 行 `sqlite_master`） |
+| 审计触发器生效 | 建库后 `UPDATE` / `DELETE` 审计表 | ✅ 12 个触发器全部生效；`ekbs_qa_session` 只允许改 `ended_at` / `message_count`，且 NULL→值 的篡改也会被拦（用 `IS NOT` 而非 `<>`） |
+| plist 合法 | `plutil -lint deploy/launchd/*.plist` | ✅ 4/4 OK |
+| shell 语法 | `bash -n deploy/scripts/*.sh` | ✅ 6/6 OK |
+| 关键配置值 | 抽查 `application.yaml` | ✅ `host: 127.0.0.1`、`workers: 1`、`rerank.top_n: 15` / `keep: 5`、`l4_enabled: false` |
+
+> **尚未验证**（需要真机与凭据，属 `00` §11 的 M1~M6）：`install.sh` 全流程、MinerU 在 macOS 26 的安装与解析、
+> 云端三模型连通性、`smoke.sh --with-qa` 的真实问答。**这些是 POC 首周要做的事。**
+
+---
+
+## 四、与文档不一致时怎么办
+
+本目录是 `01`/`04` 的落地，**不新增设计**。若发现两者不一致：
+
+| 情况 | 处置 |
+|---|---|
+| `deploy/` 里是旧的（文档已改） | 改 `deploy/`，并在 `01`/`04` 的修订记录里记一下 |
+| `deploy/` 里是新想法 | **先改文档**（`00` 决策台账或对应文档），再改 `deploy/` —— 不要让脚本成为隐性设计源 |
+| 文档本身自相矛盾 | 列出来找架构负责人定，**不要自己选一个然后悄悄改** |
+
+### 已知的文档口径差异（已在 `smoke.sh` 头部标注）
+
+`01` §14 的旧写法用过 `/health/ready`，而 `04` §7.3 定义的是 `/livez`、`/healthz`、`/readyz`、`/health/deps`。
+**现以 `04` §7.3 为准**（`01` §8.3 与 §14 已改为 `/readyz`）。
+`/health/deps` **会真实出网**（探测云端三模型），因此**绝不能作为 readiness 探针**；探针只用 `/readyz`。

@@ -1,0 +1,179 @@
+# =============================================================================
+# EKBS 云端联调配置（对应 01 §7 的 /opt/ekbs/etc/application.yaml）
+# -----------------------------------------------------------------------------
+# 用途：**接真实云端模型**的开发/联调配置 —— 与 application.dev.yaml 的唯一区别是
+#       模型 provider 由 mock 换成 dashscope（embed / rerank / LLM 三个都走真实 API，
+#       需要环境变量 DASHSCOPE_API_KEY；每次问答都真花 token）。
+#   ① 目录：data_dir / log_dir / database.path 指向仓库内 var/ 与 var-cloud/，
+#       不碰 /opt 与 /data（生产：/opt/ekbs/log、/data/ekbs、/data/ekbs/index/ekbs.db）
+#   ② 模型：qwen3.7-text-embedding-flash@1024 + qwen3.7-text-rerank + qwen-max
+#       （2026-09-27 选型；rerank.min_score 按三带实测校准为 0.60）
+#
+# 【密钥纪律】本文件是**非敏感**配置：任何 key / secret / token 都不得写在这里。
+#   ekbs/config.py 会做反向检查，发现密钥类键名即报错退出（04 §2.6）。
+#   云端 key 放 ~/.ekbs/secrets.env（权限 600），或开发机上用环境变量注入。
+# =============================================================================
+
+app:
+  name: ekbs
+  env: dev                 # 云端联调（真实模型，数据仍用合成语料）
+  timezone: Asia/Shanghai
+  log_dir: var-cloud/log         # 开发（生产 /opt/ekbs/log）
+  data_dir: var            # 开发（生产 /data/ekbs）
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  # 必须为 1：权限缓存的进程内 L1 靠同进程同步失效（04 §1.5 / §7.2）
+  workers: 1
+
+database:
+  path: var-cloud/index/ekbs.db  # 开发（生产 /data/ekbs/index/ekbs.db）
+  wal: true
+
+# ---------- 检索链路参数（对应 00 §2.1；数值与生产一致，改的是 provider 不是参数）----------
+retrieval:
+  dense_top_k: 30
+  sparse_top_k: 30
+  rrf_k: 60
+  rerank:
+    enabled: true
+    provider: dashscope
+    model: qwen3.7-text-rerank
+    top_n: 15
+    keep: 5
+    # 实测校准（2026-09-27，alice 视角，demo 语料 2 文档 / 8 向量，qwen3.7-text-rerank）：
+    #   ① 语料内可答（年假天数/申请/打卡/补偿）      top 分 0.926 ~ 0.991
+    #   ② 域内但语料里没有答案（报销/绩效/合同/竞业/股权/财务报表） top 分 0.108 ~ 0.391
+    #   ③ 完全域外（天气/写诗/Python/高铁）           top 分 0.002 ~ 0.020
+    # 两段空隙：②③ 之间（0.020~0.108）、①② 之间（0.391~0.926）。
+    # 拒答只取决于 ① 与 ② 的分界，故取 ①② 空隙的几何中点 ~0.60：
+    # 高于 ② 上限 1.5 倍、低于 ① 下限 1.5 倍，两侧留等量余量。
+    # 01 §7 模板的 0.30 落在 ② 内部，会让「报销标准」「合同审批」等
+    # **语料里根本没有**的问题通过阈值，交给 LLM 去圆（实测 0.391/0.321 均 >0.30）。
+    # ⚠️ demo 语料只有 2 个文档、且 ① 类问题近乎逐字命中（0.93+），带宽偏乐观；
+    #    真实语料导入后必须按 `方案/01 §7` 的 M3 方法重做三带校准。
+    min_score: 0.60
+  parent_expand: true
+  # 查询改写（00 §2.1 的第一步，多轮对话时启用）；策略：off | heuristic | llm
+  # heuristic：当前问题含指代或过短时并入上一轮问题；llm：用云端模型按模板改写成自包含查询
+  query_rewrite:
+    strategy: heuristic
+  cache:
+    backend: memory+sqlite
+    l1_size: 2000
+    query_embedding_ttl: 86400
+    retrieve_ttl: 1800
+    answer_ttl: 3600
+
+# ---------- 云端模型 ----------
+models:
+  embed:
+    provider: dashscope
+    # 选型：2026-09-27 由你从候选清单中选定（00 D2 原选 text-embedding-v4）。
+    # 理由：115ms（最快）、0.000125 元/千 token（v4 的 1/4 价）、1024 维（与本地 bge-m3
+    # 迁移路径兼容）、RPM 24000（v4 仅 1800）、上下文 128K。
+    model: qwen3.7-text-embedding-flash
+    dim: 1024
+    # 该模型单请求上限 20 条（v4 是 10）；已实测确认，见下方 batch 探测记录
+    batch_size: 20
+    timeout_s: 30
+    max_retries: 3
+  llm:
+    provider: dashscope
+    model: qwen-max
+    temperature: 0.1
+    top_p: 0.8
+    max_tokens: 2048
+    timeout_s: 120
+    max_retries: 2
+    fallback:              # 主模型不可用时启用（00 §2.3）；开发环境无 fallback
+      provider: ""
+      model: ""
+
+# ---------- 解析 ----------
+parse:
+  engine: mineru
+  max_file_mb: 500
+  timeout_s: 1800
+  worker_concurrency: 1
+  keep_tmp_days: 7
+
+# ---------- 权限 ----------
+permission:
+  default_level: 2
+  l4_enabled: false
+  l3_ingest_enabled: false
+  policy_cache_ttl: 300
+  # 合规闸（00 §7）：云端嵌入 = 全量语料出网。书面确认前保持 false，仅允许合成语料。
+  corpus_egress_ack: false
+  corpus_egress_ack_ticket: ""
+  # dept_code → 钉钉部门 ID 列表 的映射。见 docs/spec/10 的 O6-1 / K1：
+  # 权威方案未定义该映射存在哪里，本骨架先由配置承载（不新增 Schema）。
+  # ⚠️ 必须放在**配置**里而不是进程内存里：入库（worker）、路由（api）是两个进程，
+  #    内存态映射会让同一部门在不同进程里解析出不同的分片名（实测踩过：kb_hr_L2 vs kb_102_L2）。
+  #    O6-1 定稿后应迁到权威位置，并同步方案文档。
+  dept_code_map:
+    hr: ["102"]
+    finance: ["103"]
+
+# ---------- 钉钉（开发环境关闭；凭据走 secrets.env）----------
+dingtalk:
+  stream_enabled: false    # 开发：不连钉钉 Stream，adapter 不启动
+  per_user_session: true
+  rate_limit_per_user_per_min: 20
+  max_reply_chars: 3500
+  reconnect_backoff_seconds: [3, 5, 10, 20, 30]
+  heartbeat_ping_seconds: 60
+  ack_timeout_seconds: 10
+  robot_code: "dingdevplaceholder"
+  openapi:
+    base_url: "https://api.dingtalk.com"
+    legacy_base_url: "https://oapi.dingtalk.com"
+    connect_timeout: 3.0
+    read_timeout: 5.0
+    max_retries: 2
+    token_cache_key: "ekbs:dt:app_token:{app_key}"
+    token_refresh_ahead_seconds: 300
+  card:
+    ai_template_id: "dingdevplaceholder"
+    citation_template_id: "dingdevplaceholder"
+    streaming_enabled: true
+    streaming_chunk_chars: 24
+    streaming_min_interval_ms: 300
+    streaming_max_duration_seconds: 120
+    thinking_text: "正在检索企业知识库…"
+
+adapter:
+  host: 127.0.0.1
+  port: 8100
+  graceful_shutdown_seconds: 30
+  api_base: "http://127.0.0.1:8000"
+  qa_stream_timeout_seconds: 180
+  request_timeout_seconds: 30
+
+session:
+  context_max_turns: 6
+  context_ttl_seconds: 7200
+  group_share_context: false
+
+limits:
+  global_qps: 20
+  per_user_qps: 2
+  per_conversation_qps: 3
+  max_question_chars: 2000
+  max_file_size_mb: 100
+  file_ext_whitelist: [pdf, docx, doc, pptx, ppt, xlsx, xls, txt, md, html, png, jpg, jpeg]
+
+security:
+  allowed_file_mime:
+    - application/pdf
+    - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+    - application/vnd.openxmlformats-officedocument.presentationml.presentation
+    - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+    - text/plain
+    - text/markdown
+    - image/png
+    - image/jpeg
+  sensitive_words_path: "config/sensitive_words.txt"   # 开发（生产 /opt/ekbs/etc/sensitive_words.txt）
+  content_security_enabled: true

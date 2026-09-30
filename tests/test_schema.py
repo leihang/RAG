@@ -1,0 +1,96 @@
+"""Schema 与审计表只写不改（`01` §5.6/§5.7、`02` TC-ENV-010）。"""
+
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+
+from ekbs.db import EXPECTED_TABLES, EXPECTED_TRIGGERS, Database
+
+
+def test_apply_schema_is_idempotent(settings) -> None:
+    database = Database(settings)
+    first = database.apply_schema()
+    assert first.tables == EXPECTED_TABLES
+    assert first.triggers == EXPECTED_TRIGGERS
+    # 重复执行不报错、不改变结构（DDL 全部 IF NOT EXISTS）
+    second = database.apply_schema(force=True)
+    assert second.tables == EXPECTED_TABLES
+    assert second.triggers == EXPECTED_TRIGGERS
+    assert second.ok
+
+
+def test_schema_report_ok(db) -> None:
+    report = db.verify_schema()
+    assert report.ok, report.problems()
+    assert report.policy_version == 1
+    assert report.journal_mode.lower() == "wal"
+    assert report.integrity == "ok"
+
+
+def test_fts5_virtual_table_exists(db) -> None:
+    with db.sync_connect() as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'ekbs_chunk_fts%'"
+        ).fetchall()
+    names = {str(r["name"]) for r in rows}
+    assert "ekbs_chunk_fts" in names
+    assert {"ekbs_chunk_fts_data", "ekbs_chunk_fts_idx"} <= names
+
+
+def _insert_message(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO ekbs_qa_session(session_id, user_id, channel, perm_fingerprint, "
+        "clearance_at) VALUES ('s1', 1, 'web', 'fp', 2)"
+    )
+    conn.execute(
+        "INSERT INTO ekbs_qa_message(session_id, turn, role, question, answer) "
+        "VALUES ('s1', 1, 'assistant', 'q', 'a')"
+    )
+
+
+def test_audit_tables_reject_update_and_delete(db) -> None:
+    """审计表 append-only：SQLite 没有 GRANT/REVOKE，只能靠触发器硬拒（01 §5.6）。"""
+    with db.sync_connect() as conn:
+        _insert_message(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE ekbs_qa_message SET answer = 'tampered'")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("DELETE FROM ekbs_qa_message")
+        # 触发器拒绝后事务仍可用（ABORT 只回滚当前语句）
+        assert conn.execute("SELECT answer FROM ekbs_qa_message").fetchone()["answer"] == "a"
+
+
+def test_qa_session_allows_only_two_fields(db) -> None:
+    """``ekbs_qa_session`` 只允许改 ``ended_at`` / ``message_count``。
+
+    其余字段一律拒绝 —— 且用的是 ``IS NOT`` 而不是 ``<>``：``<>`` 在任一侧为 NULL 时结果为
+    NULL，``WHEN`` 子句会当成假，「从 NULL 改成有值」这种篡改就漏过去了
+    （`01` §5.6 的注释与 ``deploy/README.md`` 都点明了这个坑）。
+    """
+    with db.sync_connect() as conn:
+        _insert_message(conn)  # conversation_id 初始为 NULL
+        conn.execute(
+            "UPDATE ekbs_qa_session SET ended_at = datetime('now'), message_count = 2 "
+            "WHERE session_id = 's1'"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE ekbs_qa_session SET perm_fingerprint = 'other'")
+        # NULL → 值 的篡改同样必须被拦（IS NOT 的价值所在）
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE ekbs_qa_session SET conversation_id = 'forged'")
+        # 白名单字段仍可继续更新（归档/结束会话需要）
+        conn.execute("UPDATE ekbs_qa_session SET message_count = 4 WHERE session_id = 's1'")
+        assert (
+            conn.execute(
+                "SELECT message_count FROM ekbs_qa_session WHERE session_id = 's1'"
+            ).fetchone()["message_count"]
+            == 4
+        )
+
+
+def test_policy_version_seed_single_row(db) -> None:
+    with db.sync_connect() as conn:
+        count = conn.execute("SELECT COUNT(*) AS c FROM ekbs_policy_version").fetchone()["c"]
+    assert int(count) == 1

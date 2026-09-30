@@ -1,0 +1,43 @@
+# ---- Python ----
+__pycache__/
+# ---- Python 构建产物（pip install . / python -m build 会生成）----
+build/
+dist/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+
+# ---- 本地运行数据（对应 01 §1 的 /data/ekbs，开发机落在 var/）----
+var/
+# 云端联调用的第二份数据目录（config/application.cloud.yaml）。
+# 必须整体忽略：日志文件名不一定带 .log（手工起服务时是 api*.out），
+# 只按扩展名忽略会让它们漏进版本库。
+var-cloud/
+*.db
+*.db-wal
+*.db-shm
+*.faiss
+*.log
+
+# ---- 密钥（01 §0.2 / 04 §2.6：绝不入库）----
+secrets.env
+.env
+*.pem
+
+# ---- macOS ----
+.DS_Store
+
+# ---- 甲方方案文档（独立交付物，不入代码库；如需私有库保留，删掉这一段即可）----
+方案/
+# ---- 一次性的交付报表与 Excel 临时文件 ----
+docs/文件夹与文件用途.xlsx
+docs/.~*

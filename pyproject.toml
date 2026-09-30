@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ekbs"
+version = "0.1.0"
+description = "EKBS 企业知识中枢 —— 部门级 RAG 试点（Python venv + launchd，无 Docker）"
+requires-python = ">=3.11"
+# 依赖版本口径的唯一权威是 requirements.txt（镜像 方案/deploy/requirements.txt），
+# 这里不重复声明，避免两处漂移。
+dependencies = []
+
+[tool.setuptools.packages.find]
+# [修正] 原写 `packages = ["ekbs"]`，只声明顶层包 —— `pip install .` / 构建 wheel 时
+# **10 个子包（api/retrieval/permission/index/ingest/provider/dingtalk/cache/tools/observability）
+# 全部不会被打进去**，装完 import ekbs.api 直接 ModuleNotFoundError。
+# 生产上没暴露是因为 deploy/scripts/release.sh 用的是 `pip install -e`（editable 把项目根
+# 加进 sys.path，子包靠文件系统解析）。非 editable 安装/打包必须靠这条 find 规则。
+include = ["ekbs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
