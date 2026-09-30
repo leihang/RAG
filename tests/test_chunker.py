@@ -5,10 +5,12 @@ from __future__ import annotations
 from ekbs.ingest.chunker import (
     CHILD_MAX_TOKENS,
     CHILD_MIN_TOKENS,
+    OVERLAP_MIN_RATIO,
     PARENT_MAX_TOKENS,
     PARENT_MIN_TOKENS,
     chunk_markdown,
     count_tokens,
+    ensure_heading_path,
     split_sections,
 )
 
@@ -21,6 +23,16 @@ SHORT_DOC = """# 年假管理制度
 ## 第二条 申请流程
 
 须提前 3 个工作日在系统提交申请。
+"""
+
+#: 无 Markdown # 标题、纯条款行 —— 制度 PDF / 纯文本常见形态
+CLAUSE_PLAIN = """年假管理制度
+
+第一条 年假天数
+员工年假天数按司龄确定：满一年五天，满三年十天。另有补充说明若干。
+
+第二条 申请流程
+须提前三个工作日在系统提交申请，经主管审批后方可休假。
 """
 
 
@@ -40,6 +52,24 @@ def test_split_sections_builds_heading_path() -> None:
     assert any("第一条 年假天数" in path for path in paths)
 
 
+def test_clause_lines_become_heading_path() -> None:
+    """无 # 时，``第X条`` 行仍应成为 heading_path（条款感知）。"""
+    sections = split_sections(CLAUSE_PLAIN)
+    paths = [s.heading_path for s in sections]
+    assert any("第一条" in p for p in paths)
+    assert any("第二条" in p for p in paths)
+    result = chunk_markdown(CLAUSE_PLAIN, doc_title="年假管理制度")
+    assert all(n.heading_path.strip() for n in result.nodes)
+    assert any("第一条" in n.heading_path for n in result.children)
+
+
+def test_heading_path_never_empty_with_doc_title() -> None:
+    result = chunk_markdown("没有任何标题的一段正文。", doc_title="差旅费管理办法")
+    assert result.parents
+    assert all(n.heading_path == "差旅费管理办法" for n in result.nodes)
+    assert ensure_heading_path("", doc_title="") == "文档"
+
+
 def test_short_document_produces_linked_parent_and_children() -> None:
     result = chunk_markdown(SHORT_DOC)
     assert result.parents, "至少一个父块"
@@ -48,7 +78,7 @@ def test_short_document_produces_linked_parent_and_children() -> None:
         assert child.parent_index is not None
         parent = result.nodes[child.parent_index]
         assert parent.chunk_type == "parent"
-        # 子块必须落在父块文本内（父子关系可回溯）
+        # 子块必须落在父块文本内（父子关系可回溯）；overlap 前缀也来自同父块兄弟
         assert child.content.strip()[:12] in parent.content
 
 
@@ -63,7 +93,9 @@ def test_long_document_respects_token_bounds() -> None:
     result = chunk_markdown(_long_doc())
     assert len(result.parents) >= 3, "长文档应切出多个父块"
     assert all(PARENT_MIN_TOKENS <= node.token_count <= PARENT_MAX_TOKENS for node in result.parents)
-    assert all(node.token_count <= CHILD_MAX_TOKENS for node in result.children)
+    # 相邻 overlap 会让子块略超 CHILD_MAX（≤ max + 12% 预算）
+    child_ceiling = CHILD_MAX_TOKENS + int(CHILD_MAX_TOKENS * OVERLAP_MIN_RATIO) + 32
+    assert all(node.token_count <= child_ceiling for node in result.children)
     # 每个父块最多允许一个「尾部余量」子块小于 CHILD_MIN：
     # 父块总长不足以切成两个合规子块时（例如 500 token），这在数学上无法避免。
     assert len(result.children) - len(result.parents) <= sum(
@@ -71,6 +103,25 @@ def test_long_document_respects_token_bounds() -> None:
     )
     # 但绝不允许退化碎块（几十 token 的碎片会污染 rerank）
     assert all(node.token_count >= CHILD_MIN_TOKENS // 4 for node in result.children)
+
+
+def test_adjacent_children_share_overlap() -> None:
+    """同一父块下相邻子块必须有 12%+ 尾部重叠（TC-INDEX-003）。"""
+    result = chunk_markdown(_long_doc(sections=1, body_chars=2400))
+    by_parent: dict[int, list] = {}
+    for child in result.children:
+        assert child.parent_index is not None
+        by_parent.setdefault(child.parent_index, []).append(child)
+    multi = next((kids for kids in by_parent.values() if len(kids) >= 2), None)
+    assert multi is not None, "长小节应切出 ≥2 个子块以验证 overlap"
+    prev, cur = multi[0], multi[1]
+    # cur 应以 prev 尾部为前缀（或至少共享一段尾部文本）
+    overlap_budget = int(CHILD_MAX_TOKENS * OVERLAP_MIN_RATIO)
+    tail = prev.content[-max(40, overlap_budget) :]
+    assert any(
+        piece and piece in cur.content
+        for piece in (tail, prev.content[-60:], prev.content.split("。")[-2] if "。" in prev.content else "")
+    ), f"相邻子块未见 overlap：prev_tail={tail[:40]!r} cur_head={cur.content[:80]!r}"
 
 
 def test_small_section_becomes_a_small_parent() -> None:
@@ -87,9 +138,10 @@ def test_small_section_becomes_a_small_parent() -> None:
 def test_children_are_smaller_than_or_equal_to_parents() -> None:
     result = chunk_markdown(_long_doc())
     by_index = {index: node for index, node in enumerate(result.nodes)}
+    slack = int(CHILD_MAX_TOKENS * OVERLAP_MIN_RATIO) + 32
     for child in result.children:
         parent = by_index[child.parent_index]
-        assert child.token_count <= parent.token_count
+        assert child.token_count <= parent.token_count + slack
 
 
 def test_count_tokens_is_positive_and_monotonic() -> None:

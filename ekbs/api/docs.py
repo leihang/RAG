@@ -39,6 +39,9 @@ from pydantic import BaseModel, Field
 from ekbs.api.auth import INTERNAL_TOKEN_HEADER, INTERNAL_USER_HEADER
 from ekbs.api.qa import _authenticate
 from ekbs.errors import ConfigError, PermissionDenied, SchemaError
+from ekbs.ingest.dir_import import ImportPathError, assert_path_within_raw
+from ekbs.ingest.parser import SUFFIX_ENGINES, normalize_suffix
+from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
 from ekbs.logging import get_logger
 from ekbs.permission.changes import PermissionChangeService
 from ekbs.permission.router import bump_policy_version
@@ -142,13 +145,29 @@ async def create_document(
     if kb_id is None:
         raise HTTPException(status_code=422, detail="必须给出 kb_id 或 kb_code")
 
+    # source_path 红线：必须落在 data_dir/raw 内的真实文件。空路径 / 逃逸路径会让
+    # worker 解析任意本机文件进知识库（与 dir_import 同等级别的越权）。
+    raw_path = (payload.source_path or "").strip()
+    if not raw_path:
+        raise HTTPException(
+            status_code=422,
+            detail="必须提供 raw 目录内的 source_path，或改走 /docs/upload",
+        )
+    try:
+        resolved = assert_path_within_raw(settings, raw_path)
+    except ImportPathError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not resolved.is_file():
+        raise HTTPException(status_code=422, detail=f"文件不存在：{resolved}")
+    source_path = str(resolved)
+
     with runtime.db.sync_connect() as conn:
         conn.execute(
             "INSERT INTO ekbs_document(kb_id, title, source_path, level, visible_dept_ids, "
             "status, checksum, doc_version, effective_date, expire_date, created_by) "
             "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
             (
-                kb_id, payload.title, payload.source_path or payload.title, payload.level,
+                kb_id, payload.title, source_path, payload.level,
                 json.dumps(payload.visible_dept_ids, ensure_ascii=False), payload.checksum,
                 payload.doc_version, payload.effective_date, payload.expire_date, user.user_id,
             ),
@@ -267,7 +286,10 @@ async def publish_document(
     with runtime.db.sync_connect() as conn:
         chunks = int(
             conn.execute(
-                "SELECT COUNT(*) FROM ekbs_chunk WHERE doc_id = ? AND chunk_type = 'child'", (doc_id,)
+                # 用「可检索块」而不是 child：代码文件切出来的是符号块（parent），
+                # 写死 child 会让纯代码文档永远卡在"尚无分块"而发布不了
+                f"SELECT COUNT(*) FROM ekbs_chunk c WHERE c.doc_id = ? AND {RETRIEVABLE_PREDICATE}",
+                (doc_id,),
             ).fetchone()[0]
         )
     if chunks == 0:
@@ -337,62 +359,320 @@ async def delete_document(
     doc_id: int,
     request: Request,
     reason: str = Query(default=""),
+    hard: bool = Query(default=False, description="true=物理删除行与资产；默认软删除进回收站"),
+    purge_assets: bool = Query(
+        default=True,
+        description="仅 hard=true 时生效：是否同时删除磁盘原件与解析产物",
+    ),
     authorization: str | None = Header(default=None),
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """删除文档：分块 + FTS5 行 + 文档行一并清理，并自增策略版本。
-
-    ⚠️ FAISS 是**追加型**索引（``IndexFlatIP`` 不支持删除），因此旧向量会留成分片里的
-    孤儿 —— 它们召不回（按 ``shard_id`` 与 ``ekbs_chunk`` 联查不到），但会白占容量。
-    响应里会提示去跑 ``POST /api/v1/system/index/rebuild``。
-    """
+    """删除文档。默认**软删除**（摘索引、清解析图与图注；``raw`` 原件保留 30 天）；
+    ``hard=true`` 才物理删行；``purge_assets`` 控制硬删时是否连原件一并清。"""
     user, _ = _principal(
         request, _headers(authorization, x_internal_token, x_internal_user_id),
         "doc:document:delete",
     )
+    return JSONResponse(
+        _perform_delete(
+            _runtime(request), doc_id, user_id=user.user_id, reason=reason or "api:delete",
+            hard=hard, purge_assets=purge_assets,
+        )
+    )
+
+
+@router.post("/docs/documents/{doc_id}/restore")
+async def restore_document(
+    doc_id: int,
+    request: Request,
+    reason: str = Query(default=""),
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """从回收站恢复：``deleted → offline``。索引已在软删时摘掉，须 **reparse** 才能再发布。"""
+    user, _ = _principal(
+        request, _headers(authorization, x_internal_token, x_internal_user_id),
+        "doc:document:update",
+    )
     runtime = _runtime(request)
-    _load_document(runtime, doc_id)
+    row = _load_document(runtime, doc_id)
+    if str(row["status"]) != "deleted":
+        raise HTTPException(status_code=409, detail=f"仅 deleted 可恢复，当前 status={row['status']}")
     with runtime.db.sync_connect() as conn:
-        chunk_ids = [
-            int(r["chunk_id"])
-            for r in conn.execute("SELECT chunk_id FROM ekbs_chunk WHERE doc_id = ?", (doc_id,)).fetchall()
-        ]
-        shards = [
-            str(r["shard_id"])
-            for r in conn.execute(
-                "SELECT DISTINCT shard_id FROM ekbs_chunk WHERE doc_id = ?", (doc_id,)
-            ).fetchall()
-        ]
-    if chunk_ids:
-        runtime.fts.delete_chunk_ids(chunk_ids)
-    with runtime.db.sync_connect() as conn:
-        conn.execute("DELETE FROM ekbs_chunk WHERE doc_id = ?", (doc_id,))
-        conn.execute("DELETE FROM ekbs_document WHERE doc_id = ?", (doc_id,))
+        conn.execute(
+            "UPDATE ekbs_document SET status = 'offline', deleted_at = NULL, "
+            "updated_at = datetime('now') WHERE doc_id = ?",
+            (doc_id,),
+        )
         conn.execute(
             "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
             "field, old_value, new_value, reason) "
-            "VALUES (?, 'document', ?, 'delete', 'deleted', 'present', 'absent', ?)",
-            (user.user_id, str(doc_id), reason or "api:delete"),
+            "VALUES (?, 'document', ?, 'restore', 'status', 'deleted', 'offline', ?)",
+            (user.user_id, str(doc_id), reason or "api:restore"),
         )
-        version = bump_policy_version(conn, reason=f"api:delete:doc={doc_id}")
+        version = bump_policy_version(conn, reason=f"api:restore:doc={doc_id}")
         conn.commit()
+    log.info("document_restored", doc_id=doc_id, operator=user.user_id, policy_version=version)
+    return JSONResponse({
+        "doc_id": doc_id,
+        "status": "offline",
+        "policy_version": version,
+        "hint": "已恢复为 offline；需 reparse 后才能再次发布进索引",
+    })
+
+
+def _collect_chunk_image_paths(runtime: Any, doc_id: int) -> list[str]:
+    """摘索引前先记下 figure 块的 ``image_path``（相对 data_dir），供清图注缓存。"""
+    with runtime.db.sync_connect() as conn:
+        rows = conn.execute(
+            "SELECT image_path FROM ekbs_chunk "
+            "WHERE doc_id = ? AND image_path IS NOT NULL AND TRIM(image_path) != ''",
+            (doc_id,),
+        ).fetchall()
+    return [str(r["image_path"]) for r in rows]
+
+
+def _figure_stems_from_image_paths(paths: list[str]) -> set[str]:
+    """``parse/.../images/img-<sha8>.png`` → ``img-<sha8>``（与图注缓存文件名对齐）。"""
+    stems: set[str] = set()
+    for rel in paths:
+        stem = Path(rel).stem
+        if stem.startswith("img-"):
+            stems.add(stem)
+    return stems
+
+
+def _figure_stems_under_parse_dir(parse_dir: Path) -> set[str]:
+    """扫解析目录里的图片文件名（chunk 已删或 CLI 入库走 sha- 目录时的兜底）。"""
+    stems: set[str] = set()
+    images = parse_dir / "images"
+    if not images.is_dir():
+        return stems
+    for item in images.iterdir():
+        if item.is_file() and item.stem.startswith("img-"):
+            stems.add(item.stem)
+    return stems
+
+
+def _purge_figure_caption_cache(runtime: Any, stems: set[str], *, doc_id: int) -> list[str]:
+    """图注是文档内容的一部分：文档失效则缓存一并清，不跨文档留用。"""
+    from ekbs.ingest.figure_caption import caption_cache_dir
+
+    removed: list[str] = []
+    cache_dir = caption_cache_dir(runtime.settings.data_dir)
+    for stem in sorted(stems):
+        path = cache_dir / f"{stem}.json"
+        if path.is_file():
+            path.unlink()
+            removed.append(str(path))
+    if removed:
+        log.info(
+            "document_caption_cache_removed",
+            doc_id=doc_id,
+            count=len(removed),
+        )
+    return removed
+
+
+def _purge_document_assets(
+    runtime: Any,
+    row: Any,
+    doc_id: int,
+    *,
+    image_paths: list[str] | None = None,
+    purge_raw: bool = True,
+) -> list[str]:
+    """删掉这份文档**在磁盘上的解析产物、图注缓存，以及（可选）原件**，返回被删路径。
+
+    图片与图注是文档内容生成的，文档删/失效时必须一起清 —— 不为「同图再入库省
+    一次 vision 费」跨文档留缓存。
+
+    解析目录两种约定都清：``parse/<doc_id>/``（worker）与
+    ``parse/sha-<checksum前16>/``（CLI import）。
+
+    ⚠️ **越界保护**：``source_path`` 只有确认落在 ``data_dir/raw`` **之内**才 unlink。
+    """
+    removed: list[str] = []
+    paths = runtime.settings.data_paths()
+    parse_root = paths["parse"]
+    stems = _figure_stems_from_image_paths(image_paths or [])
+
+    parse_dirs: list[Path] = [parse_root / str(doc_id)]
+    checksum = str(row["checksum"] or "").strip()
+    if checksum:
+        parse_dirs.append(parse_root / f"sha-{checksum[:16]}")
+
+    for parse_dir in parse_dirs:
+        if not parse_dir.is_dir():
+            continue
+        stems |= _figure_stems_under_parse_dir(parse_dir)
+        shutil.rmtree(parse_dir, ignore_errors=True)
+        removed.append(str(parse_dir))
+        log.info("document_assets_removed", doc_id=doc_id, path=str(parse_dir), kind="parse")
+
+    removed.extend(_purge_figure_caption_cache(runtime, stems, doc_id=doc_id))
+
+    if purge_raw:
+        raw_root = paths["raw"].resolve()
+        source = str(row["source_path"] or "")
+        if source:
+            target = Path(source)
+            try:
+                resolved = target.resolve()
+                resolved.relative_to(raw_root)
+            except Exception:
+                log.warning("delete_asset_outside_raw", doc_id=doc_id, path=source)
+            else:
+                if resolved.is_file():
+                    resolved.unlink()
+                    removed.append(str(resolved))
+                    log.info("document_asset_removed", doc_id=doc_id, path=str(resolved))
+    return removed
+
+
+def _drop_document_index(runtime: Any, doc_id: int) -> tuple[list[int], list[str]]:
+    """从 FAISS / FTS / ekbs_chunk 摘掉该文档的全部索引，返回 (chunk_ids, shard_ids)。"""
+    with runtime.db.sync_connect() as conn:
+        rows = conn.execute(
+            "SELECT chunk_id, shard_id FROM ekbs_chunk WHERE doc_id = ?", (doc_id,)
+        ).fetchall()
+    chunk_ids = [int(r["chunk_id"]) for r in rows]
+    by_shard: dict[str, list[int]] = {}
+    for row in rows:
+        by_shard.setdefault(str(row["shard_id"]), []).append(int(row["chunk_id"]))
+    shards = sorted(by_shard)
+    if chunk_ids:
+        runtime.fts.delete_chunk_ids(chunk_ids)
+        for shard_id, ids_in_shard in by_shard.items():
+            removed = runtime.shards.remove(shard_id, ids_in_shard)
+            log.info("document_vectors_removed", doc_id=doc_id, shard_id=shard_id, removed=removed)
+    with runtime.db.sync_connect() as conn:
+        conn.execute("DELETE FROM ekbs_chunk WHERE doc_id = ?", (doc_id,))
+        conn.commit()
+    return chunk_ids, shards
+
+
+def _perform_delete(
+    runtime: Any,
+    doc_id: int,
+    *,
+    user_id: int,
+    reason: str,
+    hard: bool = False,
+    purge_assets: bool = True,
+) -> dict[str, Any]:
+    """删除一篇文档的**核心逻辑**（单篇路由与批量路由共用同一份）。
+
+    * **软删除（默认）**：立刻摘 FAISS/FTS/chunk，文档行 ``status='deleted'`` +
+      ``deleted_at``；**解析图与图注缓存立刻清**；``raw`` 原件保留 30 天供恢复。
+    * **硬删除（``hard=true``）**：摘索引 + 删文档行；``purge_assets`` 控制是否连
+      原件/解析产物/图注一并删。
+
+    索引是 ``IndexIDMap2``（标签 = ``chunk_id``），因此摘向量是真删，不留孤儿。
+    """
+    doc_row = _load_document(runtime, doc_id)
+    if str(doc_row["status"]) == "deleted" and not hard:
+        raise HTTPException(status_code=409, detail="文档已在回收站；物理清除请传 hard=true")
+
+    # 必须在删 chunk 之前记下 image_path，否则图注缓存找不到对应 stem
+    image_paths = _collect_chunk_image_paths(runtime, doc_id)
+    chunk_ids, shards = _drop_document_index(runtime, doc_id)
+    assets_removed: list[str] = []
+
+    if hard:
+        if purge_assets:
+            assets_removed = _purge_document_assets(
+                runtime, doc_row, doc_id, image_paths=image_paths, purge_raw=True,
+            )
+        with runtime.db.sync_connect() as conn:
+            conn.execute("DELETE FROM ekbs_document WHERE doc_id = ?", (doc_id,))
+            conn.execute(
+                "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
+                "field, old_value, new_value, reason) "
+                "VALUES (?, 'document', ?, 'delete', 'deleted', 'present', 'absent', ?)",
+                (user_id, str(doc_id), reason or "api:hard_delete"),
+            )
+            version = bump_policy_version(conn, reason=f"api:hard_delete:doc={doc_id}")
+            conn.commit()
+        mode = "hard"
+        hint = (
+            "已物理删除文档行"
+            + ("与磁盘资产" if purge_assets else "（磁盘原件保留）")
+        )
+    else:
+        # 软删：原件留 30 天；图片/图注是文档内容，文档已失效则立刻清
+        assets_removed = _purge_document_assets(
+            runtime, doc_row, doc_id, image_paths=image_paths, purge_raw=False,
+        )
+        with runtime.db.sync_connect() as conn:
+            conn.execute(
+                "UPDATE ekbs_document SET status = 'deleted', deleted_at = datetime('now'), "
+                "updated_at = datetime('now') WHERE doc_id = ?",
+                (doc_id,),
+            )
+            conn.execute(
+                "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
+                "field, old_value, new_value, reason) "
+                "VALUES (?, 'document', ?, 'soft_delete', 'status', ?, 'deleted', ?)",
+                (user_id, str(doc_id), str(doc_row["status"]), reason or "api:soft_delete"),
+            )
+            version = bump_policy_version(conn, reason=f"api:soft_delete:doc={doc_id}")
+            conn.commit()
+        mode = "soft"
+        hint = (
+            "已软删除：索引与解析图/图注已清；磁盘原件保留 30 天；"
+            "可用 /restore 恢复为 offline 后 reparse"
+        )
+
     log.warning(
         "document_deleted",
         doc_id=doc_id,
+        mode=mode,
         chunks=len(chunk_ids),
         shards=shards,
-        note="FAISS 旧向量成为孤儿，建议 rebuild 回收容量",
+        assets_removed=len(assets_removed),
+        purge_assets=purge_assets if hard else True,
     )
-    return JSONResponse(
-        {
-            "doc_id": doc_id,
-            "deleted_chunks": len(chunk_ids),
-            "affected_shards": shards,
-            "policy_version": version,
-            "hint": "FAISS 为追加型索引：建议对这些分片执行 /api/v1/system/index/rebuild 回收容量",
-        }
-    )
+    return {
+        "doc_id": doc_id,
+        "mode": mode,
+        "status": "absent" if hard else "deleted",
+        "deleted_chunks": len(chunk_ids),
+        "affected_shards": shards,
+        "policy_version": version,
+        "assets_removed": assets_removed,
+        "hint": hint,
+    }
+
+
+TRASH_RETENTION_DAYS = 30
+
+
+def purge_expired_trash(runtime: Any, *, retention_days: int = TRASH_RETENTION_DAYS) -> dict[str, Any]:
+    """物理清理回收站中超过保留期的文档（scheduler 日作业调用）。"""
+    with runtime.db.sync_connect() as conn:
+        rows = conn.execute(
+            "SELECT doc_id FROM ekbs_document WHERE status = 'deleted' "
+            "AND deleted_at IS NOT NULL "
+            "AND deleted_at <= datetime('now', ?)",
+            (f"-{int(retention_days)} days",),
+        ).fetchall()
+    purged: list[int] = []
+    errors: list[dict[str, str]] = []
+    for row in rows:
+        doc_id = int(row["doc_id"])
+        try:
+            _perform_delete(
+                runtime, doc_id, user_id=0, reason="scheduler:trash_purge",
+                hard=True, purge_assets=True,
+            )
+            purged.append(doc_id)
+        except Exception as exc:  # pragma: no cover - 单条失败不阻断整批
+            log.error("trash_purge_failed", doc_id=doc_id, error=str(exc))
+            errors.append({"doc_id": str(doc_id), "error": str(exc)})
+    return {"purged": purged, "errors": errors, "retention_days": retention_days}
 
 
 # ---------------------------------------------------------------------------
@@ -402,10 +682,14 @@ async def delete_document(
 
 class BatchRequest(BaseModel):
     doc_ids: list[int] = Field(min_length=1, max_length=200)
-    action: str = Field(description="publish | offline | update")
+    action: str = Field(description="publish | offline | update | delete")
     level: int | None = Field(default=None, ge=1, le=4)
     visible_dept_ids: list[str] | None = None
     reason: str = ""
+    #: 仅对 ``action='delete'``：是否物理删除（默认软删进回收站）
+    hard: bool = False
+    #: 仅 ``hard=true`` 时有意义：是否连磁盘原件与解析产物一起删（默认删）
+    purge_assets: bool = True
 
 
 @router.post("/docs/documents/batch")
@@ -417,13 +701,18 @@ async def batch_documents(
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
     """批量操作：按动作分别校验权限点（publish → ``doc:document:publish``，
-    offline → ``doc:document:offline``，update → ``doc:document:update``）。"""
+    offline → ``doc:document:offline``，update → ``doc:document:update``，
+    delete → ``doc:document:delete``）。"""
     headers = _headers(authorization, x_internal_token, x_internal_user_id)
     action = payload.action.strip().lower()
     permission = {
         "publish": "doc:document:publish",
         "offline": "doc:document:offline",
         "update": "doc:document:update",
+        # 管理台的「删除 / 批量删除」走的都是这个批量接口（见 DocumentList.runConfirm），
+        # 这里原先没有 delete ⇒ 确认框修好后仍会撞 422「不支持的 action」。
+        # 与单篇删除共用 `_perform_delete`，两条路径不会漂移。
+        "delete": "doc:document:delete",
     }.get(action)
     if permission is None:
         raise HTTPException(status_code=422, detail=f"不支持的 action：{payload.action}")
@@ -445,6 +734,14 @@ async def batch_documents(
                 _set_status(runtime, doc_id, "offline", operator_id=user.user_id,
                             reason=payload.reason or "api:batch_offline")
                 results.append({"doc_id": doc_id, "ok": True, "status": "offline"})
+            elif action == "delete":
+                info = _perform_delete(
+                    runtime, doc_id, user_id=user.user_id,
+                    reason=payload.reason or "api:batch_delete",
+                    hard=payload.hard,
+                    purge_assets=payload.purge_assets,
+                )
+                results.append({"ok": True, **info})
             else:
                 changes = []
                 if payload.level is not None:
@@ -477,6 +774,22 @@ async def batch_documents(
 # ---------------------------------------------------------------------------
 
 
+def safe_relative_name(filename: str) -> str:
+    """把上传文件名规整成**raw 目录内的相对路径**，挡掉一切越界写法。
+
+    上传文件夹时前端会带上相对路径（``制度/2026/预算表.xlsx``）——
+    保留它才能把目录结构带进库；但 ``filename`` 是客户端给的，
+    所以必须自己挡：绝对路径、``..`` 段、空段、以点开头的段一律剔除。
+    """
+    parts: list[str] = []
+    for raw in str(filename or "").replace("\\", "/").split("/"):
+        seg = raw.strip()
+        if not seg or seg in {".", ".."} or seg.startswith("."):
+            continue
+        parts.append(seg)
+    return "/".join(parts) or "未命名"
+
+
 class UploadInit(BaseModel):
     filename: str = Field(min_length=1)
     size_bytes: int = Field(ge=0)
@@ -485,6 +798,77 @@ class UploadInit(BaseModel):
     kb_code: str | None = None
     level: int = Field(default=2, ge=1, le=4)
     visible_dept_ids: list[str] = Field(default_factory=list)
+    #: 可选标题。上传文件夹时前端把相对路径（去扩展名）作为标题传上来，
+    #: 否则 `Path(filename).stem` 会把目录结构整段丢掉，用户看到的就是"文件夹被分离了"。
+    title: str | None = Field(default=None, max_length=512)
+
+
+class UploadCheckHash(BaseModel):
+    checksum: str = Field(min_length=16, description="客户端 SHA-256 hex")
+    filename: str | None = None
+    size_bytes: int | None = Field(default=None, ge=0)
+
+
+def _find_instant_doc(runtime: Any, checksum: str) -> int | None:
+    """秒传命中：同 checksum 且非 failed/非 deleted。"""
+    with runtime.db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT doc_id FROM ekbs_document WHERE checksum = ? "
+            "AND status NOT IN ('failed', 'deleted') "
+            "ORDER BY doc_id LIMIT 1",
+            (checksum,),
+        ).fetchone()
+    return int(row["doc_id"]) if row is not None else None
+
+
+@router.post("/docs/upload/check-hash")
+async def upload_check_hash(
+    payload: UploadCheckHash,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """秒传预检（方案 §6.5）：有同内容且有效文档则 ``instant=true``。"""
+    _principal(
+        request, _headers(authorization, x_internal_token, x_internal_user_id),
+        "doc:document:create",
+    )
+    doc_id = _find_instant_doc(_runtime(request), payload.checksum.strip().lower())
+    if doc_id is not None:
+        return JSONResponse({"instant": True, "doc_id": doc_id, "message": "秒传：内容已存在"})
+    return JSONResponse({"instant": False})
+
+
+@router.get("/docs/upload/{upload_id}/status")
+async def upload_status(
+    upload_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """断点续传状态：已收分片位图 + 分片大小提示。"""
+    _principal(
+        request, _headers(authorization, x_internal_token, x_internal_user_id),
+        "doc:document:create",
+    )
+    if not all(c in "0123456789abcdef" for c in upload_id.lower()) or len(upload_id) < 16:
+        raise HTTPException(status_code=422, detail="非法 upload_id")
+    runtime = _runtime(request)
+    state = await runtime.cache.get(f"{UPLOAD_CACHE_PREFIX}{upload_id}")
+    if not isinstance(state, dict):
+        raise HTTPException(status_code=404, detail="upload_id 不存在或已过期")
+    chunk_mb = int(getattr(runtime.settings.upload, "chunk_size_mb", 8) or 8)
+    parts = sorted(int(p) for p in (state.get("parts") or []))
+    return JSONResponse(
+        {
+            "upload_id": upload_id,
+            "uploaded_chunks": parts,
+            "chunk_size_hint": chunk_mb * 1024 * 1024,
+            "size_bytes": int(state.get("size_bytes") or 0),
+        }
+    )
 
 
 @router.post("/docs/upload/init")
@@ -502,25 +886,49 @@ async def upload_init(
     )
     runtime = _runtime(request)
     settings = runtime.settings
-    extension = Path(payload.filename).suffix.lower().lstrip(".")
-    whitelist = {str(e).lower().lstrip(".") for e in (settings.limits or {}).get("file_ext_whitelist", DEFAULT_EXTS)}
+    # 用统一的归一化取后缀：尾部空格 / 全角句点 / 末尾多余点都会让裸 suffix 取错，
+    # 结果用户明明传的是 .xlsx 却被判"不支持的类型"（实测踩到）。
+    extension = normalize_suffix(payload.filename)
+    # **准入 = 配置允许 ∩ 解析器真能解析**
+    # 只按配置白名单放行会出现"上传成功、入库却是乱码"：配置里有 .ppt/.html 这类
+    # 解析器根本没实现的格式，放进来后 worker 走 text 分支把二进制当 UTF-8 读。
+    # 取交集后：配置仍照 `01` §7 写（不偏离方案），但实际只放行能解析的格式；
+    # 等解析分支补上，交集自动变大，配置一个字都不用改。
+    configured = {str(e).lower().lstrip(".") for e in (settings.limits or {}).get("file_ext_whitelist", DEFAULT_EXTS)}
+    parseable = {suffix.lstrip(".") for suffix in SUFFIX_ENGINES}
+    whitelist = configured & parseable
     if extension not in whitelist:
+        if extension in configured:
+            raise HTTPException(
+                status_code=422,
+                detail=f"暂不支持解析该格式：.{extension}（配置允许，但解析器尚未实现，"
+                       f"可用格式：{'、'.join(sorted(whitelist))}）",
+            )
         raise HTTPException(status_code=422, detail=f"不支持的文件类型：.{extension}")
-    max_mb = float((settings.limits or {}).get("max_file_size_mb", 100) or 100)
+    max_mb = float((settings.limits or {}).get("max_file_size_mb", 500) or 500)
     if payload.size_bytes > max_mb * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"文件超过 {max_mb:g} MB 上限")
 
+    # **分片归属判定前置**：L2/L3 不给部门、L4 未开，都会在**解析阶段**才被拒
+    # （worker 异步失败，界面上只显示"上传成功"）。放在这里就能立刻 422，且复用
+    # 入库路径的**同一份**判定函数（不另写规则）。
+    # 顺序：扩展名 → 大小 → 归属。文件本身不合格（413/415）比元数据不合格更该先报。
+    try:
+        from ekbs.index.shard import resolve_shard_for_document
+
+        resolve_shard_for_document(
+            level=int(payload.level),
+            visible_dept_ids=list(payload.visible_dept_ids),
+            settings=settings,
+        )
+    except ConfigError as exc:
+        raise HTTPException(status_code=422, detail=f"密级/部门不满足入库条件：{exc}") from exc
+
     if payload.checksum:
-        with runtime.db.sync_connect() as conn:
-            row = conn.execute(
-                "SELECT doc_id FROM ekbs_document WHERE checksum = ? AND status != 'failed' "
-                "ORDER BY doc_id LIMIT 1",
-                (payload.checksum,),
-            ).fetchone()
-        if row is not None:
-            # 秒传：同样的内容已经在库里，不再重复上传
+        doc_id = _find_instant_doc(runtime, str(payload.checksum).strip().lower())
+        if doc_id is not None:
             return JSONResponse(
-                {"instant": True, "doc_id": int(row["doc_id"]), "message": "秒传：内容已存在"}
+                {"instant": True, "doc_id": doc_id, "message": "秒传：内容已存在"}
             )
 
     upload_id = uuid.uuid4().hex
@@ -528,6 +936,7 @@ async def upload_init(
         f"{UPLOAD_CACHE_PREFIX}{upload_id}",
         {
             "filename": payload.filename,
+            "title": payload.title,
             "size_bytes": payload.size_bytes,
             "checksum": payload.checksum or "",
             "kb_id": payload.kb_id,
@@ -539,37 +948,64 @@ async def upload_init(
         ttl=UPLOAD_TTL_SECONDS,
     )
     (runtime.settings.data_paths()["tmp"] / upload_id).mkdir(parents=True, exist_ok=True)
-    return JSONResponse({"instant": False, "upload_id": upload_id, "chunk_size_hint": 5 * 1024 * 1024})
+    # 分片大小由配置给（方案 §6.5 的 upload.chunk_size_mb，默认 8 MB）。
+    # 原先硬编码 5 MB，与配置项对不上，也不是方案口径。
+    chunk_mb = int(getattr(settings.upload, "chunk_size_mb", 8) or 8)
+    return JSONResponse(
+        {
+            "instant": False,
+            "upload_id": upload_id,
+            "chunk_size_hint": chunk_mb * 1024 * 1024,
+            "uploaded_chunks": [],
+        }
+    )
 
 
 @router.post("/docs/upload/{upload_id}/chunk")
 async def upload_chunk(
     upload_id: str,
     request: Request,
-    index: int = Form(default=0),
-    file: UploadFile = File(...),
+    index: int | None = Form(default=None),
+    chunk_index: int | None = Form(default=None),
+    file: UploadFile | None = File(default=None),
+    chunk: UploadFile | None = File(default=None),
     authorization: str | None = Header(default=None),
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """上传一个分片（单请求也可，分片只为断点续传）。"""
+    """上传一个分片。兼容方案字段 ``chunk_index``+``chunk`` 与现有 ``index``+``file``。"""
     _principal(
         request, _headers(authorization, x_internal_token, x_internal_user_id),
         "doc:document:create",
     )
+    if not all(c in "0123456789abcdef" for c in upload_id.lower()) or len(upload_id) < 16:
+        raise HTTPException(status_code=422, detail="非法 upload_id")
     runtime = _runtime(request)
     state = await runtime.cache.get(f"{UPLOAD_CACHE_PREFIX}{upload_id}")
     if not isinstance(state, dict):
         raise HTTPException(status_code=404, detail="upload_id 不存在或已过期")
+    part_index = chunk_index if chunk_index is not None else index
+    if part_index is None:
+        raise HTTPException(status_code=422, detail="必须提供 index 或 chunk_index")
+    upload = chunk or file
+    if upload is None:
+        raise HTTPException(status_code=422, detail="必须提供 file 或 chunk")
     target_dir = runtime.settings.data_paths()["tmp"] / upload_id
     target_dir.mkdir(parents=True, exist_ok=True)
-    part_path = target_dir / f"part-{int(index):05d}"
-    part_path.write_bytes(await file.read())
+    part_path = target_dir / f"part-{int(part_index):05d}"
+    part_path.write_bytes(await upload.read())
     parts = set(state.get("parts") or [])
-    parts.add(int(index))
+    parts.add(int(part_index))
     state["parts"] = sorted(parts)
     await runtime.cache.set(f"{UPLOAD_CACHE_PREFIX}{upload_id}", state, ttl=UPLOAD_TTL_SECONDS)
-    return JSONResponse({"upload_id": upload_id, "received": len(parts), "index": int(index)})
+    return JSONResponse(
+        {
+            "upload_id": upload_id,
+            "received": len(parts),
+            "index": int(part_index),
+            "uploaded_chunks": sorted(parts),
+        }
+    )
 
 
 @router.post("/docs/upload/{upload_id}/complete")
@@ -594,19 +1030,47 @@ async def upload_complete(
     if not parts:
         raise HTTPException(status_code=409, detail="没有收到任何分片")
     merged = tmp_dir / "merged.bin"
+    # **流式**合并与哈希：不要 `merged.read_bytes()` —— 那会把整个文件读进内存。
+    # 上限一旦放宽（比如对齐 scheme §6.5 的 500 MB），一次性读入就等于凭空多出
+    # 一个与文件等大的内存峰值，正好撞上「16 GB 机器不让解析峰值叠加」这条约束
+    # （见 ekbs/worker.py 顶部）。这里边写边算，内存占用与文件大小无关。
+    hasher = hashlib.sha256()
     with merged.open("wb") as sink:
         for part in parts:
-            sink.write(part.read_bytes())
+            with part.open("rb") as src:
+                while block := src.read(1 << 20):
+                    sink.write(block)
+                    hasher.update(block)
 
-    digest = hashlib.sha256(merged.read_bytes()).hexdigest()
+    digest = hasher.hexdigest()
+    merged_bytes = merged.stat().st_size
+    declared = int(state.get("size_bytes") or 0)
+    # 闸门①：**分片完整性**（片数/顺序之外的最后一道，且**不依赖客户端校验和**）。
+    #
+    # 为什么必须有这道：浏览器算 SHA-256 用的是 `crypto.subtle`，它只在 https 或
+    # localhost 下存在。内网走 http://<ip>:8000/admin 时 `sha256Hex()` 返回 null，
+    # `checksum` 于是是空字符串 —— 下面那道校验和比对被 `if state.get(...)` 直接跳过。
+    # 也就是说**在内网部署这个最常见的形态下，之前没有任何服务端校验**：
+    # 少传一片、片区半截、片被改，都会照常入库。对 .md/.txt 这类纯文本，
+    # 截断后仍能正常解析 ⇒ 静默丢内容；而 `ekbs_document.size_bytes` 记的是
+    # **声明值**，库里连长度都对不上却没人比。
+    #
+    # 判断依据：切片的并集恰好覆盖整个文件（前端 `file.slice` 无重叠无缝隙），
+    # 所以"合并后字节数 == init 声明的 size_bytes"是必要条件。
+    # 保留 tmp 目录不删：`upload_chunk` 按 index 覆盖写，客户端补传缺的那片后
+    # 可以再调一次 complete 恢复，不必整份重传。
+    if declared and merged_bytes != declared:
+        log.warning(
+            "upload_size_mismatch",
+            upload_id=upload_id, merged_bytes=merged_bytes, declared_bytes=declared,
+            parts=len(parts),
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=f"分片不完整：合并后 {merged_bytes} 字节，上传时声明 {declared} 字节",
+        )
     if state.get("checksum") and str(state["checksum"]) != digest:
         raise HTTPException(status_code=422, detail="校验和不匹配（文件在传输中被改动或分片缺失）")
-
-    raw_dir = runtime.settings.data_paths()["raw"] / digest[:16]
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    final_path = raw_dir / str(state["filename"])
-    shutil.move(str(merged), final_path)
-    shutil.rmtree(tmp_dir, ignore_errors=True)
 
     kb_id = state.get("kb_id")
     if kb_id is None and state.get("kb_code"):
@@ -624,13 +1088,39 @@ async def upload_complete(
     except ConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # **先校验再落盘**：原先把 shutil.move 放在校验之前，于是任何一次失败的上传
+    # （最常见的正是上面那个 422）都会在 raw 里留下一个**没有文档记录的孤儿文件** ——
+    # 用户重试一次就多一份垃圾，而且库里查不到、看起来像"上传没生效"。
+    # 落盘布局：``raw/<知识库 code>/<你上传时的相对路径>``。
+    # 早先用 ``raw/<sha256 前16位>/`` 做目录名 —— 功能上没错（同内容同目录），
+    # 但在文件管理器里就是一堆 `95fbf1ef16573acf` 这样的壳子，人根本认不出是什么。
+    # 去重本来就在库里按 ``checksum`` 做（秒传），不依赖目录名。
+    raw_root = runtime.settings.data_paths()["raw"]
+    kb_code = state.get("kb_code")
+    if not kb_code:
+        with runtime.db.sync_connect() as conn:
+            row = conn.execute("SELECT code FROM ekbs_kb WHERE kb_id = ?", (int(kb_id),)).fetchone()
+        kb_code = str(row["code"]) if row else "default"
+    rel_name = safe_relative_name(str(state["filename"]))
+    final_path = raw_root / safe_relative_name(str(kb_code)) / rel_name
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    if final_path.exists():
+        # 同名但内容不同（改了再传）：不覆盖原件，加内容后缀区分
+        suffix = "".join(final_path.suffixes) or ""
+        stem = final_path.name[: len(final_path.name) - len(suffix)] if suffix else final_path.name
+        final_path = final_path.with_name(f"{stem}-{digest[:8]}{suffix}")
+    shutil.move(str(merged), final_path)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
     with runtime.db.sync_connect() as conn:
         conn.execute(
             "INSERT INTO ekbs_document(kb_id, title, source_path, level, visible_dept_ids, "
             "status, checksum, size_bytes, doc_version, created_by) "
             "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, 'v1', ?)",
             (
-                int(kb_id), Path(str(state["filename"])).stem, str(final_path),
+                int(kb_id),
+                str(state.get("title") or Path(rel_name).stem),
+                str(final_path),
                 int(state.get("level", 2)),
                 json.dumps(state.get("visible_dept_ids") or [], ensure_ascii=False),
                 digest, int(state.get("size_bytes") or final_path.stat().st_size), user.user_id,

@@ -126,7 +126,7 @@ async function loadUsers() {
     if (!items.length) throw new Error("empty");
   } catch (e) {
     // /perm/users 需要管理员令牌；未登录时退化为内置演示用户
-    sel.innerHTML = [[1,"Carol（总部/L1）"],[2,"Alice（人力/L2）"],[3,"Bob（财务/L3）"]]
+    sel.innerHTML = [[1,"Carol · L1"],[2,"Alice · L2"],[3,"Bob · L3"]]
       .map(([id,nick]) => `<option value="${id}">${id} · ${nick}</option>`).join("");
   }
 }

@@ -14,11 +14,15 @@ from fastapi.responses import JSONResponse
 
 from ekbs.api import (
     admin,
+    admin_ui,
+    admin_web,
     assets,
     auth_routes,
     chunks,
     docs,
     health,
+    imports,
+    kb,
     parse_tasks,
     perm_admin,
     playground,
@@ -66,7 +70,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     app.include_router(health.router)
-    app.include_router(ui.router)   # 临时测试台 /ui（非 05 规划的管理台）
+    app.include_router(ui.router)         # 问答调试台 /ui
+    # 管理台前端：优先托管 ekbs-admin-web 的构建产物（方案 05 §6.9）；
+    # 产物不存在时保持旧的免构建单页，管理入口不会消失。
+    app.state.admin_web_dir = admin_web.install_admin_web(app, resolved)
+    app.include_router(admin_ui.router)   # 旧的免构建单页（/admin 有新产物时让位）
     for prefix in ROUTE_PREFIXES:
         app.include_router(qa.router, prefix=prefix)
         app.include_router(auth_routes.router, prefix=prefix)
@@ -77,6 +85,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(playground.router, prefix=prefix)
         app.include_router(chunks.router, prefix=prefix)
         app.include_router(perm_admin.router, prefix=prefix)
+        app.include_router(imports.router, prefix=prefix)
+        app.include_router(kb.router, prefix=prefix)
 
     # 必须在 include_router 之后：中文化需要遍历 app.routes 取每个接口的 docstring
     install_docs(app)

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -51,12 +52,30 @@ async def me(
             "FROM ekbs_user WHERE user_id = ?",
             (user.user_id,),
         ).fetchone()
+        dept_names: list[str] = []
+        raw_chain = []
+        if row and row["dept_chain"]:
+            try:
+                raw_chain = json.loads(str(row["dept_chain"]))
+            except Exception:
+                raw_chain = []
+            if isinstance(raw_chain, list) and raw_chain:
+                placeholders = ",".join("?" for _ in raw_chain)
+                name_rows = conn.execute(
+                    f"SELECT dingtalk_dept_id, name FROM ekbs_dept "
+                    f"WHERE dingtalk_dept_id IN ({placeholders})",
+                    [str(x) for x in raw_chain],
+                ).fetchall()
+                by_id = {str(r["dingtalk_dept_id"]): str(r["name"]) for r in name_rows}
+                dept_names = [by_id.get(str(x), str(x)) for x in raw_chain]
     perm = await runtime.perm_context(user.user_id)
     return {
         "user_id": user.user_id,
         "dingtalk_userid": user.dingtalk_userid,
         "nick": str(row["nick"]) if row else "",
         "clearance": int(row["clearance"]) if row else 0,
+        "dept_chain": [str(x) for x in raw_chain] if isinstance(raw_chain, list) else [],
+        "dept_names": dept_names,
         "channel": user.channel,
         "via": user.via,
         # 权限点集合（前端菜单过滤依据）
@@ -97,6 +116,43 @@ async def perm_view(
 class DevTokenRequest(BaseModel):
     user_id: int = Field(gt=0)
     channel: str = "web"
+
+
+@router.get("/auth/dev-users")
+async def dev_users(request: Request) -> JSONResponse:
+    """列出可用于**开发身份切换**的用户（生产 404）。
+
+    为什么需要它：管理台登录页原本硬编码演示身份的用户 ID，而 ID 是自增的
+    （实测补种子后 Dave/Root 变成 7/8，硬编码的 4/5 直接 401）。
+    这类"ID 猜错"的故障只有真点一下才暴露，所以改成让界面**动态取**。
+    """
+    runtime = request.app.state.runtime
+    if not runtime.settings.is_dev:
+        raise HTTPException(status_code=404, detail="not_found")
+    with runtime.db.sync_connect() as conn:
+        rows = conn.execute(
+            "SELECT u.user_id, u.dingtalk_userid, u.nick, u.clearance, "
+            "       GROUP_CONCAT(r.code) AS roles "
+            "FROM ekbs_user u "
+            "LEFT JOIN ekbs_user_role ur ON ur.user_id = u.user_id "
+            "LEFT JOIN ekbs_role r ON r.role_id = ur.role_id "
+            "WHERE u.status = 'active' "
+            "GROUP BY u.user_id ORDER BY u.user_id"
+        ).fetchall()
+    return JSONResponse(
+        {
+            "items": [
+                {
+                    "user_id": int(r["user_id"]),
+                    "dingtalk_userid": str(r["dingtalk_userid"]),
+                    "nick": r["nick"],
+                    "clearance": int(r["clearance"] or 1),
+                    "roles": str(r["roles"] or "").split(",") if r["roles"] else [],
+                }
+                for r in rows
+            ]
+        }
+    )
 
 
 @router.post("/auth/dev-token")

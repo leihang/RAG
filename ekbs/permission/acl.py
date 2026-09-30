@@ -44,11 +44,16 @@ class DocumentFacts:
 
     @classmethod
     def from_row(cls, row: Any) -> "DocumentFacts":
-        raw_depts = row["visible_dept_ids"] or "[]"
-        try:
-            depts = tuple(str(d) for d in json.loads(raw_depts))
-        except (TypeError, ValueError):
-            depts = ()
+        raw_depts = row["visible_dept_ids"] if "visible_dept_ids" in row.keys() else "[]"
+        if raw_depts is None:
+            raw_depts = "[]"
+        if isinstance(raw_depts, (list, tuple)):
+            depts = tuple(str(d) for d in raw_depts)
+        else:
+            try:
+                depts = tuple(str(d) for d in json.loads(raw_depts or "[]"))
+            except (TypeError, ValueError):
+                depts = ()
         keys = row.keys()
         return cls(
             doc_id=int(row["doc_id"]),
@@ -161,17 +166,48 @@ class DocumentGate:
         *,
         today: str | None = None,
     ) -> AclDecision:
-        """`docs/spec/10` §7 的精确判定顺序（不可调整顺序：先 deny 再 allow 才能保证 deny 优先）。"""
+        """检索侧 C5：必须 ``published`` 且未过期。"""
+        return self.can_see_document(
+            perm, doc, entries, for_retrieval=True, today=today
+        )
+
+    def can_see_document(
+        self,
+        perm: PermContext,
+        doc: DocumentFacts | None,
+        entries: Iterable[AclEntry] | None = None,
+        *,
+        for_retrieval: bool = True,
+        allow_deleted: bool = False,
+        admin_bypass: bool = False,
+        today: str | None = None,
+    ) -> AclDecision:
+        """文档可见性判定。
+
+        * ``for_retrieval=True``（C5）：必须 ``published`` + 时效有效。
+        * ``for_retrieval=False``（管理台列表/详情）：允许 pending/failed/offline 等，
+          但拒绝 ``deleted``（除非 ``allow_deleted=True`` 查回收站）；
+          密级 / kb / ACL / 部门规则与 C5 相同。
+        * ``admin_bypass=True``：仅用于 ``super_admin`` 管理台 —— 跨部门/密级运维，
+          仍拒绝 ``deleted``（除非 allow_deleted）。**检索路径禁止传 True**。
+        """
         if doc is None:
             return AclDecision(False, "doc_not_found")
+        if admin_bypass and not for_retrieval:
+            if doc.status == "deleted" and not allow_deleted:
+                return AclDecision(False, "deleted")
+            return AclDecision(True, "admin_bypass")
         # 1) 状态与时效
-        if doc.status != "published":
-            return AclDecision(False, "status")
-        today = today or _today()
-        if doc.effective_date and str(doc.effective_date) > today:
-            return AclDecision(False, "not_effective")
-        if doc.expire_date and str(doc.expire_date) <= today:
-            return AclDecision(False, "expired")
+        if for_retrieval:
+            if doc.status != "published":
+                return AclDecision(False, "status")
+            today = today or _today()
+            if doc.effective_date and str(doc.effective_date) > today:
+                return AclDecision(False, "not_effective")
+            if doc.expire_date and str(doc.expire_date) <= today:
+                return AclDecision(False, "expired")
+        elif doc.status == "deleted" and not allow_deleted:
+            return AclDecision(False, "deleted")
         # 2) 密级（纵向）
         if doc.level > perm.clearance:
             return AclDecision(False, "level")

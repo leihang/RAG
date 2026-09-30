@@ -1,0 +1,38 @@
+/* 设计令牌对齐方案 05 §5.1/§5.2（Ant Design Pro 默认令牌 + 企业视觉）。 */
+:root {
+  --ekbs-primary: #1677ff;
+  --ekbs-success: #52c41a;
+  --ekbs-warning: #faad14;
+  --ekbs-error: #ff4d4f;
+  --ekbs-bg-layout: #f5f7fa;
+  --ekbs-bg-container: #ffffff;
+  --ekbs-text-secondary: rgba(0, 0, 0, 0.45);
+  --ekbs-border-secondary: #f0f0f0;
+}
+
+html, body, #root { height: 100%; margin: 0; }
+body {
+  font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Source Han Sans SC', sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  background: var(--ekbs-bg-layout);
+}
+
+/* 代码/数字用等宽字体（§5.2 排版规范） */
+.ekbs-mono, code, pre, .ant-typography code {
+  font-family: 'JetBrains Mono', Menlo, Consolas, monospace;
+}
+
+/* 长文本两行省略（§5.3 单元格溢出规范） */
+.ekbs-ellipsis-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 密级不足整行灰显（§5.1 列表行处理） */
+.ekbs-row-insufficient > td { opacity: 0.55; }
+
+/* 解析失败行左侧红色竖条（§5.3 行高亮） */
+.ekbs-row-failed > td:first-child { box-shadow: inset 3px 0 0 var(--ekbs-error); }

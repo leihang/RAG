@@ -166,6 +166,12 @@ class LLMCfg(_Section):
 class ModelsCfg(_Section):
     embed: EmbedCfg = Field(default_factory=EmbedCfg)
     llm: LLMCfg = Field(default_factory=LLMCfg)
+    #: **视觉模型**：给文档里的图片生成一句描述（`06` §4.11 的"图内文字/图意进索引"）。
+    #: 独立于 `llm`：那是 qwen-max（纯文本），这是 qwen-vl-*（能看图）。
+    #: ⚠️ 默认 ``model=""`` = **不启用**：它会计费且把图片发到云端，必须显式配置才生效。
+    #: （不能直接复用 `LLMCfg()` 的默认值 —— 那个默认是 `qwen-max`，会让未配置的部署
+    #: 一启动就去要密钥、并在开工时把图片发给一个纯文本模型。）
+    vision: LLMCfg = Field(default_factory=lambda: LLMCfg(model=""))
 
 
 class ParseCfg(_Section):
@@ -174,6 +180,23 @@ class ParseCfg(_Section):
     timeout_s: int = 1800
     worker_concurrency: int = 1
     keep_tmp_days: int = 7
+    #: 是否给文档里的图片生成描述（**会出网、会计费**，默认关）。
+    #: 打开后：每张图调一次视觉模型，描述写进图片块的检索文本；
+    #: 描述按**图片内容哈希**缓存，重复解析/重复上传不会二次计费。
+    figure_caption: bool = False
+
+
+class UploadCfg(_Section):
+    """上传行为（`方案 05` §6.5 的 `upload.*`）。
+
+    这两个值都是**给前端用的默认值**，由 `/import/meta` 报给界面：
+    ``chunk_size_mb`` 决定分片大小（界面按它切片），``concurrent`` 决定同时上传几个文件。
+    放在服务端而不是写死在界面里，是为了"改配置即生效"，不用重新构建前端。
+    """
+
+    chunk_size_mb: int = 8               # 方案 §6.5：固定 8 MB，可由系统参数调整
+    concurrent: int = 3                  # 方案 §6.5：默认并发 3
+    max_retry: int = 3                   # 方案 §6.5：失败分片指数退避重试 3 次
 
 
 class PermissionCfg(_Section):
@@ -222,6 +245,7 @@ class Settings(BaseSettings):
     retrieval: RetrievalCfg = Field(default_factory=RetrievalCfg)
     models: ModelsCfg = Field(default_factory=ModelsCfg)
     parse: ParseCfg = Field(default_factory=ParseCfg)
+    upload: UploadCfg = Field(default_factory=UploadCfg)
     permission: PermissionCfg = Field(default_factory=PermissionCfg)
     dingtalk: dict[str, Any] = Field(default_factory=dict)
     adapter: AdapterCfg = Field(default_factory=AdapterCfg)
@@ -441,7 +465,14 @@ def load_settings(
     if data_dir is not None:
         resolved = _resolve_dir(str(data_dir), repo_root)
         app["data_dir"] = resolved
-        app.setdefault("log_dir", str(Path(resolved) / "log"))
+        # ⚠️ 这里**必须是赋值，不能是 `setdefault`**：三份配置文件里都显式写了
+        # `app.log_dir: var/log`，`setdefault` 于是永远不生效 —— 传 data_dir=<tmp> 的
+        # 调用方（全部测试夹具）嘴上说"跑在临时目录上"，日志却照写仓库的 var/log。
+        # 实测后果：`var/log/test.json.log` 涨到 19 MB，并且测试进程以 service="api"
+        # 配置日志时会把 `kb_created` 这类记录混进 `api.json.log`，
+        # 让人以为线上库被写过（排查时真被骗过一次）。
+        # 需要"数据在临时目录、日志另放"的调用方，用 overrides 显式给 app.log_dir。
+        app["log_dir"] = str(Path(resolved) / "log")
     if db_path is not None:
         database["path"] = str(Path(db_path))
     if overrides:

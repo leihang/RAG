@@ -227,9 +227,16 @@ async def debug_query(
                 {
                     "cite_index": c.cite_index, "chunk_id": c.chunk_id, "doc_title": c.doc_title,
                     "page_from": c.page_from, "acl_result": c.acl_result, "page_check": c.page_check,
+                    # ⚠️ 图片字段不能省：图片块被召回时，前端要靠 chunk_id 去
+                    # `GET /assets/figure/{chunk_id}` 取原图显示。原先这里漏了
+                    # `figure_id` / `image_path`，而 `/qa/chat` 是带的 —— 同一个引用
+                    # 两个接口两套字段，调试台上永远看不到图（用户实测反馈）。
+                    "figure_id": c.figure_id,
+                    "image_path": c.image_path,
                 }
                 for c in answer.citations
             ],
+            "faithfulness": answer.faithfulness,
             "stages": result.stage_debug,
             "timings_ms": {**result.timings_ms, "generate_ms": answer.ttft_ms},
         }

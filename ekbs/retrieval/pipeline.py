@@ -37,6 +37,11 @@ from ekbs.permission.acl import DocumentGate
 from ekbs.permission.context import PermContext
 from ekbs.provider.base import LLMProvider, RerankDoc
 from ekbs.provider.registry import Providers
+from ekbs.retrieval.faithfulness import (
+    REFUSE_MISSING_CITATION,
+    REFUSE_UNSUPPORTED_CLAIM,
+    assess_faithfulness,
+)
 from ekbs.retrieval.rrf import rrf_fuse, ranks_of
 
 log = get_logger(component="retrieval")
@@ -49,6 +54,7 @@ REFUSE_BELOW_THRESHOLD = "below_threshold"
 REFUSE_ALL_DENIED = "all_denied_by_c5"
 REFUSE_EMPTY_ANSWER = "empty_answer"
 REFUSE_NO_BASIS = "no_basis_in_context"
+# REFUSE_MISSING_CITATION / REFUSE_UNSUPPORTED_CLAIM 自 faithfulness 导入后原样再导出
 
 #: 提示词约定的「资料不足」口径（`00` §2.1 要求「直接回复『未找到可靠依据』」）。
 #: 模型可能带引号/前缀标点，故只在开头比对，不做全文包含判断 ——
@@ -143,6 +149,8 @@ class AnswerResult:
     refused: bool = False
     refusal_reason: str = ""
     hallucinated_citations: list[int] = field(default_factory=list)
+    #: 生成侧忠实度报告（规则型 claim 支撑检查；调试台面板用）
+    faithfulness: dict[str, Any] = field(default_factory=dict)
     ttft_ms: int = 0
     total_ms: int = 0
     prompt_tokens: int = 0
@@ -269,21 +277,26 @@ class RetrievalPipeline:
         return [chunk_id for _, chunk_id in per_shard]
 
     def _chunk_ids_by_faiss_row(self, shard_id: str, rows: Sequence[int]) -> dict[int, int]:
-        """``(shard_id, faiss_row) → chunk_id``；同时做**权限与状态下推**（与 FTS5 路径语义等价）。"""
+        """FAISS 命中 → ``chunk_id``；同时做**权限与状态下推**（与 FTS5 路径语义等价）。
+
+        索引换成 ``IndexIDMap2`` 后，FAISS 返回的标签**就是 ``chunk_id``**，
+        所以这里直接按主键回表。名字保留 ``faiss_row`` 是为了不动调用方；
+        语义已从"行号"变成"身份"（见 ``ekbs/index/faiss_store.py`` 的说明）。
+        """
         if not rows:
             return {}
         placeholders = ",".join("?" for _ in rows)
         sql = (
-            "SELECT c.faiss_row AS faiss_row, c.chunk_id AS chunk_id "
+            "SELECT c.chunk_id AS chunk_id "
             "FROM ekbs_chunk c JOIN ekbs_document d ON d.doc_id = c.doc_id "
-            "WHERE c.shard_id = ? AND c.faiss_row IN (" + placeholders + ") "
+            "WHERE c.shard_id = ? AND c.chunk_id IN (" + placeholders + ") "
             "AND d.status = 'published' "
             "AND (d.effective_date IS NULL OR d.effective_date <= date('now')) "
             "AND (d.expire_date IS NULL OR d.expire_date > date('now'))"
         )
         with self.db.sync_connect() as conn:
             result = conn.execute(sql, (shard_id, *[int(r) for r in rows])).fetchall()
-        return {int(r["faiss_row"]): int(r["chunk_id"]) for r in result}
+        return {int(r["chunk_id"]): int(r["chunk_id"]) for r in result}
 
     def _sparse_recall(
         self, query: str, perm: PermContext, top_k: int | None = None
@@ -667,7 +680,6 @@ class RetrievalPipeline:
         answer_text, hallucinated = self._drop_hallucinated(llm_result.text, len(chunks))
         # L4 输出侧检测：答案里不得出现当前用户看不到的文档名（04 §6.4）
         answer_text, leaked_titles = self._apply_output_guard(answer_text, perm)
-        citations = self._post_check_citations(answer_text, chunks, perm)
         if hallucinated:
             self.gate.record_security_event(
                 "hallucinated_citation",
@@ -677,6 +689,12 @@ class RetrievalPipeline:
             )
 
         total = _ms(started)
+        timing_kw = dict(
+            ttft_ms=int(_ms(llm_started, llm_done)),
+            total_ms=total,
+            prompt_tokens=llm_result.prompt_tokens,
+            completion_tokens=llm_result.completion_tokens,
+        )
         # 模型自己判定「资料不足」时，必须回 refused=True 且清空引用：
         # 否则接口出现 refused=false + 5 条引用 + 答案「未找到可靠依据」的自相矛盾状态，
         # 前端照 refused 渲染，会把"没答"显示成"答了并给了出处"（实测踩到）。
@@ -695,12 +713,36 @@ class RetrievalPipeline:
                 refused=True,
                 refusal_reason=REFUSE_NO_BASIS,
                 hallucinated_citations=hallucinated,
-                ttft_ms=int(_ms(llm_started, llm_done)),
-                total_ms=total,
-                prompt_tokens=llm_result.prompt_tokens,
-                completion_tokens=llm_result.completion_tokens,
+                **timing_kw,
             )
 
+        # P0 忠实度：无 [n] 不成溯源；数字/量词须落在入选分块原文中
+        report = assess_faithfulness(answer_text, chunks)
+        if not report.ok:
+            self.gate.record_security_event(
+                "faithfulness_refused",
+                user_id=perm.user_id,
+                severity="medium",
+                detail={
+                    "reason": report.reason,
+                    "unsupported": report.unsupported[:10],
+                    "model": llm_result.model,
+                },
+            )
+            return AnswerResult(
+                answer=answer_text,
+                citations=[],
+                retrieval=retrieval,
+                model=llm_result.model,
+                refused=True,
+                refusal_reason=report.reason,
+                hallucinated_citations=hallucinated,
+                faithfulness=report.as_dict(),
+                degraded=[f"output_title_masked:{len(leaked_titles)}"] if leaked_titles else [],
+                **timing_kw,
+            )
+
+        citations = self._post_check_citations(answer_text, chunks, perm)
         return AnswerResult(
             answer=answer_text,
             citations=citations,
@@ -708,11 +750,9 @@ class RetrievalPipeline:
             model=llm_result.model,
             refused=False,
             hallucinated_citations=hallucinated,
+            faithfulness=report.as_dict(),
             degraded=[f"output_title_masked:{len(leaked_titles)}"] if leaked_titles else [],
-            ttft_ms=int(_ms(llm_started, llm_done)),
-            total_ms=total,
-            prompt_tokens=llm_result.prompt_tokens,
-            completion_tokens=llm_result.completion_tokens,
+            **timing_kw,
         )
 
     def _retrieval_only_answer(
@@ -774,12 +814,15 @@ class RetrievalPipeline:
     def _post_check_citations(
         self, answer: str, chunks: Sequence[RetrievedChunk], perm: PermContext
     ) -> list[Citation]:
-        """引用后置校验（`00` §2.2、`docs/spec/10` §8）：编号存在 + ACL 二次确认 + 页码区间。"""
+        """引用后置校验（`00` §2.2、`docs/spec/10` §8）：编号存在 + ACL 二次确认 + 页码区间。
+
+        **P0**：答案里没有 ``[n]`` 时返回空列表 —— 禁止「没标出处却挂上全部候选」的假溯源。
+        """
         if not answer.strip():
             return []
         cited_indices = {int(m.group(1)) for m in _CITATION_RE.finditer(answer)}
-        if not cited_indices:  # 没标引用时，把全部入围块作为可溯源依据返回
-            cited_indices = set(range(1, len(chunks) + 1))
+        if not cited_indices:
+            return []
         allowed, dropped = self.gate.filter_chunks(
             perm, [(c.chunk_id, c.doc_id) for c in chunks]
         )

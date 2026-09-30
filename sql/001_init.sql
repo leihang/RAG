@@ -193,16 +193,18 @@ CREATE TABLE IF NOT EXISTS ekbs_document (
     visible_dept_ids TEXT   NOT NULL DEFAULT '[]',       -- JSON 数组，空表示不限部门
     effective_date  TEXT,
     expire_date     TEXT,
-    status          TEXT    NOT NULL DEFAULT 'pending',  -- pending|parsing|indexing|published|failed|offline
+    status          TEXT    NOT NULL DEFAULT 'pending',  -- pending|parsing|indexing|published|failed|offline|deleted
     checksum        TEXT,                                -- SHA-256，用于秒传与去重
     created_by      INTEGER,
     created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+    updated_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    deleted_at      TEXT                                 -- 软删除时间；非空时 status 必为 deleted
 );
 CREATE INDEX IF NOT EXISTS idx_doc_kb_status ON ekbs_document(kb_id, status);
 CREATE INDEX IF NOT EXISTS idx_doc_level     ON ekbs_document(level, status);
 CREATE INDEX IF NOT EXISTS idx_doc_effective ON ekbs_document(effective_date, expire_date);
 CREATE INDEX IF NOT EXISTS idx_doc_checksum  ON ekbs_document(checksum);
+CREATE INDEX IF NOT EXISTS idx_doc_deleted   ON ekbs_document(deleted_at) WHERE deleted_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS ekbs_chunk (
     chunk_id        INTEGER PRIMARY KEY AUTOINCREMENT,

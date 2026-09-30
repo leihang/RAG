@@ -136,8 +136,13 @@ async def test_edit_child_swaps_vector_and_rewrites_fts(client, admin) -> None:
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["embedded"] is True
-    assert body["faiss_row"] != before["faiss_row"], "必须追加新向量（FAISS 不能原地更新）"
-    assert "rebuild" in body["hint"]
+    # 索引是 IndexIDMap2（标签 = chunk_id）：编辑**原地替换**该向量，
+    # 所以 faiss_row 应当**保持不变**（身份没变），且分片向量总数不增长。
+    # 旧实现是"追加新行号 + 旧向量留成孤儿"，那两个问题现在都没了。
+    assert body["faiss_row"] == before["faiss_row"], (
+        "chunk_id 就是索引标签，编辑不该改变 faiss_row"
+    )
+    assert "no_rebuild_needed" in body["hint"] or "无需" in body["hint"] or "rebuild" not in body["hint"]
 
     with runtime.db.sync_connect() as conn:
         after = conn.execute(

@@ -62,16 +62,29 @@ dashscope==1.20.14               # 待实测确认；[01 §3 可选] 直接用�
 #   ② 装进来会把 torch/transformers/ultralytics 等约 2.0 GB 拖进生产 venv
 #      （16 GB 机器上不划算），且实测会在 pip 解析它的依赖树回溯时
 #      去构建 colorlog 的 sdist 而**整单失败**（colorlog 的 setup.py 有循环导入）。
-#   安装方式（与 01 §4 一致）：
+#   安装方式（与 01 §4 一致，2026-09-29 已在本机实测跑通）：
 #       python3.12 -m venv /opt/ekbs/mineru-venv
 #       /opt/ekbs/mineru-venv/bin/pip install 'mineru[core]==2.1.10'
-#       export MINERU_MODEL_SOURCE=modelscope        # 实测 HuggingFace 不可达
 #       export EKBS_MINERU_BIN=/opt/ekbs/mineru-venv/bin/mineru
-#   model 权重首次运行下载 2–3 GB（00 §11 的 M1）。
+#       # ② 模型权重：**必须显式下到应用读得到的位置**（首次约 1.2 GB）
+#       export MODELSCOPE_CACHE=/data/ekbs/mineru-models
+#       export MINERU_MODEL_SOURCE=modelscope        # 实测 HuggingFace 不可达
+#       /opt/ekbs/mineru-venv/bin/mineru-models-download -s modelscope -m pipeline
+#
+#   ⚠️ 两个真实踩过的坑，别省这两行：
+#   ① **不要依赖默认的 `~/.cache/modelscope`**。在受限账户/沙箱下它写不进去，
+#      MinerU 却**不报错**——表现为"解析跑完但一个产物都没有"：OCR 全空、PDF 解析失败，
+#      排查成本极高。实测报错原文：
+#        PermissionError: [Errno 1] Operation not permitted: '/Users/…/.cache/modelscope'
+#      本仓库的开发机等价物是 `var/mineru-models`，且 `ekbs/ingest/parser.py::_mineru_env()`
+#      会在该目录存在时**自动**把 MODELSCOPE_CACHE 指过去（显式设置优先）。
+#   ② 只装 `mineru[core]` 不装模型，等于没装：`mineru` 会正常退出、不产出任何文件。
+#      判据是产物目录里有没有 `*.md`（见 `_ocr_figure` 的 `figure_ocr_no_output` 告警）。
 # mineru[core]==2.1.10
 python-docx==1.1.2               # [01 §3] .docx 解析/兜底
 openpyxl==3.1.5                  # [01 §3] .xlsx
 python-pptx==1.0.2               # [01 §3] .pptx
+xlrd==2.0.2                     # [01 §3] 旧版 .xls（xlrd 2.x 只支持 .xls，xlsx 归 openpyxl）
 Pillow==11.0.0                   # 待实测确认；解析产物中的图片处理与 OCR 前置（01 未显式列出，属传递必需）
 pyahocorasick==2.1.0             # 待实测确认；04 §6.4 敏感词 L1 层 AC 自动机（import ahocorasick），支持热加载
 

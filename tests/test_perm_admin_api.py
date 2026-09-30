@@ -75,7 +75,7 @@ async def test_role_crud_and_builtin_protection(client, root) -> None:
     created = await client.post(
         "/api/v1/perm/roles",
         headers=headers,
-        json={"code": "hr_editor", "name": "HR 编辑", "permissions": ["doc:document:read", "qa:chat"]},
+        json={"code": "hr_editor", "name": "HR 编辑", "permissions": ["doc:document:read", "audit:qa:chat"]},
     )
     assert created.status_code == 201, created.text
     role_id = created.json()["role_id"]
@@ -90,7 +90,7 @@ async def test_role_crud_and_builtin_protection(client, root) -> None:
 
     listing = (await client.get("/api/v1/perm/roles", headers=headers)).json()
     entry = next(item for item in listing["items"] if item["role_id"] == role_id)
-    assert sorted(entry["permissions"]) == ["doc:document:read", "qa:chat"]
+    assert sorted(entry["permissions"]) == ["audit:qa:chat", "doc:document:read"]
 
     # 编辑权限点 → 策略版本自增（权限点集合变了，缓存必须全量失效）
     with runtime.db.sync_connect() as conn:
@@ -188,7 +188,7 @@ async def test_update_user_only_allows_status(client, kb_admin) -> None:
     # 未同步的字段不该被这个接口改：确认 DB 里昵称没变
     with runtime.db.sync_connect() as conn:
         nick = conn.execute("SELECT nick FROM ekbs_user WHERE user_id = ?", (alice,)).fetchone()["nick"]
-    assert nick == "Alice（人力/L2）"
+    assert nick == "Alice"
 
 
 async def test_acl_grant_and_revoke_take_effect(client, kb_admin) -> None:

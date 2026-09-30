@@ -123,7 +123,29 @@ class Database:
             if force or before != EXPECTED_TABLES:
                 conn.executescript(self.schema_sql())
                 conn.commit()
+        self.apply_schema_patches()
         return self.verify_schema()
+
+    def apply_schema_patches(self) -> None:
+        """对已有库做**向前兼容**的轻量补丁（``ALTER TABLE`` 幂等）。
+
+        新建库靠 ``001_init.sql`` 已含这些列；存量库在 init_db / 服务启动时补齐，
+        避免「必须重建库才能上软删除」。
+        """
+        if not self.path.is_file():
+            return
+        with self.sync_connect() as conn:
+            cols = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(ekbs_document)").fetchall()
+            }
+            if "deleted_at" not in cols:
+                conn.execute("ALTER TABLE ekbs_document ADD COLUMN deleted_at TEXT")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_doc_deleted "
+                    "ON ekbs_document(deleted_at) WHERE deleted_at IS NOT NULL"
+                )
+                conn.commit()
 
     def verify_schema(self) -> SchemaReport:
         """按 `01` §5.7 与 ``deploy/scripts/smoke.sh`` 的同一口径自检。"""
@@ -151,6 +173,8 @@ class Database:
         report = self.verify_schema()
         if not report.ok:
             raise SchemaError("Schema 自检未通过：" + "；".join(report.problems()))
+        # 补丁在自检通过后跑：存量库缺 deleted_at 不算 Schema 坏，但必须能软删。
+        self.apply_schema_patches()
         return report
 
     def ensure_schema(self) -> tuple[SchemaReport, bool]:
@@ -162,6 +186,7 @@ class Database:
         """
         report = self.verify_schema()
         if report.exists and report.tables == EXPECTED_TABLES:
+            self.apply_schema_patches()
             return report, False
         return self.apply_schema(), True
 

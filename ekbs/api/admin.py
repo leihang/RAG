@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse
 
 from ekbs.api.auth import INTERNAL_TOKEN_HEADER, INTERNAL_USER_HEADER
 from ekbs.api.qa import _authenticate
+from ekbs.authz import SUPER_ADMIN
 from ekbs.errors import PermissionDenied
 from ekbs.logging import get_logger
 from ekbs.observability.alerts import ALERT_RULES, evaluate_all
@@ -444,32 +445,50 @@ async def list_documents(
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """文档列表（分页/过滤）—— 权限点 ``doc:document:read``。"""
-    _principal(
-        request,
-        {
-            "authorization": authorization,
-            INTERNAL_TOKEN_HEADER.lower(): x_internal_token,
-            INTERNAL_USER_HEADER.lower(): x_internal_user_id,
-        },
-        "doc:document:read",
-    )
+    """文档列表（分页/过滤）—— 权限点 ``doc:document:read`` + **行级可见性**。"""
+    headers = {
+        "authorization": authorization,
+        INTERNAL_TOKEN_HEADER.lower(): x_internal_token,
+        INTERNAL_USER_HEADER.lower(): x_internal_user_id,
+    }
     runtime = request.app.state.runtime
+    user = _authenticate(request, headers)
+    try:
+        principal = runtime.authz.require(user.user_id, "doc:document:read")
+    except PermissionDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    perm = await runtime.perm_context(user.user_id)
+    admin_bypass = SUPER_ADMIN in principal.roles
     limit, offset = _page(limit, offset)
+    allow_deleted = str(status or "") == "deleted"
     where = ["1=1"]
     params: list[Any] = []
     if kb_id is not None:
-        where.append("kb_id = ?")
+        where.append("d.kb_id = ?")
         params.append(int(kb_id))
     if status:
-        where.append("status = ?")
+        where.append("d.status = ?")
         params.append(str(status))
+    else:
+        where.append("d.status != 'deleted'")
     if level is not None:
-        where.append("level = ?")
+        where.append("d.level = ?")
         params.append(int(level))
     if q:
-        where.append("title LIKE ?")
+        where.append("d.title LIKE ?")
         params.append(f"%{q}%")
+    # SQL 先收窄：密级 + 可见知识库（超管跳过，否则跨部门运维看不到库）
+    if not admin_bypass:
+        where.append("d.level <= ?")
+        params.append(int(perm.clearance))
+        if not perm.visible_kb_ids:
+            return JSONResponse({"items": [], "total": 0, "limit": limit, "offset": offset})
+        placeholders = ",".join("?" for _ in perm.visible_kb_ids)
+        where.append(f"d.kb_id IN ({placeholders})")
+        params.extend(int(k) for k in perm.visible_kb_ids)
+
+    # 试点规模：先取足够候选再精滤分页（避免 total 与可见行不一致）
+    fetch_cap = min(max(offset + limit * 5, 200), 2000)
     sql = (
         "SELECT d.doc_id, d.kb_id, k.code AS kb_code, d.title, d.level, d.status, "
         "d.visible_dept_ids, d.page_count, d.doc_version, d.effective_date, d.expire_date, "
@@ -477,22 +496,56 @@ async def list_documents(
         "(SELECT c.shard_id FROM ekbs_chunk c WHERE c.doc_id = d.doc_id LIMIT 1) AS shard_id, "
         "(SELECT COUNT(*) FROM ekbs_chunk c WHERE c.doc_id = d.doc_id) AS chunk_count "
         "FROM ekbs_document d LEFT JOIN ekbs_kb k ON k.kb_id = d.kb_id "
-        f"WHERE {' AND '.join(where)} ORDER BY d.doc_id DESC LIMIT ? OFFSET ?"
+        f"WHERE {' AND '.join(where)} ORDER BY d.doc_id DESC LIMIT ?"
     )
-    count_sql = f"SELECT COUNT(*) AS c FROM ekbs_document d WHERE {' AND '.join(where)}"
     with runtime.db.sync_connect() as conn:
         import json as _json
 
-        rows = []
-        for record in conn.execute(sql, (*params, limit, offset)).fetchall():
-            item = dict(record)
+        from ekbs.permission.acl import DocumentFacts
+
+        raw_rows = [dict(r) for r in conn.execute(sql, (*params, fetch_cap)).fetchall()]
+        doc_ids = [int(r["doc_id"]) for r in raw_rows]
+        acl_map = runtime.gate.load_document_acl(doc_ids)
+        visible: list[dict[str, Any]] = []
+        for record in raw_rows:
             try:
-                item["visible_dept_ids"] = _json.loads(item.get("visible_dept_ids") or "[]")
+                record["visible_dept_ids"] = _json.loads(record.get("visible_dept_ids") or "[]")
             except ValueError:
-                item["visible_dept_ids"] = []
-            rows.append(item)
-        total = int(conn.execute(count_sql, tuple(params)).fetchone()["c"])
-    return JSONResponse({"items": rows, "total": total, "limit": limit, "offset": offset})
+                record["visible_dept_ids"] = []
+            facts = DocumentFacts.from_row(record)
+            decision = runtime.gate.can_see_document(
+                perm,
+                facts,
+                acl_map.get(int(record["doc_id"]), []),
+                for_retrieval=False,
+                allow_deleted=allow_deleted,
+                admin_bypass=admin_bypass,
+            )
+            if decision.allowed:
+                visible.append(record)
+        total = len(visible)
+        # 若触顶仍可能漏计：再做一次全量精滤计数（试点文档量可接受）
+        if len(raw_rows) >= fetch_cap:
+            count_sql = (
+                "SELECT d.doc_id, d.kb_id, d.title, d.level, d.status, d.visible_dept_ids, "
+                "d.effective_date, d.expire_date, d.doc_version, "
+                "(SELECT c.shard_id FROM ekbs_chunk c WHERE c.doc_id = d.doc_id LIMIT 1) AS shard_id "
+                f"FROM ekbs_document d WHERE {' AND '.join(where)}"
+            )
+            all_rows = conn.execute(count_sql, tuple(params)).fetchall()
+            all_ids = [int(r["doc_id"]) for r in all_rows]
+            all_acl = runtime.gate.load_document_acl(all_ids)
+            total = 0
+            for row in all_rows:
+                facts = DocumentFacts.from_row(row)
+                if runtime.gate.can_see_document(
+                    perm, facts, all_acl.get(int(row["doc_id"]), []),
+                    for_retrieval=False, allow_deleted=allow_deleted,
+                    admin_bypass=admin_bypass,
+                ):
+                    total += 1
+        page = visible[offset : offset + limit]
+    return JSONResponse({"items": page, "total": total, "limit": limit, "offset": offset})
 
 
 @router.get("/docs/documents/{doc_id}")
@@ -503,24 +556,39 @@ async def get_document(
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """文档详情（含分块统计与所属分片）。"""
-    _principal(
-        request,
-        {
-            "authorization": authorization,
-            INTERNAL_TOKEN_HEADER.lower(): x_internal_token,
-            INTERNAL_USER_HEADER.lower(): x_internal_user_id,
-        },
-        "doc:document:read",
-    )
+    """文档详情（含分块统计与所属分片）；越权返回 404 防枚举。"""
+    headers = {
+        "authorization": authorization,
+        INTERNAL_TOKEN_HEADER.lower(): x_internal_token,
+        INTERNAL_USER_HEADER.lower(): x_internal_user_id,
+    }
     runtime = request.app.state.runtime
+    user = _authenticate(request, headers)
+    try:
+        principal = runtime.authz.require(user.user_id, "doc:document:read")
+    except PermissionDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    perm = await runtime.perm_context(user.user_id)
+    admin_bypass = SUPER_ADMIN in principal.roles
     with runtime.db.sync_connect() as conn:
         row = conn.execute(
-            "SELECT d.*, k.code AS kb_code FROM ekbs_document d "
+            "SELECT d.*, k.code AS kb_code, "
+            "(SELECT c.shard_id FROM ekbs_chunk c WHERE c.doc_id = d.doc_id "
+            " ORDER BY c.chunk_id LIMIT 1) AS shard_id "
+            "FROM ekbs_document d "
             "LEFT JOIN ekbs_kb k ON k.kb_id = d.kb_id WHERE d.doc_id = ?",
             (doc_id,),
         ).fetchone()
         if row is None:
+            raise HTTPException(status_code=404, detail="not_found")
+        from ekbs.permission.acl import DocumentFacts
+
+        facts = DocumentFacts.from_row(row)
+        entries = runtime.gate.load_document_acl([doc_id]).get(doc_id, [])
+        if not runtime.gate.can_see_document(
+            perm, facts, entries, for_retrieval=False, allow_deleted=False,
+            admin_bypass=admin_bypass,
+        ):
             raise HTTPException(status_code=404, detail="not_found")
         chunks = {
             str(r["chunk_type"]): int(r["c"])

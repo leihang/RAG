@@ -39,6 +39,7 @@ from ekbs.index.faiss_store import ShardIndexManager, ensure_shard_for_placement
 from ekbs.index.fts import FtsIndex
 from ekbs.index.shard import parse_shard_id, resolve_shard_for_document
 from ekbs.ingest.chunker import retrieval_text
+from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
 from ekbs.logging import get_logger
 from ekbs.permission.router import bump_policy_version
 from ekbs.provider.registry import Providers
@@ -391,9 +392,12 @@ class PermissionChangeService:
     async def _migrate_document(self, doc_id: int, target_shard: str) -> int:
         """把文档的全部 chunk 迁到目标分片：重嵌入 → 追加 → 重写 FTS → 回写 shard_id。"""
         with self.db.sync_connect() as conn:
+            # is_retrievable 在 SQL 里算好：换级要重嵌/重写 FTS 的块，
+            # 必须与入库时「叶子块才是检索单元」的口径完全一致（见 ingest.retrievable）
             rows = conn.execute(
-                "SELECT chunk_id, chunk_type, content, heading_path FROM ekbs_chunk "
-                "WHERE doc_id = ? ORDER BY seq",
+                "SELECT c.chunk_id, c.chunk_type, c.content, c.heading_path, "
+                f"CASE WHEN {RETRIEVABLE_PREDICATE} THEN 1 ELSE 0 END AS is_retrievable "
+                "FROM ekbs_chunk c WHERE c.doc_id = ? ORDER BY c.seq",
                 (doc_id,),
             ).fetchall()
         if not rows:
@@ -408,7 +412,7 @@ class PermissionChangeService:
         children = [
             (int(r["chunk_id"]), retrieval_text(r["heading_path"], str(r["content"])))
             for r in rows
-            if r["chunk_type"] == "child"
+            if r["is_retrievable"]
         ]
         new_rows: dict[int, int] = {}
         if children:
@@ -419,7 +423,8 @@ class PermissionChangeService:
             texts = [text for _, text in children]
             for start in range(0, len(texts), batch_size):
                 vectors.extend(await self.providers.embed.embed(texts[start : start + batch_size]))
-            assigned = self.shards.append(
+            # 换级重嵌：chunk_id 不变 → 必须 upsert（append 会累积重复向量）
+            assigned = self.shards.upsert(
                 target_shard, [chunk_id for chunk_id, _ in children], np.asarray(vectors, dtype="float32")
             )
             new_rows = dict(zip([chunk_id for chunk_id, _ in children], assigned))
@@ -455,13 +460,13 @@ class PermissionChangeService:
             conn.commit()
 
         # FTS5 行必须跟着换分片：否则稀疏召回仍从旧分片命中（C1 的等价性要求）
-        chunk_ids = [int(r["chunk_id"]) for r in rows if r["chunk_type"] == "child"]
+        chunk_ids = [int(r["chunk_id"]) for r in rows if r["is_retrievable"]]
         self.fts.delete_chunk_ids(chunk_ids)
         self.fts.upsert_chunks(
             [
                 (int(r["chunk_id"]), target_shard, str(r["content"]), r["heading_path"])
                 for r in rows
-                if r["chunk_type"] == "child"
+                if r["is_retrievable"]
             ]
         )
         log.warning(

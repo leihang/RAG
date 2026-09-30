@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse
 from ekbs.api.auth import INTERNAL_TOKEN_HEADER, INTERNAL_USER_HEADER
 from ekbs.api.qa import _authenticate
 from ekbs.errors import PermissionDenied
+from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
 from ekbs.logging import get_logger
 from ekbs.permission.router import bump_policy_version
 
@@ -70,6 +71,10 @@ def _task_row(runtime: Any, doc_id: int) -> Any:
             "(SELECT COUNT(*) FROM ekbs_chunk c WHERE c.doc_id = d.doc_id) AS chunk_count, "
             "(SELECT COUNT(*) FROM ekbs_chunk c WHERE c.doc_id = d.doc_id AND c.chunk_type='child') "
             "  AS child_count, "
+            # 真正进了向量/FTS 的块数（= 叶子块）。代码文档的 child_count 会是 0，
+            # 用这个字段才不会误判成"没索引"（口径见 ingest.retrievable）
+            "(SELECT COUNT(*) FROM ekbs_chunk c WHERE c.doc_id = d.doc_id AND "
+            f"{RETRIEVABLE_PREDICATE}) AS retrievable_count, "
             "(SELECT c.shard_id FROM ekbs_chunk c WHERE c.doc_id = d.doc_id LIMIT 1) AS shard_id "
             "FROM ekbs_document d LEFT JOIN ekbs_kb k ON k.kb_id = d.kb_id WHERE d.doc_id = ?",
             (doc_id,),

@@ -24,6 +24,8 @@ class Providers:
     embed: EmbeddingProvider
     rerank: RerankProvider | None
     llm: LLMProvider
+    #: 视觉模型（给图片写描述）。**可选**：没配就退回"题注/页标题/OCR"那几条路径。
+    vision: LLMProvider | None = None
 
 
 def build_embedding(settings: Settings, secrets: Secrets) -> EmbeddingProvider:
@@ -64,7 +66,15 @@ def build_rerank(settings: Settings, secrets: Secrets) -> RerankProvider | None:
 
 
 def build_llm(settings: Settings, secrets: Secrets) -> LLMProvider:
-    cfg = settings.models.llm
+    return _build_compatible_llm(settings.models.llm, secrets, what="LLM")
+
+
+def _build_compatible_llm(cfg, secrets: Secrets, *, what: str) -> LLMProvider:
+    """按 `LLMCfg` 构造一个 OpenAI 兼容的对话模型（文本 LLM 与视觉模型共用）。
+
+    抽出来是因为两者除了 `model` 完全一样（都是 `[provider, api_key, base_url, temperature,
+    top_p, max_tokens, timeout, retries, fallback]`）—— 复制一遍必然漂移。
+    """
     ref = model_ref(cfg.provider, cfg.model, version=cfg.version)
     if cfg.provider == "mock":
         return MockLLMProvider(provider=ref.provider, model=ref.model)
@@ -96,7 +106,15 @@ def build_llm(settings: Settings, secrets: Secrets) -> LLMProvider:
             max_retries=cfg.max_retries,
             fallback=fallback,
         )
-    raise ConfigError(f"未知的 LLM provider：{cfg.provider}")
+    raise ConfigError(f"未知的{what} provider：{cfg.provider}")
+
+
+def build_vision(settings: Settings, secrets: Secrets) -> LLMProvider | None:
+    """视觉模型（图片描述用）。没配 model 就返回 None —— 调用方据此跳过，不报错。"""
+    cfg = settings.models.vision
+    if not cfg.model:
+        return None
+    return _build_compatible_llm(cfg, secrets, what="视觉")
 
 
 def build_providers(settings: Settings, secrets: Secrets | None = None) -> Providers:
@@ -105,4 +123,5 @@ def build_providers(settings: Settings, secrets: Secrets | None = None) -> Provi
         embed=build_embedding(settings, secrets),
         rerank=build_rerank(settings, secrets),
         llm=build_llm(settings, secrets),
+        vision=build_vision(settings, secrets),
     )

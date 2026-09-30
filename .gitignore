@@ -39,5 +39,14 @@ secrets.env
 # ---- 甲方方案文档（独立交付物，不入代码库；如需私有库保留，删掉这一段即可）----
 方案/
 # ---- 一次性的交付报表与 Excel 临时文件 ----
-docs/文件夹与文件用途.xlsx
-docs/.~*
+# 维护/交接文档（独立交付物，不入代码库；要在仓库里保留就删掉这两行）
+RAG维护文档/
+
+# 管理台前端（ekbs-admin-web）：依赖与构建产物都不入库
+ekbs-admin-web/node_modules/
+ekbs-admin-web/dist/
+ekbs-admin-web/.vite/
+
+# 根目录误装的前端依赖
+node_modules/
+:memory:.ses

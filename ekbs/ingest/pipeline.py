@@ -24,7 +24,19 @@ from ekbs.errors import ConfigError
 from ekbs.index.faiss_store import ShardIndexManager, ensure_shard_for_placement
 from ekbs.index.fts import FtsIndex
 from ekbs.index.shard import parse_shard_id, resolve_shard_for_document
-from ekbs.ingest.chunker import ChunkNode, chunk_markdown, count_tokens, retrieval_text
+from ekbs.ingest.code_chunker import chunk_code, display_source_path, is_code_source
+from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE, retrievable_chunk_ids
+from ekbs.ingest.chunker import (
+    CHILD_MAX_TOKENS,
+    CHILD_MIN_TOKENS,
+    ChunkNode,
+    ChunkingResult,
+    FigureInput,
+    TableInput,
+    chunk_markdown,
+    count_tokens,
+    retrieval_text,
+)
 from ekbs.logging import get_logger
 from ekbs.permission.router import bump_policy_version
 from ekbs.provider.registry import Providers
@@ -85,13 +97,15 @@ class IngestPipeline:
         real_corpus: bool = False,
         checksum: str | None = None,
         existing_doc_id: int | None = None,
+        figures: Sequence[FigureInput] = (),
+        tables: Sequence[TableInput] = (),
     ) -> IngestResult:
         """把一份 Markdown 入库（清洗与解析由调用方完成，见 :mod:`ekbs.ingest.parser`）。
 
         ``existing_doc_id``：复用已有文档行（``ekbs-worker`` 的「重新解析」路径，`01` §16）。
-        会先删掉该文档的旧分块与旧 FTS 行；**FAISS 中旧向量不会随之消失**
-        （``IndexFlatIP`` 不支持删除），旧行因为查不到对应 ``ekbs_chunk`` 而不会被召回，
-        但会白占容量 —— 因此重解析后建议跑一次 ``ekbs.tools.rebuild_shard`` 重建该分片。
+        会先删掉该文档的旧分块、旧 FTS 行**与旧向量**（见 :meth:`_replace_existing`）：
+        分片自 ``IndexIDMap2`` 改造后支持 ``remove``，重解析不再留孤儿向量，
+        因此**不需要**再跑 ``ekbs.tools.rebuild_shard`` 回收。
         """
         # 闸门①：合规（真实语料 + 云端嵌入 = 全量出网）
         self.settings.assert_compliance_gate(real_corpus=real_corpus)
@@ -130,7 +144,33 @@ class IngestPipeline:
             )
 
         try:
-            chunking = chunk_markdown(markdown, page_map=page_map)
+            # 代码文件走**代码感知分块**（按函数/类切，path+符号进 heading_path）：
+            # 定长/Markdown 分块会把函数从中间切断，代码检索效果很差。
+            if is_code_source(source_path):
+                # heading_path 里**不能**放机器绝对路径：路径本来就在磁盘上（source_path 列），
+                # 放进每个块会让检索语义随机器/目录变化，还把服务器布局泄进引用。
+                display_path = display_source_path(self.settings, source_path)
+                chunking = ChunkingResult(
+                    nodes=chunk_code(
+                        markdown,
+                        path=display_path,
+                        max_tokens=CHILD_MAX_TOKENS,
+                        min_tokens=CHILD_MIN_TOKENS,
+                    )
+                )
+                log.info(
+                    "chunked_as_code",
+                    source_path=source_path, display_path=display_path,
+                    nodes=len(chunking.nodes),
+                )
+            else:
+                chunking = chunk_markdown(
+                    markdown,
+                    page_map=page_map,
+                    figures=figures,
+                    tables=tables,
+                    doc_title=title,
+                )
             self._insert_chunks(doc_id, shard_id, chunking.nodes)
             child_ids = self._child_chunk_ids(doc_id)
             vectors = await self._embed_children(doc_id, child_ids)
@@ -193,7 +233,7 @@ class IngestPipeline:
             conn.commit()
 
     def _replace_existing(self, doc_id: int, *, shard_id: str) -> None:
-        """重新解析前清掉旧分块与旧 FTS 行（FAISS 旧向量见 :meth:`ingest_markdown` 的说明）。"""
+        """重新解析前清掉旧分块、旧 FTS 行与旧向量（三处必须同口径，见 :meth:`ingest_markdown`）。"""
         with self.db.sync_connect() as conn:
             chunk_ids = [
                 int(r["chunk_id"])
@@ -204,15 +244,27 @@ class IngestPipeline:
         if not chunk_ids:
             return
         self.fts.delete_chunk_ids(chunk_ids)
+        # 重新解析前把旧向量**真删**（IDMap2 支持 remove_ids），
+        # 否则每重跑一次解析就在分片里留一批孤儿向量
+        with self.db.sync_connect() as conn:
+            by_shard: dict[str, list[int]] = {}
+            for row in conn.execute(
+                "SELECT chunk_id, shard_id FROM ekbs_chunk WHERE doc_id = ?", (doc_id,)
+            ).fetchall():
+                by_shard.setdefault(str(row["shard_id"]), []).append(int(row["chunk_id"]))
+        for shard_id, ids in by_shard.items():
+            self.shards.remove(shard_id, ids)
         with self.db.sync_connect() as conn:
             conn.execute("DELETE FROM ekbs_chunk WHERE doc_id = ?", (doc_id,))
             conn.commit()
-        log.warning(
-            "reingest_stale_vectors",
+        # 这是**正常路径**，不是告警：上面已连同分块与 FTS 一起把旧向量真删了。
+        # 早期这里用 warning + "请跑 rebuild_shard" 是因为 IndexFlatIP 删不掉向量；
+        # 换 IDMap2 之后那条提示已经不成立，留着会让运维白跑一次全量重建。
+        log.info(
+            "reingest_vectors_removed",
             doc_id=doc_id,
             shard_id=shard_id,
-            removed_chunks=len(chunk_ids),
-            hint="IndexFlatIP 不支持删除：请跑 ekbs.tools.rebuild_shard 重建该分片",
+            removed_vectors=len(chunk_ids),
         )
 
     def _insert_document(
@@ -271,19 +323,19 @@ class IngestPipeline:
             conn.commit()
 
     def _child_chunk_ids(self, doc_id: int) -> list[int]:
+        """**可向量化/可检索**的块 id —— 口径见 :mod:`ekbs.ingest.retrievable`。
+
+        一条「叶子块才是检索单元」同时兑现三件事：图片块进得了向量（图上的文字搜得到）、
+        代码的符号块进得了向量（代码库不再是"存了但搜不到"）、Markdown 的父容器不重复入向量。
+        """
         with self.db.sync_connect() as conn:
-            rows = conn.execute(
-                "SELECT chunk_id FROM ekbs_chunk WHERE doc_id = ? AND chunk_type = 'child' "
-                "ORDER BY seq",
-                (doc_id,),
-            ).fetchall()
-        return [int(r["chunk_id"]) for r in rows]
+            return retrievable_chunk_ids(conn, doc_id=doc_id)
 
     def _index_fts(self, doc_id: int, shard_id: str, nodes: Sequence[ChunkNode]) -> None:
         with self.db.sync_connect() as conn:
             rows = conn.execute(
-                "SELECT chunk_id, content, heading_path FROM ekbs_chunk "
-                "WHERE doc_id = ? AND chunk_type = 'child' ORDER BY seq",
+                "SELECT c.chunk_id, c.content, c.heading_path FROM ekbs_chunk c "
+                f"WHERE c.doc_id = ? AND {RETRIEVABLE_PREDICATE} ORDER BY c.seq",
                 (doc_id,),
             ).fetchall()
         self.fts.upsert_chunks(
@@ -294,15 +346,16 @@ class IngestPipeline:
         )
 
     async def _embed_children(self, doc_id: int, chunk_ids: Sequence[int]):
-        """分批嵌入（``models.embed.batch_size``），入库期失败按 `00` §2.3 排队重试。"""
+        """分批嵌入（``models.embed.batch_size``）—— **子块 + 图片块**，
+        入库期失败按 `00` §2.3 排队重试。"""
         import numpy as np
 
         if not chunk_ids:
             return None
         with self.db.sync_connect() as conn:
             rows = conn.execute(
-                "SELECT chunk_id, content, heading_path FROM ekbs_chunk "
-                "WHERE doc_id = ? AND chunk_type = 'child' ORDER BY seq",
+                "SELECT c.chunk_id, c.content, c.heading_path FROM ekbs_chunk c "
+                f"WHERE c.doc_id = ? AND {RETRIEVABLE_PREDICATE} ORDER BY c.seq",
                 (doc_id,),
             ).fetchall()
         # 嵌入的是「标题路径 + 正文」（口径唯一，见 chunker.retrieval_text）

@@ -40,16 +40,27 @@ DEMO_DEPTS = [
 
 DEMO_USERS = [
     {
-        "dingtalk_userid": "demo_carol", "nick": "Carol（总部/L1）", "clearance": 1,
+        "dingtalk_userid": "demo_carol", "nick": "Carol", "clearance": 1,
         "dept_ids": ["1"], "primary_dept_id": "1", "title": "行政专员",
     },
     {
-        "dingtalk_userid": "demo_alice", "nick": "Alice（人力/L2）", "clearance": 2,
+        "dingtalk_userid": "demo_alice", "nick": "Alice", "clearance": 2,
         "dept_ids": ["102", "1"], "primary_dept_id": "102", "title": "HR 专员",
     },
     {
-        "dingtalk_userid": "demo_bob", "nick": "Bob（财务/L3）", "clearance": 3,
+        "dingtalk_userid": "demo_bob", "nick": "Bob", "clearance": 3,
         "dept_ids": ["103", "1"], "primary_dept_id": "103", "title": "财务主管",
+    },
+    # 管理台的两个必要视角（方案 05 §1.2 五类角色画像）：
+    # 没有它们，「问答日志与审计」（audit:qa:read 等）在演示库里永远打不开，
+    # 看起来像功能缺失，实际是缺身份。
+    {
+        "dingtalk_userid": "demo_dave", "nick": "Dave", "clearance": 3,
+        "dept_ids": ["1"], "primary_dept_id": "1", "title": "内审专员",
+    },
+    {
+        "dingtalk_userid": "demo_root", "nick": "Root", "clearance": 4,
+        "dept_ids": ["1"], "primary_dept_id": "1", "title": "平台管理员",
     },
 ]
 
@@ -145,15 +156,16 @@ def seed_static(db: Database, settings: Settings) -> dict[str, Any]:
                 )
         conn.execute(
             "INSERT INTO ekbs_kb(code, name, description, default_level, status, created_at) "
-            "VALUES ('demo', '演示知识库', '合成语料（合规闸未开时唯一允许的入库内容）', 2, 1, "
+            "VALUES ('main', '企业知识库', '默认知识库；可在管理台「导入」页新建更多', 2, 1, "
             "datetime('now')) ON CONFLICT(code) DO NOTHING"
         )
-        kb_row = conn.execute("SELECT kb_id FROM ekbs_kb WHERE code = 'demo'").fetchone()
+        kb_row = conn.execute("SELECT kb_id FROM ekbs_kb WHERE code = 'main'").fetchone()
         kb_id = int(kb_row["kb_id"])
         # 角色授予：carol 为 kb_admin，alice/bob 为 end_user
         for dt_userid, role_code in (
             ("demo_carol", "kb_admin"), ("demo_alice", "end_user"), ("demo_bob", "end_user"),
-        ):  # 想看审计视角可再给某个账号 auditor 角色（见 tests/test_admin_api.py 的用法）
+            ("demo_dave", "auditor"), ("demo_root", "super_admin"),
+        ):
             conn.execute(
                 "INSERT INTO ekbs_user_role(user_id, role_id, scope_type, scope_id, granted_at) "
                 "SELECT u.user_id, r.role_id, 'global', 0, datetime('now') "
@@ -260,9 +272,31 @@ async def seed(settings: Settings | None = None, *, runtime: Runtime | None = No
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="生成合成演示语料（仅合成数据）")
-    parser.parse_args(argv)
+    parser.add_argument(
+        "--identities-only",
+        action="store_true",
+        help="只重建组织/角色/权限/用户，不建知识库、不灌语料（清库后从零开始测试用）",
+    )
+    args = parser.parse_args(argv)
     settings = load_settings()
     configure_logging(settings, "tools")
+    # 清库后「能登录但一个知识库都没有」是部署前功能测试的起点：
+    # 演示语料会真的调云端嵌入（有 token 成本）并且会塞进一个演示知识库，
+    # 而这两件事在"我要自己建库、自己传文档"的场景里都是污染。
+    if args.identities_only:
+        settings.ensure_dirs()
+        db = Database(settings)
+        db.ensure_schema()
+        static = seed_static(db, settings)
+        with db.sync_connect() as conn:
+            removed = int(conn.execute("SELECT count(*) AS c FROM ekbs_kb").fetchone()["c"])
+            conn.execute("DELETE FROM ekbs_kb")
+            conn.commit()
+        print("已重建身份（未建知识库、未灌语料）：")
+        print(f"  部门 {static['depts']}  用户 {static['users']}")
+        print(f"  seed 顺带建的知识库已删除 {removed} 个 —— 当前库里 0 个知识库。")
+        print("  下一步：在管理台「导入」页点「新建」建第一个知识库，再上传文档。")
+        return 0
     summary = asyncio.run(seed(settings))
     print("已生成演示数据：")
     print(f"  部门 {summary['depts']}  用户 {summary['users']}  知识库 kb_id={summary['kb_id']}")

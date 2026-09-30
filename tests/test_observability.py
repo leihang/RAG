@@ -221,9 +221,17 @@ def test_scheduler_job_fires_alert_end_to_end(runtime) -> None:
     # 制造一次超阈值：1 小时内重连 6 次（阈值 > 5）
     _write_metric(runtime, m.RECONNECT_TOTAL, [6], seconds_ago=[60])
     job_metrics_collect(runtime)
+    # ⚠️ 不能只取"最新一条"：**业务时段**还会额外触发
+    # 「5 分钟内没有收到任何消息」那条规则（实测在 09:51 跑就命中了），
+    # 它排在后面前面就把重连告警挤掉 → 用例按**当前钟点**随机红。
+    # 断言改成"本次采集落下的告警里**包含**重连告警"，与钟点无关。
     with runtime.db.sync_connect() as conn:
-        row = conn.execute(
+        rows = conn.execute(
             "SELECT detail FROM ekbs_security_event WHERE event_type='metric_alert' "
-            "ORDER BY event_id DESC LIMIT 1"
-        ).fetchone()
-    assert row is not None and m.RECONNECT_TOTAL in str(row["detail"])
+            "AND created_at > datetime('now','-1 minute')"
+        ).fetchall()
+    details = [str(r["detail"]) for r in rows]
+    assert details, "本次采集没有落下任何 metric_alert"
+    assert any(m.RECONNECT_TOTAL in d for d in details), (
+        "本次采集的告警里没有重连告警，实际落库的是：\n  " + "\n  ".join(details)
+    )

@@ -5,8 +5,12 @@
 三个使用场景：
 
 1. 换嵌入模型 / 换维度（分片登记的 ``embedding_fingerprint`` 与新模型不一致 → 启动被拒）；
-2. 重新解析某文档后清理 FAISS 里的陈旧向量（``IndexFlatIP`` 不支持删除）；
-3. 索引文件损坏或与登记值（``dim`` / ``vector_count``）不一致。
+2. 索引文件损坏或与登记值（``dim`` / ``vector_count``）不一致；
+3. 想主动压紧索引文件（长期增删后 ``IndexIDMap2`` 内部有余量）。
+
+⚠️ **不再是"重新解析后清理陈旧向量"的手段**：索引已换成 ``IndexIDMap2``，
+重解析（``ingest._replace_existing``）与删除文档都会按 ``chunk_id`` **真删**旧向量。
+按旧结论去跑重建 = 白跑一趟 + 真花钱重嵌一遍全部块。
 
 实现：新建空索引 → 按 ``seq`` 顺序重嵌入该分片全部子块 → 原子替换文件 → 回写
 ``faiss_row`` / ``embedding_fingerprint`` / ``vector_count``。
@@ -21,6 +25,7 @@ import sys
 from ekbs.config import Secrets, load_settings
 from ekbs.index.faiss_store import ShardIndex, ShardIndexManager
 from ekbs.ingest.chunker import retrieval_text
+from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
 from ekbs.logging import configure_logging, get_logger
 from ekbs.provider.registry import build_embedding
 from ekbs.runtime import Runtime
@@ -34,9 +39,10 @@ async def rebuild(runtime: Runtime, shard_id: str, *, dry_run: bool = False) -> 
         runtime.db, runtime.settings, dim=int(embed.ref.dim or 0), fingerprint=embed.ref.fingerprint
     )
     with runtime.db.sync_connect() as conn:
+        # 必须与入库用**同一口径**（叶子块），否则重建一次就悄悄丢掉代码/图片向量
         rows = conn.execute(
-            "SELECT chunk_id, content, heading_path FROM ekbs_chunk "
-            "WHERE shard_id = ? AND chunk_type = 'child' ORDER BY seq",
+            "SELECT c.chunk_id, c.content, c.heading_path FROM ekbs_chunk c "
+            f"WHERE c.shard_id = ? AND {RETRIEVABLE_PREDICATE} ORDER BY c.seq",
             (shard_id,),
         ).fetchall()
     chunk_ids = [int(r["chunk_id"]) for r in rows]
@@ -56,21 +62,24 @@ async def rebuild(runtime: Runtime, shard_id: str, *, dry_run: bool = False) -> 
     for start in range(0, len(texts), batch_size):
         vectors.extend(await embed.embed(texts[start : start + batch_size]))
     if vectors:
-        index.add(np.asarray(vectors, dtype="float32"))
+        # 标签用 chunk_id（IDMap2）：重建不再"重排行号"，也就没有了
+        # "重建完所有 faiss_row 全体错位"的风险 —— 这是本次换格式的主要收益之一。
+        index.add(np.asarray(vectors, dtype="float32"), chunk_ids)
     index.save()  # 原子替换
 
     with runtime.db.sync_connect() as conn:
-        # 重建后行号重排：先清空该分片所有行的 faiss_row，再按新顺序回写
+        # 仍然先清空该分片所有行的 faiss_row：被剔除的块（例如已删除文档的残留）
+        # 不该继续显示为"在索引里"
         conn.execute("UPDATE ekbs_chunk SET faiss_row = NULL WHERE shard_id = ?", (shard_id,))
-        for row, chunk_id in enumerate(chunk_ids):
+        for chunk_id in chunk_ids:
             conn.execute(
                 "UPDATE ekbs_chunk SET faiss_row = ?, embedding_fingerprint = ? WHERE chunk_id = ?",
-                (row, embed.ref.fingerprint, chunk_id),
+                (int(chunk_id), embed.ref.fingerprint, chunk_id),
             )
         conn.execute(
             "UPDATE ekbs_shard SET dim = ?, embedding_fingerprint = ?, vector_count = ?, "
-            "updated_at = datetime('now') WHERE shard_id = ?",
-            (dim, embed.ref.fingerprint, index.vector_count, shard_id),
+            "index_type = ?, updated_at = datetime('now') WHERE shard_id = ?",
+            (dim, embed.ref.fingerprint, index.vector_count, ShardIndex.INDEX_TYPE, shard_id),
         )
         conn.commit()
     manager.drop_from_cache(shard_id)

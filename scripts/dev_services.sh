@@ -30,6 +30,16 @@ LOG_DIR="$ROOT/var/log"
 export EKBS_CONFIG="${EKBS_CONFIG:-config/application.dev.yaml}"
 export PYTHONUNBUFFERED=1
 
+# 与生产 launchd 的口径对齐：launchd 用 `zsh -lc 'set -a; source secrets.env; …'` 注入密钥，
+# 而本脚本原先只靠调用者自己 export —— 结果是"生产能起、dev 起不来"（或反过来靠手工 export
+# 才能跑云端配置）。这里补上同一件事，dev 与正式路径的密钥来源就一致了。
+if [ -f "$HOME/.ekbs/secrets.env" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$HOME/.ekbs/secrets.env"
+  set +a
+fi
+
 SERVICES=(api dingtalk worker scheduler)
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 

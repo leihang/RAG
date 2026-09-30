@@ -16,6 +16,9 @@
 cd /Users/lh/Documents/工作学习/AI项目/RAG
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt   # 首次
 
+# 管理台前端（首次；改前端后重跑 build 即生效，服务不用重启）
+cd ekbs-admin-web && npm install && npm run build && cd ..
+
 export EKBS_CONFIG=config/application.dev.yaml
 export EKBS_INTERNAL_TOKEN=dev-internal-token      # 联调用；生产放 ~/.ekbs/secrets.env
 
@@ -88,11 +91,19 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
 | `ekbs/retrieval/pipeline.py` | 链路编排：召回 → RRF → rerank → C5 → 父块 → 引用校验 | `00` §2.1/§2.2 |
 | `ekbs/cache/store.py` | L1 LRU + L2 `ekbs_cache`（替代 Redis） | `01` §5.5、`03` §4.4 |
 | `ekbs/ingest/` | 解析（可插拔）/ 四层分块 / 入库编排 | `06` §3、`docs/spec/20` |
+| `ekbs/ingest/parser.py` | **解析引擎单一来源** `SUFFIX_ENGINES`（63 种后缀）：MinerU（PDF/图片）、`textutil`（旧版 `.doc`）、`python-pptx`、`xlrd`、代码后缀→文本 | `06` §3.1 |
+| `ekbs/ingest/code_chunker.py` | **代码感知分块**：Python AST 符号切分 / 51 种后缀启发式 / 行窗口兜底 | `docs/代码知识库-方案C.md` |
+| `ekbs/ingest/retrievable.py` | **「谁进向量/进 FTS/可被检索」的唯一口径**（叶子块规则，6 个消费方共用） | `06` §4.11、`03` §5.4 |
+| `ekbs/ingest/dir_import.py` | **服务器目录导入**：路径限定 raw 之内（防穿越/软链接逃逸）+ 扫描分类 + 登记 `pending`（解析交 worker） | `01` §12 |
 | `ekbs/audit.py` | 问答审计三表（append-only） | `01` §5.4/§5.6 |
 | `ekbs/api/` | FastAPI 应用、鉴权、健康端点、问答、图片回源、**管理台只读接口** | `04` §7.3、`05` §8.1/§8.2 |
 | `ekbs/authz.py` | RBAC 判定（角色 → 权限点；``super_admin`` 通配） | `01` §5.3、`05` §3.4 |
 | `ekbs/api/docs.py` | **文档写接口**：登记/编辑（含分片迁移）/发布/下线/删除/批量/上传（秒传）/索引重建 | `05` §8.2 |
 | `ekbs/api/parse_tasks.py` | **解析任务中心**：任务列表（含成功率）、详情、结果预览、重跑、取消 | `05` §8.2 |
+| `ekbs/api/imports.py` | **导入接口**：目录浏览 / 扫描预览 / 执行登记 / 队列反馈 / 元信息（两张白名单） | `05` §8.2 |
+| `ekbs/api/admin_ui.py` | **常规管理台 `/admin`**（免构建单页）：概览/文档/**导入**/权限/分块/解析/调试/系统/审计 | `05` §8.1 |
+| `ekbs-admin-web/` | **管理台前端工程**（方案 `05` §1.1 技术栈）：React 18 + TS5 + Vite5 + Ant Design Pro 5 + TanStack Query + Zustand + React Router 6 + ECharts；`vite build` → `dist/` | `05` §1.1/§6.1 |
+| `ekbs/api/admin_web.py` | 托管 `dist/`：SPA 回落 + 哈希资源长缓存 + `index.html` 禁缓存 + 穿越防护（方案 §6.9 的 Caddy 过渡期实现） | `05` §6.9 |
 | `ekbs/api/playground.py` | **检索调试台**：改写/逐环节召回/完整链路/权限模拟/路由解释 | `05` §8.2 |
 | `ekbs/api/chunks.py` | **分块预览与编辑**：父子块树/详情/导出/编辑（换向量+重写 FTS）/拆分/合并/重嵌入 | `05` §8.2 |
 | `ekbs/api/perm_admin.py` | **权限管理页**：角色 CRUD/分配、用户密级与状态、部门视图、ACL 增删、权限模拟、变更审计 | `05` §8.2 |
@@ -103,12 +114,38 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
 | `ekbs/scheduler.py` | `python -m ekbs.scheduler` APScheduler 单实例 | `00` D13、`04` §7.1.4 |
 | `ekbs/stream.py` | `python -m ekbs.stream` 钉钉适配器（`/livez` `/readyz`） | `04` §7.3 |
 | `ekbs/tools/` | `init_db` / `new_shard` / `rebuild_shard` / `sync_org` / `seed_demo` / **`backup`（含恢复演练）** / **`import`（批量入库）** | `01` §5.7/§6.3/§12/§13/§16、`04` §4 |
+| `ekbs/tools/gc.py` | **删除后的残留清理**：raw 孤儿文件 / parse 孤儿产物 / 孤儿向量盘点（默认只报告） | `00` §3.1 |
 | `scripts/dev_services.sh` | 开发机四服务管理（与 launchd 同一套入口，无 root） | `01` §8 |
 | `scripts/dev_smoke.sh` | **开发机冒烟**（与生产 `smoke.sh` 同口径）：Schema/分片/四服务/健康端点/两条红线 | `01` §14、`04` §7.3 |
 | `scripts/acceptance.sh` | **上线接收检查**：把 DoD 逐项 + 迁移闸门 + 配置断言 + 契约测试 + 冒烟 + 备份演练汇总成**一次命令的结论**（READY / NOT-READY + 待外部条件清单） | `01` §0.3 |
 | `docs/spec/` | 四份**实现规格**（从 `方案/` 提炼，含待确认清单） | — |
 
 `sql/001_init.sql` 是 `deploy/sql/001_init.sql` 的逐字副本（部署时它落在 `$APP_DIR/sql/`）。
+
+### 支持的文件类型（**两张清单，宽度不同**）
+
+权威来源只有一处：`ekbs/ingest/parser.py::SUFFIX_ENGINES`（**63 种**）。
+但收文件的两条路宽度不同，复核时最容易张冠李戴：
+
+| 入口 | 生效清单 | 宽度 |
+|---|---|---|
+| **批量导入 CLI**（`ekbs.tools.import`） | `SUFFIX_ENGINES` 全量 | **63 种** |
+| **上传接口 HTTP**（`/api/v1/docs/upload/init`） | 配置 `limits.file_ext_whitelist` ∩ `SUFFIX_ENGINES` | **11 种** |
+
+| 引擎 | 数量 | 后缀 |
+|---|---|---|
+| `mineru` | 4 | `.pdf` `.png` `.jpg` `.jpeg` |
+| `docx` / `doc` | 2 | `.docx`；`.doc`（macOS 自带 `textutil`，**无需 LibreOffice**） |
+| `xlsx` / `xls` | 2 | `.xlsx`（openpyxl）；`.xls`（`xlrd`，只读旧版） |
+| `pptx` | 1 | `.pptx`（`python-pptx`，逐页 Slide） |
+| `text` | 54 | `.md` `.markdown` `.txt` + **51 种代码后缀**（`.py .ts .go .java .sql .sh .rs .cpp …`） |
+
+* **上传接口可收的 11 种**：`pdf docx doc pptx xlsx xls txt md png jpg jpeg`
+* ⚠️ **代码文件目前只能走 CLI 批量导入** —— 从上传接口传 `.py` 等会被 **422**（配置白名单不含代码后缀）。
+  若要在管理台上传代码，改**配置**即可（取交集那步会自动放行），不必动解析器。
+* ⚠️ **明确不支持**：`.csv` `.json` `.rst` `.ini` `.toml`（不在 63 种内，CLI 按"跳过"计数）；
+  `.ppt` `.html`（配置里有、解析器没实现 → 上传时 **422 并说明原因**，不会静默收下变乱码）。
+* 以上清单已用 `tests/test_ingest_extensions.py` 钉住（含各引擎数量、51 种代码后缀、上传口径宽度）。
 
 ---
 
@@ -172,6 +209,14 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
 | **四服务真实 launchd 演练**（`scripts/deploy_rehearsal.sh`）：把四份 plist 逐字搬进本机 `gui/<uid>` 域跑一遍再拆掉 —— 四服务全部 bootstrap 成功、api `/readyz → ready`、四个 label 出现在 `launchctl list`、启动标志进日志、日志落点正确；`kill -TERM` 后 **6734ms 自愈**（`02` TC-ENV-022 要求 ≤15s）；`bootout` 后保持停止 | **PASS=38 FAIL=0** + `tests/test_deployment_contract.py::test_launchd_semantics_are_per_service`（4 条） |
 | **分块编辑**：改子块 → 追加新向量 + 新 `faiss_row` + **FTS5 重写**；父块编辑不碰向量；拆分/合并只支持子块（父块会牵连全部子块）；整篇重向量化复用分片重建 | `tests/test_chunks_api.py`（11 用例）+ curl 实测 |
 | **跨进程索引可见性**（回归用例）：一个 Runtime 写入 → 另一个 Runtime 无需重启即可见 | `tests/test_retrieval.py::test_shard_index_reloads_after_external_writer` |
+| **图片不丢 + 可检索**（需求②）：文档内图片落盘到 `var/parse/<sha\|doc_id>/images/`（不再被 `tempfile` 回收）、生成 `figure` 块并**入向量 + 入 FTS**（检索文本 = 题注 + OCR）、`/assets/figure/<chunk_id>` 可回源且复检 ACL、无题注无 OCR 的图**跳过不落块**。实测：扫描合同 3 张图入库，OCR 文字可被关键词召回，`/assets/figure/50` 返回真实 JPEG | `tests/test_ingest_code_and_figures.py`（4 用例）+ curl 实测 |
+| **旧版 Office 格式兼容**（需求①）：`.doc` 走 macOS 自带 `textutil` 转 docx（无需 LibreOffice）、`.pptx` 走 `python-pptx` 逐页、`.xls` 走 `xlrd`（`.xlsx` 仍走 openpyxl，数值 `1` 不显示成 `1.0`）。实测：`.doc` 出 341 字正确中文；38 页 `.pptx` 0.10s / 3151 字 / 峰值 302MB；`.xls` 出 markdown 表格 | 解析分支 + 上传接口实测（`.doc/.pptx/.xls/.pdf` → 200） |
+| **代码知识库（方案 C）**（需求③）：代码走 `parse_file` → **符号级分块**（Python AST：`路径 > Class.method`；51 种后缀启发式；行窗口兜底）→ 与制度文档**同一套分片/FTS/权限/检索**。实测真实仓 `ekbs/ingest/` 6 文件：三方对账 138=138=138、`diff_ratio=0.0`；用只存在于代码里的符号名提问，代码块排 **rank 1/2** | `tests/test_code_chunker.py`（27 用例）+ `tests/test_ingest_code_and_figures.py` + 真实 CLI 导入，见 `docs/代码知识库-方案C.md` |
+| **「可检索」口径单一权威**（跨层回归）：规则曾是散落 8 处的 `chunk_type='child'` —— 代码符号块与图片块因此**入不了向量，且重建分片会再丢一次**。现统一为「叶子块」判据（`ekbs/ingest/retrievable.py`），入库/重建/批量导入/换级重嵌/三方对账/发布闸门 6 处共用；两道 lint 用例防止它再散回去 | `tests/test_ingest_code_and_figures.py` 的 3 条不变式用例 |
+| **扩展名白名单单一来源**：CLI 默认白名单与配置白名单曾是两张皮（`.pdf` 只在配置里 → `--ext .pdf` 才看得见 PDF）。现统一取自 `parser.SUFFIX_ENGINES`（63 种）；上传接口取「配置允许 ∩ 解析器已实现」，`.ppt/.html` 这类返回 **422 并说明原因**而非静默丢弃 | `tests/test_ingest_extensions.py` + 上传接口实测 |
+| **管理台「导入」页**（`/admin` → 导入）：**服务器目录导入** —— 逐层浏览 `data_dir/raw`（**支持中文多级子目录**）→ 扫描预览（可导入 / 重复跳过 / 超限 / 闸门原因）→ 一键登记；解析交 worker，进度复用「解析任务」页。三个安全性质用用例钉住：**路径只能落在 raw 之内**（`..`、绝对路径、软链接逃逸三种都拒）、**闸门不能被界面绕过**（合规闸/L3 闸与 CLI 同一判据，且把原因显示出来而不是抛 500）、**只登记不解析**（避免网页请求挂几十分钟） | `tests/test_import_api.py`（20 用例）+ 真实 HTTP 全流程实测 |
+| **管理台上传页签**：浏览器选文件 → 分片（5 MB）→ 秒传（浏览器算 SHA-256）→ 进度条；明确区分「目录导入 63 种」与「上传 11 种」，并把配置里允许但未实现的 `.ppt/.html` 提前标出来，不让用户挑完文件才吃 422 | `tests/test_admin_ui_page.py` + 上传接口实测 |
+| **管理台页面自身的回归**：页面是内嵌在 Python 字符串里的单文件 JS，JS 一坏**接口全绿、页面全白**。用 `node --check` 真解析一遍（无 node 则跳过），并锁住「菜单 ↔ 视图一一对应」「每个菜单都声明权限点」 | `tests/test_admin_ui_page.py`（6 用例） |
 | **权限管理页**：角色 CRUD（内置角色禁删）、角色分配（幂等）、改密级与改 ACL **走权限变更服务**（策略版本+缓存+审计一体）、权限模拟落安全事件、变更审计 | `tests/test_perm_admin_api.py`（10 用例）+ curl 实测闭环 |
 | **四服务同时运行**实测：api/dingtalk/worker/scheduler 共享同一 SQLite，探针全绿，问答链路正常 | `bash scripts/dev_services.sh start all` + curl |
 | **钉钉 OpenAPI 客户端**：鉴权头 `x-acs-dingtalk-access-token`、`msgParam` JSON 字符串与 20 人上限、卡片 `openSpaceId` 构造、流式全量帧与长度上限、`flowControlledStaffIdList` 检查 | `tests/test_dingtalk_client.py`（17 用例） |
@@ -183,7 +228,11 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
 | 项 | 现状 | 缺什么 |
 |---|---|---|
 | 云端模型真实连通性 | ✅ **已用真实 key 跑通**（embed/rerank/LLM 全部可用、延迟与价格已核实，见 `docs/spec/40`、`60`） | 仅剩**真实语料**下的阈值重校准（demo 语料只有 2 文档，带宽偏乐观） |
-| MinerU 解析 | `parse_file` 对 PDF/图片**明确报错**，不假装成功 | `pip install mineru==2.1.10`（2–3 GB 模型）+ 实测 `structure.json` 字段（T8） |
+| MinerU 解析 | ✅ **已实现并实测**：独立 venv（`var/mineru-venv`）+ 1.9 GB 模型（`var/mineru-models`，`_mineru_env()` 自动指向）；2026-09-29 实测 PDF 端到端通（1 页中文 PDF，30 s 含模型加载，正文抽取正确） | 生产机把模型放非 TCC 保护路径（如 `/data/ekbs/mineru-models`）并显式 `MODELSCOPE_CACHE`：开发机的 `~/Downloads` 受 macOS 隐私保护，launchd 进程读不到 |
+| 图片 OCR | 默认开启（`EKBS_FIGURE_OCR=1`），让"只有图形、没有题注"的图也能被检索 | 真实语料下张数与最小体积阈值可能要调（`EKBS_FIGURE_OCR_MAX` / `_MIN_KB`） |
+| 代码知识库 | 方案 C 已实现并验证（符号切分 + 同一套权限与检索），见 `docs/代码知识库-方案C.md` | **不支持**符号跳转与跨文件调用图；管理台分块编辑目前只支持 `child`，代码符号块需改源文件后重导 |
+| 音频 / 视频 | **不支持**（不在扩展名白名单） | 需先转写。官方 ASR `qwen3-asr-flash` 约 **0.792 元/小时**；本机 `mlx_whisper` 已装但未下模型 |
+| **删除回收站** | 当前是**硬删除**：分块 / FTS 行 / **FAISS 向量** / 文档行 + **磁盘原件与解析产物**一次清完（策略版本 +1；索引已换 `IndexIDMap2`，删得掉、不留孤儿）。删空后分片 `.faiss` 留一个 0 向量的空壳（它是注册在库里的基础设施对象，下次复用）。接口可带 `purge_assets=false` 只清库与向量 | 方案 P5 要求「软删除 + 回收站 30 天」；需加 `deleted_at` + 列表过滤 + 恢复接口 + 30 天清理作业 |
 | 钉钉 Stream 接入 | 适配器进程与 `/readyz` 已就绪 | 企业应用凭据（AppKey/AppSecret/RobotCode/CorpId） |
 | 钉钉免登 / JWT 签发 | `dev-token` 可用；`dingtalk-login` 返回 501 | 免登流程实现（`04` §3） |
 | 审计归档 | 明确跳过并告警 | 事务内 DROP 触发器 → 删除 → 重建（`04` §6.3） |
@@ -250,6 +299,27 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
 | 43 | **MinerU 2.1.10 的产物里根本没有 `structure.json`**（`01` §1/§4、`docs/spec/20`、`06` §4.3 都按它写）：实测产物是 `<out>/<文件名>/auto/` 下的 `<stem>_content_list.json`（块列表）+ `_middle.json` + `_model.json` + `.md` + `images/`。另有两处保真度问题：**文档标题行会被整块丢弃**（测试 PDF 的「员工年假管理制度」在 `.md` 与块列表里都不见），**`第X条` 中文条文不被识别成 heading**（`text_level` 缺失） | 页码/图片/标题路径的取法全部按旧假设写会取不到；标题路径为空会影响 `06` §3 的分块 | 已按实测实现 `_parse_mineru`（页码取 `page_idx+1`、图片取 `img_path`、异常一律明确报错），并同步 `01 §4` 产物契约 + 关闭 `docs/spec/20` 的 T8；**`06` §4.3 的表格取法待一并按 `table_body` 调整** |
 | 45 | **`$var` 紧跟非 ASCII 字符会让 macOS 自带 bash 3.2 解析错变量名**（我自己踩了三次：`$svc：` 被当成变量 `svc：`，报 `unbound variable`，行号还指向别处）。真机部署默认就是 bash 3.2，必须守住 | 脚本在真机静默失效/报怪错 | 已全部加花括号（`${svc}：`），并加**仓库级 lint 测试**扫描 `scripts/` 与 `deploy/scripts/` 下所有 shell 脚本；该测试当场又抓出 `dev_smoke.sh` 里两处既有隐患并修掉 |
 | 44 | **`mineru` 装在 venv 里时，`shutil.which("mineru")` 在生产会找不到**：launchd 的 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，而可执行文件在 `/opt/ekbs/venv/bin/`。把 MinerU 放独立 venv（推荐）后更明显 | 会误报「MinerU 未安装」，且只在 launchd 场景复现（手工 `source activate` 时正常） | 已把查找顺序改为**「与解释器同 venv」优先**，再回退 PATH；`EKBS_MINERU_BIN` 可显式覆盖。已加回归用例（模拟 launchd 窄 PATH） |
+| 46 | **「可检索」的口径被写死成 `chunk_type='child'` 散落在 8 个文件里**。本轮加代码分块与图片块时暴露：代码的符号块是 `parent`（顶层 `class`/`def` 没有子块）、图片块是 `figure`，**两者都不在 `'child'` 里** ⇒ 入库时进不了向量与 FTS（代码库"建了但搜不到"）；更隐蔽的是 `rebuild_shard` / 权限换级重嵌 / 三方对账 / 发布闸门也各写了一遍，所以**重建分片一次还会把已入的向量再丢一次**，而库里看不出异常（对账数自己也按同一错误口径算，diff_ratio 反而=0） | 代码与图片静默不可检索；重建即丢数据；对账指标自证清白 | 统一为「**叶子块才是检索单元**」并收敛到 `ekbs/ingest/retrievable.py` 一处，6 个消费方全部改引用；加两道 lint 用例（不允许再出现 `chunk_type='child'` 过滤、6 个模块必须引用同一口径）。教训：**跨层的不变量不能靠"每处都记得写对"** |
+| 47 | **CLI 默认扩展名白名单与配置白名单是两张皮**：配置里 `limits.file_ext_whitelist` 含 `.pdf`，而 `import.py` 的 `DEFAULT_EXTENSIONS` 不含 —— 于是 `发现文件 0`，看起来像"目录里没文件"。上传接口则只按配置判白名单，`.ppt`/`.html` 这类**配置允许但解析器没实现**的格式会被收下来再静默失败 | PDF 默认导不进去；用户以为目录错了 | 白名单单一来源化（取 `parser.SUFFIX_ENGINES`，63 种）；上传接口改为「配置允许 ∩ 解析器已实现」，未实现的返回 **422 并说明原因**；加 `tests/test_ingest_extensions.py` 锁住 |
+| 66 | **`00` §11 的 M12 / `06` §4.11.2 的 O6-7（MinerU 对纯图片输入的支持程度）——已实测关闭，答案是「不支持」**：装好模型后拿真实图片跑 `_ocr_figure`，MinerU 对独立 PNG/JPG 走的是版面分析流水线，它把整张图判定成一个 figure 区域，产出的 markdown 就是**这张图自己的引用**（`img-02561a4c.png 530KB 32.1s → "![](images/2b6202af….jpg)"`）——每张图 ~33 秒、换回一个链接、一个字都没有。按方案写好的兜底：**回落 PaddleOCR PP-OCRv4**（`06` §4.11.2 第 3 步） | 文档内嵌图片的「图内 OCR 文字进索引」目前拿不到；若沿用 MinerU 每张图要空跑 33 秒 | 已把 `_figure_ocr_budget()` 默认改为 **0**（并让它按「尝试次数」扣预算、剥掉回吐的图片链接、产出为空时不再逐张重试）；接入 PaddleOCR 后重新打开。图片本身照旧落盘 + 建 figure 块（题注路径可用） |
+| 48 | **MinerU 抽出的图片被 `tempfile.TemporaryDirectory` 回收**：解析产物交给 `assets_dir` 之前，临时目录已随 `with` 退出被删，库里 `image_path` 指向不存在的文件 —— 「图片不丢」在"存了但打不开"这一层就已失效 | 图全丢，引用回源 404 | 图片改为 `_persist_figure()` 复制到**持久目录** `var/parse/<sha\|doc_id>/images/`（按内容 sha 命名，天然去重）；`image_path` 只存**相对 `data_dir`** 的路径，换机/换目录不失效 |
+| 49 | **`ekbs_chunk_fts.chunk_id` 是 FTS5 的 `UNINDEXED` 列且以字符串存入**（`FtsIndex.upsert_chunks` 里 `str(chunk_id)`）。手工清理时用 `DELETE ... WHERE chunk_id IN (50)` 用**整数**比较，**一行都删不掉**（FTS5 列无 affinity，不会把字面量转成文本），静默留下 130 条悬挂行；而 `JOIN ekbs_chunk ON c.chunk_id = f.chunk_id` 却能匹配（列对列比较时会应用 INTEGER affinity），所以"查得到、删不掉"，更迷惑 | 手工运维只删了主表，FTS 里留下悬挂行，对账看不出来 | 已记入 `docs/测试方案-按工作流.md` §1.5 的提醒：**动 FTS 一律用 `FtsIndex.delete_chunk_ids()` / `upsert_chunks()`**，不要裸 SQL |
+| 50 | **worker 不把文件 checksum 传给 pipeline，导致「秒传/去重」的键在解析完那一刻就变了**：`upload_complete` / 目录导入写入的是**文件内容 SHA-256**，而 `pipeline.ingest_markdown` 里有一句 `checksum = checksum or sha256(markdown)`，worker 没传就回写**markdown 内容哈希**覆盖掉它。后果：同一份文件再次上传查不到重复（去重失效、重复入库、重复向量），而且从库里看不出异常 | 秒传/去重静默失效；同一份文件在库里出现多份 | worker 改为把 `ekbs_document.checksum` 原样传下去（与 CLI 一致），并在用例里断言「解析完成后 checksum 仍等于文件内容 SHA-256」 |
+| 51 | **代码块的 `heading_path` 里进了机器绝对路径**：`code_chunker` 的文档明确要求传仓库相对路径，但 worker 与 CLI 传的是 `doc["source_path"]`（磁盘绝对路径），于是变成 `/Users/<用户名>/…/var/raw/代码样例/order_service.py > OrderService`。三个后果：同一份代码在不同机器/不同 `data_dir` 下**检索语义不同**（绝对路径进了嵌入文本）；用户名与项目目录名混进向量与 FTS 成噪声；**服务器目录结构随引用卡片泄漏给最终用户** | 换机/换目录后检索结果漂移；引用里暴露服务器路径 | 新增 `code_chunker.display_source_path()`：raw 下 → `raw/<相对路径>`，data_dir 其它位置 → 相对 data_dir，本来就是相对路径 → 原样，**数据目录之外 → 只留文件名**。已加两条回归用例（含从绝对路径入库的端到端）。**这是实测管理台导入时才暴露的**：单元测试里我用的是相对路径，看不见 |
+| 52 | **管理台侧栏菜单点了不换内容 —— 用户看到的症状是「选导入文件没有入口」**：侧栏是原生 `<a href="#/view">`，但页面**从来没有注册 `hashchange` 监听**，点击处理里也只改了高亮就 `return`；于是改 hash 没人渲染，主区域一直停在旧页面。性质恶劣在于：**后端接口全绿、`node --check` 也过**，只有真点一下才知道坏了 | 整个管理台的导航都是失效的（不只是导入页） | 改为原生 hash 路由（`hashchange` → `syncFromHash()` → `render()`），并新增 `tests/test_admin_ui_nav.py`：用 Node + 最小 DOM 桩**把页面真跑起来并模拟点击**，断言内容确实换了（已验证：去掉监听后该用例立刻变红）。另把「导入」做成侧栏常驻按钮、导入页默认落在上传页签、加拖拽区与已选文件回显，不再让「选文件」藏在第二个页签里 |
+| 53 | **上传 `.xlsx` 被判「不支持的类型」**：三层原因叠在一起 —— ① 前端**又硬编码了一份** 11 种白名单（刚在 CLI/配置之间修掉「两张皮」，前端重犯）；② 扩展名取法太脆：`PurePath(name).suffix` 遇到 `报表.xlsx `（尾部空格，Windows/邮件下载常见）得 `'xlsx '`、遇到 `报表．xlsx`（**全角**句点，中文输入法）与 `报表.xlsx.` 得 `''`，三种都会命中「不支持」分支；③ 报错只说「不支持的类型」却不显示**检出的是什么**，用户无从判断 | 一个明明支持的格式传不上去，而接口单独测是 200 —— 只在真点界面时才暴露 | 后端新增 `parser.normalize_suffix()`（去空格 / 全角句点 / 尾部点 / 大写归一），上传与目录导入**共用同一份**；前端新增 `utils/fileExt.ts`（与后端同口径），且准入清单改为**从 `/import/meta` 取**、拿不到时不拦（权威在后端，原则 P3）；报错改为 `不支持的类型「.{检出的后缀}」；支持 .pdf / …`。两侧各加用例，含「归一化不能把 `.exe` 也放过」的反向断言 |
+| 54 | **两个上传问题同源：拖入文件夹时浏览器给的是「没有扩展名的文件」**。① `方案 §4.4` 要求的「选择文件夹」我**根本没做**（只做了选择文件）；② 拖入文件夹时浏览器交的是一个**目录 entry**，早先直接拿 `dataTransfer.files` 当文件列表，得到的是一条「名字是文件夹名、无后缀」的记录 → 被类型校验判成「不支持的类型（无后缀）」。所以用户看到的是「拖文件夹说格式不支持」，指向了完全错误的方向 | 文件夹根本传不了 | 新增 `utils/fileDrop.ts`（`webkitGetAsEntry` 递归展开）+「选择文件夹」按钮（`webkitdirectory` 原生目录选择器）+ 保留相对路径以区分不同目录下的同名文件 + 单次 300 个文件上限并如实告知截断 |
+| 55 | **递归展开目录的 `for(;;)` 可能永不退出**：`readEntries` 必须循环读到返回空数组（浏览器每次最多给 100 条，不循环会静默少传），但若实现异常或软链接成环让它**一直返回非空**，同层循环就退不出去 —— 目录深度护栏只管纵向，管不住横向爆炸。**这条是新写的测试把它挂死才发现的**（vitest 卡了三分钟被我杀掉） | 页面卡死且没有任何报错 | 加**全局遍历预算**（`MAX_ENTRIES=5000` / `MAX_READ_CALLS=500` / `MAX_FOLDER_FILES=300`），并加一条专门断言「readEntries 永不返回空时必须终止」的用例 |
+| 56 | **「上传 xlsx 提示：提交内容不符合要求」——真实原因被我的错误处理吃掉了**。前端 `errorTextOf(code, status)` 排在 `detailToText(body.detail)` **前面**，于是任何 422 都被状态码兜底文案（`422 → 提交内容不符合要求`）盖住，后端那句「上传初始化时需给出 kb_id 或 kb_code」根本传不到界面上，用户无从下手。而真实原因确实是它：上传页当时只有一个**空的**「知识库 code」文本框，而后端在 **complete** 阶段要求 `kb_id` 或 `kb_code` 至少给一个 | 报错指向错误方向，同一个 422 有多种成因却长得一模一样 | ① 错误处理改成**后端 `detail` 优先**，状态码兜底文案垫底；② 上传页的知识库改成**从 `/import/meta` 取的下拉选择**并默认第一个，提交前本地先拦一道并给出明确提示 |
+| 57 | **上传文件夹时「文件夹被分离了」**：后端用 `Path(filename).stem` 当标题、落盘只取 basename，相对路径整段丢掉 —— 传进去的是 `制度/2026/预算表.xlsx`，库里只剩「预算表」 | 目录结构完全丢失，用户以为功能坏了 | `UploadInit` 增加可选 `title`；前端上传时带上**相对路径**与其去扩展名形式；后端新增 `safe_relative_name()`（挡掉绝对路径/`..`/隐藏段）后按相对路径落盘并建父目录。实测：标题 `制度/2026/预算表2026`、落盘 `raw/<sha>/制度/2026/…`。**注意方案 §1.5 把「目录树管理」列为首期不做（扁平目录+标签）** —— 现在保留的是路径信息，不是可授权的目录对象 |
+| 58 | **「FAISS 不支持热更新」这个前提只对了一半**：新增早就热（`os.replace` 原子替换 + 按 `(mtime_ns,size)` 指纹跨进程重载），删除在**逻辑上**也热（检索回表联查 `ekbs_chunk`，孤儿召不回），真正做不到的只有**单条物理删除**。而物理删除的缺失会连带出一串「删完还要重建」的收尾动作 | 删文档后分片里堆孤儿向量，占内存又占盘；重建分片时 `faiss_row` 全体行号重排，是「重建完所有行号错位」的隐患 | 索引换成 **`IndexIDMap2`**（标签 = `chunk_id`）：`remove_ids` 真删、`upsert` 原地替换、重建不再重排行号。实测删文档后分片登记向量 3 → **0** |
+| 59 | **`add_with_ids` 对重复 id 是累积而不是替换**（实测：同一 id 加两次 `ntotal` 1→2，且搜索会把同一个 chunk 返回两次）。而「编辑子块 / 换级重嵌」正是**同一个 `chunk_id` 重新嵌入** —— 如果只做 `add_with_ids`，索引会越长越大且召回重复 | 编辑一次就多一条重复向量，越用越慢越脏 | 新增 `ShardIndex.upsert()`（先 `remove_ids` 再 `add_with_ids`），编辑/换级/重嵌全部改走 upsert；并加用例把这个「必须 upsert」的事实钉住 |
+| 60 | **权限目录缺 22 个首期权限点，却没有任何用例守着**：方案 `03` §3.4 首期启用 **57** 个，实现只有 41 个；另有 `qa:chat` 用了**封闭模块前缀集合之外**的 `qa` 前缀。缺权限点的表现是「某个按钮消失 / 某个接口 403」，不测永远发现不了 | 首期功能看似缺失、且新增权限点无从对齐 | 按方案 §3.2 的矩阵**程序化生成**补齐（避免手抄）：编码阶段用脚本解析矩阵，生成权限点与角色授权；`qa:chat` 登记进 `LEGACY_PERMISSION_MAP` 重命名为 `audit:qa:chat`（存量库升级时自动搬，不会新旧并存）；新增 `tests/test_rbac_spec_conformance.py` 6 条用例，其中一条**逐点比对方案矩阵**，并把「已知且有意保留的缺口」写成带原因的清单 |
+| 61 | **`/docs/documents` 没有行级权限过滤**：它只要 `doc:document:read` 就返回**全库**文档的标题/密级/状态，没有任何 `clearance`/`visible_dept_ids` 条件（实测确认）。也就是说「列表不泄漏」完全依赖「只有受信管理员角色持有这个点」这个隐含假设 | 一旦按方案 §3.2 把 `doc:document:read` 授予 `auditor`/`end_user`（矩阵标着 ✔），他们就能枚举全库文档元数据 | 本轮**不授予**这两类角色的读权限点，并在 conformance 用例里把这条写成带原因的「已知缺口」；要放开必须先给列表类接口补数据层过滤 |
+| 62 | **改了 `faiss_store.py` 却只重启了 api、忘了 worker** → 用户上传直接失败。旧 worker 进程（改代码前启动）对着已被新代码换成 `IndexIDMap2` 的分片文件调 `index.add(向量)`（不带 id），FAISS 抛 `IndexIDMapTemplate<Index>::add`。**这是我自己造成的**：上一轮刚从同一个坑里学到「部分进程跑旧代码最难查」，这轮又踩了 | 用户看到「上传成功」但文档 `failed`（异步失败，界面不显示原因） | 重启 worker 并重新上传验证通过；**教训固化**：改 `ekbs/index/` `ekbs/ingest/` `ekbs/retrieval/` 下任何文件后，api/worker/scheduler **三个都要重启**（它们各自 import 一份） |
+| 63 | **知识库只能靠种子造、界面里只有一个 `demo`**：`/kb/knowledge-bases` 一族接口（`方案 05` §8.1）没实现，只有 CLI 的 `ensure_kb` 能建库 —— 于是管理台里永远只有「演示知识库」可选，用起来就像个演示程序 | 用户直接质疑「这还算演示程序吗」 | 新增 `ekbs/api/kb.py`（列/建/改/删 + 文档数），界面支持「新建知识库」并按**名称**显示；种子库改名 `演示知识库` → `企业知识库`、code `demo` → `main`；删库有护栏：**库里有文档时 409 拒绝**，避免误删整库语料 |
+| 64 | **上传落盘目录是 `raw/<sha256前16位>/…`** —— 文件管理器里就是一堆 `95fbf1ef16573acf` 这样的壳子，人认不出是什么；用户反馈「上传后会自动产生一个数字字母编号的新文件夹壳子」 | 落盘结果不可读，运维时无法判断哪个目录是谁的 | 改成 `raw/<知识库 code>/<上传时的相对路径>`（如 `raw/main/制度/年假办法.md`）；同名但内容不同时加 `-<sha8>` 后缀而不覆盖原件；去重本来就在库里按 checksum 做（秒传），不依赖目录名 |
+| 65 | **云端配置的 `database.path` 与 `data_dir` 分居两棵树**：文件头写着「与 dev 的唯一区别是模型 provider」，但 `data_dir: var` 而 `database.path: var-cloud/index/ekbs.db`、`log_dir: var-cloud/log` —— DB 在 `var-cloud/`、raw/parse/分片按 `data_dir` 落在 `var/` | 环境边界说不清：清一次 `var-cloud` 就把「云端环境」弄坏了（表现为 `Schema 自检未通过：数据库文件不存在`，而报错完全看不出是配置分叉导致的） | 把 cloud 配置的 `log_dir` / `database.path` 对齐到 `var/`，与它自己声明的「唯一区别是 provider」一致 |
 
 
 ### 四之二、钉钉：`方案/04` 与官方文档不符之处（14 条，其中 5 条会导致功能不正确）
@@ -308,12 +378,22 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
    **仍需你/真机补**：在生产 venv 的 **Python 3.12** 下跑一次真实解析（我只在 3.11 下实测过，
    3.12 仅验证了依赖可解析），并把 `EKBS_MINERU_BIN` 写进部署配置。
 4. **真实语料试点**：合规确认到位后开 `corpus_egress_ack`，首批 200 份入库（`01` §12）。
+   **入库方式（本轮起可以不用命令行）**：打开 `http://127.0.0.1:8000/admin` → 左栏「导入」→
+   「服务器目录导入」逐层选到目录 → 扫描预览 → 执行。文件放 `data_dir/raw`（开发机是 `var/raw`，
+   生产是 `/data/ekbs/raw`），**支持中文多级子目录**；也可以走「上传文件」页签传少量文件。
+   两条路的差别与边界见 `docs/测试方案-按工作流.md` §1.1。
 5. **本机 launchd 演练（已可跑，建议每次改部署件后都跑）**：`bash scripts/deploy_rehearsal.sh`
    —— 用真实 launchd 拉起四服务、探活、测自愈、再拆掉（当前 **PASS=38 / FAIL=0**，api 自愈 6.7s）。
    ⚠️ 该脚本需要**未被沙箱限制的 shell**：受限环境下 `launchctl bootstrap` 会以
    `Bootstrap failed: 5: Input/output error` 失败（本机实测；同一命令在放开沙箱后成功）。
 6. **目标机部署**：`deploy/scripts/install.sh` → `preflight.sh` → `smoke.sh`（需 Mac mini 与 `/opt`、`/data` 写权限）。
 7. **钉钉接入**：拿到企业应用凭据后实现 Stream 客户端与免登（`04` §3）。
+8. ~~需求①②③（本轮）~~ ✅ **已完成**：① 旧版 Office `.doc`（macOS `textutil`）/`.pptx`（`python-pptx`）/`.xls`（`xlrd`）兼容；
+   ② 图片**不丢 + 可检索**（落盘持久 + `figure` 块入向量与 FTS + 可回源；无题注无 OCR 不落块）；
+   ③ 代码知识库走**方案 C**（符号级分块 + 复用同一套权限与检索，见 `docs/代码知识库-方案C.md`）。
+   顺带修掉两处跨层不一致：**扩展名白名单两张皮**、**「可检索」口径散落 8 处**（后者会让重建分片悄悄丢代码/图片向量）。
+   **仍需你定**：`代码文件/` 目录（142MB `.pptx`、`.doc`、317 页中芯国际研报 PDF）是否纳入代码知识库；
+   合规闸仍是 `corpus_egress_ack=false`，真实语料仍不能入库。
 
 ---
 

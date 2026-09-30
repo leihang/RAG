@@ -103,6 +103,10 @@ def test_migration_aligns_catalog_and_grants(legacy_db: Database) -> None:
     assert report.permissions_renamed == {
         "kb:document:upload": "doc:document:create",
         "kb:document:publish": "doc:document:publish",
+        # `qa` 不在方案 05 §3.1 的封闭模块前缀集合里，按命名规则搬到 audit 域；
+        # 登记进 LEGACY_PERMISSION_MAP 后，**存量库升级时会自动搬过去**，
+        # 不会新旧两个点并存（这正是这条用例守的事）。
+        "qa:chat": "audit:qa:chat",
     }
     # 废弃点（模型配置走 YAML，不暴露写接口）
     assert "system:model:config" in report.permissions_retired

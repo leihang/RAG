@@ -31,6 +31,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from ekbs.config import load_settings
+from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
 from ekbs.logging import get_logger
 from ekbs.observability.alerts import evaluate_all, record_alerts
 from ekbs.observability.metrics import snapshot
@@ -139,7 +140,7 @@ def job_reconcile(runtime: Runtime) -> None:
         chunk_rows = int(
             conn.execute(
                 "SELECT COUNT(*) FROM ekbs_chunk c JOIN ekbs_document d ON d.doc_id = c.doc_id "
-                "WHERE c.chunk_type = 'child' AND d.status = 'published'"
+                f"WHERE {RETRIEVABLE_PREDICATE} AND d.status = 'published'"
             ).fetchone()[0]
         )
     fts_rows = runtime.fts.count()
@@ -205,6 +206,15 @@ def job_audit_archive(runtime: Runtime) -> None:
         )
 
 
+def job_trash_purge(runtime: Runtime) -> None:
+    """回收站物理清理：软删除超过 30 天的文档连同磁盘资产一并清除。"""
+    from ekbs.api.docs import purge_expired_trash
+
+    report = purge_expired_trash(runtime)
+    if report["purged"] or report["errors"]:
+        log.info("trash_purged", **report)
+
+
 def build_scheduler(runtime: Runtime) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=runtime.settings.app.timezone)
     scheduler.add_job(job_cache_cleanup, IntervalTrigger(minutes=10), args=[runtime],
@@ -225,6 +235,8 @@ def build_scheduler(runtime: Runtime) -> AsyncIOScheduler:
                       id="org_sync", replace_existing=True)
     scheduler.add_job(job_audit_archive, CronTrigger(hour=3, minute=0), args=[runtime],
                       id="audit_archive", replace_existing=True)
+    scheduler.add_job(job_trash_purge, CronTrigger(hour=3, minute=30), args=[runtime],
+                      id="trash_purge", replace_existing=True)
     return scheduler
 
 
@@ -245,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         ("reconcile", job_reconcile),
         ("org_sync", job_org_sync),
         ("audit_archive", job_audit_archive),
+        ("trash_purge", job_trash_purge),
     ]
     try:
         if args.once:

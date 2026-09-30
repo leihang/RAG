@@ -77,6 +77,8 @@ models:
 
 # ---------- 解析 ----------
 parse:
+  # 开发环境用 mock 模型，视觉描述不启用
+  figure_caption: false
   engine: mineru
   max_file_mb: 500
   timeout_s: 1800
@@ -141,12 +143,18 @@ session:
   context_ttl_seconds: 7200
   group_share_context: false
 
+# ---------- 上传行为（05 §6.5）----------
+upload:
+  chunk_size_mb: 8            # 分片大小；界面按它切片
+  concurrent: 3               # 同一时刻上传几个文件（界面可临时调小）
+  max_retry: 3                # 失败分片指数退避重试次数
+
 limits:
   global_qps: 20
   per_user_qps: 2
   per_conversation_qps: 3
   max_question_chars: 2000
-  max_file_size_mb: 100
+  max_file_size_mb: 500
   file_ext_whitelist: [pdf, docx, doc, pptx, ppt, xlsx, xls, txt, md, html, png, jpg, jpeg]
 
 security:

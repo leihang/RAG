@@ -94,8 +94,11 @@ def test_mineru_blocks_map_to_markdown_and_pages(tmp_path: Path, fake_env) -> No
     assert parsed.engine == "mineru"
     assert parsed.markdown.splitlines()[0] == "# 员工年假管理制度", "text_level=1 应转成一级标题"
     assert "第一条 年假天数" in parsed.markdown
-    assert "<table>" in parsed.markdown, "表格应取 table_body"
+    assert "[表格 1]" in parsed.markdown, "表格应留锚点，不把 HTML 摊进正文"
     assert "表 1 年假天数" in parsed.markdown, "表格标题不能丢"
+    assert len(parsed.tables) == 1
+    assert "<table>" in parsed.tables[0].body, "表格正文进 ParsedTable"
+    assert parsed.tables[0].caption == "表 1 年假天数"
     assert "![组织架构](images/abc.jpg)" in parsed.markdown
     assert "$$ E = mc^2 $$" in parsed.markdown
 
@@ -177,3 +180,47 @@ def test_mineru_empty_output_raises(tmp_path: Path, fake_env) -> None:
     source.write_bytes(b"%PDF")
     with pytest.raises(ParserUnavailable):
         parse_file(source)
+
+
+# ---------------------------------------------------------------------------
+# MinerU 子进程的环境（模型缓存放哪）
+# ---------------------------------------------------------------------------
+
+def test_mineru_env_points_model_cache_into_repo(monkeypatch, tmp_path) -> None:
+    """模型缓存缺省指向 `<repo>/var/mineru-models`。
+
+    踩过的坑：MinerU 默认把模型下到 `~/.cache/modelscope`，而那个路径在沙箱/生产里
+    常常写不进去（`PermissionError: Operation not permitted`）。它的表现不是报错，
+    而是"跑完但一个产物都没有" —— 于是 OCR 静默全空、PDF 解析也失败，极难定位。
+    """
+    import ekbs.ingest.parser as parser
+
+    monkeypatch.delenv("MODELSCOPE_CACHE", raising=False)
+    models = tmp_path / "mineru-models"
+    models.mkdir()
+    monkeypatch.setattr(parser, "_repo_mineru_models_dir", lambda: models)
+
+    env = parser._mineru_env()
+    assert env["MODELSCOPE_CACHE"] == str(models)
+    assert env["MINERU_MODEL_SOURCE"] == "modelscope"
+
+
+def test_mineru_env_respects_explicit_settings(monkeypatch, tmp_path) -> None:
+    """显式设置永远优先（生产把模型放 /data/ekbs/mineru-models 时不会被覆盖）。"""
+    import ekbs.ingest.parser as parser
+
+    monkeypatch.setenv("MODELSCOPE_CACHE", "/data/ekbs/mineru-models")
+    monkeypatch.setenv("MINERU_MODEL_SOURCE", "huggingface")
+    env = parser._mineru_env()
+    assert env["MODELSCOPE_CACHE"] == "/data/ekbs/mineru-models"
+    assert env["MINERU_MODEL_SOURCE"] == "huggingface"
+
+
+def test_mineru_env_leaves_default_when_dir_absent(monkeypatch, tmp_path) -> None:
+    """仓库里没有模型目录时不要瞎指 —— 交给 MinerU 自己的默认（别造一个空目录让它以为有模型）。"""
+    import ekbs.ingest.parser as parser
+
+    monkeypatch.delenv("MODELSCOPE_CACHE", raising=False)
+    monkeypatch.setattr(parser, "_repo_mineru_models_dir", lambda: tmp_path / "not-there")
+    assert "MODELSCOPE_CACHE" not in parser._mineru_env()
+

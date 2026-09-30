@@ -65,7 +65,10 @@ async def test_endpoints_require_credentials(client) -> None:
 
 
 async def test_end_user_is_forbidden_everywhere(client, seeded) -> None:
-    """end_user 只有 qa:chat：所有运维只读接口都必须 403（而不是 200）。"""
+    """end_user 没有任何**管理**权限点：所有运维只读接口都必须 403（而不是 200）。
+
+    （它按方案 03 §3.2 只有「发起问答」与「查看目录」两个**业务**点，不含任何管理台点位。）
+    """
     runtime, _ = seeded
     user_id = user_id_of(runtime.db, "demo_alice")
     for path in ENDPOINTS:
@@ -106,7 +109,8 @@ async def test_super_admin_is_wildcard(client, seeded) -> None:
 
 async def test_documents_list_filters_and_pagination(client, seeded) -> None:
     runtime, _ = seeded
-    admin_id = grant_role(runtime, "demo_carol", "kb_admin")
+    # 用超管：列表已行级 ACL，L1 的 carol 看不到 L2/L3 语料
+    admin_id = grant_role(runtime, "demo_root", "super_admin")
     headers = headers_for(admin_id)
     body = (await client.get("/api/v1/docs/documents", headers=headers)).json()
     assert body["total"] >= 3
@@ -128,6 +132,20 @@ async def test_documents_list_filters_and_pagination(client, seeded) -> None:
     # 分页护栏：limit 再大也不超过 200
     big = (await client.get("/api/v1/docs/documents?limit=100000", headers=headers)).json()
     assert big["limit"] == 200
+
+
+async def test_documents_list_hides_higher_clearance(client, seeded) -> None:
+    """行级 ACL：低密级用户即使有 doc:document:read 也看不到更高密级标题。"""
+    runtime, _ = seeded
+    # carol clearance=1；授予 kb_admin 以获得 document:read
+    admin_id = grant_role(runtime, "demo_carol", "kb_admin")
+    headers = headers_for(admin_id)
+    body = (await client.get("/api/v1/docs/documents", headers=headers)).json()
+    levels = {int(item["level"]) for item in body["items"]}
+    assert levels <= {1}
+    titles = {item["title"] for item in body["items"]}
+    assert "年假管理制度" not in titles  # L2
+    assert "财务保密制度" not in titles  # L3
 
 
 async def test_document_detail_and_404(client, seeded) -> None:
@@ -209,4 +227,5 @@ async def test_me_returns_permissions_for_menu_filtering(client, seeded) -> None
 
     end_user = user_id_of(runtime.db, "demo_bob")
     plain = (await client.get("/api/v1/auth/me", headers=headers_for(end_user))).json()
-    assert plain["permissions"] == ["qa:chat"]
+    # 方案 03 §3.2：end_user = 发起问答 + 查看目录；两者都不授予任何管理接口
+    assert sorted(plain["permissions"]) == ["audit:qa:chat"]

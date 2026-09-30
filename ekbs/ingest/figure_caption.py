@@ -1,0 +1,147 @@
+"""给文档里的图片生成一句描述（`06` §4.11：图内文字/图意进索引）。
+
+## 为什么需要它
+
+图片抽出来、落盘、建 `figure` 块，都只解决了"存下来"；**图片块要有文字才进索引**
+（`chunker.chunk_markdown` 的口径），否则搜什么都搜不到它 —— 实测用户那份 38 页 PPT
+里 92 张图，只有 6 张有 Alt Text（还是 `5506745资源 1@2x` 这种素材名），其余 86 张
+在界面上、在检索里都等于不存在。图片处理于是变成摆设。
+
+纯 OCR（MinerU）解决不了：它对独立图片走版面分析流水线，回来的是**这张图自己的引用**
+而不是文字（实测，见 README 第 66 条）。而视觉模型能读出**图意**：
+
+* 图表 → 「2024–2026 用电量 5460941/5535105/5960922 度，逐年上升，公司承担部分先升后降」
+* 现场照片 → 「德力西 DT862 型三相四线有功电能表，读数 10544.9 kWh」
+
+## 两条硬约束
+
+1. **计费 + 出网**：每张图一次视觉模型调用，且图片离开内网。所以默认关闭
+   （`parse.figure_caption=false`），打开前还会过合规闸（`corpus_egress_ack`）。
+2. **同文档重解析不重复计费**：描述按图片内容哈希缓存在
+   ``<data_dir>/cache/figure-captions/``。**文档删除时缓存随文档一起清**
+   （见 ``docs._purge_document_assets``）—— 图注是文档内容，不为跨文档省
+   一点点 vision 费而残留。重解析同一篇未删除文档时仍可命中缓存。
+
+失败一律降级：某张图调用失败就返回空，由调用方退回"Alt Text / 页面标题"那条路径，
+不影响整篇入库。
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import time
+from pathlib import Path
+from typing import Any, Sequence
+
+from ekbs.logging import get_logger
+
+log = get_logger(component="ingest.figure_caption")
+
+#: 提示词：要的是"能当检索文本用"的一句话，不是客套话。
+#: 明确要求把图表里的数字/趋势写出来 —— 实测这一句能显著提高描述的检索价值。
+CAPTION_PROMPT = (
+    "用一句中文描述这张图的内容，供全文检索使用。"
+    "如果是图表，把关键数字与趋势写出来（包含单位和年份）；"
+    "如果是现场照片，写清是什么设施、什么场景、有任何可见的文字/型号/读数也写出来。"
+    "只输出描述本身，不要客套话，不要用 Markdown。"
+)
+
+#: 单张图的图片体积上限（超过就不送）：避免把超大图整张塞进请求。
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+def caption_cache_dir(data_dir: Path) -> Path:
+    """描述缓存目录（同文档重解析复用；文档删除时由删除链路清掉）。"""
+    return Path(data_dir) / "cache" / "figure-captions"
+
+
+def _cache_path(data_dir: Path, image_name: str) -> Path:
+    """缓存文件名 = 图片文件名去掉扩展名（也就是内容哈希 `img-<sha8>`）。"""
+    stem = Path(image_name).stem
+    return caption_cache_dir(data_dir) / f"{stem}.json"
+
+
+def read_cached_caption(data_dir: Path, image_name: str) -> str | None:
+    path = _cache_path(data_dir, image_name)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # 缓存损坏就当没有，不要让它挡住入库
+        return None
+    text = str(payload.get("caption") or "").strip()
+    return text or None
+
+
+def write_cached_caption(data_dir: Path, image_name: str, caption: str, *, model: str) -> None:
+    path = _cache_path(data_dir, image_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"caption": caption, "model": model, "at": int(time.time())},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _image_data_url(image: Path) -> str | None:
+    try:
+        if image.stat().st_size > MAX_IMAGE_BYTES:
+            return None
+        raw = image.read_bytes()
+    except OSError:
+        return None
+    suffix = image.suffix.lstrip(".").lower() or "png"
+    mime = "image/jpeg" if suffix in {"jpg", "jpeg"} else f"image/{suffix}"
+    return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+
+
+async def caption_images(
+    *,
+    data_dir: Path,
+    vision: Any,
+    images: Sequence[tuple[str, Path]],
+) -> dict[str, str]:
+    """给一批图片生成描述，返回 ``{图片名: 描述}``。
+
+    ``vision`` 是 OpenAI 兼容的对话 provider（`Providers.vision`）。
+    命中缓存的不再调用；失败的跳过（不抛异常）。
+    """
+    out: dict[str, str] = {}
+    model = str(getattr(getattr(vision, "ref", None), "model", "") or "vision")
+    called = 0
+    for name, path in images:
+        cached = read_cached_caption(data_dir, name)
+        if cached:
+            out[name] = cached
+            continue
+        data_url = _image_data_url(path)
+        if data_url is None:
+            log.warning("figure_caption_skipped", image=name, reason="image_unreadable_or_too_large")
+            continue
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": CAPTION_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ]
+        try:
+            result = await vision.generate(messages)
+            text = str(getattr(result, "text", "") or "").strip()
+        except Exception as exc:  # 单张失败不影响入库
+            log.warning("figure_caption_failed", image=name, error=str(exc)[:120])
+            continue
+        called += 1
+        if not text:
+            log.warning("figure_caption_empty", image=name)
+            continue
+        out[name] = text
+        write_cached_caption(data_dir, name, text, model=model)
+    if called:
+        log.info("figure_captions_done", generated=called, reused=len(out) - called, total=len(images))
+    return out

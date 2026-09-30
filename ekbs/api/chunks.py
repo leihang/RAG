@@ -4,7 +4,8 @@
 （``IndexFlatIP`` 不支持原地更新/删除）。本模块的处理方式与分片迁移一致：
 
 1. 生成新向量 → **追加**到分片索引 → 回写 ``ekbs_chunk.faiss_row``；
-2. 旧向量留在索引里成为**孤儿** —— 它召不回（按 ``faiss_row`` 联查不到对应行），
+2. （旧实现）旧向量留在索引里成为**孤儿** —— 现在索引是 ``IndexIDMap2``，
+   编辑走 upsert 原地替换，不再有孤儿；这条保留作历史说明：
    只白占容量；响应里提示去跑 ``/api/v1/system/index/rebuild`` 回收。
 3. 本地全文索引（FTS5）必须**同步重写**：``ekbs_chunk_fts`` 存的是 jieba 预分词结果，
    改了正文不重写，稀疏召回就会继续命中旧内容（`03` §5.3）。
@@ -104,7 +105,9 @@ async def _reembed_async(
     shard_id = str(row["shard_id"])
     text = retrieval_text(heading_path, content)
     vector = await runtime.providers.embed.embed_one(text)
-    rows = runtime.shards.append(shard_id, [chunk_id], np.asarray([vector], dtype="float32"))
+    # **upsert 而非 append**：编辑/重嵌用的是同一个 chunk_id，
+    # 而 FAISS 的 add_with_ids 对重复 id 是累积而不是替换（会召回重复、索引越长越大）
+    rows = runtime.shards.upsert(shard_id, [chunk_id], np.asarray([vector], dtype="float32"))
     fingerprint = runtime.providers.embed.ref.fingerprint
     with runtime.db.sync_connect() as conn:
         conn.execute(
@@ -244,7 +247,7 @@ async def update_chunk(
 ) -> JSONResponse:
     """编辑分块文本。
 
-    * **子块**：内容变了就要换向量 —— 追加新向量并重写 FTS 行（旧向量成孤儿，见模块 docstring）；
+    * **子块**：内容变了就**原地替换**向量（``IndexIDMap2`` 的 upsert：先删后加）并重写 FTS 行；
     * **父块**：只改内容与 token 数（父块不进向量索引，也不会进 FTS）。
     """
     principal = _principal(
@@ -280,7 +283,7 @@ async def update_chunk(
             "parent_id": row["parent_id"],
             "old_content_chars": len(old_content),
             "new_content_chars": len(payload.content),
-            "hint": "子块换向量后旧向量成为孤儿；可用 /api/v1/system/index/rebuild 回收容量",
+            "hint": "子块向量已按 chunk_id 原地替换（upsert），无需 rebuild 回收容量",
             "context_hint": (
                 "进 LLM 上下文的是父块全文（00 §2.1）：只改子块时答案仍会引用旧父块内容，"
                 "如需答案立即反映修改，请同时编辑父块"
@@ -375,7 +378,7 @@ async def split_chunk(
             "new_chunk_id": new_id,
             "left_chars": len(left),
             "right_chars": len(right),
-            "hint": "两半都已重嵌入并重写 FTS；旧向量成为孤儿，可 rebuild 回收",
+            "hint": "两半都已重嵌入并重写 FTS；原块向量已真删，无需 rebuild",
         }
     )
 
@@ -398,7 +401,7 @@ async def merge_chunk(
         raise HTTPException(status_code=409, detail="只支持合并 child 分块（理由同 split）")
     with runtime.db.sync_connect() as conn:
         sibling = conn.execute(
-            "SELECT chunk_id, content, seq FROM ekbs_chunk WHERE doc_id = ? AND chunk_type='child' "
+            "SELECT chunk_id, content, seq, shard_id FROM ekbs_chunk WHERE doc_id = ? AND chunk_type='child' "
             "AND parent_id IS ? AND seq > ? ORDER BY seq LIMIT 1",
             (int(row["doc_id"]), row["parent_id"], int(row["seq"])),
         ).fetchone()
@@ -407,6 +410,8 @@ async def merge_chunk(
 
     merged = f"{str(row['content']).rstrip()}\n\n{str(sibling['content']).lstrip()}"
     runtime.fts.delete_chunk_ids([int(sibling["chunk_id"])])
+    # 兄弟块的**向量也要真删**：索引是 IDMap2，删掉即回收（旧实现只能留孤儿）
+    runtime.shards.remove(str(sibling["shard_id"]), [int(sibling["chunk_id"])])
     with runtime.db.sync_connect() as conn:
         conn.execute("DELETE FROM ekbs_chunk WHERE chunk_id = ?", (int(sibling["chunk_id"]),))
         conn.commit()
@@ -420,7 +425,7 @@ async def merge_chunk(
             "chunk_id": chunk_id,
             "removed_chunk_id": int(sibling["chunk_id"]),
             "merged_chars": len(merged),
-            "hint": "被并入块的向量成为孤儿，可 rebuild 回收",
+            "hint": "被并入块的向量已真删，无需 rebuild",
         }
     )
 

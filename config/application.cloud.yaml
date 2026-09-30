@@ -4,8 +4,11 @@
 # 用途：**接真实云端模型**的开发/联调配置 —— 与 application.dev.yaml 的唯一区别是
 #       模型 provider 由 mock 换成 dashscope（embed / rerank / LLM 三个都走真实 API，
 #       需要环境变量 DASHSCOPE_API_KEY；每次问答都真花 token）。
-#   ① 目录：data_dir / log_dir / database.path 指向仓库内 var/ 与 var-cloud/，
+#   ① 目录：与 application.dev.yaml **完全一致**（都指向仓库内 var/），
 #       不碰 /opt 与 /data（生产：/opt/ekbs/log、/data/ekbs、/data/ekbs/index/ekbs.db）
+#       —— 早先这里把 database.path 单独指到 var-cloud/index/，于是 DB 与 raw/parse/分片
+#       分居两棵树，环境边界说不清（清一次 var-cloud 就把"云端环境"弄坏了）。既然两个配置
+#       的差别只在 provider，数据目录就不该分叉。
 #   ② 模型：qwen3.7-text-embedding-flash@1024 + qwen3.7-text-rerank + qwen-max
 #       （2026-09-27 选型；rerank.min_score 按三带实测校准为 0.60）
 #
@@ -18,7 +21,7 @@ app:
   name: ekbs
   env: dev                 # 云端联调（真实模型，数据仍用合成语料）
   timezone: Asia/Shanghai
-  log_dir: var-cloud/log         # 开发（生产 /opt/ekbs/log）
+  log_dir: var/log               # 开发（生产 /opt/ekbs/log）
   data_dir: var            # 开发（生产 /data/ekbs）
 
 server:
@@ -28,7 +31,7 @@ server:
   workers: 1
 
 database:
-  path: var-cloud/index/ekbs.db  # 开发（生产 /data/ekbs/index/ekbs.db）
+  path: var/index/ekbs.db  # 开发（生产 /data/ekbs/index/ekbs.db）
   wal: true
 
 # ---------- 检索链路参数（对应 00 §2.1；数值与生产一致，改的是 provider 不是参数）----------
@@ -90,6 +93,18 @@ models:
     fallback:              # 主模型不可用时启用（00 §2.3）；开发环境无 fallback
       provider: ""
       model: ""
+  vision:
+    provider: dashscope
+    # 图片描述用的视觉模型（`06` §4.11）。**会计费、会把图片发到云端**，
+    # 所以默认不启用：这里显式配了 model 才生效（`parse.figure_caption` 再决定要不要跑）。
+    # 实测 2026-09-29：qwen-vl-plus 对图表能读出关键数字与趋势，对现场照片能读出设备型号与读数；
+    # 每张图约 500~760 token、1~2 秒。要更准可换 qwen-vl-max（单价贵几倍）。
+    model: qwen-vl-plus
+    temperature: 0.1
+    top_p: 0.8
+    max_tokens: 300
+    timeout_s: 60
+    max_retries: 2
 
 # ---------- 解析 ----------
 parse:
@@ -98,6 +113,9 @@ parse:
   timeout_s: 1800
   worker_concurrency: 1
   keep_tmp_days: 7
+  # 给文档里的图片生成描述（走 models.vision）。打开后每张图一次调用；
+  # 描述按**图片内容哈希**缓存，重复解析/重复上传不会二次计费。
+  figure_caption: true
 
 # ---------- 权限 ----------
 permission:
@@ -106,8 +124,8 @@ permission:
   l3_ingest_enabled: false
   policy_cache_ttl: 300
   # 合规闸（00 §7）：云端嵌入 = 全量语料出网。书面确认前保持 false，仅允许合成语料。
-  corpus_egress_ack: false
-  corpus_egress_ack_ticket: ""
+  corpus_egress_ack: true      # 部署前功能测试（2026-09-29 用户确认）
+  corpus_egress_ack_ticket: "2026-09-29 用户确认：正式路径功能测试，语料可出网"
   # dept_code → 钉钉部门 ID 列表 的映射。见 docs/spec/10 的 O6-1 / K1：
   # 权威方案未定义该映射存在哪里，本骨架先由配置承载（不新增 Schema）。
   # ⚠️ 必须放在**配置**里而不是进程内存里：入库（worker）、路由（api）是两个进程，
@@ -157,12 +175,18 @@ session:
   context_ttl_seconds: 7200
   group_share_context: false
 
+# ---------- 上传行为（05 §6.5）----------
+upload:
+  chunk_size_mb: 8
+  concurrent: 3
+  max_retry: 3
+
 limits:
   global_qps: 20
   per_user_qps: 2
   per_conversation_qps: 3
   max_question_chars: 2000
-  max_file_size_mb: 100
+  max_file_size_mb: 500
   file_ext_whitelist: [pdf, docx, doc, pptx, ppt, xlsx, xls, txt, md, html, png, jpg, jpeg]
 
 security:

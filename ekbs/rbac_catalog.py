@@ -23,7 +23,7 @@
 | ``sys:dashboard:read`` | ✔ | ✔ | — | ✔ | — |
 | ``sys:health:read`` | ✔ | ✔ | — | ✔ | — |
 | ``sys:index:rebuild`` / ``sys:setting:read`` | ✔ | — | — | — | — |
-| ``qa:chat`` | ✔ | ✔ | ✔ | ✔ | ✔ |
+| ``audit:qa:chat`` | ✔ | ✔ | ✔ | ✔ | ✔ |
 
 ``super_admin`` 在判定处按**通配**处理（`ekbs.authz`），这里仍显式授全量，
 便于管理台把「该角色有哪些权限点」展示成一张完整的表。
@@ -56,7 +56,7 @@ PERMISSIONS: Final[tuple[tuple[str, str, str], ...]] = (
     ("parse:task:read", "查看解析任务", "parse"),
     ("parse:task:manage", "管理解析任务", "parse"),
     # 问答与检索
-    ("qa:chat", "发起问答", "qa"),
+
     ("rag:playground:run", "检索调试台执行", "rag"),
     ("rag:playground:simulate", "以指定用户身份检索（高危）", "rag"),
     # 审计
@@ -84,13 +84,50 @@ PERMISSIONS: Final[tuple[tuple[str, str, str], ...]] = (
     ("sys:health:read", "查看系统健康与分片", "sys"),
     ("sys:index:rebuild", "重建分片索引", "sys"),
     ("sys:setting:read", "查看生效配置", "sys"),
+    # 知识库（方案 03 §3.2，本轮补齐首期缺口）
+    ("kb:knowledge_base:config", "配置检索参数", "kb"),
+    ("kb:knowledge_base:delete", "删除知识库", "kb"),
+    ("kb:knowledge_base:update", "编辑知识库", "kb"),
+    # 目录（方案 03 §3.2，本轮补齐首期缺口）
+    ("kb:folder:create", "创建目录", "kb"),
+    ("kb:folder:delete", "删除目录", "kb"),
+    ("kb:folder:read", "查看目录", "kb"),
+    ("kb:folder:update", "编辑目录", "kb"),
+    # 文档（方案 03 §3.2，本轮补齐首期缺口）
+    ("doc:document:export", "导出文档清单", "doc"),
+    ("doc:version:read", "查看版本历史", "doc"),
+    # 解析（方案 03 §3.2，本轮补齐首期缺口）
+    ("parse:config:update", "修改解析配置", "parse"),
+    # 调试（方案 03 §3.2，本轮补齐首期缺口）
+    ("rag:playground:feedback", "提交调试反馈", "rag"),
+    ("rag:playground:preset", "保存调试预设", "rag"),
+    # 权限（方案 03 §3.2，本轮补齐首期缺口）
+    ("perm:level:read", "查看密级配置", "perm"),
+    ("perm:user:create", "新建用户", "perm"),
+    ("perm:user:disable", "禁用用户", "perm"),
+    # 模型（方案 03 §3.2，本轮补齐首期缺口）
+    ("model:config:read", "查看模型配置", "model"),
+    ("model:config:test", "连通性测试", "model"),
+    ("model:config:update", "修改模型配置", "model"),
+    # 评估（方案 03 §3.2，本轮补齐首期缺口）
+    ("eval:dataset:annotate", "标注问答对", "eval"),
+    ("eval:dataset:create", "创建评测集", "eval"),
+    ("eval:dataset:read", "查看评测集", "eval"),
+    # 审计（方案 03 §3.2，本轮补齐首期缺口）
+    ("audit:qa:export", "导出问答日志", "audit"),
+    ("audit:qa:chat", "发起问答（钉钉/网页）", "audit"),
 )
 
 #: 角色 → 权限点（依据 `05` §3.4 的矩阵；super_admin 额外由代码通配兜底）
+#:
+#: **诚实原则**：只授予**已有后端 API**的权限点。目录里可保留二期码（folder / model /
+#: eval / export / preset…），但角色矩阵不授 —— 避免「菜单看起来有、接口 404」。
 ROLE_GRANTS: Final[dict[str, tuple[str, ...]]] = {
-    "end_user": ("qa:chat",),
+    "end_user": (
+        "audit:qa:chat",
+    ),
     "auditor": (
-        "qa:chat",
+        "audit:qa:chat",
         "audit:qa:read",
         "audit:qa:read_all",
         "audit:trace:read",
@@ -105,47 +142,50 @@ ROLE_GRANTS: Final[dict[str, tuple[str, ...]]] = {
         "sys:health:read",
     ),
     "doc_reviewer": (
-        "qa:chat",
-        "doc:document:read",
-        "doc:document:create",
-        "doc:document:update",
-        "doc:document:publish",
-        "doc:document:offline",
-        "doc:document:reparse",
-        "doc:document:download",
+        "audit:qa:chat",
         "doc:chunk:read",
         "doc:chunk:update",
+        "doc:document:create",
+        "doc:document:offline",
+        "doc:document:publish",
+        "doc:document:read",
+        "doc:document:reparse",
+        "doc:document:update",
         "kb:knowledge_base:read",
         "parse:task:read",
         "rag:playground:run",
+        "sys:dashboard:read",
     ),
     "kb_admin": (
-        "doc:document:read",
-        "doc:document:create",
-        "doc:document:update",
-        "doc:document:delete",
-        "doc:document:publish",
-        "doc:document:offline",
-        "doc:document:reparse",
-        "doc:document:download",
         "doc:chunk:read",
-        "doc:chunk:update",
         "doc:chunk:reembed",
-        "kb:knowledge_base:read",
+        "doc:chunk:update",
+        "doc:document:create",
+        "doc:document:delete",
+        "doc:document:offline",
+        "doc:document:publish",
+        "doc:document:read",
+        "doc:document:reparse",
+        "doc:document:update",
         "kb:knowledge_base:create",
-        "parse:task:read",
+        "kb:knowledge_base:read",
+        "kb:knowledge_base:update",
         "parse:task:manage",
-        "rag:playground:run",
+        "parse:task:read",
         "perm:acl:create",
         "perm:acl:delete",
         "perm:acl:read",
         "perm:audit:read",
         "perm:dept:read",
+        "perm:dept:map",
         "perm:role:read",
         "perm:user:read",
         "perm:user:update",
+        "rag:playground:run",
         "sys:dashboard:read",
         "sys:health:read",
+        "audit:qa:read",
+        "audit:trace:read",
     ),
 }
 
@@ -156,6 +196,11 @@ LEGACY_PERMISSION_MAP: Final[dict[str, str | None]] = {
     "kb:document:upload": "doc:document:create",
     "kb:document:publish": "doc:document:publish",
     "system:model:config": None,  # 模型/知识库配置走 YAML（05 §8.1 的说明）
+    # `qa` 不在 05 §3.1 的**封闭模块前缀集合**里（kb/doc/parse/rag/perm/model/eval/audit/ds/sys），
+    # 而「发起问答」在方案的 101 个点里也没有（问答是登录后的基线能力）。
+    # 本项目需要一个点来区分"能用机器人"与"不能用"，故按命名规则落到 audit 域的 qa 对象上。
+    # 登记成重命名映射，存量库升级时会自动搬过去，不会新旧两个点并存。
+    "qa:chat": "audit:qa:chat",
 }
 
 #: 内置角色（`00` §3.3 固定五个）

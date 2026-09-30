@@ -88,10 +88,23 @@ class ShardIndex:
     def vector_count(self) -> int:
         return int(self.index.ntotal)
 
+    #: 索引格式标记（写进 ``ekbs_shard.index_type``）。换格式必须能被识别出来，
+    #: 否则旧文件会被新代码按错误的语义读进来 —— 那是"静默算错"，比报错危险得多。
+    INDEX_TYPE = "idmap2"
+    #: 旧格式：纯 ``IndexFlatIP``，位置即行号，**不支持删除**（删文档只留孤儿向量）。
+    LEGACY_INDEX_TYPE = "flat"
+
     @classmethod
     def create(cls, shard_id: str, path: Path, dim: int, fingerprint: str) -> "ShardIndex":
+        """建空分片：``IndexIDMap2(IndexFlatIP)``。
+
+        为什么包一层 ``IndexIDMap2``：纯 ``IndexFlatIP`` 没有 ``remove_ids``，
+        删一个文档只能留着孤儿向量、靠重建分片回收。包上 IDMap2 之后
+        **索引的标签就是 ``chunk_id``**，于是「删文档 → 真删那几条向量」成为可能，
+        同时保留原本的暴力内积检索语义（分片小，不需要近似索引）。
+        """
         faiss = _import_faiss()
-        index = faiss.IndexFlatIP(int(dim))
+        index = faiss.IndexIDMap2(faiss.IndexFlatIP(int(dim)))
         return cls(shard_id, path, dim, fingerprint, index)
 
     @classmethod
@@ -103,30 +116,86 @@ class ShardIndex:
         if not Path(path).is_file():
             raise SchemaError(f"分片索引文件缺失：{path}（shard_id={shard_id}）")
         index = faiss.read_index(str(path))
+        faiss_mod = _import_faiss()
+        if not isinstance(index, faiss_mod.IndexIDMap2):
+            if int(index.ntotal) == 0:
+                # 空的旧格式文件：没有任何数据，直接换成新格式，不必打扰用户
+                log.warning("shard_index_upgraded_empty", shard_id=shard_id)
+                index = faiss_mod.IndexIDMap2(faiss_mod.IndexFlatIP(int(index.d)))
+            else:
+                raise SchemaError(
+                    f"{shard_id} 是旧格式索引（纯 IndexFlatIP，{int(index.ntotal)} 个向量）："
+                    "它用行号当标识、不支持删除单条向量。请先迁移："
+                    "`.venv/bin/python -m ekbs.tools.migrate_faiss_idmap`"
+                    "（只重排标签，不重新嵌入，不会改变检索结果）"
+                )
         if expected_dim is not None and int(index.d) != int(expected_dim):
             raise EmbeddingFingerprintMismatch(
                 f"{shard_id} 维度不一致：索引 d={index.d}，当前模型 dim={expected_dim}"
             )
         return cls(shard_id, Path(path), int(index.d), expected_fingerprint or "", index)
 
-    def add(self, vectors: np.ndarray) -> list[int]:
-        """追加向量，返回它们在索引中的行号（即 ``faiss_row``）。"""
+    def add(self, vectors: np.ndarray, ids: Sequence[int]) -> list[int]:
+        """按 ``chunk_id`` 追加向量，返回写入的标签（= 传入的 ids）。
+
+        ``ids`` 就是 ``ekbs_chunk.chunk_id``：**它是真正的身份**，不是行号。
+        这样删除、重建、跨进程重载都不会错位（旧实现用行号，一重建就全体错位）。
+        """
         if vectors.ndim != 2 or vectors.shape[1] != self.dim:
             raise ValueError(f"向量形状 {vectors.shape} 与分片维度 {self.dim} 不符")
-        start = int(self.index.ntotal)
-        self.index.add(normalize(vectors))
-        return list(range(start, start + vectors.shape[0]))
+        labels = [int(i) for i in ids]
+        if len(labels) != vectors.shape[0]:
+            raise ValueError(f"ids 数量 {len(labels)} 与向量条数 {vectors.shape[0]} 不符")
+        self.index.add_with_ids(
+            normalize(vectors), np.asarray(labels, dtype="int64")
+        )
+        return labels
+
+    def remove(self, ids: Sequence[int]) -> int:
+        """**真删**这些 ``chunk_id`` 对应的向量，返回实际删掉的条数。
+
+        这是换 ``IndexIDMap2`` 换来的能力：删文档不再留孤儿向量，
+        也就不再需要"删完再重建分片"这套收尾动作。
+        """
+        labels = [int(i) for i in ids]
+        if not labels or self.index.ntotal == 0:
+            return 0
+        before = int(self.index.ntotal)
+        self.index.remove_ids(np.asarray(labels, dtype="int64"))
+        return before - int(self.index.ntotal)
+
+    def upsert(self, vectors: np.ndarray, ids: Sequence[int]) -> list[int]:
+        """按 ``chunk_id`` 覆盖写入（**先删后加**）。
+
+        为什么必须有这个而不是直接用 ``add``：FAISS 的 ``add_with_ids`` 对**重复 id
+        不会替换而是累积**（实测：同一个 id 加两次 ntotal 从 1 变 2，搜索会把同一个
+        chunk 返回两次）。而"编辑子块 / 换级重嵌"都是**同一个 chunk_id 重新嵌入**，
+        直接 add 会让索引越长越大且召回重复。所以这类路径一律走 upsert。
+        """
+        self.remove(ids)
+        return self.add(vectors, ids)
 
     def search(self, vector: np.ndarray, top_k: int) -> list[tuple[int, float]]:
-        """返回 ``[(faiss_row, score), …]``，score 越大越相关。"""
+        """返回 ``[(chunk_id, score), …]``，score 越大越相关。
+
+        注意语义变化：旧实现返回的是**行号**（还要回表换算），
+        现在直接返回 ``chunk_id`` —— 命中即是身份，少一次映射就少一处错位风险。
+        """
         if self.index.ntotal == 0 or top_k <= 0:
             return []
-        query = normalize(np.asarray([vector], dtype="float32"))
-        scores, rows = self.index.search(query, min(int(top_k), int(self.index.ntotal)))
+        arr = np.asarray(vector, dtype="float32")
+        if arr.ndim != 1:
+            # 不校验的话会被下面那层 [ ] 包成 3 维，FAISS 抛的错误是
+            # "too many values to unpack (expected 2)"，完全看不出是入参形状问题
+            raise ValueError(
+                f"search 只接受单条向量（1 维，长度 {self.dim}），实得形状 {arr.shape}"
+            )
+        query = normalize(np.asarray([arr], dtype="float32"))
+        scores, labels = self.index.search(query, min(int(top_k), int(self.index.ntotal)))
         return [
-            (int(row), float(score))
-            for row, score in zip(rows[0], scores[0])
-            if int(row) >= 0
+            (int(label), float(score))
+            for label, score in zip(labels[0], scores[0])
+            if int(label) >= 0
         ]
 
     def save(self, path: Path | None = None, *, atomic: bool = True) -> None:
@@ -204,13 +273,21 @@ class ShardIndexManager:
     # ------------------------------------------------------------------
 
     def create_shard(
-        self, shard_id: str, *, fingerprint: str | None = None, index_type: str = "flat"
+        self,
+        shard_id: str,
+        *,
+        fingerprint: str | None = None,
+        index_type: str = ShardIndex.INDEX_TYPE,
     ) -> ShardIndex:
         """建空分片：写 ``.faiss`` 文件 + 登记 ``ekbs_shard``（`01` §6.3）。"""
         dept_code, level = parse_shard_id(shard_id)
-        if index_type != "flat":
-            # 06 §2.3：ivf 仅在规模超过阈值后启用；阈值本身是开放项 O6-3
-            log.warning("index_type_not_flat", shard_id=shard_id, index_type=index_type)
+        if index_type != ShardIndex.INDEX_TYPE:
+            # 06 §2.3：ivf 仅在规模超过阈值后启用（开放项 O6-3）。
+            # 默认格式现在是 idmap2（标签=chunk_id，可真删单条），不再是 flat。
+            log.warning(
+                "index_type_not_default", shard_id=shard_id,
+                index_type=index_type, default=ShardIndex.INDEX_TYPE,
+            )
         index = ShardIndex.create(shard_id, self.faiss_path(shard_id), self.dim, fingerprint or self.fingerprint)
         index.save()
         with self.db.sync_connect() as conn:
@@ -300,9 +377,12 @@ class ShardIndexManager:
         index = self.get(shard_id)
         if index is None:
             raise SchemaError(f"分片未登记：{shard_id}（先用 ekbs.tools.new_shard 建分片）")
-        rows = index.add(vectors)
+        rows = index.add(vectors, chunk_ids)
         index.save()
         with self.db.sync_connect() as conn:
+            # ``faiss_row`` 这一列**保留**（不动 schema、不动已有查询），但在 IDMap2 下
+            # 它的值 = 索引标签 = ``chunk_id`` —— 不再是"第几行"。
+            # 非空仍然表示"这个块在索引里"，所有既有的对账/巡检语义都成立。
             conn.executemany(
                 "UPDATE ekbs_chunk SET faiss_row = ?, embedding_fingerprint = ?, shard_id = ? "
                 "WHERE chunk_id = ?",
@@ -318,6 +398,62 @@ class ShardIndexManager:
             )
             conn.commit()
         return rows
+
+    def upsert(
+        self, shard_id: str, chunk_ids: Sequence[int], vectors: np.ndarray
+    ) -> list[int]:
+        """覆盖写入（先删后加）—— 用于"同一个 chunk_id 重新嵌入"的场景。
+
+        与 :meth:`append` 的区别只有一个：append 假定这些 id 是**新的**（入库路径
+        的 chunk_id 由自增主键保证不重复），upsert 则先把旧的删掉。
+        """
+        index = self.get(shard_id)
+        if index is None:
+            raise SchemaError(f"分片未登记：{shard_id}")
+        labels = index.upsert(vectors, chunk_ids)
+        index.save()
+        with self.db.sync_connect() as conn:
+            conn.executemany(
+                "UPDATE ekbs_chunk SET faiss_row = ?, embedding_fingerprint = ?, shard_id = ? "
+                "WHERE chunk_id = ?",
+                [
+                    (label, self.fingerprint, shard_id, int(chunk_id))
+                    for label, chunk_id in zip(labels, chunk_ids)
+                ],
+            )
+            conn.execute(
+                "UPDATE ekbs_shard SET vector_count = ?, embedding_fingerprint = ?, "
+                "dim = ?, updated_at = datetime('now') WHERE shard_id = ?",
+                (index.vector_count, self.fingerprint, self.dim, shard_id),
+            )
+            conn.commit()
+        return labels
+
+    def remove(self, shard_id: str, chunk_ids: Sequence[int]) -> int:
+        """从分片里**真删**这些块（``IndexIDMap2.remove_ids``），并回写登记向量数。
+
+        删文档时调用。旧实现只能留着孤儿向量等重建，现在删完即回收。
+        删不掉的（索引里本来就没有的 id）会被 FAISS 忽略，返回值是**实际删掉的条数**。
+        """
+        ids = [int(c) for c in chunk_ids]
+        if not ids:
+            return 0
+        index = self.get(shard_id)
+        if index is None:
+            log.warning("shard_remove_skipped_missing", shard_id=shard_id, count=len(ids))
+            return 0
+        removed = index.remove(ids)
+        if removed:
+            index.save()  # 原子替换：其他进程按指纹自动重载，无需停服
+            with self.db.sync_connect() as conn:
+                conn.execute(
+                    "UPDATE ekbs_shard SET vector_count = ?, updated_at = datetime('now') "
+                    "WHERE shard_id = ?",
+                    (index.vector_count, shard_id),
+                )
+                conn.commit()
+            log.info("shard_vectors_removed", shard_id=shard_id, removed=removed)
+        return removed
 
     def search(self, shard_id: str, vector: np.ndarray, top_k: int) -> list[tuple[int, float]]:
         index = self.get(shard_id)

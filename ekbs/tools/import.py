@@ -49,15 +49,28 @@ from typing import Any, Sequence
 from ekbs.config import Secrets, Settings, load_settings
 from ekbs.errors import ConfigError, EkbsError
 from ekbs.index.shard import parse_shard_id, resolve_shard_for_document
+from ekbs.ingest.chunker import FigureInput, TableInput
 from ekbs.ingest.parser import ParserUnavailable, parse_file
+from ekbs.ingest.dir_import import (
+    checksum_of,
+    discover_files,
+    existing_doc_by_checksum,
+)
+from ekbs.ingest.parser import SUFFIX_ENGINES
 from ekbs.ingest.pipeline import IngestPipeline
+from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
 from ekbs.logging import configure_logging, get_logger
 from ekbs.runtime import Runtime
 
 log = get_logger(component="tools.import")
 
-#: 默认识别的扩展名（与 `01` §7 的 `limits.file_ext_whitelist` 同口径，去掉图片与旧版 Office）
-DEFAULT_EXTENSIONS = (".md", ".markdown", ".txt", ".docx", ".xlsx", ".pptx")
+#: 默认识别的扩展名 —— **直接取解析器真正实现的格式**（`parser.SUFFIX_ENGINES`）。
+#:
+#: 修正历史：原先这里硬编码 `(".md",".markdown",".txt",".docx",".xlsx",".pptx")`，
+#: 于是 ① **PDF 不在默认白名单里**，不加 `--ext .pdf` 就一个都发现不了（静默漏掉，
+#: 连"跳过"都不显示）；② 反而把解析器**没实现**的 `.pptx` 放进来，会被当纯文本读成乱码。
+#: 现在与解析器单点对齐，并由 `tests/test_parser_mineru.py` 的用例锁住不再漂移。
+DEFAULT_EXTENSIONS: tuple[str, ...] = tuple(SUFFIX_ENGINES)
 
 #: 解析成功率达标线（`01` §12 的入库验收表）
 SUCCESS_RATE_TARGET = 0.98
@@ -126,41 +139,13 @@ class ImportReport:
 # ---------------------------------------------------------------------------
 
 
-def discover_files(
-    directory: Path,
-    *,
-    extensions: Sequence[str] = DEFAULT_EXTENSIONS,
-    recursive: bool = True,
-    limit: int | None = None,
-) -> list[Path]:
-    if not directory.is_dir():
-        raise FileNotFoundError(f"目录不存在：{directory}")
-    pattern = "**/*" if recursive else "*"
-    files = [
-        path
-        for path in sorted(directory.glob(pattern))
-        if path.is_file() and path.suffix.lower() in {e.lower() for e in extensions}
-    ]
-    return files[:limit] if limit else files
-
-
-def checksum_of(path: Path) -> str:
-    """SHA-256（`ekbs_document.checksum`）：用于秒传与去重（`00` §3.1）。"""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while block := handle.read(1 << 20):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _existing_by_checksum(runtime: Runtime, checksum: str) -> int | None:
-    with runtime.db.sync_connect() as conn:
-        row = conn.execute(
-            "SELECT doc_id FROM ekbs_document WHERE checksum = ? AND status != 'failed' "
-            "ORDER BY doc_id LIMIT 1",
-            (checksum,),
-        ).fetchone()
-    return int(row["doc_id"]) if row else None
+    """内容是否已在库（**薄封装**：真正口径在 :mod:`ekbs.ingest.dir_import`）。
+
+    管理台目录导入与 CLI 必须用同一份去重口径，否则会出现「界面说重复、CLI 说没有」
+    这种没法排查的分歧。
+    """
+    return existing_doc_by_checksum(runtime.db, checksum)
 
 
 # ---------------------------------------------------------------------------
@@ -328,10 +313,33 @@ async def _import_one(
     if duplicate is not None:
         return ImportItem(str(path), "skipped", doc_id=duplicate, error="checksum 重复（秒传）")
 
+    # 图片落盘目录：此刻还没建文档行（doc_id 在 ingest_markdown 里才生成），
+    # 所以用**内容哈希**做稳定目录名 —— 同一份文件重跑会复用同一目录，不会无限堆积。
+    assets_dir = runtime.settings.data_paths()["parse"] / f"sha-{checksum[:16]}"
     try:
-        parsed = await asyncio.to_thread(parse_file, path)
+        parsed = await asyncio.to_thread(parse_file, path, assets_dir=assets_dir)
     except ParserUnavailable as exc:
         return ImportItem(str(path), "failed", error=str(exc))
+
+    figures = [
+        FigureInput(
+            image_path=str((assets_dir / item.name).relative_to(runtime.settings.data_dir)),
+            caption=item.caption,
+            ocr_text=item.ocr_text,
+            page=item.page,
+            figure_id=item.figure_id,
+        )
+        for item in parsed.figures
+    ]
+    tables = [
+        TableInput(
+            body=item.body,
+            caption=item.caption,
+            page=item.page,
+            table_id=item.table_id,
+        )
+        for item in parsed.tables
+    ]
 
     # 分片：显式优先，否则按 (level × 部门) 派生
     if shard_id:
@@ -356,6 +364,8 @@ async def _import_one(
         visible_dept_ids=dept_ids,
         source_path=str(path),
         page_map=list(parsed.page_map),
+        figures=figures,
+        tables=tables,
         real_corpus=not synthetic,
         checksum=checksum,
     )
@@ -391,8 +401,8 @@ def _move_to_shard(runtime: Runtime, doc_id: int, shard_id: str) -> int:
     )
     with runtime.db.sync_connect() as conn:
         rows = conn.execute(
-            "SELECT chunk_id, content, heading_path FROM ekbs_chunk "
-            "WHERE doc_id = ? AND chunk_type = 'child' ORDER BY seq",
+            "SELECT c.chunk_id, c.content, c.heading_path FROM ekbs_chunk c "
+            f"WHERE c.doc_id = ? AND {RETRIEVABLE_PREDICATE} ORDER BY c.seq",
             (doc_id,),
         ).fetchall()
     runtime.fts.upsert_chunks(
@@ -438,7 +448,7 @@ def _post_checks(runtime: Runtime, report: ImportReport) -> dict[str, Any]:
             "SELECT c.shard_id AS shard_id, COUNT(*) AS chunks, "
             "       COUNT(DISTINCT c.embedding_fingerprint) AS fingerprints "
             "FROM ekbs_chunk c JOIN ekbs_document d ON d.doc_id = c.doc_id "
-            f"WHERE c.chunk_type = 'child' AND d.doc_id IN ({placeholders}) "
+            f"WHERE {RETRIEVABLE_PREDICATE} AND d.doc_id IN ({placeholders}) "
             "GROUP BY c.shard_id",
             tuple(imported_ids),
         ).fetchall()
