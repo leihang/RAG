@@ -178,6 +178,33 @@ async def test_debug_query_returns_answer_and_stages(client, playground_headers)
     ).json()
     assert body["answer"] and body["citations"]
     assert set(body["stages"]) >= {"dense", "sparse", "rrf", "rerank", "c5"}
+    assert body.get("history_used") is False
+    assert body.get("rewritten_query") == "年假有多少天"
+
+
+async def test_debug_query_multi_turn_rewrites_followup(client, playground_headers) -> None:
+    """调试台带 conversation_id 时走正式多轮：追问改写进检索串。"""
+    _runtime, _uid, headers = playground_headers
+    conv = "pg-test-followup"
+    first = await client.post(
+        "/api/v1/rag/debug/query",
+        headers=headers,
+        json={"query": "年假有多少天", "conversation_id": conv},
+    )
+    assert first.status_code == 200
+    assert first.json()["history_used"] is False
+
+    second = await client.post(
+        "/api/v1/rag/debug/query",
+        headers=headers,
+        json={"query": "能介绍详细点吗？", "conversation_id": conv},
+    )
+    body = second.json()
+    assert second.status_code == 200
+    assert body["history_used"] is True
+    assert body["rewritten_query"].startswith("年假有多少天")
+    assert "详细" in body["rewritten_query"]
+    assert set(body["stages"]) >= {"dense", "sparse", "rrf"}
     assert body["timings_ms"]["generate_ms"] >= 0
 
 

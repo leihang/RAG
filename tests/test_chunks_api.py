@@ -165,23 +165,27 @@ async def test_edit_parent_does_not_touch_vectors(client, admin) -> None:
     runtime, user_id = admin
     headers = headers_for(user_id)
     with runtime.db.sync_connect() as conn:
-        parent_id = int(
-            conn.execute(
-                "SELECT chunk_id FROM ekbs_chunk WHERE chunk_type = 'parent' LIMIT 1"
-            ).fetchone()["chunk_id"]
-        )
+        # 必须挑「仍有 child 的容器父块」：短节叶子 parent 现在会入向量
+        parent = conn.execute(
+            "SELECT p.chunk_id FROM ekbs_chunk p "
+            "WHERE p.chunk_type = 'parent' AND EXISTS ("
+            "  SELECT 1 FROM ekbs_chunk c WHERE c.parent_id = p.chunk_id"
+            ") LIMIT 1"
+        ).fetchone()
+        assert parent is not None, "种子语料应至少有一个带 child 的父块"
+        parent_id = int(parent["chunk_id"])
     response = await client.put(
         f"/api/v1/chunks/{parent_id}", headers=headers, json={"content": "父块正文（人工修订）"}
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["embedded"] is False and body["reason"] == "parent_chunk_not_indexed"
+    assert body["embedded"] is False and body["reason"] == "container_chunk_not_indexed"
     with runtime.db.sync_connect() as conn:
         row = conn.execute(
             "SELECT content, faiss_row FROM ekbs_chunk WHERE chunk_id = ?", (parent_id,)
         ).fetchone()
     assert row["content"] == "父块正文（人工修订）"
-    assert row["faiss_row"] is None, "父块本来就不该有向量行号"
+    assert row["faiss_row"] is None, "容器父块本来就不该有向量行号"
 
 
 async def test_split_child_creates_and_embeds_both_halves(client, admin) -> None:

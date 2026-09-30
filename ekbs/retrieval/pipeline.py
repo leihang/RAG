@@ -873,6 +873,8 @@ class RetrievalPipeline:
         conversation_id: str | None = None,
         use_cache: bool = True,
         allow_generation: bool = True,
+        overrides: RetrievalOverrides | None = None,
+        collect_debug: bool = False,
     ) -> AnswerResult:
         """检索 + 生成的一条龙（供 API 与钉钉适配器调用）。
 
@@ -883,6 +885,8 @@ class RetrievalPipeline:
         多轮时：先把会话历史取出来（``ekbs_session_ctx``，键含用户维度）→ **查询改写**
         → 用改写后的查询检索 → 带历史生成 → 把本轮写回上下文。
         每轮都重新加载 ``PermContext`` 由调用方负责（`03` §6.1 V5）。
+
+        ``overrides`` / ``collect_debug``：检索调试台用；正式问答保持默认即可。
         """
         # ① 会话历史：调用方显式给了就用给的，否则按 (conversation_id, 用户) 取
         messages = list(history)
@@ -906,7 +910,7 @@ class RetrievalPipeline:
             f"{rewrite.rewritten}|{_history_digest(messages)}|gen={int(allow_generation)}"
             f"|rc={self.retrieval_cache_revision()}",
         )
-        if use_cache:
+        if use_cache and not collect_debug:
             cached = await self.cache.get(cache_key)
         if cached:
             retrieval = RetrievalResult(
@@ -920,6 +924,7 @@ class RetrievalPipeline:
                 retrieval=retrieval,
                 model=str(cached.get("model", "")),
                 rewritten_query=rewrite.rewritten,
+                history_used=rewrite.used_history,
                 refused=bool(cached.get("refused", False)),
                 refusal_reason=str(cached.get("refusal_reason", "")),
                 degraded=["answer_cache_hit"],
@@ -928,7 +933,9 @@ class RetrievalPipeline:
             await self._remember_turn(conversation_id, perm, question, result)
             return result
 
-        retrieval = await self.retrieve(rewrite.rewritten, perm)
+        retrieval = await self.retrieve(
+            rewrite.rewritten, perm, overrides=overrides, collect_debug=collect_debug
+        )
         if allow_generation:
             result = await self.generate(question, retrieval, perm, history=messages)
         else:
@@ -939,7 +946,7 @@ class RetrievalPipeline:
         # ③ 写回上下文（群聊按用户隔离，见 session.py 的说明）
         await self._remember_turn(conversation_id, perm, question, result)
 
-        if use_cache and result.answer and not result.refused:
+        if use_cache and not collect_debug and result.answer and not result.refused:
             await self.cache.set(
                 cache_key,
                 {

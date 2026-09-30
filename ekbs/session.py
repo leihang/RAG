@@ -11,8 +11,8 @@
    策略可配（管理台的 Prompt 模板对应 ``llm`` 策略）：
 
    * ``off``：不改写；
-   * ``heuristic``（默认）：当前问题含指代（它/这个/上述/该…）或过短时，
-     把**上一轮问题**并入检索查询，保证脱离上下文也能召回；
+   * ``heuristic``（默认）：当前问题含指代（它/这个/上述/该…）、追问展开用语
+     （详细/继续/再说…）或过短时，把**上一轮问题**并入检索查询，保证脱离上下文也能召回；
    * ``llm``：用云端 LLM 按模板改写成自包含查询（需要真实模型；mock 会返回固定串，
      因此默认不启用，避免把测试与离线环境搞坏）。
 
@@ -35,6 +35,15 @@ log = get_logger(component="session")
 
 #: 需要上下文的指代词（命中则倾向于改写）
 _ANAPHORA = ("它", "他", "她", "这个", "那个", "这些", "那些", "上述", "该", "此", "这项", "那条")
+
+#: 追问/展开类用语：语义上依赖上一轮主题，但未必带指代词
+#: （用户实测：「崔超是谁」→「能介绍详细点吗？」启发式原先漏改写）
+_FOLLOWUP = (
+    "详细", "具体点", "具体一些", "具体说说", "展开", "补充", "继续",
+    "再说", "再讲", "再介绍", "更多",
+    "介绍一下", "介绍下", "介绍详细",
+    "说说看", "讲讲", "还有呢", "然后呢",
+)
 
 DEFAULT_MAX_TURNS = 6
 DEFAULT_TTL_SECONDS = 7200
@@ -222,11 +231,20 @@ class QueryRewriter:
 
 
 def _needs_context(question: str) -> bool:
-    """问题是否依赖上下文：含指代词，或过短（少于 6 个字符且非纯英文短句）。"""
+    """问题是否依赖上下文。
+
+    触发条件（任一即可）：
+
+    * 含指代词（它/他/这个/上述…）；
+    * 含追问展开用语（详细/继续/再说…）—— 「能介绍详细点吗？」这类不带指代；
+    * 过短（CJK < 6），脱离上一轮无法独立检索。
+    """
     text = (question or "").strip()
     if not text:
         return False
     if any(marker in text for marker in _ANAPHORA):
+        return True
+    if any(marker in text for marker in _FOLLOWUP):
         return True
     cjk = re.findall(r"[\u4e00-\u9fff]", text)
     return len(cjk) < 6

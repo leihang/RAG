@@ -5,6 +5,9 @@
  * 逐分片稠密召回 / 稀疏召回 / RRF / rerank / 父块扩展的全过程都能看到，
  * 参数覆盖**不改全局配置**（后端把 override 放在请求作用域内，并发安全）。
  * 权限模拟是唯一允许越权读取的入口，仅 `rag:playground:simulate` 可见（§3.4 约束 3）。
+ *
+ * 多轮：页面在 sessionStorage 里持有 `conversation_id`，连续提问走查询改写 + 会话上下文；
+ * 「新会话」会换一个 id（不调 clear API，避免误清正式会话）。
  */
 import { useState } from 'react'
 import {
@@ -30,12 +33,50 @@ interface ShardInfo {
   warnings: string[]
 }
 
+const CONV_KEY = 'ekbs:playground:conversation_id'
+
+function newConversationId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `pg-${crypto.randomUUID()}`
+  }
+  return `pg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function loadOrCreateConversationId(): string {
+  try {
+    const existing = sessionStorage.getItem(CONV_KEY)
+    if (existing) return existing
+  } catch {
+    /* private mode */
+  }
+  const id = newConversationId()
+  try {
+    sessionStorage.setItem(CONV_KEY, id)
+  } catch {
+    /* ignore */
+  }
+  return id
+}
+
 export default function Playground() {
   const [form] = Form.useForm()
   const [simForm] = Form.useForm()
   const [result, setResult] = useState<DebugQueryResp | null>(null)
   const [shards, setShards] = useState<ShardInfo | null>(null)
   const [loading, setLoading] = useState(false)
+  const [conversationId, setConversationId] = useState(loadOrCreateConversationId)
+
+  const resetConversation = () => {
+    const id = newConversationId()
+    try {
+      sessionStorage.setItem(CONV_KEY, id)
+    } catch {
+      /* ignore */
+    }
+    setConversationId(id)
+    setResult(null)
+    message.success('已开启新会话（上一轮上下文不再带入）')
+  }
 
   const run = async () => {
     const v = await form.validateFields()
@@ -43,10 +84,11 @@ export default function Playground() {
     try {
       setResult(await debugQuery({
         query: v.query,
+        conversation_id: conversationId,
         rerank_enabled: Boolean(v.rerank_enabled),
-        top_k: v.top_k ?? undefined,
-        keep: v.keep ?? undefined,
-        min_score: v.min_score ?? undefined,
+        dense_top_k: v.top_k ?? undefined,
+        rerank_keep: v.keep ?? undefined,
+        rerank_min_score: v.min_score ?? undefined,
       }))
     } catch (err) { message.error(err instanceof Error ? err.message : String(err)) }
     finally { setLoading(false) }
@@ -72,7 +114,7 @@ export default function Playground() {
       <Card title="检索并生成">
         <Form form={form} layout="vertical" initialValues={{ rerank_enabled: true }}>
           <Form.Item name="query" label="问题" rules={[{ required: true, message: '请输入问题' }]}>
-            <Input.TextArea rows={2} placeholder="如：年假有多少天" />
+            <Input.TextArea rows={2} placeholder="如：年假有多少天；下一轮可追问「能介绍详细点吗？」" />
           </Form.Item>
           <Space size={16} wrap align="end">
             <Form.Item name="rerank_enabled" label="启用精排" valuePropName="checked" style={{ marginBottom: 0 }}>
@@ -89,9 +131,11 @@ export default function Playground() {
             </Form.Item>
             <Button type="primary" loading={loading} onClick={() => void run()}>检索并生成</Button>
             <Button onClick={() => void loadShards()}>看权限路由</Button>
+            <Button onClick={resetConversation}>新会话</Button>
           </Space>
           <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
-            参数覆盖只作用于本次请求，<b>不改全局配置</b>（并发安全）。
+            参数覆盖只作用于本次请求，<b>不改全局配置</b>。同一会话连续提问会改写指代/追问；
+            会话 id：<span className="ekbs-mono">{conversationId}</span>
           </Typography.Paragraph>
         </Form>
       </Card>
@@ -118,6 +162,10 @@ export default function Playground() {
             </Typography.Paragraph>
             <Space size={8} wrap>
               {result.model ? <Tag>模型 {result.model}</Tag> : null}
+              {result.history_used ? <Tag color="blue">已用会话改写</Tag> : <Tag>单轮 / 未改写</Tag>}
+              {result.rewritten_query && result.rewritten_query !== result.query ? (
+                <Tag color="purple">检索串：{result.rewritten_query}</Tag>
+              ) : null}
               {result.timings_ms ? Object.entries(result.timings_ms).map(([k, v]) => (
                 <Tag key={k}>{k} {formatMs(v)}</Tag>
               )) : null}

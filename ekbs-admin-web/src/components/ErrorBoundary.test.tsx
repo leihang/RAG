@@ -11,7 +11,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import ErrorBoundary from './ErrorBoundary'
 
-function Boom({ message }: { message: string }) {
+function Boom({ message }: { message: string }): React.ReactNode {
   throw new Error(message)
 }
 

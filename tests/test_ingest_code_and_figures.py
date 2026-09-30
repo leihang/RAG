@@ -184,7 +184,7 @@ async def test_figure_becomes_searchable_chunk(seeded) -> None:
             ),
         ),
     )
-    assert result.child_count > 0, "正文块也没切出来"
+    assert result.parent_count > 0 or result.child_count > 0, "正文块也没切出来"
 
     with runtime.db.sync_connect() as conn:
         figs = conn.execute(

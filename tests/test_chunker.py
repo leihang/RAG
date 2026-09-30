@@ -60,7 +60,7 @@ def test_clause_lines_become_heading_path() -> None:
     assert any("第二条" in p for p in paths)
     result = chunk_markdown(CLAUSE_PLAIN, doc_title="年假管理制度")
     assert all(n.heading_path.strip() for n in result.nodes)
-    assert any("第一条" in n.heading_path for n in result.children)
+    assert any("第一条" in n.heading_path for n in result.parents)
 
 
 def test_heading_path_never_empty_with_doc_title() -> None:
@@ -70,15 +70,23 @@ def test_heading_path_never_empty_with_doc_title() -> None:
     assert ensure_heading_path("", doc_title="") == "文档"
 
 
-def test_short_document_produces_linked_parent_and_children() -> None:
+def test_short_document_leaves_parent_as_leaf() -> None:
+    """短节只能切出与父块相同的一块时：不建 child，父块本身作叶子入向量。"""
     result = chunk_markdown(SHORT_DOC)
     assert result.parents, "至少一个父块"
-    assert result.children, "至少一个子块"
+    assert not result.children, "短节不应再造一份等同正文的 child"
+    for parent in result.parents:
+        assert parent.parent_index is None
+
+
+def test_long_parent_still_splits_into_children() -> None:
+    """够长的父块仍切出多个 child，并挂上 parent_index。"""
+    result = chunk_markdown(_long_doc(sections=1, body_chars=2400))
+    assert result.children, "长小节应有子块"
     for child in result.children:
         assert child.parent_index is not None
         parent = result.nodes[child.parent_index]
         assert parent.chunk_type == "parent"
-        # 子块必须落在父块文本内（父子关系可回溯）；overlap 前缀也来自同父块兄弟
         assert child.content.strip()[:12] in parent.content
 
 

@@ -184,6 +184,8 @@ class ParseCfg(_Section):
     #: 打开后：每张图调一次视觉模型，描述写进图片块的检索文本；
     #: 描述按**图片内容哈希**缓存，重复解析/重复上传不会二次计费。
     figure_caption: bool = False
+    #: 图注视觉调用并发（仅未命中缓存的图；MinerU 仍串行）。默认 1。
+    figure_caption_concurrency: int = 1
 
 
 class UploadCfg(_Section):

@@ -42,7 +42,7 @@ retrieval:
     min_score: 0.30
   parent_expand: true
   # 查询改写（00 §2.1 的第一步，多轮对话时启用）；策略：off | heuristic | llm
-  # heuristic：当前问题含指代或过短时并入上一轮问题；llm：用云端模型按模板改写成自包含查询
+  # heuristic：含指代 / 追问展开用语（详细、继续…）/ 过短时并入上一轮问题
   query_rewrite:
     strategy: heuristic
   cache:

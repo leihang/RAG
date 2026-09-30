@@ -86,6 +86,7 @@ async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:
                         images=[
                             (item.name, assets_dir / item.name) for item in parsed.figures
                         ],
+                        concurrency=runtime.settings.parse.figure_caption_concurrency,
                     )
 
         figures = [

@@ -204,19 +204,46 @@ async def debug_query(
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """完整链路（检索 + 生成），返回各阶段结构化结果。"""
+    """完整链路（改写 → 检索 → 生成），返回各阶段结构化结果。
+
+    传入 ``conversation_id`` 时走正式多轮：读/写 ``ekbs_session_ctx``、查询改写、
+    生成侧带历史。不传则仍是单轮（与改前行为兼容）。
+    """
     user, _ = _principal(
         request, _h(authorization, x_internal_token, x_internal_user_id), "rag:playground:run"
     )
     runtime = request.app.state.runtime
     perm = await runtime.perm_context(user.user_id)
-    result = await runtime.pipeline.retrieve(
-        payload.query, perm, overrides=payload.overrides(), collect_debug=True
+    # 调试台必须看见 stages：关答案缓存 + collect_debug；调参仍只作用于本次
+    answer = await runtime.pipeline.answer(
+        payload.query,
+        perm,
+        conversation_id=payload.conversation_id,
+        use_cache=False,
+        overrides=payload.overrides(),
+        collect_debug=True,
     )
-    answer = await runtime.pipeline.generate(payload.query, result, perm)
+    result = answer.retrieval
+    await _record_history(
+        runtime,
+        {
+            "at": int(time.time()),
+            "kind": "query",
+            "operator": user.user_id,
+            "query": payload.query,
+            "rewritten": answer.rewritten_query,
+            "history_used": answer.history_used,
+            "conversation_id": payload.conversation_id,
+            "chunks": len(result.chunks),
+            "refused": answer.refused,
+        },
+    )
     return JSONResponse(
         {
             "query": payload.query,
+            "rewritten_query": answer.rewritten_query,
+            "history_used": answer.history_used,
+            "conversation_id": payload.conversation_id,
             "answer": answer.answer,
             "refused": answer.refused,
             "refusal_reason": answer.refusal_reason,

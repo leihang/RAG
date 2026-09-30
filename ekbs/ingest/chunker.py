@@ -267,6 +267,9 @@ def chunk_markdown(
     不与正文 parent/child 重复索引。
 
     ``doc_title``：小节无标题时注入 ``heading_path`` 根，避免检索用文本丢限定词。
+
+    短节若只能切出与父块正文相同的一块 child，则**跳过 child**：父块作为叶子入向量
+    （见 :mod:`ekbs.ingest.retrievable`），避免同文双索引。
     """
     from ekbs.ingest.table_serialize import serialize_table_body
 
@@ -291,8 +294,16 @@ def chunk_markdown(
             result.nodes.append(parent)
             parent_index = len(result.nodes) - 1
 
+            # 短节：子块只能切出 1 块且与父块正文相同 → 不建 child。
+            # 父块本身就是叶子，按 retrievable 叶子规则入向量，避免同文双索引。
             overlap = int(child_max * OVERLAP_MIN_RATIO)
-            for child_text in _pack(parent_text, child_min, child_max, overlap=overlap):
+            child_texts = _pack(parent_text, child_min, child_max, overlap=overlap)
+            if (
+                len(child_texts) == 1
+                and child_texts[0].strip() == parent_text.strip()
+            ):
+                continue
+            for child_text in child_texts:
                 seq += 1
                 result.nodes.append(
                     ChunkNode(

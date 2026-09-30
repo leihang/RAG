@@ -2,7 +2,14 @@ import { http } from './client'
 
 export interface DebugQueryBody {
   query: string
+  /** 多轮会话 id；同一 id 连续提问会走查询改写与上下文 */
+  conversation_id?: string
   rerank_enabled?: boolean
+  dense_top_k?: number
+  sparse_top_k?: number
+  rerank_keep?: number
+  rerank_min_score?: number
+  /** @deprecated 用 dense_top_k；保留兼容旧调用 */
   top_k?: number
   keep?: number
   min_score?: number
@@ -38,6 +45,9 @@ export interface FaithfulnessReport {
 
 export interface DebugQueryResp {
   query: string
+  rewritten_query?: string | null
+  history_used?: boolean | null
+  conversation_id?: string | null
   answer?: string | null
   refused?: boolean | null
   refusal_reason?: string | null

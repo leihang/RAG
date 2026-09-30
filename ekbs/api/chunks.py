@@ -44,6 +44,7 @@ from ekbs.api.auth import INTERNAL_TOKEN_HEADER, INTERNAL_USER_HEADER
 from ekbs.api.qa import _authenticate
 from ekbs.errors import PermissionDenied
 from ekbs.ingest.chunker import count_tokens, retrieval_text
+from ekbs.ingest.retrievable import is_retrievable
 from ekbs.logging import get_logger
 
 router = APIRouter(tags=["chunks"])
@@ -97,10 +98,16 @@ async def _reembed_async(
             "SELECT chunk_id, doc_id, shard_id, chunk_type FROM ekbs_chunk WHERE chunk_id = ?",
             (chunk_id,),
         ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="chunk_not_found")
-    if str(row["chunk_type"]) != "child":
-        return {"embedded": False, "reason": "parent_chunk_not_indexed"}
+        if row is None:
+            raise HTTPException(status_code=404, detail="chunk_not_found")
+        has_children = (
+            conn.execute(
+                "SELECT 1 FROM ekbs_chunk WHERE parent_id = ? LIMIT 1", (chunk_id,)
+            ).fetchone()
+            is not None
+        )
+    if not is_retrievable(str(row["chunk_type"]), has_children=has_children):
+        return {"embedded": False, "reason": "container_chunk_not_indexed"}
 
     shard_id = str(row["shard_id"])
     text = retrieval_text(heading_path, content)
@@ -247,8 +254,8 @@ async def update_chunk(
 ) -> JSONResponse:
     """编辑分块文本。
 
-    * **子块**：内容变了就**原地替换**向量（``IndexIDMap2`` 的 upsert：先删后加）并重写 FTS 行；
-    * **父块**：只改内容与 token 数（父块不进向量索引，也不会进 FTS）。
+    * **叶子块**（child，或无子块的 parent/table/figure）：内容变了就**原地替换**向量并重写 FTS；
+    * **容器父块**（仍有 child）：只改内容与 token 数（不进向量，也不进 FTS）。
     """
     principal = _principal(
         request, _h(authorization, x_internal_token, x_internal_user_id), "doc:chunk:update"
@@ -260,7 +267,14 @@ async def update_chunk(
     if old_content == payload.content and heading == row["heading_path"]:
         return JSONResponse({"chunk_id": chunk_id, "changed": False, "note": "内容与标题均未变化"})
 
-    if str(row["chunk_type"]) == "child":
+    with runtime.db.sync_connect() as conn:
+        has_children = (
+            conn.execute(
+                "SELECT 1 FROM ekbs_chunk WHERE parent_id = ? LIMIT 1", (chunk_id,)
+            ).fetchone()
+            is not None
+        )
+    if is_retrievable(str(row["chunk_type"]), has_children=has_children):
         result = await _reembed_async(runtime, chunk_id, content=payload.content, heading_path=heading)
     else:
         with runtime.db.sync_connect() as conn:
@@ -270,7 +284,7 @@ async def update_chunk(
                 (payload.content, heading, count_tokens(payload.content), chunk_id),
             )
             conn.commit()
-        result = {"embedded": False, "reason": "parent_chunk_not_indexed"}
+        result = {"embedded": False, "reason": "container_chunk_not_indexed"}
     log.info(
         "chunk_updated", chunk_id=chunk_id, operator=principal.user_id,
         chunk_type=str(row["chunk_type"]), **result,
@@ -283,7 +297,7 @@ async def update_chunk(
             "parent_id": row["parent_id"],
             "old_content_chars": len(old_content),
             "new_content_chars": len(payload.content),
-            "hint": "子块向量已按 chunk_id 原地替换（upsert），无需 rebuild 回收容量",
+            "hint": "叶子块向量已按 chunk_id 原地替换（upsert），无需 rebuild 回收容量",
             "context_hint": (
                 "进 LLM 上下文的是父块全文（00 §2.1）：只改子块时答案仍会引用旧父块内容，"
                 "如需答案立即反映修改，请同时编辑父块"

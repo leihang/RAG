@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import time
@@ -103,24 +104,45 @@ async def caption_images(
     data_dir: Path,
     vision: Any,
     images: Sequence[tuple[str, Path]],
+    concurrency: int = 1,
 ) -> dict[str, str]:
     """给一批图片生成描述，返回 ``{图片名: 描述}``。
 
     ``vision`` 是 OpenAI 兼容的对话 provider（`Providers.vision`）。
     命中缓存的不再调用；失败的跳过（不抛异常）。
+    ``concurrency`` 控制未缓存图的并发调用数（信号量；≤0 时按 1）。
     """
     out: dict[str, str] = {}
     model = str(getattr(getattr(vision, "ref", None), "model", "") or "vision")
-    called = 0
+    pending: list[tuple[str, Path]] = []
     for name, path in images:
         cached = read_cached_caption(data_dir, name)
         if cached:
             out[name] = cached
-            continue
+        else:
+            pending.append((name, path))
+
+    if not pending:
+        if out:
+            log.info(
+                "figure_captions_done",
+                generated=0,
+                reused=len(out),
+                total=len(images),
+            )
+        return out
+
+    limit = max(1, int(concurrency or 1))
+    sem = asyncio.Semaphore(limit)
+    lock = asyncio.Lock()
+    called = 0
+
+    async def _one(name: str, path: Path) -> None:
+        nonlocal called
         data_url = _image_data_url(path)
         if data_url is None:
             log.warning("figure_caption_skipped", image=name, reason="image_unreadable_or_too_large")
-            continue
+            return
         messages = [
             {
                 "role": "user",
@@ -130,18 +152,27 @@ async def caption_images(
                 ],
             }
         ]
-        try:
-            result = await vision.generate(messages)
-            text = str(getattr(result, "text", "") or "").strip()
-        except Exception as exc:  # 单张失败不影响入库
-            log.warning("figure_caption_failed", image=name, error=str(exc)[:120])
-            continue
-        called += 1
+        async with sem:
+            try:
+                result = await vision.generate(messages)
+                text = str(getattr(result, "text", "") or "").strip()
+            except Exception as exc:  # 单张失败不影响入库
+                log.warning("figure_caption_failed", image=name, error=str(exc)[:120])
+                return
         if not text:
             log.warning("figure_caption_empty", image=name)
-            continue
-        out[name] = text
+            return
+        async with lock:
+            called += 1
+            out[name] = text
         write_cached_caption(data_dir, name, text, model=model)
-    if called:
-        log.info("figure_captions_done", generated=called, reused=len(out) - called, total=len(images))
+
+    await asyncio.gather(*(_one(name, path) for name, path in pending))
+    if called or out:
+        log.info(
+            "figure_captions_done",
+            generated=called,
+            reused=len(out) - called,
+            total=len(images),
+        )
     return out

@@ -60,6 +60,43 @@ async def test_caption_generates_once_and_reuses_cache(tmp_path: Path) -> None:
     assert len(vision.calls) == 1, "命中缓存却再次调用了视觉模型（会重复计费）"
 
 
+async def test_caption_runs_with_bounded_concurrency(tmp_path: Path) -> None:
+    """未缓存图应按 concurrency 并行，且不超过上限。"""
+    import asyncio
+
+    class SlowVision(FakeVision):
+        def __init__(self) -> None:
+            super().__init__()
+            self.in_flight = 0
+            self.max_in_flight = 0
+
+        async def generate(self, messages):
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            try:
+                await asyncio.sleep(0.05)
+                return await super().generate(messages)
+            finally:
+                self.in_flight -= 1
+
+    vision = SlowVision()
+    paths = []
+    for i in range(6):
+        p = _img(tmp_path, f"img-{i:08d}.png")
+        paths.append((p.name, p))
+
+    got = await caption_images(
+        data_dir=tmp_path / "var",
+        vision=vision,
+        images=paths,
+        concurrency=3,
+    )
+    assert len(got) == 6
+    assert len(vision.calls) == 6
+    assert vision.max_in_flight <= 3
+    assert vision.max_in_flight >= 2, "并发未生效（仍像串行）"
+
+
 async def test_caption_failure_degrades_without_raising(tmp_path: Path) -> None:
     class Boom(FakeVision):
         async def generate(self, messages):

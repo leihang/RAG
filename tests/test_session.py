@@ -77,7 +77,10 @@ def test_anaphora_detection() -> None:
     assert _needs_context("那它需要提前几天申请")
     assert _needs_context("这个怎么算")
     assert _needs_context("年假")  # 过短，脱离上下文无法检索
+    assert _needs_context("能介绍详细点吗？")  # 追问展开，无指代也要改写
+    assert _needs_context("再说详细一点")
     assert not _needs_context("员工年假天数如何计算")
+    assert not _needs_context("财务专用章由谁保管")
 
 
 async def test_rewriter_without_history_is_noop(runtime) -> None:
@@ -98,6 +101,19 @@ async def test_rewriter_merges_previous_question_on_anaphora(runtime) -> None:
     assert result.used_history is True
     assert result.rewritten.startswith("年假有多少天")
     assert "提前几天申请" in result.rewritten
+
+
+async def test_rewriter_merges_elaboration_followup(runtime) -> None:
+    """「能介绍详细点吗？」无指代词，但必须并入上一轮主题（用户实测）。"""
+    rewriter = QueryRewriter(settings=runtime.settings)
+    history = [
+        {"role": "user", "content": "崔超是谁"},
+        {"role": "assistant", "content": "崔超是…… [1]"},
+    ]
+    result = await rewriter.rewrite("能介绍详细点吗？", history)
+    assert result.used_history is True
+    assert result.rewritten.startswith("崔超是谁")
+    assert "详细" in result.rewritten
 
 
 async def test_rewriter_keeps_self_contained_question(runtime) -> None:
