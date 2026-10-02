@@ -54,3 +54,40 @@ def test_chunk_markdown_emits_table_type() -> None:
     assert tables[0].page_from == 2
     assert "档次=一档" in tables[0].content
     assert "金额=500" in tables[0].content
+
+
+def test_merged_title_rows_are_not_used_as_header() -> None:
+    """开头的合并标题行不能当表头 —— 否则列名退化成 `列2…`，表格语义就没了。
+
+    实测事故（2026-10-02，`2026年7月能耗分析.xlsx` 的「用电分析」表）：前两行都是
+    合并单元格（第 1 行表名、第 2 行写单位 `电量分析(KW/h）`），真正的内容行在第 3 行。
+    旧实现把第 1 行当表头 → 出题 97 个表格块的列名全是 `列2…列39`：按列名检索召不回、
+    取数也定位不到列（README §四 第 80 条）。
+    """
+    rows = [
+        ["熙街2026年7月用电分析表"] + [""] * 8,
+        ["电量分析(KW/h）"] + [""] * 8,
+        [" 用量   日期", "46234", "45869", "46203", "同比", "环比", "图表", "", "分析"],
+        ["", "100", "200", "300", "1%", "2%", "", "", "ok"],
+    ]
+    blocks = serialize_information_blocks(caption="用电分析", rows=rows)
+    text = blocks[0]
+    assert "列2=" not in text and "列2 |" not in text, "不应再出现列序号占位（除真正无名的列）"
+    assert "相关表头: 用量   日期 | 46234" in text
+    assert "同比=1%" in text
+    # 标题行与单位口径不能丢：它们折进「表名」
+    assert "熙街2026年7月用电分析表" in text
+    assert "电量分析(KW/h）" in text
+
+
+def test_plain_two_row_table_unchanged() -> None:
+    """普通两行表（真表头 + 一行数据）行为不变 —— 修的是"标题行"，不是所有行。"""
+    blocks = serialize_information_blocks(caption="t", rows=[["a", "b"], ["c", "d"]])
+    assert "相关表头: a | b" in blocks[0]
+    assert "a=c; b=d" in blocks[0]
+
+
+def test_table_with_only_title_rows_keeps_content() -> None:
+    """极端：整张表只有标题行 → 内容必须保留（当单列数据），不能返回空。"""
+    blocks = serialize_information_blocks(caption="", rows=[["只有标题"], [""]])
+    assert blocks and "只有标题" in blocks[0]

@@ -10,6 +10,7 @@ import re
 from html.parser import HTMLParser
 from typing import Sequence
 
+from ekbs.ingest.clean import normalize_math_in_text
 from ekbs.ingest.chunker import count_tokens
 
 #: 单块上限（spec：>2048 token 按行分组）
@@ -93,6 +94,24 @@ def coerce_rows(body: str) -> list[list[str]]:
     return [[text]]
 
 
+def _is_title_row(row: Sequence[str]) -> bool:
+    """整行合并的**标题行**：这一行足够宽、却只有一格有字 → 它是标题，不是表头。
+
+    实测（`2026年7月能耗分析.xlsx` 的「用电分析」表）：
+
+    .. code-block:: text
+
+        第1行  ['熙街2026年7月用电分析表', '', '', ...]   ← 合并标题行
+        第2行  ['电量分析(KW/h）', '', '', ...]            ← 又一个合并行（写的是单位口径）
+        第3行  [' 用量   日期', '46234', '45869', ...]     ← 才是真正的内容行
+
+    旧实现把第 1 行当表头 → 列名全退化成 `列2…列39`（实测 97 个表格块中招）。
+    表格语义（列名）就此消失：按列名检索召不回、取数也定位不到列。
+    """
+    cells = [str(c).strip() for c in row]
+    return len(cells) >= 3 and sum(1 for c in cells if c) <= 1
+
+
 def serialize_information_blocks(
     *,
     caption: str = "",
@@ -100,9 +119,32 @@ def serialize_information_blocks(
     table_id: str = "",
 ) -> list[str]:
     """把二维表打成一段或多段自解释文本（超长按行批拆）。"""
-    matrix = [list(r) for r in rows if any(str(c).strip() for c in r)]
+    # 单元格也过一遍公式/单位规整：xlsx/docx 的原生表格不经 Markdown 清洗那一路，
+    # 但 MinerU/Office 同样会把 `50%` 写成 `$5 0 \\%$`（见 ekbs/ingest/clean.py）。
+    matrix = [
+        [normalize_math_in_text(str(c))[0] for c in r]
+        for r in rows
+        if any(str(c).strip() for c in r)
+    ]
     if not matrix:
         return []
+
+    # 先剥掉开头的标题行（合并单元格），它们**不当表头**；文字折叠进 caption 而不是丢掉 ——
+    # 第 2 行那种常常是单位口径（`电量分析(KW/h）`），丢了会让数值无法解读。
+    titles: list[str] = []
+    while matrix and _is_title_row(matrix[0]):
+        title = next((str(c).strip() for c in matrix[0] if str(c).strip()), "")
+        if title:
+            titles.append(title)
+        matrix = matrix[1:]
+    if not matrix:
+        # 极端：整张表只有标题行 → 保留内容（当单列数据），不丢
+        matrix = [[t] for t in titles]
+        titles = []
+    if titles:
+        title_text = " / ".join(dict.fromkeys(titles))
+        base = caption.strip()
+        caption = f"{base}（{title_text}）" if base else title_text
 
     headers = [str(c).strip() or f"列{i + 1}" for i, c in enumerate(matrix[0])]
     data_rows = matrix[1:] if len(matrix) > 1 else []

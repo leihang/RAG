@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import hashlib
 from dataclasses import dataclass
 from typing import Sequence
@@ -27,6 +29,7 @@ from ekbs.index.fts import FtsIndex
 from ekbs.index.shard import parse_shard_id, resolve_shard_for_document
 from ekbs.ingest.code_chunker import chunk_code, display_source_path, is_code_source
 from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE, retrievable_chunk_ids
+from ekbs.ingest.clean import clean_markdown
 from ekbs.ingest.chunker import (
     CHILD_MAX_TOKENS,
     CHILD_MIN_TOKENS,
@@ -55,6 +58,9 @@ class IngestResult:
     status: str
     checksum: str
     figure_vector_count: int = 0
+    #: 图片向量化**失败**的张数（重试后仍失败）—— 这些图片块会「存了但搜不到」，
+    #: 必须能被上游看见（旧实现只记一条 warning，文档照样 published）
+    figure_vectors_failed: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -64,6 +70,7 @@ class IngestResult:
             "child_count": self.child_count,
             "vector_count": self.vector_count,
             "figure_vector_count": self.figure_vector_count,
+            "figure_vectors_failed": self.figure_vectors_failed,
             "status": self.status,
             "checksum": self.checksum,
         }
@@ -133,6 +140,14 @@ class IngestPipeline:
         )
 
         checksum = checksum or hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        # 清洗（`06` §1.7）——**显式一步**，放在 checksum 之后、分块之前：
+        #   * checksum 仍基于解析原始产物 → 「秒传/去重」的语义不变；
+        #   * 进分块、进 FTS、进向量的都是清洗后的文本（此前"清洗"没有独立实现，
+        #     解析器吐出的 `$1 0 0 \%$` 这类 LaTeX 原样入库 → 关键词那一路搜不到）。
+        cleaned = clean_markdown(markdown)
+        if cleaned.stats:
+            log.info("markdown_cleaned", title=title, **cleaned.stats)
+        markdown = cleaned.text
         if existing_doc_id is not None:
             self._replace_existing(existing_doc_id, shard_id=shard_id)
             doc_id = int(existing_doc_id)
@@ -150,6 +165,7 @@ class IngestPipeline:
 
         try:
             figure_vector_count = 0
+            figure_vectors_failed = 0
             # 代码文件走**代码感知分块**（按函数/类切，path+符号进 heading_path）：
             # 定长/Markdown 分块会把函数从中间切断，代码检索效果很差。
             if is_code_source(source_path):
@@ -182,7 +198,9 @@ class IngestPipeline:
             vectors = await self._embed_children(doc_id, child_ids)
             if vectors is not None and len(vectors):
                 self.shards.append(shard_id, child_ids, vectors)
-            figure_vector_count = await self._embed_figures_multimodal(doc_id)
+            figure_vector_count, figure_vectors_failed = (
+                await self._embed_figures_multimodal(doc_id)
+            )
             self._index_fts(doc_id, shard_id, chunking.nodes)
             self._grant_extra_depts(doc_id, placement.extra_grants, level)
             self._publish(
@@ -202,6 +220,7 @@ class IngestPipeline:
             child_count=len(chunking.children),
             vector_count=len(child_ids),
             figure_vector_count=figure_vector_count,
+            figure_vectors_failed=figure_vectors_failed,
             status="published",
             checksum=checksum,
         )
@@ -392,12 +411,12 @@ class IngestPipeline:
             )
         return array
 
-    async def _embed_figures_multimodal(self, doc_id: int) -> int:
+    async def _embed_figures_multimodal(self, doc_id: int) -> tuple[int, int]:
         """figure 块再写一路多模态图像向量（与文本 FAISS 分索引，维度通常 1152）。"""
         import numpy as np
 
         if self.figure_index is None or self.providers.multimodal is None:
-            return 0
+            return 0, 0
         with self.db.sync_connect() as conn:
             rows = conn.execute(
                 "SELECT chunk_id, image_path FROM ekbs_chunk "
@@ -407,10 +426,11 @@ class IngestPipeline:
                 (doc_id,),
             ).fetchall()
         if not rows:
-            return 0
+            return 0, 0
         data_dir = self.settings.data_dir
         vectors: list[list[float]] = []
         chunk_ids: list[int] = []
+        failed: list[int] = []
         mm = self.providers.multimodal
         for row in rows:
             rel = str(row["image_path"])
@@ -423,23 +443,48 @@ class IngestPipeline:
                     image_path=rel,
                 )
                 continue
-            try:
-                vectors.append(await mm.embed_image(path))
-                chunk_ids.append(int(row["chunk_id"]))
-            except Exception as exc:
+            vector: list[float] | None = None
+            last_error = ""
+            # 单张图的向量化失败**必须重试**：多模态端点会偶发连接错误/限流（实测
+            # `HTTPSConnectionPool(host='dashscope.aliyuncs.com')`），旧实现只记一条 warning
+            # 就跳过 —— 结果是图片进了库却**没有向量**，「存了但搜不到」，而文档照样
+            # published，除人工比对文件之外没有任何信号（实测 2/201 张图如此）。
+            for attempt in range(self.settings.models.multimodal_embed.max_retries):
+                try:
+                    vector = await mm.embed_image(path)
+                    break
+                except Exception as exc:  # noqa: BLE001 —— 网络/限流/解码一律重试
+                    last_error = str(exc)[:160]
+                    if attempt + 1 < self.settings.models.multimodal_embed.max_retries:
+                        await asyncio.sleep(self.settings.models.multimodal_embed.retry_backoff_s * (attempt + 1))
+            if vector is None:
+                failed.append(int(row["chunk_id"]))
                 log.warning(
                     "figure_mm_embed_failed",
                     doc_id=doc_id,
                     chunk_id=int(row["chunk_id"]),
-                    error=str(exc)[:160],
+                    attempts=self.settings.models.multimodal_embed.max_retries,
+                    error=last_error,
                 )
+                continue
+            vectors.append(vector)
+            chunk_ids.append(int(row["chunk_id"]))
+        if failed:
+            # 汇总一条：**可观测**比"默默少几个向量"重要（`IngestResult.figure_vectors_failed`）
+            log.warning(
+                "figure_mm_partial",
+                doc_id=doc_id,
+                failed=len(failed),
+                chunk_ids=failed[:20],
+                hint="这些图片已成为「存了但搜不到」的孤儿块，需重嵌入",
+            )
         if not vectors:
-            return 0
+            return 0, len(failed)
         written = self.figure_index.upsert(
             np.asarray(vectors, dtype="float32"), chunk_ids
         )
-        log.info("figure_mm_indexed", doc_id=doc_id, figures=written)
-        return written
+        log.info("figure_mm_indexed", doc_id=doc_id, figures=written, failed=len(failed))
+        return written, len(failed)
 
     def _grant_extra_depts(
         self, doc_id: int, extra_grants: Sequence[tuple[str, str]], level: int

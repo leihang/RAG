@@ -106,3 +106,121 @@ async def test_ingest_writes_figure_multimodal_and_retrieve(seeded) -> None:
         f"expected figure mm recall; refused={retrieved.refused} "
         f"debug={retrieved.stage_debug.get('figure_mm')}"
     )
+
+
+@pytest.mark.asyncio
+async def test_figure_embed_failure_is_retried_then_reported(seeded) -> None:
+    """单张图的向量化失败**必须重试**；重试仍失败要进 `IngestResult`（不能只记一条 warning）。
+
+    实测事故（2026-10-02，重灌 16 篇时）：`figure_mm_embed_failed chunk_id=4543
+    error=HTTPSConnectionPool(host='dashscope.aliyuncs.com')` —— 旧实现一次失败就跳过，
+    结果**图片进了库却没有向量**（「存了但搜不到」），文档照样 published，
+    除人工比对文件之外没有任何信号（实测 2/201 张如此）。
+    """
+    runtime, summary = seeded
+    assets = runtime.settings.data_dir / "parse" / "mm_retry" / "images"
+    assets.mkdir(parents=True, exist_ok=True)
+    name = "重试用例.png"
+    Image.new("RGB", (16, 16), color=(10, 10, 200)).save(assets / name)
+    rel = str((assets / name).relative_to(runtime.settings.data_dir))
+    runtime.settings.models.multimodal_embed.retry_backoff_s = 0.0  # 测试不等退避
+    dim = int(runtime.settings.models.multimodal_embed.dim)
+
+    pipeline = IngestPipeline(
+        db=runtime.db,
+        settings=runtime.settings,
+        providers=runtime.providers,
+        shards=runtime.shards,
+        fts=runtime.fts,
+        figure_index=runtime.figure_index,
+    )
+
+    class FlakyThenOK:
+        ref = runtime.providers.multimodal.ref
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def embed_image(self, path):
+            self.calls += 1
+            if self.calls < 3:  # 前两次网络失败
+                raise RuntimeError("HTTPSConnectionPool: connection reset by peer")
+            return [1.0] + [0.0] * (dim - 1)
+
+        async def embed_text(self, text):
+            return [0.0] * dim
+
+    flaky = FlakyThenOK()
+    original = runtime.providers.multimodal
+    runtime.providers.multimodal = flaky  # type: ignore[assignment]
+    try:
+        result = await pipeline.ingest_markdown(
+            title="重试用例.md",
+            markdown="# 图\n\n见附图。\n",
+            kb_id=int(summary["kb_id"]),
+            level=1,
+            visible_dept_ids=[],
+            real_corpus=False,
+            figures=(FigureInput(image_path=rel, caption="某图", ocr_text="", page=1),),
+        )
+    finally:
+        runtime.providers.multimodal = original  # type: ignore[assignment]
+
+    assert flaky.calls == 3, "前两次失败后应重试第三次并成功"
+    assert result.figure_vector_count == 1
+    assert result.figure_vectors_failed == 0
+
+
+@pytest.mark.asyncio
+async def test_figure_embed_permanent_failure_is_visible(seeded) -> None:
+    """重试仍失败 → 失败数进结果（可观测），文档不因此整篇失败。"""
+    runtime, summary = seeded
+    assets = runtime.settings.data_dir / "parse" / "mm_fail" / "images"
+    assets.mkdir(parents=True, exist_ok=True)
+    name = "永久失败.png"
+    Image.new("RGB", (16, 16), color=(200, 10, 10)).save(assets / name)
+    rel = str((assets / name).relative_to(runtime.settings.data_dir))
+    runtime.settings.models.multimodal_embed.retry_backoff_s = 0.0
+
+    pipeline = IngestPipeline(
+        db=runtime.db,
+        settings=runtime.settings,
+        providers=runtime.providers,
+        shards=runtime.shards,
+        fts=runtime.fts,
+        figure_index=runtime.figure_index,
+    )
+    dim = int(runtime.settings.models.multimodal_embed.dim)
+
+    class AlwaysFail:
+        ref = runtime.providers.multimodal.ref
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def embed_image(self, path):
+            self.calls += 1
+            raise RuntimeError("429 Too Many Requests")
+
+        async def embed_text(self, text):
+            return [0.0] * dim
+
+    bad = AlwaysFail()
+    original = runtime.providers.multimodal
+    runtime.providers.multimodal = bad  # type: ignore[assignment]
+    try:
+        result = await pipeline.ingest_markdown(
+            title="失败可见用例.md",
+            markdown="# 图\n\n见附图。\n",
+            kb_id=int(summary["kb_id"]),
+            level=1,
+            visible_dept_ids=[],
+            real_corpus=False,
+            figures=(FigureInput(image_path=rel, caption="某图", ocr_text="", page=1),),
+        )
+    finally:
+        runtime.providers.multimodal = original  # type: ignore[assignment]
+
+    assert bad.calls == int(runtime.settings.models.multimodal_embed.max_retries)
+    assert result.figure_vectors_failed == 1, "失败必须可观测（否则就是静默的「存了但搜不到」）"
+    assert result.status == "published", "图片旁路失败不该让整篇文档失败"

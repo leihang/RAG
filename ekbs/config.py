@@ -165,7 +165,12 @@ class MultimodalEmbedCfg(_Section):
     base_url: str = "https://dashscope.aliyuncs.com"
     version: str | None = None
     timeout_s: float = 60.0
-    max_retries: int = 2
+    #: 单张图向量化失败的重试次数。实测该端点会偶发连接错误/限流
+    #: （`HTTPSConnectionPool(host='dashscope.aliyuncs.com')`）：旧实现一次失败就跳过 →
+    #: 图片进库却没有向量（「存了但搜不到」），文档照样 published。
+    max_retries: int = 3
+    #: 重试退避基数（秒）：第 n 次重试等待 `retry_backoff_s * n`
+    retry_backoff_s: float = 1.0
 
 
 class LLMFallbackCfg(_Section):
