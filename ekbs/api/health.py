@@ -110,6 +110,9 @@ async def health_deps(request: Request) -> JSONResponse:
         # 期望是 `qwen:<path>`；若是 `tiktoken:cl100k_base` 说明词表没就位，
         # 尺寸判定/质量指标会偏（实测 -35%），这里显式暴露以免"悄悄降级"。
         "token_counter": active_token_counter(),
+        # 校准状态：系数与样本数（`02` TC-INDEX-004）。factor 缺失 = 还没校准过或换了模型，
+        # 此时 token 指标只是"本地估算"，别当成云端当量。
+        "token_calibration": _token_calibration(runtime),
         # —— 网络探针：缓存 60s（会出网、会计费）
         **probes,
     }
@@ -117,6 +120,14 @@ async def health_deps(request: Request) -> JSONResponse:
         # 无 active 分片是「未建分片」而非「不健康」，给 readiness 之外的明确信号
         payload["note"] = "尚无 active 分片（01 §6.3：先用 ekbs.tools.new_shard 建分片）"
     return JSONResponse(payload, status_code=200 if _deps_healthy(payload) else 503)
+
+
+def _token_calibration(runtime: Any) -> dict[str, Any] | None:
+    """当前嵌入指纹下的校准系数（没校准/换模型后返回 None）。"""
+    from ekbs.ingest import token_calib
+
+    calibration = token_calib.load(runtime.settings.data_dir, runtime.providers.embed.ref.fingerprint)
+    return calibration.as_dict() if calibration else None
 
 
 def _deps_healthy(payload: dict[str, Any]) -> bool:

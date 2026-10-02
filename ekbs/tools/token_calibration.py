@@ -50,6 +50,19 @@ def _load_embed_model() -> str:
     return str(load_settings().models.embed.model)
 
 
+def _current_fingerprint(settings) -> str:
+    """当前嵌入模型指纹（校准必须绑定它：换模型旧系数自动失效）。"""
+    try:
+        from ekbs.provider.base import model_ref
+
+        return model_ref(
+            settings.models.embed.provider, settings.models.embed.model,
+            dim=settings.models.embed.dim, version=settings.models.embed.version,
+        ).fingerprint
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _cjk_ratio(text: str) -> float:
     return sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff") / max(1, len(text))
 
@@ -126,6 +139,10 @@ def sample_from_files(limit: int, source_dirs: list[pathlib.Path]) -> list[str]:
     return segs
 
 
+class QuotaExceeded(RuntimeError):
+    """云端额度不足（不是口径问题，需要人去控制台处理）。"""
+
+
 def cloud_total(texts: list[str], *, model: str, endpoint: str) -> int:
     resp = httpx.post(
         endpoint,
@@ -135,16 +152,43 @@ def cloud_total(texts: list[str], *, model: str, endpoint: str) -> int:
     )
     data = resp.json()
     if "usage" not in data:
-        raise RuntimeError(f"云端未返回 usage：{json.dumps(data, ensure_ascii=False)[:200]}")
+        message = str((data.get("error") or {}).get("message") or data)[:220]
+        # 配额用尽是最常见的一种（实测踩到：一次入库 18.8 万 token 就把日额度打满）。
+        # 要点：**这不是代码/口径问题**，且它会同时让新文档的入库嵌入失败 —— 必须说清楚。
+        if "quota" in message.lower() or "limit" in message.lower():
+            raise QuotaExceeded(
+                "云端额度不足，无法取真值：" + message
+                + "\n   → 先去 DashScope 控制台确认套餐/额度；在恢复之前，"
+                  "新文档的入库嵌入也会失败（校准记录会缺这一篇）"
+            )
+        raise RuntimeError(f"云端未返回 usage：{message}")
     return int(data["usage"]["total_tokens"])
 
 
-def local_counters():
-    """返回 {口径名: 计数函数}。第一个是**当前生效口径**。"""
+def local_counters(with_calibration: bool = False):
+    """返回 {口径名: 计数函数}。第一个是**当前生效口径**。
+
+    ``with_calibration=True`` 时追加一列"校准后"（本地 × 云端真值聚合出的系数）——
+    这是"准确度测试"要看的那一列：校准的意义就是把它的偏差压进阈值。
+    """
     chunker = importlib.import_module("ekbs.ingest.chunker")
     counters: dict[str, object] = {}
     active = chunker.active_token_counter()
     counters[f"当前生效（{active.split(':')[0]}）"] = chunker.count_tokens
+    if with_calibration:
+        from ekbs.config import load_settings
+
+        from ekbs.ingest import token_calib
+
+        settings = load_settings()
+        calibration = token_calib.load(
+            settings.data_dir, _current_fingerprint(settings)
+        )
+        if calibration:
+            factor = calibration.factor
+            counters[f"校准后（×{factor:.3f}）"] = (
+                lambda t, _f=factor: int(round(chunker.count_tokens(t) * _f))
+            )
     try:  # 对照项：老口径（帮助判断"换了词表改善多少"）
         import tiktoken
 
@@ -210,6 +254,55 @@ def report(segs: list[str], counters, *, model: str, endpoint: str, batch: int,
     return 0 if active_ok else 1
 
 
+def from_records(*, min_samples: int) -> int:
+    """用入库时记下的云端真值聚合校准系数（不出网）。"""
+    from ekbs.config import load_settings
+
+    from ekbs.ingest import token_calib
+
+    settings = load_settings()
+    fingerprint = _current_fingerprint(settings)
+    path = token_calib.records_path(settings.data_dir)
+    if not path.is_file():
+        print(f"还没有校准记录（{path}）—— 先导入至少一篇文档，入库时会自动记录")
+        return 1
+    entries = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    matched = [e for e in entries if not fingerprint or e.get("fingerprint") == fingerprint]
+    print(f"\n记录 {len(entries)} 条；匹配当前模型指纹 {len(matched)} 条（fingerprint={fingerprint[:24]}…）")
+    print(f"  {'doc':>5}{'云端真值':>10}{'本地估算':>10}{'比例':>8}")
+    for e in matched:
+        print(f"  {e['doc_id']:>5}{e['cloud_tokens']:>10}{e['local_tokens']:>10}{e['ratio']:>8.3f}")
+    calibration = token_calib.summarize(settings.data_dir, fingerprint, min_samples=min_samples)
+    if calibration is None:
+        print(f"\n样本不足 {min_samples} 条（或数据不全）→ 暂不写系数（避免单篇把全局口径带偏）")
+        return 0
+    written = token_calib.write_factor(settings.data_dir, calibration)
+    print(
+        f"\n  逐篇比例中位数 {calibration.median_ratio:.4f}（"
+        f"加权系数 {calibration.factor:.4f} 会被最大那篇主导，两者都列出来供你判断）"
+    )
+    over = 0
+    for e in matched:
+        after = (e["local_tokens"] * calibration.factor - e["cloud_tokens"]) / e["cloud_tokens"] * 100
+        over += abs(after) > 5
+    print(f"  套用加权系数后：{len(matched) - over}/{len(matched)} 篇在 ±5% 内（{over} 篇仍超）")
+    print(
+        f"\n  聚合：云端 {calibration.cloud_tokens} / 本地 {calibration.local_tokens}"
+        f" → 系数 {calibration.factor:.4f}（校准前偏差 {calibration.deviation_pct:+.1f}%）"
+        f"\n  已写入 {written}（绑定指纹，换模型自动失效）"
+    )
+    print(
+        f"  复核方式：校准后偏差应≈0%（系数就是按它算的）；真正要看的是"
+        f"\n    python -m ekbs.tools.token_calibration --source files --segments 200"
+        f"  ← 用**独立样本**验证校准是否泛化"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="TC-INDEX-004 本地 token 计数校准")
     ap.add_argument("--segments", type=int, default=200, help="抽样段数（规格：200）")
@@ -220,7 +313,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fail-over", type=float, default=5.0, help="偏差阈值（默认 5%%）")
     ap.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     ap.add_argument("--no-cloud", action="store_true", help="只打印本地计数，不出网")
+    ap.add_argument(
+        "--from-records", action="store_true",
+        help="不出网：直接用入库时记下的云端真值（token_calibration.jsonl）聚合系数并落盘",
+    )
     args = ap.parse_args(argv)
+
+    if args.from_records:
+        return from_records(min_samples=args.segments if args.segments < 3 else 3)
 
     if args.source == "chunks":
         segs = sample_from_chunks(args.segments)
@@ -236,8 +336,17 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_cloud and not os.environ.get("DASHSCOPE_API_KEY"):
         print("缺少 DASHSCOPE_API_KEY（或加 --no-cloud）")
         return 1
+    try:
+        return _report_entry(segs, args)
+    except QuotaExceeded as exc:
+        print(f"\n❌ {exc}")
+        return 2
+
+
+def _report_entry(segs, args) -> int:
     return report(
-        segs, local_counters(), model=_load_embed_model() if not args.no_cloud else "n/a",
+        segs, local_counters(with_calibration=not args.no_cloud),
+        model=_load_embed_model() if not args.no_cloud else "n/a",
         endpoint=args.endpoint, batch=args.batch, fail_over=args.fail_over,
         use_cloud=not args.no_cloud,
     )

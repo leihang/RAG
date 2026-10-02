@@ -29,6 +29,7 @@ from ekbs.index.fts import FtsIndex
 from ekbs.index.shard import parse_shard_id, resolve_shard_for_document
 from ekbs.ingest.code_chunker import chunk_code, display_source_path, is_code_source
 from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE, retrievable_chunk_ids
+from ekbs.ingest import token_calib
 from ekbs.ingest.clean import clean_markdown
 from ekbs.ingest.chunker import (
     CHILD_MAX_TOKENS,
@@ -61,6 +62,10 @@ class IngestResult:
     #: 图片向量化**失败**的张数（重试后仍失败）—— 这些图片块会「存了但搜不到」，
     #: 必须能被上游看见（旧实现只记一条 warning，文档照样 published）
     figure_vectors_failed: int = 0
+    #: 本次入库**云端真实** token 用量（`usage.total_tokens` 累计）与本地估算值 ——
+    #: 校准 `TC-INDEX-004` 的一对真值；比值 >1 表示本地偏低。0 表示该模型没上报 usage。
+    cloud_tokens: int = 0
+    local_tokens: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -71,6 +76,8 @@ class IngestResult:
             "vector_count": self.vector_count,
             "figure_vector_count": self.figure_vector_count,
             "figure_vectors_failed": self.figure_vectors_failed,
+            "cloud_tokens": self.cloud_tokens,
+            "local_tokens": self.local_tokens,
             "status": self.status,
             "checksum": self.checksum,
         }
@@ -166,6 +173,8 @@ class IngestPipeline:
         try:
             figure_vector_count = 0
             figure_vectors_failed = 0
+            cloud_tokens = 0
+            local_tokens = 0
             # 代码文件走**代码感知分块**（按函数/类切，path+符号进 heading_path）：
             # 定长/Markdown 分块会把函数从中间切断，代码检索效果很差。
             if is_code_source(source_path):
@@ -195,7 +204,9 @@ class IngestPipeline:
                 )
             self._insert_chunks(doc_id, shard_id, chunking.nodes)
             child_ids = self._child_chunk_ids(doc_id)
-            vectors = await self._embed_children(doc_id, child_ids)
+            vectors, embed_stats = await self._embed_children(doc_id, child_ids)
+            cloud_tokens = int(embed_stats.get("cloud_tokens") or 0)
+            local_tokens = int(embed_stats.get("local_tokens") or 0)
             if vectors is not None and len(vectors):
                 self.shards.append(shard_id, child_ids, vectors)
             figure_vector_count, figure_vectors_failed = (
@@ -221,6 +232,8 @@ class IngestPipeline:
             vector_count=len(child_ids),
             figure_vector_count=figure_vector_count,
             figure_vectors_failed=figure_vectors_failed,
+            cloud_tokens=cloud_tokens,
+            local_tokens=local_tokens,
             status="published",
             checksum=checksum,
         )
@@ -385,11 +398,17 @@ class IngestPipeline:
 
     async def _embed_children(self, doc_id: int, chunk_ids: Sequence[int]):
         """分批嵌入（``models.embed.batch_size``）—— **子块 + 图片块**，
-        入库期失败按 `00` §2.3 排队重试。"""
+        入库期失败按 `00` §2.3 排队重试。
+
+        同时**顺手完成 token 校准的一条记录**：本方法知道"发给嵌入模型的正是这些文本"，
+        所以能把「Σ本地估算（retrieval_text）」与「云端 `usage.total_tokens`」配成一对，
+        写进 `ekbs.ingest.token_calib`（`02` TC-INDEX-004 的真值锚点）。
+        这是唯一能拿到"同一批文本的云端真值"的位置 —— 出了这个方法就对不上了。
+        """
         import numpy as np
 
         if not chunk_ids:
-            return None
+            return None, {}
         with self.db.sync_connect() as conn:
             rows = conn.execute(
                 "SELECT c.chunk_id, c.content, c.heading_path FROM ekbs_chunk c "
@@ -398,18 +417,36 @@ class IngestPipeline:
             ).fetchall()
         # 嵌入的是「标题路径 + 正文」（口径唯一，见 chunker.retrieval_text）
         texts = [retrieval_text(r["heading_path"], str(r["content"])) for r in rows]
+        local_tokens = sum(count_tokens(text) for text in texts)
+        pop_usage = getattr(self.providers.embed, "pop_usage", None)
+        if callable(pop_usage):  # 清账：别把上一篇/别的用途的用量算到这一篇头上
+            pop_usage()
         batch_size = max(1, int(self.settings.models.embed.batch_size))
         vectors: list[list[float]] = []
         for start in range(0, len(texts), batch_size):
             batch = texts[start : start + batch_size]
             vectors.extend(await self.providers.embed.embed(batch))
+        stats: dict[str, int] = {"local_tokens": local_tokens}
+        if callable(pop_usage):
+            cloud_tokens, calls = pop_usage()
+            stats["cloud_tokens"] = int(cloud_tokens)
+            stats["cloud_calls"] = int(calls)
+            calibration = token_calib.record(
+                self.settings.data_dir,
+                doc_id=doc_id,
+                fingerprint=self.providers.embed.ref.fingerprint,
+                cloud_tokens=int(cloud_tokens),
+                local_tokens=local_tokens,
+            )
+            if calibration:
+                stats["ratio"] = int(round(calibration["ratio"] * 1000))
         array = np.asarray(vectors, dtype="float32")
         expected_dim = int(self.providers.embed.ref.dim or 0)
         if expected_dim and array.shape[1] != expected_dim:
             raise ConfigError(
                 f"嵌入维度 {array.shape[1]} ≠ 配置 dim {expected_dim}（C3：模型与配置不一致）"
             )
-        return array
+        return array, stats
 
     async def _embed_figures_multimodal(self, doc_id: int) -> tuple[int, int]:
         """figure 块再写一路多模态图像向量（与文本 FAISS 分索引，维度通常 1152）。"""

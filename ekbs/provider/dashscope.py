@@ -94,6 +94,10 @@ class DashScopeEmbeddingProvider(EmbeddingProvider):
         self.api_key = api_key
         self.base_url = resolve_base_url(base_url, DEFAULT_BASE_URL)
         self.retry_base_delay = retry_base_delay
+        #: 云端真实 token 用量累计（`usage.total_tokens`）。校准 `TC-INDEX-004` 的唯一真值锚点：
+        #: 调用本来就要发，**记录它零成本**，而不记录就只能靠估算（实测偏差 −35%）。
+        self.usage_total = 0
+        self.usage_calls = 0
         # 双保险：即便配置写大了也不会把非法请求发出去（01 §7 曾写 20）
         cap = embed_max_batch(ref.model)
         self.batch_size = max(1, min(int(batch_size), cap))
@@ -136,6 +140,16 @@ class DashScopeEmbeddingProvider(EmbeddingProvider):
         vectors = await self.embed([text])
         return vectors[0]
 
+    def pop_usage(self) -> tuple[int, int]:
+        """取走并清零累计的云端用量，返回 ``(total_tokens, calls)``。
+
+        为什么是"取走"而不是"只读"：入库侧要按**文档**记账（校准是按文档做的），
+        不清零就会把上一篇的用量算到这一篇头上。
+        """
+        total, calls = self.usage_total, self.usage_calls
+        self.usage_total, self.usage_calls = 0, 0
+        return total, calls
+
     async def _embed_batch(self, client: httpx.AsyncClient, batch: Sequence[str]) -> list[list[float]]:
         url = f"{self.base_url}{COMPATIBLE_PATH}/embeddings"
         body = {
@@ -154,6 +168,12 @@ class DashScopeEmbeddingProvider(EmbeddingProvider):
             raise to_provider_error(exc, "embed") from exc
 
         payload = response.json()
+        # 云端真实用量：`02` TC-INDEX-004 要求本地计数与它偏差 ≤5%，所以必须留下这个数
+        usage = payload.get("usage") or {}
+        total_tokens = int(usage.get("total_tokens") or usage.get("prompt_tokens") or 0)
+        if total_tokens:
+            self.usage_total += total_tokens
+            self.usage_calls += 1
         rows = payload.get("data") or []
         if not rows:
             raise to_provider_error(
