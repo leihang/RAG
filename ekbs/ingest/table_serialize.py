@@ -148,3 +148,64 @@ def serialize_table_body(*, caption: str = "", body: str = "", table_id: str = "
     return serialize_information_blocks(
         caption=caption, rows=coerce_rows(body), table_id=table_id
     )
+
+
+def information_block_to_html(text: str) -> str | None:
+    """把入库的 ``information_block`` 还原成 HTML 表，供生成侧组装上下文。
+
+    课程 19 结论：喂给 LLM 时 HTML 对合并单元格/表头的理解优于纯 Markdown / 属性串。
+    还原失败返回 None（调用方回退原文）。
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    caption = ""
+    headers: list[str] = []
+    rows: list[list[str]] = []
+    for line in lines:
+        if line.startswith("表名:"):
+            caption = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("核心实体:"):
+            continue
+        if line.startswith("相关表头:"):
+            headers = [h.strip() for h in line.split(":", 1)[1].split("|") if h.strip()]
+            continue
+        if "=" in line and ";" in line:
+            cells_map = {}
+            for part in line.split(";"):
+                part = part.strip()
+                if "=" not in part:
+                    continue
+                key, _, value = part.partition("=")
+                cells_map[key.strip()] = value.strip()
+            if headers:
+                rows.append([cells_map.get(h, "") for h in headers])
+            elif cells_map:
+                if not headers:
+                    headers = list(cells_map.keys())
+                rows.append([cells_map.get(h, "") for h in headers])
+    if not headers or not rows:
+        return None
+    parts = ['<table border="1" cellpadding="4" cellspacing="0">']
+    if caption:
+        parts.append(f"<caption>{_xml_escape(caption)}</caption>")
+    parts.append("<thead><tr>")
+    parts.extend(f"<th>{_xml_escape(h)}</th>" for h in headers)
+    parts.append("</tr></thead><tbody>")
+    for row in rows:
+        parts.append("<tr>")
+        parts.extend(f"<td>{_xml_escape(c)}</td>" for c in row)
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
+def _xml_escape(value: str) -> str:
+    return (
+        (value or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )

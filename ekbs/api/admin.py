@@ -492,7 +492,7 @@ async def list_documents(
     sql = (
         "SELECT d.doc_id, d.kb_id, k.code AS kb_code, d.title, d.level, d.status, "
         "d.visible_dept_ids, d.page_count, d.doc_version, d.effective_date, d.expire_date, "
-        "d.updated_at, "
+        "d.updated_at, d.deleted_at, "
         "(SELECT c.shard_id FROM ekbs_chunk c WHERE c.doc_id = d.doc_id LIMIT 1) AS shard_id, "
         "(SELECT COUNT(*) FROM ekbs_chunk c WHERE c.doc_id = d.doc_id) AS chunk_count "
         "FROM ekbs_document d LEFT JOIN ekbs_kb k ON k.kb_id = d.kb_id "

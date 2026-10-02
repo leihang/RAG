@@ -199,6 +199,7 @@ async def seed_documents(runtime: Runtime, kb_id: int) -> list[dict[str, Any]]:
     pipeline = IngestPipeline(
         db=runtime.db, settings=runtime.settings, providers=runtime.providers,
         shards=runtime.shards, fts=runtime.fts,
+        figure_index=runtime.figure_index,
     )
     results: list[dict[str, Any]] = []
     # ⚠️ L3 入库闸（00 C5 / 01 §7）：默认 l3_ingest_enabled=false，**生产配置不得改**。

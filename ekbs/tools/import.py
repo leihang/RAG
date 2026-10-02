@@ -239,6 +239,7 @@ async def import_directory(
         pipeline = IngestPipeline(
             db=runtime.db, settings=settings, providers=runtime.providers,
             shards=runtime.shards, fts=runtime.fts,
+            figure_index=runtime.figure_index,
         )
         concurrency = max(1, min(int(parallel), MAX_PARALLEL))
         if int(parallel) > MAX_PARALLEL:

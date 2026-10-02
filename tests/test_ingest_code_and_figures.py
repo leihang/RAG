@@ -51,6 +51,7 @@ def _pipeline(runtime) -> IngestPipeline:
         providers=runtime.providers,
         shards=runtime.shards,
         fts=runtime.fts,
+        figure_index=runtime.figure_index,
     )
 
 
@@ -91,20 +92,21 @@ async def test_code_source_is_routed_to_code_chunker(seeded) -> None:
     assert all(row["faiss_row"] is not None for row in rows), "有块没进 FAISS 分片"
     assert all(row["embedding_fingerprint"] for row in rows), "有块没记模型指纹"
 
-    # 「存了」必须等于「搜得到」：SQLite 块数 == FTS 行数 == 分片登记向量数。
-    # 这三方对账就是 03 §5.4 的差异率口径；任一不等都意味着检索侧会漏内容。
+    # 「存了」必须等于「搜得到」：可检索块数 == FTS 覆盖的 distinct chunk == 分片向量数。
+    # Doc2Query 会让同一 chunk 多行 FTS（问题+原文），所以对账按 **distinct chunk_id**，
+    # 不是 raw FTS 行数（否则会把假设问句当成多块）。
     with runtime.db.sync_connect() as conn:
         fts_rows = int(
             conn.execute(
-                "SELECT COUNT(*) FROM ekbs_chunk_fts f JOIN ekbs_chunk c "
-                "ON c.chunk_id = f.chunk_id WHERE c.doc_id = ?",
+                "SELECT COUNT(DISTINCT f.chunk_id) FROM ekbs_chunk_fts f JOIN ekbs_chunk c "
+                "ON c.chunk_id = CAST(f.chunk_id AS INTEGER) WHERE c.doc_id = ?",
                 (result.doc_id,),
             ).fetchone()[0]
         )
     registered = {
         row.shard_id: row.vector_count for row in runtime.shards.registry()
     }[result.shard_id]
-    assert fts_rows == result.vector_count, f"FTS {fts_rows} ≠ 向量 {result.vector_count}"
+    assert fts_rows == result.vector_count, f"FTS distinct {fts_rows} ≠ 向量 {result.vector_count}"
     assert registered == before_vectors + result.vector_count, (
         f"分片登记向量 {registered} ≠ 入库前 {before_vectors} + {result.vector_count}"
     )
@@ -193,8 +195,15 @@ async def test_figure_becomes_searchable_chunk(seeded) -> None:
             (result.doc_id,),
         ).fetchall()
         fts_rows = conn.execute(
+            "SELECT COUNT(DISTINCT f.chunk_id) AS n FROM ekbs_chunk_fts f JOIN ekbs_chunk c "
+            "ON c.chunk_id = CAST(f.chunk_id AS INTEGER) "
+            "WHERE c.doc_id = ? AND c.chunk_type = 'figure'",
+            (result.doc_id,),
+        ).fetchone()["n"]
+        fts_raw = conn.execute(
             "SELECT COUNT(*) AS n FROM ekbs_chunk_fts f JOIN ekbs_chunk c "
-            "ON c.chunk_id = f.chunk_id WHERE c.doc_id = ? AND c.chunk_type = 'figure'",
+            "ON c.chunk_id = CAST(f.chunk_id AS INTEGER) "
+            "WHERE c.doc_id = ? AND c.chunk_type = 'figure'",
             (result.doc_id,),
         ).fetchone()["n"]
 
@@ -206,6 +215,7 @@ async def test_figure_becomes_searchable_chunk(seeded) -> None:
     assert fig["faiss_row"] is not None, "figure 块没进向量分片，图上文字就检索不到"
     assert ocr_text.split()[0] in (fig["content"] or ""), fig["content"]
     assert fts_rows == 1, "figure 块没进 FTS，关键词检索会漏图"
+    assert fts_raw >= 1, "Doc2Query 后 FTS 至少保留原文行"
     assert image_abs.exists(), "图片文件应当仍留在磁盘上（否则引用打不开）"
 
 

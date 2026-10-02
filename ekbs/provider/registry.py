@@ -10,8 +10,19 @@ from dataclasses import dataclass
 
 from ekbs.config import Secrets, Settings
 from ekbs.errors import ConfigError
-from ekbs.provider.base import EmbeddingProvider, LLMProvider, RerankProvider, model_ref
-from ekbs.provider.mock import MockEmbeddingProvider, MockLLMProvider, MockRerankProvider
+from ekbs.provider.base import (
+    EmbeddingProvider,
+    LLMProvider,
+    MultimodalEmbeddingProvider,
+    RerankProvider,
+    model_ref,
+)
+from ekbs.provider.mock import (
+    MockEmbeddingProvider,
+    MockLLMProvider,
+    MockMultimodalEmbeddingProvider,
+    MockRerankProvider,
+)
 
 #: 已知 provider 名（用于配置校验与错误提示）
 KNOWN_PROVIDERS = ("mock", "dashscope", "deepseek")
@@ -26,6 +37,8 @@ class Providers:
     llm: LLMProvider
     #: 视觉模型（给图片写描述）。**可选**：没配就退回"题注/页标题/OCR"那几条路径。
     vision: LLMProvider | None = None
+    #: 多模态嵌入（figure 旁路索引）。``retrieval.figure_multimodal=false`` 或未配 model 时为 None。
+    multimodal: MultimodalEmbeddingProvider | None = None
 
 
 def build_embedding(settings: Settings, secrets: Secrets) -> EmbeddingProvider:
@@ -117,6 +130,32 @@ def build_vision(settings: Settings, secrets: Secrets) -> LLMProvider | None:
     return _build_compatible_llm(cfg, secrets, what="视觉")
 
 
+def build_multimodal(
+    settings: Settings, secrets: Secrets
+) -> MultimodalEmbeddingProvider | None:
+    """figure 多模态嵌入。``retrieval.figure_multimodal=false`` 或未配 model → None。"""
+    if not bool(getattr(settings.retrieval, "figure_multimodal", False)):
+        return None
+    cfg = settings.models.multimodal_embed
+    if not cfg.model:
+        return None
+    ref = model_ref(cfg.provider, cfg.model, dim=cfg.dim, version=cfg.version)
+    if cfg.provider == "mock":
+        return MockMultimodalEmbeddingProvider(
+            dim=cfg.dim, provider=ref.provider, model=ref.model
+        )
+    if cfg.provider == "dashscope":
+        secrets.require("DASHSCOPE_API_KEY")
+        from ekbs.provider.dashscope import DashScopeMultimodalEmbeddingProvider
+
+        return DashScopeMultimodalEmbeddingProvider(
+            ref=ref,
+            api_key=secrets.get("DASHSCOPE_API_KEY"),
+            timeout_s=cfg.timeout_s,
+        )
+    raise ConfigError(f"未知的多模态嵌入 provider：{cfg.provider}")
+
+
 def build_providers(settings: Settings, secrets: Secrets | None = None) -> Providers:
     secrets = secrets or Secrets()
     return Providers(
@@ -124,4 +163,5 @@ def build_providers(settings: Settings, secrets: Secrets | None = None) -> Provi
         rerank=build_rerank(settings, secrets),
         llm=build_llm(settings, secrets),
         vision=build_vision(settings, secrets),
+        multimodal=build_multimodal(settings, secrets),
     )

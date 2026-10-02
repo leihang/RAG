@@ -37,6 +37,40 @@ def rrf_fuse(
     return sorted(scores.items(), key=lambda pair: (-pair[1], str(pair[0])))
 
 
+def alpha_fuse(
+    dense: Sequence[tuple[T, float]],
+    sparse: Sequence[tuple[T, float]],
+    *,
+    alpha: float = 0.5,
+) -> list[tuple[T, float]]:
+    """加权分数融合：``Score = α·dense_norm + (1-α)·sparse_norm``（课程 18）。
+
+    * ``dense`` / ``sparse``：``(id, raw_score)``，**越高越相关**（BM25 调用方须先取负）。
+    * 各路先 min-max 归一到 [0,1]；单路只有一个点时记 1.0。
+    * ``alpha=1`` 纯向量，``alpha=0`` 纯稀疏；默认 0.5。
+    """
+    alpha = max(0.0, min(1.0, float(alpha)))
+    dense_n = _minmax_norm(dense)
+    sparse_n = _minmax_norm(sparse)
+    ids = set(dense_n) | set(sparse_n)
+    fused = {
+        item: alpha * dense_n.get(item, 0.0) + (1.0 - alpha) * sparse_n.get(item, 0.0)
+        for item in ids
+    }
+    return sorted(fused.items(), key=lambda pair: (-pair[1], str(pair[0])))
+
+
+def _minmax_norm(scored: Sequence[tuple[T, float]]) -> dict[T, float]:
+    if not scored:
+        return {}
+    values = [float(score) for _, score in scored]
+    lo, hi = min(values), max(values)
+    if hi <= lo:
+        return {item: 1.0 for item, _ in scored}
+    span = hi - lo
+    return {item: (float(score) - lo) / span for item, score in scored}
+
+
 def ranks_of(ranking: Sequence[T]) -> dict[T, int]:
     """id → 1-based 名次（用于审计与调试）。"""
     return {item: position for position, item in enumerate(ranking, start=1)}

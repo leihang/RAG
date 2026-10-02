@@ -273,6 +273,36 @@ def list_children(settings: Settings, rel: str = "") -> dict[str, Any]:
     }
 
 
+def list_descendant_dirs(settings: Settings, rel: str = "") -> list[str]:
+    """列出 ``rel`` 下**全部子孙目录**的相对路径（相对 ``rel`` 本身，不含 ``.``）。
+
+    供上传页「保存到文件夹」下拉使用：一次拿齐，不必逐层点。
+    """
+    target = resolve_within_raw(settings, rel)
+    if not target.exists():
+        raise FileNotFoundError(f"目录不存在：{rel or 'raw'}")
+    if not target.is_dir():
+        raise NotADirectoryError(f"不是目录：{rel}")
+    root = raw_root(settings).resolve()
+    base = target.resolve()
+    out: list[str] = []
+    try:
+        candidates = sorted(base.rglob("*"), key=lambda p: str(p).lower())
+    except OSError:  # pragma: no cover
+        return out
+    for path in candidates:
+        if path.name.startswith(".") or not path.is_dir():
+            continue
+        try:
+            path.resolve().relative_to(root)
+        except ValueError:
+            continue
+        rel_under = path.relative_to(base).as_posix()
+        if rel_under and rel_under != ".":
+            out.append(rel_under)
+    return out
+
+
 def scan_directory(
     settings: Settings,
     db: Database,

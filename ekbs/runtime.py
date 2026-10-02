@@ -20,6 +20,7 @@ from ekbs.config import Secrets, Settings, load_settings
 from ekbs.db import Database, SchemaReport
 from ekbs.errors import EmbeddingFingerprintMismatch
 from ekbs.index.faiss_store import ShardIndexManager
+from ekbs.index.figure_faiss import FigureIndex
 from ekbs.index.fts import FtsIndex
 from ekbs.logging import configure_logging, get_logger
 from ekbs.permission.acl import DocumentGate
@@ -51,6 +52,8 @@ class Runtime:
     content_guard: ContentGuard
     authz: AuthzService
     schema: SchemaReport
+    #: figure 多模态旁路索引；未启用时为 None
+    figure_index: FigureIndex | None = None
 
     # ------------------------------------------------------------------
     # 构造
@@ -84,6 +87,19 @@ class Runtime:
         )
         fts = FtsIndex(db)
 
+        figure_index: FigureIndex | None = None
+        if providers.multimodal is not None:
+            mm_dim = int(providers.multimodal.ref.dim or settings.models.multimodal_embed.dim)
+            figure_path = settings.data_paths()["index"] / "figures.faiss"
+            figure_index = FigureIndex(figure_path, dim=mm_dim)
+            log.info(
+                "figure_index_ready",
+                path=str(figure_path),
+                dim=mm_dim,
+                vectors=figure_index.vector_count,
+                model=providers.multimodal.ref.ident,
+            )
+
         # 启动自检②：分片指纹一致性（C3）。全部不符 → 拒绝启动。
         active = shards.registry()
         if active:
@@ -100,7 +116,7 @@ class Runtime:
         pipeline = RetrievalPipeline(
             db=db, settings=settings, providers=providers, cache=cache, gate=gate,
             shard_manager=shards, fts=fts, session_store=sessions, rewriter=rewriter,
-            content_guard=content_guard,
+            content_guard=content_guard, figure_index=figure_index,
         )
         rate_limiter = RateLimiter(db, settings)
         log.info(
@@ -112,6 +128,9 @@ class Runtime:
             triggers=schema.triggers,
             embed=providers.embed.ref.ident,
             embed_fingerprint=providers.embed.ref.fingerprint[:12],
+            multimodal=(
+                providers.multimodal.ref.ident if providers.multimodal else "disabled"
+            ),
             rerank=providers.rerank.ref.ident if providers.rerank else "disabled",
             llm=providers.llm.ref.ident,
             corpus_egress_ack=settings.permission.corpus_egress_ack,
@@ -121,7 +140,7 @@ class Runtime:
             settings=settings, secrets=secrets, db=db, providers=providers, cache=cache,
             router=router, gate=gate, shards=shards, fts=fts, pipeline=pipeline,
             rate_limiter=rate_limiter, sessions=sessions, content_guard=content_guard,
-            authz=authz, schema=schema,
+            authz=authz, schema=schema, figure_index=figure_index,
         )
 
     # ------------------------------------------------------------------

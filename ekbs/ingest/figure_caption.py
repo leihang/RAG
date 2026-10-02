@@ -39,13 +39,19 @@ from ekbs.logging import get_logger
 
 log = get_logger(component="ingest.figure_caption")
 
-#: 提示词：要的是"能当检索文本用"的一句话，不是客套话。
-#: 明确要求把图表里的数字/趋势写出来 —— 实测这一句能显著提高描述的检索价值。
+#: 缓存版本：改提示词后必须 bump，否则旧描述会命中缓存、重解析白跑。
+CAPTION_CACHE_VERSION = "v2-extract-text"
+
+#: 提示词：检索文本优先「抄录图中可读文字」，图表再补数字/趋势。
+#: v1 只要求「一句话描述」，截图类图会变成「展示四个网站页面…」而丢掉页面上的字。
 CAPTION_PROMPT = (
-    "用一句中文描述这张图的内容，供全文检索使用。"
-    "如果是图表，把关键数字与趋势写出来（包含单位和年份）；"
-    "如果是现场照片，写清是什么设施、什么场景、有任何可见的文字/型号/读数也写出来。"
-    "只输出描述本身，不要客套话，不要用 Markdown。"
+    "这张图将用于全文检索。请用中文输出可检索文本，规则：\n"
+    "1. 优先完整抄录图中所有可读文字（标题、正文、列表、按钮、表格单元格、水印、角标），"
+    "按阅读顺序组织，保留关键专有名词与数字；\n"
+    "2. 若是图表/示意图：在抄录可见标注之外，补充关键数字、单位、年份与趋势；\n"
+    "3. 若是现场照片：写清设施/场景，并抄录可见的型号、读数、铭牌文字；\n"
+    "4. 图中确实无可读文字时写「无可读文字」并加一句场景描述；不要编造看不清的内容；\n"
+    "5. 只输出检索文本本身，不要客套话，不要用 Markdown。"
 )
 
 #: 单张图的图片体积上限（超过就不送）：避免把超大图整张塞进请求。
@@ -71,6 +77,9 @@ def read_cached_caption(data_dir: Path, image_name: str) -> str | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:  # 缓存损坏就当没有，不要让它挡住入库
         return None
+    # 旧版提示词产物一律作废（否则重解析仍复用「一句话描述」）
+    if str(payload.get("prompt_version") or "") != CAPTION_CACHE_VERSION:
+        return None
     text = str(payload.get("caption") or "").strip()
     return text or None
 
@@ -80,7 +89,12 @@ def write_cached_caption(data_dir: Path, image_name: str, caption: str, *, model
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
-            {"caption": caption, "model": model, "at": int(time.time())},
+            {
+                "caption": caption,
+                "model": model,
+                "prompt_version": CAPTION_CACHE_VERSION,
+                "at": int(time.time()),
+            },
             ensure_ascii=False,
         ),
         encoding="utf-8",

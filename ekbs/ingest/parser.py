@@ -143,21 +143,17 @@ def parse_file(
         engine = SUFFIX_ENGINES.get(suffix, "text")
 
     if engine == "text":
-        return ParsedDocument(
-            markdown=target.read_text(encoding="utf-8", errors="replace"),
-            engine="text",
-            source_path=str(target),
-        )
+        return _parse_text(target, assets_dir=assets_dir)
     if engine == "docx":
-        return _parse_docx(target)
+        return _parse_docx(target, assets_dir=assets_dir)
     if engine == "xlsx":
-        return _parse_xlsx(target)
+        return _parse_xlsx(target, assets_dir=assets_dir)
     if engine == "doc":
-        return _parse_doc(target)
+        return _parse_doc(target, assets_dir=assets_dir)
     if engine == "pptx":
         return _parse_pptx(target, assets_dir=assets_dir)
     if engine == "xls":
-        return _parse_xls(target)
+        return _parse_xls(target, assets_dir=assets_dir)
     if engine == "mineru":
         return _parse_mineru(target, assets_dir=assets_dir)
     raise ParserUnavailable(f"未知解析引擎：{engine}")
@@ -175,7 +171,34 @@ def _rows_to_pipe_markdown(rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def _parse_docx(path: Path) -> ParsedDocument:
+#: OOXML / 磁盘图片后缀（落到 ``figures`` 的才认；emf/wmf 无通用解码器，仍落盘供回源）
+_IMAGE_EXTS = frozenset({
+    "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "emf", "wmf",
+})
+
+
+def _parse_text(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
+    """纯文本 / Markdown / 代码：读正文；Markdown 本地图片引用落盘为 figure，管道表升为 table。"""
+    markdown = path.read_text(encoding="utf-8", errors="replace")
+    tables: list[ParsedTable] = []
+    figures: list[ParsedFigure] = []
+    # 仅 Markdown 族抽表/图；``.py`` / ``.txt`` 里的 ``|`` 或路径不该当表格/配图
+    if path.suffix.lower() in {".md", ".markdown"}:
+        markdown, tables = _extract_markdown_pipe_tables(markdown)
+        markdown, figures = _extract_markdown_local_figures(
+            markdown, source_path=path, assets_dir=assets_dir
+        )
+    return ParsedDocument(
+        markdown=markdown,
+        engine="text",
+        source_path=str(path),
+        figures=figures,
+        tables=tables,
+    )
+
+
+def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
+    """`.docx` —— 按文档顺序抽段落、表格与**嵌入图片**（与 pptx 同口径进 ``figures``）。"""
     try:
         import docx  # python-docx
         from docx.oxml.ns import qn
@@ -187,12 +210,28 @@ def _parse_docx(path: Path) -> ParsedDocument:
     document = docx.Document(str(path))
     lines: list[str] = []
     tables: list[ParsedTable] = []
+    figures: list[ParsedFigure] = []
     table_seq = 0
+    seen_images: set[str] = set()
+    ocr_budget = [_figure_ocr_budget()]
+    textless: list[tuple[int, int]] = []
 
-    # 按文档顺序交错段落与表格，避免「全文段落完再甩表」打乱阅读/锚点位置
+    def _ingest_images(element: Any) -> None:
+        for blob, ext, caption in _docx_images_in_element(element, document):
+            added = _register_figure_blob(
+                blob, ext,
+                assets_dir=assets_dir, figures=figures, seen=seen_images,
+                caption=caption, page=None, ocr_budget=ocr_budget,
+                log_file=path.name,
+            )
+            if added and not figures[-1].caption and not figures[-1].ocr_text:
+                textless.append((len(figures) - 1, len(blob)))
+
+    # 按文档顺序交错段落 / 表格 / 图片，避免「全文段落完再甩表/图」打乱阅读位置
     for child in document.element.body.iterchildren():
         if child.tag == qn("w:p"):
             paragraph = Paragraph(child, document)
+            _ingest_images(child)
             text = (paragraph.text or "").strip()
             if not text:
                 continue
@@ -204,6 +243,7 @@ def _parse_docx(path: Path) -> ParsedDocument:
                 lines.append(text)
         elif child.tag == qn("w:tbl"):
             table = Table(child, document)
+            _ingest_images(child)
             rows: list[list[str]] = []
             for row in table.rows:
                 cells = [((cell.text or "").strip().replace("\n", " ")) for cell in row.cells]
@@ -218,15 +258,78 @@ def _parse_docx(path: Path) -> ParsedDocument:
             )
             lines.append(f"[表格 {table_seq}]")
 
+    # 兜底：正文遍历漏掉的关系图（页眉/页脚/文本框等）仍要落盘，否则等于丢图
+    for blob, ext, caption in _docx_images_from_rels(document):
+        added = _register_figure_blob(
+            blob, ext,
+            assets_dir=assets_dir, figures=figures, seen=seen_images,
+            caption=caption, page=None, ocr_budget=ocr_budget,
+            log_file=path.name,
+        )
+        if added and not figures[-1].caption and not figures[-1].ocr_text:
+            textless.append((len(figures) - 1, len(blob)))
+
+    # 再兜底：页眉/页脚的图挂在 **header/footer part** 的关系上，不在 document.part.rels；
+    # 实测交接班制度等 docx 的 logo 只在 word/header1.xml → word/media/，正文 blip=0。
+    for section in document.sections:
+        for part in (
+            getattr(section, "header", None),
+            getattr(section, "footer", None),
+            getattr(section, "first_page_header", None),
+            getattr(section, "first_page_footer", None),
+            getattr(section, "even_page_header", None),
+            getattr(section, "even_page_footer", None),
+        ):
+            if part is None:
+                continue
+            element = getattr(part, "_element", None)
+            if element is None:
+                continue
+            for blob, ext, caption in _docx_images_in_element(element, part):
+                added = _register_figure_blob(
+                    blob, ext,
+                    assets_dir=assets_dir, figures=figures, seen=seen_images,
+                    caption=caption, page=None, ocr_budget=ocr_budget,
+                    log_file=path.name,
+                )
+                if added and not figures[-1].caption and not figures[-1].ocr_text:
+                    textless.append((len(figures) - 1, len(blob)))
+
+    # zip 级兜底：任何 part 漏扫时仍能从 word/media/ 捞到栅格图（与 xlsx 同口径）
+    for blob, ext in _ooxml_media_blobs(path, prefix="word/media/"):
+        added = _register_figure_blob(
+            blob, ext,
+            assets_dir=assets_dir, figures=figures, seen=seen_images,
+            caption="", page=None, ocr_budget=ocr_budget,
+            log_file=path.name,
+        )
+        if added and not figures[-1].caption and not figures[-1].ocr_text:
+            textless.append((len(figures) - 1, len(blob)))
+
+    if textless:
+        title = path.stem.strip()
+        if title:
+            biggest = max(textless, key=lambda item: item[1])[0]
+            if not figures[biggest].caption and not figures[biggest].ocr_text:
+                figures[biggest].caption = title
+
+    if figures:
+        log.info("docx_figures_extracted", file=path.name, figures=len(figures))
+
     return ParsedDocument(
         markdown="\n".join(lines),
         engine="docx",
         source_path=str(path),
         tables=tables,
+        figures=figures,
     )
 
 
-def _parse_xlsx(path: Path) -> ParsedDocument:
+def _parse_xlsx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
+    """`.xlsx` —— 工作表 → 表格块；嵌入图片（``sheet._images`` / ``xl/media``）→ figure。
+
+    图表（``workbook._charts`` / sheet 上的 chart）抽成 ``ParsedTable``，与 PPT 图表同口径。
+    """
     try:
         import openpyxl
     except Exception as exc:  # pragma: no cover
@@ -235,8 +338,12 @@ def _parse_xlsx(path: Path) -> ParsedDocument:
     workbook = openpyxl.load_workbook(str(path), data_only=True)
     lines: list[str] = []
     tables: list[ParsedTable] = []
+    figures: list[ParsedFigure] = []
     table_seq = 0
-    for sheet in workbook.worksheets:
+    seen_images: set[str] = set()
+    ocr_budget = [_figure_ocr_budget()]
+
+    for sheet_index, sheet in enumerate(workbook.worksheets, start=1):
         lines.append(f"## {sheet.title}")
         rows: list[list[str]] = []
         for row in sheet.iter_rows(values_only=True):
@@ -251,18 +358,133 @@ def _parse_xlsx(path: Path) -> ParsedDocument:
                 ParsedTable(
                     body=body,
                     caption=sheet.title,
-                    page=None,
+                    page=sheet_index,
                     table_id=str(table_seq),
                 )
             )
             lines.append(f"[表格 {table_seq}] {sheet.title}".rstrip())
+
+        for image in getattr(sheet, "_images", []) or []:
+            try:
+                blob = image._data()  # noqa: SLF001 — openpyxl 无稳定公开 API
+            except Exception as exc:
+                log.warning("xlsx_image_unreadable", sheet=sheet.title, error=str(exc)[:80])
+                continue
+            ext = ""
+            path_hint = getattr(image, "path", None) or ""
+            if path_hint:
+                ext = Path(str(path_hint)).suffix.lstrip(".")
+            # 浮动图可能带旋转（openpyxl Image.rotation，单位度）
+            try:
+                rotate = float(getattr(image, "rotation", 0) or 0)
+            except Exception:
+                rotate = 0.0
+            _register_figure_blob(
+                blob, ext or "png",
+                assets_dir=assets_dir, figures=figures, seen=seen_images,
+                caption=sheet.title, page=sheet_index, ocr_budget=ocr_budget,
+                log_file=path.name, rotate_degrees=rotate,
+            )
+
+        for chart_rows, caption in _xlsx_sheet_chart_tables(sheet):
+            body = _rows_to_pipe_markdown(chart_rows)
+            if not body:
+                continue
+            table_seq += 1
+            tables.append(
+                ParsedTable(
+                    body=body,
+                    caption=caption or sheet.title,
+                    page=sheet_index,
+                    table_id=str(table_seq),
+                )
+            )
+            label = caption or sheet.title
+            lines.append(f"[表格 {table_seq}] {label}".rstrip())
         lines.append("")
+
+    # sheet._images 可能漏掉部分介质：再扫 zip 内 xl/media/（按内容摘要去重）
+    for blob, ext in _ooxml_media_blobs(path, prefix="xl/media/"):
+        _register_figure_blob(
+            blob, ext,
+            assets_dir=assets_dir, figures=figures, seen=seen_images,
+            caption=path.stem, page=None, ocr_budget=ocr_budget,
+            log_file=path.name,
+        )
+
+    if figures:
+        log.info("xlsx_figures_extracted", file=path.name, figures=len(figures))
+
     return ParsedDocument(
         markdown="\n".join(lines),
         engine="xlsx",
         source_path=str(path),
         tables=tables,
+        figures=figures,
     )
+
+
+def _xlsx_sheet_chart_tables(sheet: Any) -> Iterator[tuple[list[list[str]], str]]:
+    """从工作表上的 chart 尽量还原类别×系列数值表。"""
+    charts = list(getattr(sheet, "_charts", None) or [])
+    for chart in charts:
+        try:
+            title = ""
+            title_obj = getattr(chart, "title", None)
+            if title_obj is not None:
+                # openpyxl Title.tx.rich 或 title 字符串，尽量宽松
+                title = str(getattr(title_obj, "tx", None) or title_obj or "").strip()
+                if "Title()" in title or title.startswith("<"):
+                    title = ""
+            series_list = list(getattr(chart, "series", None) or [])
+            if not series_list:
+                continue
+            # 类别：取第一条 series 的 x 值；数值取 val
+            categories: list[str] = []
+            series_cols: list[tuple[str, list[str]]] = []
+            for index, series in enumerate(series_list, start=1):
+                name = str(getattr(series, "title", None) or f"系列{index}")
+                vals = []
+                try:
+                    val = series.val
+                    nums = getattr(val, "numRef", None) or getattr(val, "numLit", None)
+                    if nums is not None and getattr(nums, "pt", None):
+                        vals = [
+                            "" if pt.v is None else str(pt.v)
+                            for pt in nums.pt
+                        ]
+                    elif hasattr(series, "values"):
+                        vals = ["" if v is None else str(v) for v in (series.values or [])]
+                except Exception:
+                    vals = []
+                try:
+                    cat_ref = series.tx if False else getattr(series, "cat", None)
+                    if cat_ref is not None and not categories:
+                        strref = getattr(cat_ref, "strRef", None) or getattr(cat_ref, "numRef", None)
+                        pts = getattr(strref, "pt", None) if strref is not None else None
+                        if pts:
+                            categories = ["" if pt.v is None else str(pt.v) for pt in pts]
+                except Exception:
+                    pass
+                series_cols.append((name, vals))
+            if not series_cols:
+                continue
+            width = max((len(vals) for _, vals in series_cols), default=0)
+            if width <= 0:
+                continue
+            if not categories:
+                categories = [str(i) for i in range(1, width + 1)]
+            header = ["类别"] + [name for name, _ in series_cols]
+            rows: list[list[str]] = [header]
+            for row_index in range(width):
+                row = [categories[row_index] if row_index < len(categories) else ""]
+                for _, vals in series_cols:
+                    row.append(vals[row_index] if row_index < len(vals) else "")
+                rows.append(row)
+            yield rows, title
+        except Exception as exc:
+            log.warning("xlsx_chart_unreadable", error=str(exc)[:80])
+            continue
 
 
 def _cell_text(value: object) -> str:
@@ -272,7 +494,7 @@ def _cell_text(value: object) -> str:
     return "" if value is None else str(value).strip()
 
 
-def _parse_doc(path: Path) -> ParsedDocument:
+def _parse_doc(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
     """旧版 `.doc`（Word 97-2003）—— 用 **macOS 自带 `textutil`** 转成 docx 后复用 docx 分支。
 
     为什么是"转换"而不是"直接解析"：`.doc` 是 OLE 复合文档，Python 侧没有可靠的纯实现
@@ -281,6 +503,9 @@ def _parse_doc(path: Path) -> ParsedDocument:
     **不转就会落到 text 分支把二进制读成乱码**（实测 24 KB 的 .doc 读出 24450 字符乱码）。
 
     非 macOS（没有 `textutil`）时**明确报错**，不静默降级。
+
+    **图片**：``textutil`` 转 docx 时常丢掉嵌入图。转换后若 ``figures`` 仍空，
+    再对原 ``.doc`` 做 PNG/JPEG 魔数扫描作兜底（与 xls 同口径），避免「有图等于没图」。
     """
     import shutil
     import subprocess
@@ -303,7 +528,23 @@ def _parse_doc(path: Path) -> ParsedDocument:
         if completed.returncode != 0 or not converted.is_file():
             tail = (completed.stderr or completed.stdout or "").strip().splitlines()[-2:]
             raise ParserUnavailable(f"textutil 转换失败（.doc）：{path.name}；" + " / ".join(tail))
-        parsed = _parse_docx(converted)
+        parsed = _parse_docx(converted, assets_dir=assets_dir)
+
+    figures = list(parsed.figures)
+    if not figures and assets_dir is not None:
+        # textutil 常丢图：从原 .doc 二进制里捞还能认的栅格图
+        seen: set[str] = set()
+        ocr_budget = [_figure_ocr_budget()]
+        for blob, ext in _scan_embedded_raster_blobs(path.read_bytes()):
+            _register_figure_blob(
+                blob, ext,
+                assets_dir=assets_dir, figures=figures, seen=seen,
+                caption=path.stem, page=None, ocr_budget=ocr_budget,
+                log_file=path.name,
+            )
+        if figures:
+            log.info("doc_figures_scanned", file=path.name, figures=len(figures))
+
     # 引擎名保留 doc，便于日志/审计区分"走了旧格式转换"
     return ParsedDocument(
         markdown=parsed.markdown,
@@ -311,7 +552,7 @@ def _parse_doc(path: Path) -> ParsedDocument:
         source_path=str(path),
         page_map=parsed.page_map,
         page_count=parsed.page_count,
-        figures=parsed.figures,
+        figures=figures,
         tables=parsed.tables,
     )
 
@@ -323,15 +564,18 @@ def _parse_pptx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
     （实测 142 MB 的 pptx 会变成一大坨乱码，还白吃内存）。原先它只在白名单里、
     没有解析分支，属于"放进来再变垃圾"。
 
-    **图片**：原先只认 ``has_text_frame`` / ``has_table``，对 ``PICTURE`` 形状视而不见 ——
-    于是"整页都是图"的汇报 PPT 抽出来只有几行标题（实测：一份 22.5 MB、38 页、
-    含 142 张图（92 张唯一）的工程汇报，只抽出 3151 字、``figures=0``）。
-    这里把图片字节落盘并登记成 :class:`ParsedFigure`，后续由分块器决定要不要进索引
-    （有题注/OCR 文字才进，见 ``chunker.chunk_markdown``）。
+    **图片放置方式**（都应能抽）：
+    * ``PICTURE`` / ``LINKED_PICTURE`` 直接图；
+    * ``PLACEHOLDER`` 里插入的图（``shape.image`` 可读时）；
+    * ``GROUP`` 组合内的图（递归 ``_iter_shapes``）；
+    * 形状 ``rotation`` / EXIF 竖拍 —— 落盘前矫正；
+    * ``ppt/media/`` zip 兜底（母版/版式漏扫时）；
+    * 图表（``CHART``）→ ``ParsedTable``（数值表，不是截图）。
+
+    竖向幻灯片（``slide_height > slide_width``）在页标题标 ``（竖向）``，便于检索区分。
 
     ⚠️ **不往 markdown 里写 ``![](images/..)`` 链接**：图片块是从 ``figures`` 建的，
-    不看链接；而链接会原样进父块/子块的正文并被算进向量（实测 ``chunk_markdown``
-    不做剥离）。142 张图 = 142 条链接噪声，检索质量只会更差。
+    不看链接；而链接会原样进父块/子块的正文并被算进向量。
     """
     try:
         from pptx import Presentation
@@ -340,71 +584,57 @@ def _parse_pptx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
         raise ParserUnavailable(f"python-pptx 不可用：{exc}") from exc
 
     presentation = Presentation(str(path))
+    portrait = bool(
+        presentation.slide_height and presentation.slide_width
+        and presentation.slide_height > presentation.slide_width
+    )
     pages: list[str] = []
     figures: list[ParsedFigure] = []
     tables: list[ParsedTable] = []
     table_seq = 0
-    ocr_budget = _figure_ocr_budget()
+    ocr_budget = [_figure_ocr_budget()]
     seen_images: set[str] = set()
     skipped_pictures = 0
 
     for number, slide in enumerate(presentation.slides, start=1):
-        lines: list[str] = [f"## 第 {number} 页"]
-        # 本页新增的"无文字"图：[(figures 下标, 字节数)]，页末挑最大的一张补页标题
+        heading = f"## 第 {number} 页" + ("（竖向）" if portrait else "")
+        lines: list[str] = [heading]
         textless: list[tuple[int, int]] = []
         for shape in _iter_shapes(slide.shapes):
-            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            # —— 图片：不限 PICTURE，占位符/链接图只要 .image 可读都抽 ——
+            picture = _pptx_shape_picture(shape)
+            if picture is not None:
+                blob, ext = picture
                 try:
-                    image = shape.image
-                    blob = image.blob
-                    ext = image.ext
-                except Exception as exc:
-                    # 链接式（未嵌入）图片取不到字节：跳过并计数，不整篇失败
-                    skipped_pictures += 1
-                    log.warning("pptx_picture_unreadable", slide=number, error=str(exc)[:80])
-                    continue
-                import hashlib
-
-                digest = hashlib.sha256(blob).hexdigest()
-                if digest in seen_images:
-                    # 同一张图重复出现（页眉/logo：实测最多重复 33 次）只登记一次，
-                    # 否则会造出几十个内容相同的图片块
-                    continue
-                seen_images.add(digest)
-                managed = _persist_figure_bytes(blob, ext, assets_dir)
-                if managed is None:
-                    # 没给 assets_dir（例如直接调 `parse_file` 做预览）→ 只能不落盘
-                    log.warning("pptx_picture_not_persisted", slide=number, file=path.name)
-                    continue
-                caption = _alt_text(shape)
-                ocr = ""
-                if ocr_budget > 0:
-                    # 预算管的是"允许调几次 MinerU"（实测 ~33s/次），**不是"识别成功几次"**：
-                    # 只有按尺寸主动跳过的小图才不扣。早先按"有文字才扣"，于是每张都识别不出
-                    # 文字时预算永不减少 —— 一份 92 张图的 PPT 会一张接一张跑到天荒地老。
-                    outcome = _ocr_figure(assets_dir / managed)
-                    ocr = outcome.text
-                    if outcome.attempted:
-                        ocr_budget -= 1
-                    if not outcome.usable:
-                        log.warning(
-                            "figure_ocr_disabled_for_document", file=path.name,
-                            skipped_after=len(figures),
-                            hint="MinerU 不可用，本文件剩余图片不再尝试 OCR（图片本身已落盘）",
-                        )
-                        ocr_budget = 0
-                figures.append(
-                    ParsedFigure(
-                        name=managed, caption=caption, page=number,
-                        ocr_text=ocr, figure_id=Path(managed).stem,
-                    )
+                    rotate = float(getattr(shape, "rotation", 0.0) or 0.0)
+                except Exception:
+                    rotate = 0.0
+                added = _register_figure_blob(
+                    blob, ext,
+                    assets_dir=assets_dir, figures=figures, seen=seen_images,
+                    caption=_alt_text(shape), page=number, ocr_budget=ocr_budget,
+                    log_file=path.name, rotate_degrees=rotate,
                 )
-                if not caption and not ocr:
+                if added and not figures[-1].caption and not figures[-1].ocr_text:
                     textless.append((len(figures) - 1, len(blob)))
+            else:
+                # 明确是图片类形状但读不出字节（断链的链接图等）
+                try:
+                    st = shape.shape_type
+                except Exception:
+                    st = None
+                if st in {
+                    MSO_SHAPE_TYPE.PICTURE,
+                    MSO_SHAPE_TYPE.LINKED_PICTURE,
+                }:
+                    skipped_pictures += 1
+                    log.warning("pptx_picture_unreadable", slide=number, shape_type=str(st))
+
             if getattr(shape, "has_text_frame", False):
                 text = (shape.text_frame.text or "").strip()
                 if text:
                     lines.append(text)
+
             if getattr(shape, "has_table", False):
                 table = shape.table
                 rows: list[list[str]] = []
@@ -417,24 +647,31 @@ def _parse_pptx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
                     table_seq += 1
                     tables.append(
                         ParsedTable(
-                            body=body,
-                            caption="",
-                            page=number,
-                            table_id=str(table_seq),
+                            body=body, caption="", page=number, table_id=str(table_seq),
                         )
                     )
                     lines.append(f"[表格 {table_seq}]")
+
+            # 图表 → 数值表（放置方式与「图片截图」不同，但问答同样要能引用）
+            chart_rows = _pptx_chart_rows(shape)
+            if chart_rows:
+                body = _rows_to_pipe_markdown(chart_rows)
+                if body:
+                    table_seq += 1
+                    title = _alt_text(shape) or ""
+                    tables.append(
+                        ParsedTable(
+                            body=body, caption=title, page=number, table_id=str(table_seq),
+                        )
+                    )
+                    lines.append(f"[表格 {table_seq}]{(' ' + title) if title else ''}".rstrip())
+
         notes = getattr(slide, "notes_slide", None)
         if notes is not None:
             note_text = (notes.notes_text_frame.text or "").strip()
             if note_text:
                 lines.append(f"（备注）{note_text}")
 
-        # **兜底检索文本**：一张图如果有题注或 OCR 文字，它自己就能被检索；
-        # 都没有时（实测量子：92 张图里 86 张）它此前**完全不进索引** —— 搜什么都搜不到它。
-        # 这里给本页**最大的那张**无文字图补上页标题（幻灯片的第一行文字），
-        # 于是"按主题/按页"提问能召回这一页的图。只补一张，避免同一页多张图造出
-        # 一批几乎相同的块把检索结果挤满（chunker 当初就是为这个才跳过无文字图片的）。
         if textless:
             page_title = next((ln.strip() for ln in lines[1:] if ln.strip()), "")
             if page_title:
@@ -447,10 +684,20 @@ def _parse_pptx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
                 )
         pages.append("\n".join(lines))
 
+    # zip 兜底：母版/版式/漏扫形状里的 media
+    for blob, ext in _ooxml_media_blobs(path, prefix="ppt/media/"):
+        _register_figure_blob(
+            blob, ext,
+            assets_dir=assets_dir, figures=figures, seen=seen_images,
+            caption=path.stem if portrait else "", page=None, ocr_budget=ocr_budget,
+            log_file=path.name,
+        )
+
     if figures or skipped_pictures:
         log.info(
             "pptx_figures_extracted", file=path.name, figures=len(figures),
-            unreadable=skipped_pictures, ocr_budget=_figure_ocr_budget(),
+            unreadable=skipped_pictures, portrait=portrait,
+            ocr_budget=_figure_ocr_budget(),
         )
     markdown = "\n\n".join(pages)
     return ParsedDocument(
@@ -461,10 +708,61 @@ def _parse_pptx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
     )
 
 
-def _parse_xls(path: Path) -> ParsedDocument:
+def _pptx_shape_picture(shape: Any) -> tuple[bytes, str] | None:
+    """从形状取嵌入/占位图片字节。覆盖 PICTURE / LINKED_PICTURE / 含图的 PLACEHOLDER。"""
+    try:
+        image = shape.image
+    except Exception:
+        return None
+    try:
+        blob = image.blob
+        ext = image.ext or "png"
+    except Exception:
+        return None
+    if not blob:
+        return None
+    return blob, str(ext)
+
+
+def _pptx_chart_rows(shape: Any) -> list[list[str]] | None:
+    """图表系列 → 二维表；不是图就返回 None。"""
+    if not getattr(shape, "has_chart", False):
+        return None
+    try:
+        chart = shape.chart
+        plot = chart.plots[0]
+        categories = [
+            "" if getattr(cat, "label", None) is None else str(cat.label)
+            for cat in plot.categories
+        ]
+        series_list = list(plot.series)
+        if not categories and not series_list:
+            return None
+        header = ["类别"] + [
+            str(series.name or f"系列{index}")
+            for index, series in enumerate(series_list, start=1)
+        ]
+        rows: list[list[str]] = [header]
+        values_per_series = [list(series.values) for series in series_list]
+        for index, category in enumerate(categories):
+            row = [category]
+            for values in values_per_series:
+                value = values[index] if index < len(values) else ""
+                row.append("" if value is None else str(value))
+            rows.append(row)
+        return rows if len(rows) > 1 else None
+    except Exception as exc:
+        log.warning("pptx_chart_unreadable", error=str(exc)[:80])
+        return None
+
+
+def _parse_xls(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
     """旧版 `.xls` —— 用 `xlrd` 按工作表抽成 Markdown 表格（与 xlsx 分支同口径）。
 
     注意：`xlrd` 2.x **只支持旧版 `.xls`**（xlsx 由 openpyxl 负责），两者正好互补。
+
+    **图片**：xlrd 不暴露嵌入图 API。这里对文件字节做 PNG/JPEG 魔数扫描作兜底
+    （与 ``.doc`` 同口径），能捞到的栅格图进 ``figures``；矢量/OLE 包装图仍会漏。
     """
     try:
         import xlrd
@@ -477,8 +775,9 @@ def _parse_xls(path: Path) -> ParsedDocument:
     book = xlrd.open_workbook(str(path))
     lines: list[str] = []
     tables: list[ParsedTable] = []
+    figures: list[ParsedFigure] = []
     table_seq = 0
-    for sheet in book.sheets():
+    for sheet_index, sheet in enumerate(book.sheets(), start=1):
         lines.append(f"## {sheet.name}")
         rows: list[list[str]] = []
         for row_index in range(sheet.nrows):
@@ -494,17 +793,32 @@ def _parse_xls(path: Path) -> ParsedDocument:
                 ParsedTable(
                     body=body,
                     caption=sheet.name,
-                    page=None,
+                    page=sheet_index,
                     table_id=str(table_seq),
                 )
             )
             lines.append(f"[表格 {table_seq}] {sheet.name}".rstrip())
         lines.append("")
+
+    if assets_dir is not None:
+        seen: set[str] = set()
+        ocr_budget = [_figure_ocr_budget()]
+        for blob, ext in _scan_embedded_raster_blobs(path.read_bytes()):
+            _register_figure_blob(
+                blob, ext,
+                assets_dir=assets_dir, figures=figures, seen=seen,
+                caption=path.stem, page=None, ocr_budget=ocr_budget,
+                log_file=path.name,
+            )
+        if figures:
+            log.info("xls_figures_scanned", file=path.name, figures=len(figures))
+
     return ParsedDocument(
         markdown="\n".join(lines),
         engine="xls",
         source_path=str(path),
         tables=tables,
+        figures=figures,
     )
 
 
@@ -728,7 +1042,333 @@ def _alt_text(shape: Any) -> str:
         return ""
 
 
-def _persist_figure_bytes(data: bytes, ext: str, assets_dir: Path | None) -> str | None:
+def _register_figure_blob(
+    blob: bytes,
+    ext: str,
+    *,
+    assets_dir: Path | None,
+    figures: list[ParsedFigure],
+    seen: set[str],
+    caption: str = "",
+    page: int | None = None,
+    ocr_budget: list[int],
+    log_file: str = "",
+    rotate_degrees: float = 0.0,
+) -> bool:
+    """落盘并登记一张图。``seen`` 按**矫正后**内容摘要去重；``ocr_budget`` 为长度 1 的可变预算。
+
+    返回是否**新登记**了一张（重复 / 未落盘 → False）。与 pptx 分支同口径，
+    供 docx / xlsx / md / doc / xls 复用，避免再漏「有 media 却 figures=0」。
+
+    ``rotate_degrees``：形状/控件上的显示旋转（PPT ``shape.rotation``），落盘时矫正，
+    避免竖放照片被按横图 OCR。去重在矫正之后做，这样「同一张手机竖拍、
+    EXIF 方向不同」只会进索引一次。
+    """
+    import hashlib
+
+    if not blob:
+        return False
+    normalized, ext_norm = _normalize_raster_bytes(
+        blob, ext, rotate_degrees=rotate_degrees
+    )
+    digest = hashlib.sha256(normalized).hexdigest()
+    if digest in seen:
+        return False
+    seen.add(digest)
+    # 已矫正，persist 时不再二次旋转/重编码
+    managed = _persist_figure_bytes(
+        normalized, ext_norm, assets_dir, normalize=False
+    )
+    if managed is None:
+        log.warning("figure_not_persisted", file=log_file or None)
+        return False
+    ocr = ""
+    if ocr_budget and ocr_budget[0] > 0 and assets_dir is not None:
+        outcome = _ocr_figure(assets_dir / managed)
+        ocr = outcome.text
+        if outcome.attempted:
+            ocr_budget[0] -= 1
+        if not outcome.usable:
+            log.warning(
+                "figure_ocr_disabled_for_document", file=log_file or None,
+                skipped_after=len(figures),
+                hint="MinerU 不可用，本文件剩余图片不再尝试 OCR（图片本身已落盘）",
+            )
+            ocr_budget[0] = 0
+    figures.append(
+        ParsedFigure(
+            name=managed,
+            caption=(caption or "").strip(),
+            page=page,
+            ocr_text=ocr,
+            figure_id=Path(managed).stem,
+        )
+    )
+    return True
+
+
+def _docx_images_in_element(element: Any, document: Any) -> Iterator[tuple[bytes, str, str]]:
+    """从一段 / 一表 / 页眉的 OOXML 节点里抽出嵌入图 ``(blob, ext, caption)``。
+
+    覆盖：
+    * DrawingML ``a:blip``（``wp:inline`` 环绕 / ``wp:anchor`` 浮于文字上 都走 blip）；
+    * 旧式 VML ``v:imagedata``（``w:pict``，早期 Word 仍常见）。
+    """
+    try:
+        from docx.oxml.ns import qn
+    except Exception:  # pragma: no cover
+        return
+
+    def _related_blob(r_id: str) -> tuple[bytes, str] | None:
+        if not r_id:
+            return None
+        try:
+            part = document.part.related_parts[r_id]
+        except (KeyError, AttributeError):
+            return None
+        blob = getattr(part, "blob", None)
+        if not blob:
+            return None
+        partname = str(getattr(part, "partname", "") or "")
+        ext = Path(partname).suffix.lstrip(".").lower() or "png"
+        if ext not in _IMAGE_EXTS:
+            return None
+        return blob, ext
+
+    blip_tag = qn("a:blip")
+    embed_attr = qn("r:embed")
+    for blip in element.iter(blip_tag):
+        r_id = blip.get(embed_attr)
+        got = _related_blob(r_id)
+        if not got:
+            continue
+        blob, ext = got
+        caption = ""
+        parent = blip.getparent()
+        for _ in range(8):
+            if parent is None:
+                break
+            for attr in ("descr", "title", "name"):
+                value = parent.get(attr)
+                if value and str(value).strip():
+                    caption = str(value).strip()
+                    break
+            if caption:
+                break
+            parent = parent.getparent()
+        yield blob, ext, caption
+
+    # VML：``{urn:schemas-microsoft-com:vml}imagedata`` + ``r:id``
+    vml_imagedata = "{urn:schemas-microsoft-com:vml}imagedata"
+    r_id_attr = qn("r:id")
+    for node in element.iter(vml_imagedata):
+        r_id = node.get(r_id_attr) or node.get(
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        )
+        got = _related_blob(r_id or "")
+        if not got:
+            continue
+        blob, ext = got
+        caption = (
+            node.get("{urn:schemas-microsoft-com:office:office}title")
+            or node.get("o:title")
+            or ""
+        )
+        yield blob, ext, str(caption or "").strip()
+
+
+def _docx_images_from_rels(document: Any) -> Iterator[tuple[bytes, str, str]]:
+    """扫文档所有 image 关系（页眉/页脚/文本框等正文遍历会漏的）。"""
+    try:
+        rels = document.part.rels.values()
+    except Exception:  # pragma: no cover
+        return
+    for rel in rels:
+        reltype = str(getattr(rel, "reltype", "") or "")
+        if "image" not in reltype.lower():
+            continue
+        try:
+            part = rel.target_part
+            blob = part.blob
+        except Exception:
+            continue
+        if not blob:
+            continue
+        partname = str(getattr(part, "partname", "") or "")
+        ext = Path(partname).suffix.lstrip(".").lower() or "png"
+        if ext not in _IMAGE_EXTS:
+            continue
+        yield blob, ext, ""
+
+
+def _ooxml_media_blobs(path: Path, *, prefix: str) -> Iterator[tuple[bytes, str]]:
+    """从 OOXML zip（docx/xlsx/pptx）的 ``media/`` 目录枚举图片字节。"""
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for name in archive.namelist():
+                if not name.startswith(prefix) or name.endswith("/"):
+                    continue
+                ext = Path(name).suffix.lstrip(".").lower()
+                if ext not in _IMAGE_EXTS:
+                    continue
+                try:
+                    yield archive.read(name), ext
+                except Exception as exc:
+                    log.warning("ooxml_media_unreadable", entry=name, error=str(exc)[:80])
+    except zipfile.BadZipFile:
+        return
+
+
+def _scan_embedded_raster_blobs(data: bytes) -> Iterator[tuple[bytes, str]]:
+    """从 OLE/二进制容器里按魔数捞 PNG / JPEG（``.doc`` / ``.xls`` 的图兜底）。
+
+    不保证完整率（矢量/OLE 包装会漏），但比 ``figures=0`` 强——同类型缺陷的最小补缺。
+    """
+    if not data:
+        return
+    png_sig = b"\x89PNG\r\n\x1a\n"
+    iend = b"IEND\xaeB`\x82"
+    offset = 0
+    while True:
+        start = data.find(png_sig, offset)
+        if start < 0:
+            break
+        end = data.find(iend, start)
+        if end < 0:
+            break
+        end += len(iend)
+        blob = data[start:end]
+        if len(blob) >= 67:  # 最小合法 PNG 量级
+            yield blob, "png"
+        offset = end
+
+    # JPEG：``FFD8FF`` … ``FFD9``；限制单张上限避免把整文件当一张图
+    jpeg_sig = b"\xff\xd8\xff"
+    offset = 0
+    max_jpeg = 20 * 1024 * 1024
+    while True:
+        start = data.find(jpeg_sig, offset)
+        if start < 0:
+            break
+        end = data.find(b"\xff\xd9", start + 3)
+        if end < 0:
+            break
+        end += 2
+        if end - start <= max_jpeg and end - start >= 128:
+            yield data[start:end], "jpg"
+        offset = end
+
+
+#: Markdown 本地 / 相对路径图片：``![alt](path)``（跳过 http(s) / data:）
+_MD_LOCAL_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+#: GFM 管道表（表头 + 分隔行 + 至少一行数据）
+_MD_PIPE_TABLE_RE = re.compile(
+    r"(?:^[ \t]*\|.+\|[ \t]*\n^[ \t]*\|[-:| \t]+\|[ \t]*\n(?:^[ \t]*\|.+\|[ \t]*\n?)+)",
+    re.MULTILINE,
+)
+
+
+def _extract_markdown_pipe_tables(markdown: str) -> tuple[str, list[ParsedTable]]:
+    """把 Markdown 管道表升为 ``ParsedTable``，正文改成 ``[表格 N]`` 锚点（与 Office 同口径）。"""
+    tables: list[ParsedTable] = []
+    if not markdown:
+        return markdown, tables
+
+    def replacer(match: re.Match[str]) -> str:
+        body = match.group(0).rstrip()
+        tables.append(
+            ParsedTable(body=body, caption="", page=None, table_id=str(len(tables) + 1))
+        )
+        return f"[表格 {len(tables)}]\n"
+
+    cleaned = _MD_PIPE_TABLE_RE.sub(replacer, markdown)
+    return cleaned, tables
+
+
+def _extract_markdown_local_figures(
+    markdown: str,
+    *,
+    source_path: Path,
+    assets_dir: Path | None,
+) -> tuple[str, list[ParsedFigure]]:
+    """Markdown 本地图片引用 → 落盘 ``figures``，正文改成短锚点（与 pptx/MinerU 同口径）。
+
+    远程 ``http(s):`` / ``data:`` 保留原链接（不是入库资产，也落不了盘）。
+    """
+    figures: list[ParsedFigure] = []
+    if not markdown:
+        return markdown, figures
+    if assets_dir is None:
+        # 与 pptx 一致：没持久目录就不抽图、不改正文（预览场景）
+        return markdown, figures
+    seen: set[str] = set()
+    ocr_budget = [_figure_ocr_budget()]
+    base = source_path.parent
+    replacements: list[tuple[int, int, str]] = []
+
+    for match in _MD_LOCAL_IMAGE_RE.finditer(markdown):
+        alt = (match.group(1) or "").strip()
+        src = (match.group(2) or "").strip().strip("\"'")
+        if not src or src.startswith(("http://", "https://", "data:", "mailto:")):
+            continue
+        src_path = src.split("#", 1)[0].split("?", 1)[0]
+        candidate = Path(src_path)
+        if not candidate.is_absolute():
+            candidate = (base / candidate).resolve()
+        if not candidate.is_file():
+            log.warning("markdown_local_image_missing", src=src, file=source_path.name)
+            continue
+        ext = candidate.suffix.lstrip(".").lower() or "png"
+        if ext not in _IMAGE_EXTS:
+            continue
+        try:
+            blob = candidate.read_bytes()
+        except OSError as exc:
+            log.warning("markdown_local_image_unreadable", src=src, error=str(exc)[:80])
+            continue
+        before = len(figures)
+        _register_figure_blob(
+            blob, ext,
+            assets_dir=assets_dir, figures=figures, seen=seen,
+            caption=alt or candidate.stem, page=None, ocr_budget=ocr_budget,
+            log_file=source_path.name,
+        )
+        if len(figures) > before:
+            stem = figures[-1].figure_id
+            caption = figures[-1].caption
+            anchor = f"[图片 {stem[:12]}]{(' ' + caption) if caption else ''}".rstrip()
+        else:
+            # 重复图 / 未落盘：仍剥链接，避免噪声进向量
+            anchor = f"[图片]{(' ' + alt) if alt else ''}".rstrip() or "[图片]"
+        replacements.append((match.start(), match.end(), anchor))
+
+    if replacements:
+        parts: list[str] = []
+        cursor = 0
+        for start, end, anchor in replacements:
+            parts.append(markdown[cursor:start])
+            parts.append(anchor)
+            cursor = end
+        parts.append(markdown[cursor:])
+        markdown = "".join(parts)
+
+    if figures:
+        log.info(
+            "markdown_figures_extracted", file=source_path.name, figures=len(figures)
+        )
+    return markdown, figures
+
+
+def _persist_figure_bytes(
+    data: bytes,
+    ext: str,
+    assets_dir: Path | None,
+    *,
+    rotate_degrees: float = 0.0,
+    normalize: bool = True,
+) -> str | None:
     """把**容器内的**图片字节落盘到持久目录，返回相对 ``assets_dir`` 的路径。
 
     与 :func:`_persist_figure` 的区别：那个用于 MinerU 已经把图片写在磁盘上的情形，
@@ -738,11 +1378,17 @@ def _persist_figure_bytes(data: bytes, ext: str, assets_dir: Path | None) -> str
     文件名用**内容摘要**（``img-<sha8>.<ext>``）而不是序号：
     实测这份 PPT 里同一张图最多出现 **33 次**（页眉 logo），按序号命名会落 33 份
     完全相同的文件；按内容命名天然去重，且"改了图再导"不会覆盖旧图。
+
+    **方向**：默认落盘前做 EXIF Orientation 矫正，并可选叠加形状旋转角
+    （PPT/Word 里「竖着放的手机照片」常见 —— 不矫正则 OCR/题注按横图读，答非所问）。
+    ``normalize=False`` 供调用方已矫正过的路径，避免二次重编码。
     """
     if not data or assets_dir is None:
         return None
     import hashlib
 
+    if normalize:
+        data, ext = _normalize_raster_bytes(data, ext, rotate_degrees=rotate_degrees)
     digest = hashlib.sha256(data).hexdigest()[:8]
     suffix = f".{ext.lstrip('.').lower()}" if ext else ".png"
     target = assets_dir / "images" / f"img-{digest}{suffix}"
@@ -752,14 +1398,54 @@ def _persist_figure_bytes(data: bytes, ext: str, assets_dir: Path | None) -> str
     return f"images/{target.name}"
 
 
+def _normalize_raster_bytes(
+    data: bytes, ext: str, *, rotate_degrees: float = 0.0
+) -> tuple[bytes, str]:
+    """EXIF 方向矫正 + 可选旋转；失败则原样返回（矢量/损坏图不硬转）。"""
+    ext_norm = (ext or "png").lstrip(".").lower()
+    if ext_norm in {"emf", "wmf", "svg"}:
+        return data, ext_norm
+    try:
+        import io
+
+        from PIL import Image, ImageOps
+    except Exception:  # pragma: no cover
+        return data, ext_norm
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image = ImageOps.exif_transpose(image) or image
+            degrees = float(rotate_degrees or 0.0) % 360.0
+            # PPT 形状旋转：顺时针；Pillow rotate 是逆时针 → 取负
+            if degrees:
+                # 只对接近直角的旋转做无损近似，斜角也转（expand 防裁切）
+                image = image.rotate(-degrees, expand=True)
+            buf = io.BytesIO()
+            save_ext = ext_norm
+            if image.mode not in {"RGB", "L", "RGBA", "P"}:
+                image = image.convert("RGB")
+                save_ext = "png" if save_ext not in {"jpg", "jpeg", "png", "webp"} else save_ext
+            if save_ext in {"jpg", "jpeg"}:
+                if image.mode == "RGBA":
+                    image = image.convert("RGB")
+                image.save(buf, format="JPEG", quality=92)
+                return buf.getvalue(), "jpg"
+            if save_ext == "webp":
+                image.save(buf, format="WEBP")
+                return buf.getvalue(), "webp"
+            image.save(buf, format="PNG")
+            return buf.getvalue(), "png"
+    except Exception:
+        return data, ext_norm
+
+
 def _persist_figure(img_rel: str, out_root: Path | None, assets_dir: Path | None) -> str | None:
     """把 MinerU 抽出的图片**复制到持久目录**，返回相对 ``assets_dir`` 的路径。
 
     为什么必须复制：MinerU 的产出目录是临时目录，解析函数一返回就被删 ——
     只把 ``img_path`` 写进 markdown 会得到一堆**死链**（本仓库实测的 bug）。
-    """
-    import shutil
 
+    PDF/扫描件里手机竖拍图常带 EXIF Orientation；复制时矫正，与 Office 分支同口径。
+    """
     if not img_rel or out_root is None or assets_dir is None:
         return None
     candidate = Path(img_rel)
@@ -770,11 +1456,20 @@ def _persist_figure(img_rel: str, out_root: Path | None, assets_dir: Path | None
             log.warning("figure_source_missing", img=img_rel)
             return None
         source = hits[0]
-    target = assets_dir / "images" / source.name
+    ext = source.suffix.lstrip(".").lower() or "png"
+    try:
+        raw = source.read_bytes()
+    except OSError as exc:
+        log.warning("figure_source_unreadable", img=img_rel, error=str(exc)[:80])
+        return None
+    normalized, ext_norm = _normalize_raster_bytes(raw, ext)
+    # 文件名保留 MinerU 原名主干，扩展名跟矫正后的格式走
+    stem = source.stem
+    target = assets_dir / "images" / f"{stem}.{ext_norm}"
     target.parent.mkdir(parents=True, exist_ok=True)
     if not target.exists():
-        shutil.copy2(source, target)
-    return f"images/{source.name}"
+        target.write_bytes(normalized)
+    return f"images/{target.name}"
 
 
 #: markdown 图片引用：```![alt](images/xxx.jpg)```
@@ -965,7 +1660,12 @@ def _blocks_to_document(
                         ocr_text=ocr, figure_id=Path(managed).stem,
                     )
                 )
-                emit(f"![{caption or '图片'}]({managed})")
+                # 与 pptx 分支一致：**不要**把 `![](images/…)` 写进 markdown。
+                # 图片块只从 ``figures`` 建；链接进正文会被切成 parent/child 并向量化，
+                # 检索污染实测见开班典礼第 1 页（整段只有图片链接却双索引）。
+                # 正文只留短锚点，方便对照页内有图。
+                stem = Path(managed).stem
+                emit(f"[图片 {stem[:12]}]{(' ' + caption) if caption else ''}".rstrip())
         elif kind == "equation":
             emit(text if text.startswith("$$") else f"$$ {text} $$")
         else:

@@ -78,6 +78,31 @@ class FtsIndex:
             conn.commit()
         return len(payload)
 
+    def upsert_retrievable_with_doc2query(
+        self,
+        rows: Sequence[tuple[int, str, str, str | None, str]],
+        *,
+        enabled: bool = True,
+        max_questions: int = 4,
+    ) -> int:
+        """写原文 FTS 行，并按需追加 Doc2Query 假设问句行。
+
+        ``rows``: ``(chunk_id, shard_id, content, heading_path, chunk_type)``
+        """
+        base = [
+            (int(chunk_id), shard_id, content, heading)
+            for chunk_id, shard_id, content, heading, _ctype in rows
+        ]
+        written = self.upsert_chunks(base)
+        if not enabled or not rows:
+            return written
+        from ekbs.ingest.doc2query import fts_doc2query_rows
+
+        extra = fts_doc2query_rows(rows, max_questions=max_questions)
+        if extra:
+            written += self.upsert_chunks(extra)
+        return written
+
     def delete_chunk_ids(self, chunk_ids: Iterable[int]) -> int:
         ids = [str(int(c)) for c in chunk_ids]
         if not ids:

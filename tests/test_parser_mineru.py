@@ -99,6 +99,7 @@ def test_mineru_blocks_map_to_markdown_and_pages(tmp_path: Path, fake_env) -> No
     assert len(parsed.tables) == 1
     assert "<table>" in parsed.tables[0].body, "表格正文进 ParsedTable"
     assert parsed.tables[0].caption == "表 1 年假天数"
+    # 未给 assets_dir：只能保留 markdown 链接（并告警）；有 assets_dir 时见下条用例
     assert "![组织架构](images/abc.jpg)" in parsed.markdown
     assert "$$ E = mc^2 $$" in parsed.markdown
 
@@ -107,6 +108,31 @@ def test_mineru_blocks_map_to_markdown_and_pages(tmp_path: Path, fake_env) -> No
     pages = [item[1] for item in parsed.page_map]
     assert pages == [1, 2], f"页码映射应按页面首块位置生成：{parsed.page_map}"
     assert parsed.page_map[0][0] == 0, "第一页首块偏移应为 0"
+
+
+def test_mineru_persisted_figures_do_not_pollute_markdown(
+    tmp_path: Path, fake_env, monkeypatch
+) -> None:
+    """落盘成功的图片只建 figures，正文只留锚点 —— 禁止 `![](images/…)` 进 parent/child。"""
+    from ekbs.ingest.parser import _blocks_to_document
+
+    out_root = tmp_path / "mineru-out"
+    img = out_root / "images" / "abc.jpg"
+    img.parent.mkdir(parents=True)
+    img.write_bytes(b"\xff\xd8\xff\xd9")  # 最小 JPEG 头尾
+    assets = tmp_path / "parse" / "doc1"
+    parsed = _blocks_to_document(
+        _blocks(),
+        tmp_path / "x.pdf",
+        markdown_file=None,
+        out_root=out_root,
+        assets_dir=assets,
+    )
+    assert parsed.figures, "应登记 ParsedFigure"
+    assert (assets / parsed.figures[0].name).is_file()
+    assert "![" not in parsed.markdown, parsed.markdown
+    assert "[图片" in parsed.markdown
+    assert "组织架构" in parsed.markdown
 
 
 def test_mineru_missing_binary_raises_with_actionable_hint(tmp_path: Path, monkeypatch) -> None:

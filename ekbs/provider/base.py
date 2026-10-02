@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 #: `00` §3.1 的模型标识：``<provider>/<model>@<version>#<dim>``
@@ -105,6 +106,17 @@ class EmbeddingProvider(Protocol):
     async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
 
     async def embed_one(self, text: str) -> list[float]: ...
+
+
+@runtime_checkable
+class MultimodalEmbeddingProvider(Protocol):
+    """多模态统一空间：文本查询与图片进同一维度（课程 17 / tongyi-embedding-vision）。"""
+
+    ref: ModelRef
+
+    async def embed_text(self, text: str) -> list[float]: ...
+
+    async def embed_image(self, image_path: str | Path) -> list[float]: ...
 
 
 @runtime_checkable

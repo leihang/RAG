@@ -197,6 +197,7 @@ async def run_forever(runtime: Runtime) -> None:
     ingest = IngestPipeline(
         db=runtime.db, settings=runtime.settings, providers=runtime.providers,
         shards=runtime.shards, fts=runtime.fts,
+        figure_index=runtime.figure_index,
     )
     stop = asyncio.Event()
 
@@ -239,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
     ingest = IngestPipeline(
         db=runtime.db, settings=settings, providers=runtime.providers,
         shards=runtime.shards, fts=runtime.fts,
+        figure_index=runtime.figure_index,
     )
     try:
         if args.once:

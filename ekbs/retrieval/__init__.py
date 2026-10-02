@@ -12,7 +12,7 @@ from ekbs.retrieval.pipeline import (
     RetrievalResult,
     RetrievedChunk,
 )
-from ekbs.retrieval.rrf import DEFAULT_RRF_K, ranks_of, rrf_fuse
+from ekbs.retrieval.rrf import DEFAULT_RRF_K, alpha_fuse, ranks_of, rrf_fuse
 
 __all__ = [
     "DEFAULT_RRF_K",

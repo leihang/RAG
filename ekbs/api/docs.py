@@ -368,7 +368,7 @@ async def delete_document(
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """删除文档。默认**软删除**（摘索引、清解析图与图注；``raw`` 原件保留 30 天）；
+    """删除文档。默认**软删除**（摘索引、清解析图与图注；原件从 ``raw`` 迁入 ``trash``，保留 30 天）；
     ``hard=true`` 才物理删行；``purge_assets`` 控制硬删时是否连原件一并清。"""
     user, _ = _principal(
         request, _headers(authorization, x_internal_token, x_internal_user_id),
@@ -391,7 +391,8 @@ async def restore_document(
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """从回收站恢复：``deleted → offline``。索引已在软删时摘掉，须 **reparse** 才能再发布。"""
+    """从回收站恢复：``deleted → offline``；原件从 ``trash/`` 迁回 ``raw/``。
+    索引已在软删时摘掉，须 **reparse** 才能再发布。"""
     user, _ = _principal(
         request, _headers(authorization, x_internal_token, x_internal_user_id),
         "doc:document:update",
@@ -400,7 +401,13 @@ async def restore_document(
     row = _load_document(runtime, doc_id)
     if str(row["status"]) != "deleted":
         raise HTTPException(status_code=409, detail=f"仅 deleted 可恢复，当前 status={row['status']}")
+    restored_path = _restore_raw_from_trash(runtime, row, doc_id)
     with runtime.db.sync_connect() as conn:
+        if restored_path and restored_path != str(row["source_path"] or ""):
+            conn.execute(
+                "UPDATE ekbs_document SET source_path = ? WHERE doc_id = ?",
+                (restored_path, doc_id),
+            )
         conn.execute(
             "UPDATE ekbs_document SET status = 'offline', deleted_at = NULL, "
             "updated_at = datetime('now') WHERE doc_id = ?",
@@ -419,7 +426,8 @@ async def restore_document(
         "doc_id": doc_id,
         "status": "offline",
         "policy_version": version,
-        "hint": "已恢复为 offline；需 reparse 后才能再次发布进索引",
+        "source_path": restored_path or row["source_path"],
+        "hint": "已恢复为 offline（原件已迁回 raw）；需 reparse 后才能再次发布进索引",
     })
 
 
@@ -476,6 +484,152 @@ def _purge_figure_caption_cache(runtime: Any, stems: set[str], *, doc_id: int) -
     return removed
 
 
+def _under_root(path: Path, root: Path) -> Path | None:
+    """若 ``path`` 落在 ``root`` 内返回相对路径，否则 ``None``。"""
+    try:
+        return path.resolve().relative_to(root.resolve())
+    except Exception:
+        return None
+
+
+def _cleanup_empty_parents(start: Path, *, stop_at: Path) -> None:
+    cur = start
+    stop = stop_at.resolve()
+    while True:
+        try:
+            cur.resolve().relative_to(stop)
+        except ValueError:
+            break
+        if cur.resolve() == stop or not cur.is_dir():
+            break
+        try:
+            next(cur.iterdir())
+            break
+        except StopIteration:
+            try:
+                cur.rmdir()
+            except OSError:
+                break
+            cur = cur.parent
+        except OSError:
+            break
+
+
+def _unlink_if_under_allowed(
+    runtime: Any,
+    source: str,
+    *,
+    doc_id: int,
+    allowed: tuple[str, ...] = ("raw", "trash"),
+) -> str | None:
+    """仅当文件落在允许的 data 子目录内才 unlink，返回被删路径。"""
+    if not source:
+        return None
+    paths = runtime.settings.data_paths()
+    try:
+        resolved = Path(source).resolve()
+    except Exception:
+        log.warning("delete_asset_unresolvable", doc_id=doc_id, path=source)
+        return None
+    for name in allowed:
+        root = paths[name]
+        if _under_root(resolved, root) is None:
+            continue
+        if resolved.is_file():
+            resolved.unlink()
+            log.info("document_asset_removed", doc_id=doc_id, path=str(resolved), kind=name)
+            if name == "trash":
+                _cleanup_empty_parents(resolved.parent, stop_at=root.resolve())
+            return str(resolved)
+        return None
+    log.warning("delete_asset_outside_allowed", doc_id=doc_id, path=source, allowed=list(allowed))
+    return None
+
+
+def _quarantine_raw_to_trash(runtime: Any, row: Any, doc_id: int) -> tuple[str | None, list[str]]:
+    """软删：把 ``raw`` 下原件挪到 ``trash/<doc_id>/…``，返回 (新路径, 变动路径列表)。"""
+    moved: list[str] = []
+    source = str(row["source_path"] or "").strip()
+    if not source:
+        return None, moved
+    paths = runtime.settings.data_paths()
+    raw_root = paths["raw"]
+    trash_root = paths["trash"]
+    trash_root.mkdir(parents=True, exist_ok=True)
+    try:
+        resolved = Path(source).resolve()
+    except Exception:
+        log.warning("quarantine_unresolvable", doc_id=doc_id, path=source)
+        return None, moved
+
+    if _under_root(resolved, trash_root) is not None:
+        return str(resolved), moved
+
+    rel = _under_root(resolved, raw_root)
+    if rel is None:
+        log.warning("quarantine_outside_raw", doc_id=doc_id, path=source)
+        return None, moved
+    if not resolved.is_file():
+        log.warning("quarantine_missing_file", doc_id=doc_id, path=source)
+        return None, moved
+
+    dest = trash_root / str(doc_id) / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    shutil.move(str(resolved), str(dest))
+    moved.append(str(dest))
+    log.info(
+        "document_raw_quarantined",
+        doc_id=doc_id,
+        from_path=str(resolved),
+        to_path=str(dest),
+    )
+    return str(dest), moved
+
+
+def _restore_raw_from_trash(runtime: Any, row: Any, doc_id: int) -> str | None:
+    """恢复：把 ``trash/<doc_id>/…`` 迁回 ``raw/…``，返回新 ``source_path``。"""
+    source = str(row["source_path"] or "").strip()
+    if not source:
+        return None
+    paths = runtime.settings.data_paths()
+    raw_root = paths["raw"]
+    trash_root = paths["trash"]
+    try:
+        resolved = Path(source).resolve()
+    except Exception:
+        log.warning("restore_unresolvable", doc_id=doc_id, path=source)
+        return None
+
+    under_trash = _under_root(resolved, trash_root)
+    if under_trash is None:
+        if _under_root(resolved, raw_root) is not None and resolved.is_file():
+            return str(resolved)
+        return None
+    if not resolved.is_file():
+        return None
+
+    parts = under_trash.parts
+    if parts and parts[0] == str(doc_id):
+        rel = Path(*parts[1:]) if len(parts) > 1 else Path(resolved.name)
+    else:
+        rel = under_trash
+    dest = raw_root / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.resolve() != resolved:
+        dest = dest.with_name(f"{dest.stem}.restored{dest.suffix}")
+    shutil.move(str(resolved), str(dest))
+    _cleanup_empty_parents(resolved.parent, stop_at=trash_root.resolve())
+    log.info(
+        "document_raw_restored",
+        doc_id=doc_id,
+        from_path=str(resolved),
+        to_path=str(dest),
+    )
+    return str(dest)
+
+
 def _purge_document_assets(
     runtime: Any,
     row: Any,
@@ -492,7 +646,8 @@ def _purge_document_assets(
     解析目录两种约定都清：``parse/<doc_id>/``（worker）与
     ``parse/sha-<checksum前16>/``（CLI import）。
 
-    ⚠️ **越界保护**：``source_path`` 只有确认落在 ``data_dir/raw`` **之内**才 unlink。
+    ⚠️ **越界保护**：``source_path`` 只有确认落在 ``data_dir/raw`` 或
+    ``data_dir/trash`` **之内**才 unlink。
     """
     removed: list[str] = []
     paths = runtime.settings.data_paths()
@@ -515,20 +670,11 @@ def _purge_document_assets(
     removed.extend(_purge_figure_caption_cache(runtime, stems, doc_id=doc_id))
 
     if purge_raw:
-        raw_root = paths["raw"].resolve()
-        source = str(row["source_path"] or "")
-        if source:
-            target = Path(source)
-            try:
-                resolved = target.resolve()
-                resolved.relative_to(raw_root)
-            except Exception:
-                log.warning("delete_asset_outside_raw", doc_id=doc_id, path=source)
-            else:
-                if resolved.is_file():
-                    resolved.unlink()
-                    removed.append(str(resolved))
-                    log.info("document_asset_removed", doc_id=doc_id, path=str(resolved))
+        gone = _unlink_if_under_allowed(
+            runtime, str(row["source_path"] or ""), doc_id=doc_id, allowed=("raw", "trash"),
+        )
+        if gone:
+            removed.append(gone)
     return removed
 
 
@@ -548,6 +694,8 @@ def _drop_document_index(runtime: Any, doc_id: int) -> tuple[list[int], list[str
         for shard_id, ids_in_shard in by_shard.items():
             removed = runtime.shards.remove(shard_id, ids_in_shard)
             log.info("document_vectors_removed", doc_id=doc_id, shard_id=shard_id, removed=removed)
+        if getattr(runtime, "figure_index", None) is not None:
+            runtime.figure_index.remove(chunk_ids)
     with runtime.db.sync_connect() as conn:
         conn.execute("DELETE FROM ekbs_chunk WHERE doc_id = ?", (doc_id,))
         conn.commit()
@@ -566,9 +714,10 @@ def _perform_delete(
     """删除一篇文档的**核心逻辑**（单篇路由与批量路由共用同一份）。
 
     * **软删除（默认）**：立刻摘 FAISS/FTS/chunk，文档行 ``status='deleted'`` +
-      ``deleted_at``；**解析图与图注缓存立刻清**；``raw`` 原件保留 30 天供恢复。
+      ``deleted_at``；**解析图与图注缓存立刻清**；``raw`` 原件迁入 ``trash/<doc_id>/``
+      保留 30 天供恢复。
     * **硬删除（``hard=true``）**：摘索引 + 删文档行；``purge_assets`` 控制是否连
-      原件/解析产物/图注一并删。
+      原件（raw 或 trash）/解析产物/图注一并删。
 
     索引是 ``IndexIDMap2``（标签 = ``chunk_id``），因此摘向量是真删，不留孤儿。
     """
@@ -602,11 +751,18 @@ def _perform_delete(
             + ("与磁盘资产" if purge_assets else "（磁盘原件保留）")
         )
     else:
-        # 软删：原件留 30 天；图片/图注是文档内容，文档已失效则立刻清
+        # 软删：原件迁入 trash/；图片/图注是文档内容，文档已失效则立刻清
         assets_removed = _purge_document_assets(
             runtime, doc_row, doc_id, image_paths=image_paths, purge_raw=False,
         )
+        new_source, quarantined = _quarantine_raw_to_trash(runtime, doc_row, doc_id)
+        assets_removed.extend(quarantined)
         with runtime.db.sync_connect() as conn:
+            if new_source and new_source != str(doc_row["source_path"] or ""):
+                conn.execute(
+                    "UPDATE ekbs_document SET source_path = ? WHERE doc_id = ?",
+                    (new_source, doc_id),
+                )
             conn.execute(
                 "UPDATE ekbs_document SET status = 'deleted', deleted_at = datetime('now'), "
                 "updated_at = datetime('now') WHERE doc_id = ?",
@@ -622,8 +778,8 @@ def _perform_delete(
             conn.commit()
         mode = "soft"
         hint = (
-            "已软删除：索引与解析图/图注已清；磁盘原件保留 30 天；"
-            "可用 /restore 恢复为 offline 后 reparse"
+            "已软删除：索引与解析图/图注已清；原件已迁入 trash/ 保留 30 天；"
+            "可用 /restore 迁回 raw 并恢复为 offline 后 reparse"
         )
 
     log.warning(

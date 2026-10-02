@@ -31,6 +31,12 @@ router = APIRouter(tags=["kb"])
 #: 部门与密级决定，见 `ekbs/index/shard.py::make_shard_id` → `kb_<dept>_L<level>`。）
 CODE_PATTERN = r"^[a-z0-9][a-z0-9_-]{1,31}$"
 
+#: 界面「N 篇」：回收站（status=deleted）不计入；硬删/过期清理后才会真正从库里消失。
+_LIVE_DOC_COUNT = (
+    "(SELECT COUNT(*) FROM ekbs_document d "
+    "WHERE d.kb_id = k.kb_id AND d.status != 'deleted')"
+)
+
 
 def _h(authorization: str | None, token: str | None, user_id: str | None) -> dict[str, str | None]:
     return {
@@ -78,7 +84,7 @@ async def list_knowledge_bases(
         rows = conn.execute(
             "SELECT k.kb_id, k.code, k.name, k.description, k.default_level, k.status, "
             "       k.created_at, "
-            "       (SELECT COUNT(*) FROM ekbs_document d WHERE d.kb_id = k.kb_id) AS document_count "
+            f"       {_LIVE_DOC_COUNT} AS document_count "
             "FROM ekbs_kb k WHERE k.status != 0 ORDER BY k.kb_id"
         ).fetchall()
     return JSONResponse({"items": [_row_to_dict(r) for r in rows], "total": len(rows)})
@@ -159,7 +165,7 @@ async def update_knowledge_base(
             conn.commit()
         updated = conn.execute(
             "SELECT k.kb_id, k.code, k.name, k.description, k.default_level, k.status, "
-            "       k.created_at, (SELECT COUNT(*) FROM ekbs_document d WHERE d.kb_id = k.kb_id) "
+            f"       k.created_at, {_LIVE_DOC_COUNT} "
             "       AS document_count FROM ekbs_kb k WHERE k.kb_id = ?",
             (kb_id,),
         ).fetchone()
@@ -184,14 +190,27 @@ async def delete_knowledge_base(
         row = conn.execute("SELECT code FROM ekbs_kb WHERE kb_id = ?", (kb_id,)).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail=f"知识库不存在：{kb_id}")
-        count = int(
-            conn.execute("SELECT COUNT(*) FROM ekbs_document WHERE kb_id = ?", (kb_id,)).fetchone()[0]
+        live = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM ekbs_document WHERE kb_id = ? AND status != 'deleted'",
+                (kb_id,),
+            ).fetchone()[0]
         )
-        if count:
-            raise HTTPException(
-                status_code=409,
-                detail=f"知识库里还有 {count} 篇文档，请先删除它们再删库（避免误删整库语料）",
-            )
+        in_trash = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM ekbs_document WHERE kb_id = ? AND status = 'deleted'",
+                (kb_id,),
+            ).fetchone()[0]
+        )
+        if live or in_trash:
+            if live:
+                detail = f"知识库里还有 {live} 篇文档，请先删除它们再删库（避免误删整库语料）"
+            else:
+                detail = (
+                    f"回收站里还有 {in_trash} 篇文档，请先在回收站永久删除"
+                    "（或等 30 天自动清理）后再删库"
+                )
+            raise HTTPException(status_code=409, detail=detail)
         conn.execute("DELETE FROM ekbs_kb WHERE kb_id = ?", (kb_id,))
         version = bump_policy_version(conn, reason=f"kb:delete:{row['code']}")
         conn.commit()

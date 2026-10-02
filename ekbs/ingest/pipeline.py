@@ -22,6 +22,7 @@ from ekbs.config import Settings
 from ekbs.db import Database
 from ekbs.errors import ConfigError
 from ekbs.index.faiss_store import ShardIndexManager, ensure_shard_for_placement
+from ekbs.index.figure_faiss import FigureIndex
 from ekbs.index.fts import FtsIndex
 from ekbs.index.shard import parse_shard_id, resolve_shard_for_document
 from ekbs.ingest.code_chunker import chunk_code, display_source_path, is_code_source
@@ -53,6 +54,7 @@ class IngestResult:
     vector_count: int
     status: str
     checksum: str
+    figure_vector_count: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -61,6 +63,7 @@ class IngestResult:
             "parent_count": self.parent_count,
             "child_count": self.child_count,
             "vector_count": self.vector_count,
+            "figure_vector_count": self.figure_vector_count,
             "status": self.status,
             "checksum": self.checksum,
         }
@@ -74,12 +77,14 @@ class IngestPipeline:
         providers: Providers,
         shards: ShardIndexManager,
         fts: FtsIndex | None = None,
+        figure_index: FigureIndex | None = None,
     ) -> None:
         self.db = db
         self.settings = settings
         self.providers = providers
         self.shards = shards
         self.fts = fts or FtsIndex(db)
+        self.figure_index = figure_index
 
     # ------------------------------------------------------------------
 
@@ -144,6 +149,7 @@ class IngestPipeline:
             )
 
         try:
+            figure_vector_count = 0
             # 代码文件走**代码感知分块**（按函数/类切，path+符号进 heading_path）：
             # 定长/Markdown 分块会把函数从中间切断，代码检索效果很差。
             if is_code_source(source_path):
@@ -176,6 +182,7 @@ class IngestPipeline:
             vectors = await self._embed_children(doc_id, child_ids)
             if vectors is not None and len(vectors):
                 self.shards.append(shard_id, child_ids, vectors)
+            figure_vector_count = await self._embed_figures_multimodal(doc_id)
             self._index_fts(doc_id, shard_id, chunking.nodes)
             self._grant_extra_depts(doc_id, placement.extra_grants, level)
             self._publish(
@@ -194,6 +201,7 @@ class IngestPipeline:
             parent_count=len(chunking.parents),
             child_count=len(chunking.children),
             vector_count=len(child_ids),
+            figure_vector_count=figure_vector_count,
             status="published",
             checksum=checksum,
         )
@@ -254,6 +262,8 @@ class IngestPipeline:
                 by_shard.setdefault(str(row["shard_id"]), []).append(int(row["chunk_id"]))
         for shard_id, ids in by_shard.items():
             self.shards.remove(shard_id, ids)
+        if self.figure_index is not None:
+            self.figure_index.remove(chunk_ids)
         with self.db.sync_connect() as conn:
             conn.execute("DELETE FROM ekbs_chunk WHERE doc_id = ?", (doc_id,))
             conn.commit()
@@ -334,16 +344,25 @@ class IngestPipeline:
     def _index_fts(self, doc_id: int, shard_id: str, nodes: Sequence[ChunkNode]) -> None:
         with self.db.sync_connect() as conn:
             rows = conn.execute(
-                "SELECT c.chunk_id, c.content, c.heading_path FROM ekbs_chunk c "
+                "SELECT c.chunk_id, c.content, c.heading_path, c.chunk_type FROM ekbs_chunk c "
                 f"WHERE c.doc_id = ? AND {RETRIEVABLE_PREDICATE} ORDER BY c.seq",
                 (doc_id,),
             ).fetchall()
-        self.fts.upsert_chunks(
+        written = self.fts.upsert_retrievable_with_doc2query(
             [
-                (int(r["chunk_id"]), shard_id, str(r["content"]), r["heading_path"])
+                (
+                    int(r["chunk_id"]),
+                    shard_id,
+                    str(r["content"]),
+                    r["heading_path"],
+                    str(r["chunk_type"] or "child"),
+                )
                 for r in rows
-            ]
+            ],
+            enabled=bool(getattr(self.settings.retrieval, "doc2query_enabled", True)),
+            max_questions=int(getattr(self.settings.retrieval, "doc2query_max", 4) or 4),
         )
+        log.info("fts_indexed", doc_id=doc_id, rows=written)
 
     async def _embed_children(self, doc_id: int, chunk_ids: Sequence[int]):
         """分批嵌入（``models.embed.batch_size``）—— **子块 + 图片块**，
@@ -372,6 +391,55 @@ class IngestPipeline:
                 f"嵌入维度 {array.shape[1]} ≠ 配置 dim {expected_dim}（C3：模型与配置不一致）"
             )
         return array
+
+    async def _embed_figures_multimodal(self, doc_id: int) -> int:
+        """figure 块再写一路多模态图像向量（与文本 FAISS 分索引，维度通常 1152）。"""
+        import numpy as np
+
+        if self.figure_index is None or self.providers.multimodal is None:
+            return 0
+        with self.db.sync_connect() as conn:
+            rows = conn.execute(
+                "SELECT chunk_id, image_path FROM ekbs_chunk "
+                "WHERE doc_id = ? AND chunk_type = 'figure' "
+                "AND image_path IS NOT NULL AND TRIM(image_path) != '' "
+                "ORDER BY seq",
+                (doc_id,),
+            ).fetchall()
+        if not rows:
+            return 0
+        data_dir = self.settings.data_dir
+        vectors: list[list[float]] = []
+        chunk_ids: list[int] = []
+        mm = self.providers.multimodal
+        for row in rows:
+            rel = str(row["image_path"])
+            path = (data_dir / rel).resolve()
+            if not path.is_file():
+                log.warning(
+                    "figure_mm_missing_file",
+                    doc_id=doc_id,
+                    chunk_id=int(row["chunk_id"]),
+                    image_path=rel,
+                )
+                continue
+            try:
+                vectors.append(await mm.embed_image(path))
+                chunk_ids.append(int(row["chunk_id"]))
+            except Exception as exc:
+                log.warning(
+                    "figure_mm_embed_failed",
+                    doc_id=doc_id,
+                    chunk_id=int(row["chunk_id"]),
+                    error=str(exc)[:160],
+                )
+        if not vectors:
+            return 0
+        written = self.figure_index.upsert(
+            np.asarray(vectors, dtype="float32"), chunk_ids
+        )
+        log.info("figure_mm_indexed", doc_id=doc_id, figures=written)
+        return written
 
     def _grant_extra_depts(
         self, doc_id: int, extra_grants: Sequence[tuple[str, str]], level: int

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from ekbs.ingest.figure_caption import (
+    CAPTION_CACHE_VERSION,
     CAPTION_PROMPT,
     caption_images,
     read_cached_caption,
@@ -130,6 +131,7 @@ def test_cache_file_is_json_with_model_and_time(tmp_path: Path) -> None:
     payload = json.loads((data_dir / "cache" / "figure-captions" / "img-x.json").read_text("utf-8"))
     assert payload["caption"] == "一句话描述"
     assert payload["model"] == "qwen-vl-plus"
+    assert payload["prompt_version"] == CAPTION_CACHE_VERSION
     assert isinstance(payload["at"], int)
 
 
@@ -141,6 +143,25 @@ def test_corrupt_cache_is_ignored_not_fatal(tmp_path: Path) -> None:
     assert read_cached_caption(data_dir, "img-bad.png") is None
 
 
-def test_prompt_asks_for_searchable_numbers() -> None:
-    """提示词要明确"图表把数字/趋势写出来" —— 实测这一句决定描述能不能当检索文本。"""
+def test_prompt_asks_for_searchable_numbers_and_visible_text() -> None:
+    """提示词必须同时要求：抄录图中文字 + 图表数字/趋势（截图类否则只剩空描述）。"""
+    assert "抄录" in CAPTION_PROMPT or "可读文字" in CAPTION_PROMPT
     assert "数字" in CAPTION_PROMPT and "趋势" in CAPTION_PROMPT
+
+
+def test_old_caption_cache_without_prompt_version_is_ignored(tmp_path: Path) -> None:
+    data_dir = tmp_path / "var"
+    write_cached_caption(data_dir, "img-old.png", "旧一句话", model="qwen-vl-plus")
+    # 手工写成 v1 缓存（无 prompt_version）
+    path = data_dir / "cache" / "figure-captions" / "img-old.json"
+    path.write_text(
+        json.dumps({"caption": "旧一句话", "model": "qwen-vl-plus", "at": 1}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    assert read_cached_caption(data_dir, "img-old.png") is None
+    write_cached_caption(data_dir, "img-new.png", "新检索文本", model="qwen-vl-plus")
+    assert read_cached_caption(data_dir, "img-new.png") == "新检索文本"
+    payload = json.loads(
+        (data_dir / "cache" / "figure-captions" / "img-new.json").read_text(encoding="utf-8")
+    )
+    assert payload["prompt_version"] == "v2-extract-text"

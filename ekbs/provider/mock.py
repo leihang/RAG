@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from pathlib import Path
 from typing import Any, Sequence
 
 from ekbs.provider.base import (
@@ -24,6 +25,7 @@ from ekbs.provider.base import (
     LLMProvider,
     LLMResult,
     ModelRef,
+    MultimodalEmbeddingProvider,
     RerankDoc,
     RerankResult,
     RerankProvider,
@@ -89,6 +91,33 @@ class MockEmbeddingProvider(EmbeddingProvider):
             vector[0] = 1.0
             return vector
         return [v / norm for v in vector]
+
+
+class MockMultimodalEmbeddingProvider(MultimodalEmbeddingProvider):
+    """离线多模态：文本与**文件名 stem**进同一哈希词袋空间。
+
+    真实 ``tongyi-embedding-vision-plus`` 把像素与文本对齐；mock 用文件名（测试里
+    故意起成可检索中文/关键词）验证旁路索引与第三路 RRF 配管，不出网。
+    """
+
+    def __init__(
+        self,
+        dim: int = 64,
+        provider: str = "mock",
+        model: str = "mock-mm-embed-v1",
+    ) -> None:
+        self.ref: ModelRef = model_ref(provider, model, dim=dim)
+        self._text = MockEmbeddingProvider(dim=dim, provider=provider, model=model)
+
+    async def embed_text(self, text: str) -> list[float]:
+        return await self._text.embed_one(text)
+
+    async def embed_image(self, image_path: str | Path) -> list[float]:
+        path = Path(image_path)
+        stem = path.stem.replace("_", " ").replace("-", " ")
+        # 混入内容短摘要，避免同名不同图完全撞车；仍以 stem 语义为主
+        digest = hashlib.sha256(path.read_bytes() if path.is_file() else stem.encode()).hexdigest()[:8]
+        return await self._text.embed_one(f"{stem} {digest}")
 
 
 class MockRerankProvider(RerankProvider):

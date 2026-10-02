@@ -484,12 +484,13 @@ async def test_hard_delete_honours_purge_assets_false(client, kb_admin) -> None:
 
 
 async def test_soft_delete_keeps_raw_but_purges_parse_and_captions(client, kb_admin) -> None:
-    """软删除：原件保留；解析图与图注缓存立刻清（图是文档内容）。"""
+    """软删除：原件迁入 trash/；解析图与图注缓存立刻清（图是文档内容）。"""
     runtime, _, headers = kb_admin
     with runtime.db.sync_connect() as conn:
         row = conn.execute("SELECT doc_id FROM ekbs_document ORDER BY doc_id LIMIT 1").fetchone()
     doc_id = int(row["doc_id"])
     raw = runtime.settings.data_paths()["raw"]
+    trash = runtime.settings.data_paths()["trash"]
     parse = runtime.settings.data_paths()["parse"]
     source = raw / "测试库" / "软删保留.md"
     source.parent.mkdir(parents=True, exist_ok=True)
@@ -516,9 +517,28 @@ async def test_soft_delete_keeps_raw_but_purges_parse_and_captions(client, kb_ad
     response = await client.delete(f"/api/v1/docs/documents/{doc_id}", headers=headers)
     assert response.status_code == 200
     assert response.json()["mode"] == "soft"
-    assert source.is_file(), "软删必须保留 raw 原件"
+    assert not source.exists(), "软删后原件不应再留在 raw/"
+    quarantined = trash / str(doc_id) / "测试库" / "软删保留.md"
+    assert quarantined.is_file(), f"原件应迁入 trash/（期望 {quarantined}）"
+    with runtime.db.sync_connect() as conn:
+        sp = conn.execute(
+            "SELECT source_path FROM ekbs_document WHERE doc_id = ?", (doc_id,)
+        ).fetchone()["source_path"]
+    assert Path(str(sp)).resolve() == quarantined.resolve()
     assert not (parse / str(doc_id)).exists(), "软删应立刻清 parse/<doc_id>"
     assert not caption.exists(), "软删应立刻清图注缓存"
+
+    # 恢复：迁回 raw，status=offline
+    restored = await client.post(f"/api/v1/docs/documents/{doc_id}/restore", headers=headers)
+    assert restored.status_code == 200
+    assert restored.json()["status"] == "offline"
+    assert source.is_file(), "恢复后原件应回到 raw/"
+    assert not quarantined.exists(), "恢复后 trash 副本应搬走"
+    with runtime.db.sync_connect() as conn:
+        sp2 = conn.execute(
+            "SELECT source_path FROM ekbs_document WHERE doc_id = ?", (doc_id,)
+        ).fetchone()["source_path"]
+    assert Path(str(sp2)).resolve() == source.resolve()
 
 
 async def test_hard_delete_purges_caption_cache_and_sha_parse(client, kb_admin) -> None:

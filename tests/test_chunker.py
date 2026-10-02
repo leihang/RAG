@@ -70,6 +70,20 @@ def test_heading_path_never_empty_with_doc_title() -> None:
     assert ensure_heading_path("", doc_title="") == "文档"
 
 
+def test_short_slide_page_skips_identical_child() -> None:
+    """PPT 短页（远小于 child_min）不得 parent+child 同文双索引。"""
+    md = (
+        "# 第 4 页\n\n"
+        "1.能耗管理1-7用电量（工程部）\n"
+        "总用电量累计:2026比2025增长1.76%。\n"
+    )
+    result = chunk_markdown(md, doc_title="工程汇报")
+    assert result.parents
+    assert not result.children
+    # 父块是叶子：没有 child 指向它
+    assert all(n.parent_index is None for n in result.nodes)
+
+
 def test_short_document_leaves_parent_as_leaf() -> None:
     """短节只能切出与父块相同的一块时：不建 child，父块本身作叶子入向量。"""
     result = chunk_markdown(SHORT_DOC)
@@ -162,3 +176,40 @@ def test_page_map_annotates_sections() -> None:
     page_map = [(0, 1, 1), (40, 2, 2)]
     result = chunk_markdown(SHORT_DOC, page_map=page_map)
     assert any(node.page_from == 1 for node in result.nodes)
+
+
+def test_pages_for_uses_last_marker_not_in_range() -> None:
+    """页标在小节起点之前时，仍应落到该页 —— 不能 fallback 成第 1 页。"""
+    from ekbs.ingest.chunker import _pages_for
+
+    page_map = [(0, 1, 1), (100, 2, 2), (200, 3, 3)]
+    # 小节完全落在第 2 页正文内（起点在页界之后）
+    assert _pages_for(101, 150, page_map) == (2, 2)
+    # 跨页：从第 2 页写到第 3 页
+    assert _pages_for(150, 250, page_map) == (2, 3)
+    # 第 1 页
+    assert _pages_for(0, 50, page_map) == (1, 1)
+    # 空 page_map
+    assert _pages_for(0, 10, None) == (None, None)
+
+
+def test_chunk_markdown_does_not_collapse_later_pages_to_page_one() -> None:
+    """回归开班典礼：后页小节不得因页标不在区间内而被标成 page_from=1。"""
+    # 模拟三页：每页一段短正文 + 标题
+    md = (
+        "# 开班典礼\n\n封面标题\n\n"
+        "# 导师介绍\n\n前知乎教育业务负责人\n\n"
+        "# 几种典型企业类别\n\n创业型公司与一人公司\n"
+    )
+    # 页界刻意落在标题行之后，复现「小节 current_start > 页标 offset」
+    page_map = [
+        (0, 1, 1),
+        (md.index("# 导师介绍"), 2, 2),
+        (md.index("# 几种典型企业类别"), 3, 3),
+    ]
+    result = chunk_markdown(md, page_map=page_map, doc_title="开班典礼")
+    by_heading = {n.heading_path: n for n in result.parents}
+    assert by_heading["开班典礼"].page_from == 1
+    assert by_heading["导师介绍"].page_from == 2
+    assert by_heading["几种典型企业类别"].page_from == 3
+    assert all(n.page_from != 1 or "开班典礼" in n.heading_path for n in result.parents)

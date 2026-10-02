@@ -9,13 +9,19 @@ from ekbs.provider.base import (
     LLMProvider,
     LLMResult,
     ModelRef,
+    MultimodalEmbeddingProvider,
     RerankDoc,
     RerankProvider,
     RerankResult,
     derive_version,
     model_ref,
 )
-from ekbs.provider.mock import MockEmbeddingProvider, MockLLMProvider, MockRerankProvider
+from ekbs.provider.mock import (
+    MockEmbeddingProvider,
+    MockLLMProvider,
+    MockMultimodalEmbeddingProvider,
+    MockRerankProvider,
+)
 from ekbs.provider.registry import Providers, build_providers
 
 __all__ = [
@@ -24,8 +30,10 @@ __all__ = [
     "LLMResult",
     "MockEmbeddingProvider",
     "MockLLMProvider",
+    "MockMultimodalEmbeddingProvider",
     "MockRerankProvider",
     "ModelRef",
+    "MultimodalEmbeddingProvider",
     "Providers",
     "RerankDoc",
     "RerankProvider",

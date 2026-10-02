@@ -128,6 +128,18 @@ class RetrievalCfg(_Section):
     rerank: RerankCfg = Field(default_factory=RerankCfg)
     parent_expand: bool = True
     cache: RetrievalCacheCfg = Field(default_factory=RetrievalCacheCfg)
+    #: 融合策略：``rrf``（默认，只用名次）| ``alpha``（α·向量 + (1-α)·稀疏，课程 18）
+    fusion: str = "rrf"
+    #: ``fusion=alpha`` 时的向量权重；0=纯 BM25，1=纯向量，0.5=平衡
+    hybrid_alpha: float = 0.5
+    #: 入库时为可检索块生成假设问句写入 FTS（确定性 Doc2Query，不写 FAISS）
+    doc2query_enabled: bool = True
+    #: 每个块最多写几条假设问句
+    doc2query_max: int = 4
+    #: MultiQuery：稀疏召回并行的改写问句数（1=关闭；建议 3）
+    multi_query: int = 1
+    #: figure 图片进多模态旁路索引，检索时作为 RRF 第三路（课程 17）
+    figure_multimodal: bool = True
 
 
 class EmbedCfg(_Section):
@@ -141,6 +153,19 @@ class EmbedCfg(_Section):
     batch_size: int = 20
     timeout_s: int = 30
     max_retries: int = 3
+
+
+class MultimodalEmbedCfg(_Section):
+    """图片/查询共用的多模态嵌入（与 ``models.embed`` 维度不同，必须旁路 FAISS）。"""
+
+    provider: str = "mock"
+    model: str = "mock-mm-embed-v1"
+    #: ``tongyi-embedding-vision-plus`` = 1152；mock 默认 64 减轻测试负担
+    dim: int = 64
+    base_url: str = "https://dashscope.aliyuncs.com"
+    version: str | None = None
+    timeout_s: float = 60.0
+    max_retries: int = 2
 
 
 class LLMFallbackCfg(_Section):
@@ -172,6 +197,8 @@ class ModelsCfg(_Section):
     #: （不能直接复用 `LLMCfg()` 的默认值 —— 那个默认是 `qwen-max`，会让未配置的部署
     #: 一启动就去要密钥、并在开工时把图片发给一个纯文本模型。）
     vision: LLMCfg = Field(default_factory=lambda: LLMCfg(model=""))
+    #: **多模态嵌入**（figure 旁路索引，课程 17）。与文本 embed 维度不同。
+    multimodal_embed: MultimodalEmbedCfg = Field(default_factory=MultimodalEmbedCfg)
 
 
 class ParseCfg(_Section):
@@ -297,9 +324,13 @@ class Settings(BaseSettings):
         return candidates[0]
 
     def data_paths(self) -> dict[str, Path]:
-        """`01` §1 的 ``/data/ekbs/{raw,parse,index,backup,tmp}`` 五件套。"""
+        """``data_dir`` 下的运行目录：``raw/parse/index/backup/tmp``，
+        以及软删原件暂存的 ``trash``（保留期见 ``TRASH_RETENTION_DAYS``）。"""
         base = self.data_dir
-        return {name: base / name for name in ("raw", "parse", "index", "backup", "tmp")}
+        return {
+            name: base / name
+            for name in ("raw", "parse", "index", "backup", "tmp", "trash")
+        }
 
     def ensure_dirs(self) -> None:
         """创建运行所需目录（幂等）。"""

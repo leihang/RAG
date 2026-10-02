@@ -476,3 +476,24 @@ async def test_shard_index_reloads_after_external_writer(seeded, settings, tmp_p
     assert any(chunk.doc_title == "专项条款规定" for chunk in after.chunks), (
         "另一个进程写入的向量必须对 API 可见（否则就是「刚入库搜不到」）"
     )
+
+
+def test_build_context_marks_figure_chunks() -> None:
+    """索图问答依赖上下文里的【图片】标记，提示词才能指引模型去引用。"""
+    from ekbs.retrieval.pipeline import RetrievalPipeline, RetrievedChunk
+
+    chunks = [
+        RetrievedChunk(
+            chunk_id=1, doc_id=1, shard_id="kb_all_L1", content="计量表更换说明",
+            chunk_type="parent", doc_title="工程汇报", page_from=8, page_to=9,
+        ),
+        RetrievedChunk(
+            chunk_id=2, doc_id=1, shard_id="kb_all_L1", content="DT862 电能表",
+            chunk_type="figure", doc_title="工程汇报", page_from=8, page_to=8,
+            image_path="parse/1/images/a.png",
+        ),
+    ]
+    ctx = RetrievalPipeline.build_context(chunks)
+    assert "【图片】" in ctx
+    assert "[1]" in ctx and "[2]" in ctx
+    assert "DT862" in ctx
