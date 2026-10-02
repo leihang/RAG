@@ -7,7 +7,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Alert, AutoComplete, Button, Card, Form, Input, Modal, Progress, Select, Space, Table, Tag, Typography, message,
+  Alert, Button, Card, Form, Input, Modal, Progress, Select, Space, Table, Tag, Typography, message,
 } from 'antd'
 import { InboxOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
@@ -95,22 +95,26 @@ export default function DocumentUpload() {
       return
     }
     try {
-      // 落盘是 raw/<kb_code>/…；浏览该库根下的子目录供用户点选
-      const res = (await http.get('/import/dirs', { params: { path: kb.code } })) as {
-        dirs?: { name?: string; rel_path?: string }[]
+      // recursive：一次拿齐该库下全部已有子目录，供下拉选择
+      const res = (await http.get('/import/dirs', {
+        params: { path: kb.code, recursive: true },
+      })) as {
+        dirs?: { name?: string; rel_path?: string; rel_under?: string }[]
       }
       const rows = res.dirs ?? []
       const opts = rows
         .map((r) => {
+          const under = String(r.rel_under || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+          if (under) return under
           const full = String(r.rel_path || r.name || '').replace(/\\/g, '/')
-          // 去掉知识库 code 前缀，界面上显示相对库根的路径
           const prefix = `${kb.code}/`
           return full.startsWith(prefix) ? full.slice(prefix.length) : full === kb.code ? '' : (r.name || '')
         })
         .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b, 'zh-CN'))
       setDestFolders(opts)
     } catch {
-      // 库根目录尚不存在（从未上传过）→ 空列表，仍可手填新路径
+      // 库根目录尚不存在（从未上传过）→ 空列表
       setDestFolders([])
     }
   }, [kbs])
@@ -581,20 +585,23 @@ export default function DocumentUpload() {
           <Form.Item
             name="dest_folder"
             label="保存到文件夹"
-            tooltip="相对知识库根目录。留空则落在库根；可点选已有目录，也可手填新路径（如 制度/2026）。最终路径：raw/<知识库>/<此文件夹>/<文件相对路径>。"
-            normalize={(v) => String(v ?? '').trim().replace(/^\/+|\/+$/g, '').replace(/\\/g, '/') || undefined}
+            tooltip="相对知识库根目录。从下拉选择已有目录；选「知识库根目录」则直接落在库根。最终路径：raw/<知识库>/<此文件夹>/<文件相对路径>。"
+            normalize={(v) => {
+              if (v == null || v === '') return undefined
+              return String(v).trim().replace(/^\/+|\/+$/g, '').replace(/\\/g, '/') || undefined
+            }}
           >
-            <AutoComplete
+            <Select
               allowClear
-              placeholder="留空 = 知识库根目录；可点选或输入新路径（如 制度/2026）"
+              showSearch
+              placeholder={destFolders.length ? '知识库根目录（或不选 / 点选已有文件夹）' : '暂无子文件夹，将保存到知识库根目录'}
+              optionFilterProp="label"
               options={destFolders.map((p) => ({ value: p, label: p }))}
-              filterOption={(input, option) =>
-                String(option?.value ?? '').toLowerCase().includes(input.toLowerCase())
-              }
+              notFoundContent={destFolders.length ? '无匹配文件夹' : '该知识库下还没有子文件夹'}
             />
           </Form.Item>
           <Typography.Paragraph type="secondary" style={{ marginTop: -8, fontSize: 12 }}>
-            「选择文件夹」是选<strong>本机待上传</strong>的源目录；这里的「保存到文件夹」才是服务器落盘位置。
+            「选择文件夹」是选<strong>本机待上传</strong>的源目录；这里的「保存到文件夹」是服务器上已有的落盘目录（下拉选择）。
           </Typography.Paragraph>
           <Form.Item
             name="level"

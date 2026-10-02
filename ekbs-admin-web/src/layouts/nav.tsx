@@ -24,7 +24,9 @@ export const NAV: NavItem[] = [
     name: '知识资产',
     children: [
       { path: '/docs/list', name: '文档管理', perm: 'doc:document:read' },
+      { path: '/docs/trash', name: '回收站', perm: 'doc:document:read' },
       { path: '/docs/upload', name: '上传文档', perm: 'doc:document:create' },
+      { path: '/docs/import', name: '目录导入', perm: 'doc:document:create' },
     ],
   },
   {

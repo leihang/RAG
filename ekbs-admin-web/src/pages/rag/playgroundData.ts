@@ -416,6 +416,8 @@ export interface PlaygroundParams {
   rerankKeep: number
   /** `rerank_min_score`（「Rerank 阈值」） */
   rerankMinScore: number
+  /** 作答模式：`prose`（业务问答）| `numeric`（取数，见 ekbs/retrieval/numeric.py） */
+  mode?: 'prose' | 'numeric'
 }
 
 export const DEFAULT_PARAMS: PlaygroundParams = {
@@ -424,6 +426,7 @@ export const DEFAULT_PARAMS: PlaygroundParams = {
   sparseTopK: 50,
   rerankKeep: 5,
   rerankMinScore: 0.35,
+  mode: 'prose',
 }
 
 /**
@@ -445,13 +448,73 @@ export function buildQueryBody(
   sparse_top_k: number
   rerank_keep: number
   rerank_min_score: number
+  mode: 'prose' | 'numeric'
 } {
   return {
     query,
+    mode: params.mode ?? 'prose',
     rerank_enabled: params.rerankEnabled,
     dense_top_k: params.denseTopK,
     sparse_top_k: params.sparseTopK,
     rerank_keep: params.rerankKeep,
     rerank_min_score: params.rerankMinScore,
+  }
+}
+
+/**
+ * 忠实度卡片的呈现口径 —— 与后端 **P0 分级策略**一一对应：
+ *
+ * * `ok` → 通过（绿）；
+ * * 未通过但**没有拒答** → 降级放行（黄）：答案与引用都还在，只是有数字/量词
+ *   没能在原文里逐字核对上（表格汇总题常因单位换算/四舍五入命中这一类）；
+ * * 未通过且已拒答 → 红。
+ *
+ * 抽成纯函数是为了能单测：这段口径曾经写死成"未通过=红"，与后端降级策略不一致，
+ * 会把"降级放行"误报成"拒答"，让人以为答案没了。
+ */
+export interface FaithfulnessBanner {
+  type: 'success' | 'warning' | 'error'
+  message: string
+  /** 展示用的一句话结论 */
+  detail: string
+}
+
+export function faithfulnessBanner(input: {
+  ok?: boolean | null
+  refused?: boolean | null
+  reason?: string | null
+  unsupported?: readonly string[] | null
+  citedIndices?: readonly number[] | null
+  claimCount?: number | null
+}): FaithfulnessBanner | null {
+  if (input.ok === undefined || input.ok === null) return null
+  if (input.ok) {
+    return {
+      type: 'success',
+      message: '通过（规则型支撑检查）',
+      detail: `引用编号：[${(input.citedIndices ?? []).join(', ')}]；可核对 claim ${input.claimCount ?? 0} 条均落在入选资料中。`,
+    }
+  }
+  const reason = input.reason || '（未给）'
+  if (input.reason === 'missing_citation') {
+    return {
+      type: 'error',
+      message: '未通过（已拒答）',
+      detail: `原因：${reason} — 答案无 [n]，禁止挂伪溯源引用。`,
+    }
+  }
+  if (input.refused) {
+    return {
+      type: 'error',
+      message: '未通过（已拒答）',
+      detail: `原因：${reason} — 多数数字/量词未在入选分块原文出现，按整篇不可信拒答。`,
+    }
+  }
+  return {
+    type: 'warning',
+    message: '降级放行（答案与引用已保留）',
+    detail:
+      `原因：${reason} — 有 ${input.unsupported?.length ?? 0} 个数字/量词未能在原文中逐字核对` +
+      `（可能是单位换算或四舍五入）；答案与引用仍然给出，请人工核对后再采信。`,
   }
 }

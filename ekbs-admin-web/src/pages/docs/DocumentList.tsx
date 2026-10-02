@@ -1,6 +1,7 @@
 /**
  * 文档管理列表（方案 05 §4.4）。
  * 密级徽标强制显示（§5.1/P4）；批量走 §5.5 分级确认且上限 500 条（§5.6）。
+ * 删除默认进回收站（原件保留 30 天）；永久清除在「回收站」页操作。
  */
 import { useRef, useState } from 'react'
 import { ProTable, type ActionType, type ProColumns } from '@ant-design/pro-components'
@@ -18,7 +19,7 @@ import { formatTime } from '@/utils/format'
 
 const BATCH_LIMIT = 500
 type BatchAction = 'publish' | 'offline' | 'delete'
-const ACTION_TEXT: Record<BatchAction, string> = { publish: '批量发布', offline: '批量下线', delete: '批量删除' }
+const ACTION_TEXT: Record<BatchAction, string> = { publish: '批量发布', offline: '批量下线', delete: '移入回收站' }
 
 export default function DocumentList() {
   const actionRef = useRef<ActionType>()
@@ -40,7 +41,7 @@ export default function DocumentList() {
       if (failed.length) {
         // §5.6：部分失败必须给明细，不能只说"已提交"
         message.warning(`${ok} 项成功，${failed.length} 项失败：` + failed.slice(0, 3).map((f) => `#${f.doc_id} ${f.error}`).join('；'))
-      } else message.success(`${ok} 项已提交`)
+      } else message.success(pending.action === 'delete' ? `${ok} 项已移入回收站` : `${ok} 项已提交`)
       setPending(null); setSelected([]); actionRef.current?.reload()
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err))
@@ -73,12 +74,12 @@ export default function DocumentList() {
     { title: '版本', dataIndex: 'doc_version', width: 70, search: false },
     { title: '知识库', dataIndex: 'kb_code', width: 100, search: false },
     { title: '更新时间', dataIndex: 'updated_at', width: 170, search: false, render: (_, r) => formatTime(r.updated_at) },
-    { title: '操作', valueType: 'option', width: 170, fixed: 'right', render: (_, row) => [
+    { title: '操作', valueType: 'option', width: 200, fixed: 'right', render: (_, row) => [
       <Auth key="pub" code="doc:document:publish">{row.status === 'published' ? null : <a onClick={() => void single(row.doc_id, 'publish')}>发布</a>}</Auth>,
       <Auth key="off" code="doc:document:offline">{row.status === 'offline' ? null : <a onClick={() => void single(row.doc_id, 'offline')}>下线</a>}</Auth>,
       <a key="tree" onClick={() => navigate(`/chunks/${row.doc_id}`)}>分块</a>,
       <a key="detail" onClick={() => navigate(`/docs/${row.doc_id}`)}>详情</a>,
-      // 删除是 §5.5 的 L-C 高危操作：收在最后、红色、要输入 DELETE 并填原因
+      // 删除进回收站（§5.5 L-C）：原件保留 30 天，永久清除在回收站页
       <Auth key="del" code="doc:document:delete">
         <a
           style={{ color: '#ff4d4f' }}
@@ -103,6 +104,14 @@ export default function DocumentList() {
         scroll={{ x: 1180 }}
         options={{ density: true, fullScreen: true, setting: true, reload: true }}
         pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100] }}
+        toolBarRender={() => [
+          <Button key="trash" onClick={() => navigate('/docs/trash')}>
+            回收站
+          </Button>,
+          <Auth key="upload" code="doc:document:create">
+            <Button type="primary" onClick={() => navigate('/docs/upload')}>上传文档</Button>
+          </Auth>,
+        ]}
         request={async (params) => {
           const res = await listDocuments({
             limit: params.pageSize,
@@ -142,7 +151,9 @@ export default function DocumentList() {
         }
         consequence={pending ? (
           <Typography.Text>
-            {pending.action === 'delete' ? '删除后立即停止被检索：分块、全文索引、向量、文档记录，以及磁盘上的原件与解析产物都会被删掉，需重新导入才能恢复。' : `确认${ACTION_TEXT[pending.action]}这 ${pending.ids.length} 篇文档？`}
+            {pending.action === 'delete'
+              ? '将移入回收站：立即停止检索并清除索引与解析产物；原件从 raw/ 迁入 trash/，保留 30 天，可在回收站恢复或永久删除。'
+              : `确认${ACTION_TEXT[pending.action]}这 ${pending.ids.length} 篇文档？`}
           </Typography.Text>
         ) : null}
         impact={pending ? (

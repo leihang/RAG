@@ -1,9 +1,27 @@
 import { http } from './client'
 
+export interface NumericAnswer {
+  value?: number | null
+  unit?: string
+  page?: number | null
+  quote?: string
+  indicator?: string
+  reason?: string
+  /** 是否通过「抄写校验」（值必须逐字来自 quote 所在原文片段） */
+  verified?: boolean
+  cite_index?: number | null
+  /** 口径限定词（年份/期间/表名…）：必须能从引用片段里逐字核到 */
+  scope?: string
+  /** 同一行标签下的**其它数值**（如 2024 年那一行）——有就说明存在口径歧义，需人工确认 */
+  alternatives?: { value?: number; label?: string; chunk_id?: number; doc_title?: string; page?: number | null }[]
+}
+
 export interface DebugQueryBody {
   query: string
   /** 多轮会话 id；同一 id 连续提问会走查询改写与上下文 */
   conversation_id?: string
+  /** 作答模式：prose（默认，业务问答）| numeric（取数） */
+  mode?: 'prose' | 'numeric'
   rerank_enabled?: boolean
   dense_top_k?: number
   sparse_top_k?: number
@@ -53,6 +71,12 @@ export interface DebugQueryResp {
   refusal_reason?: string | null
   model?: string
   citations?: Citation[]
+  /** 降级标记（如 `unsupported_claim:9`）：答案已返回，但有一项检查被降级了 */
+  degraded?: string[] | null
+  /** 作答模式：prose（业务问答，默认）| numeric（取数：值/单位/页码 + 抄写校验） */
+  mode?: 'prose' | 'numeric' | null
+  /** 取数模式的结构化结果（prose 模式下为 null） */
+  numeric?: NumericAnswer | null
   faithfulness?: FaithfulnessReport | null
   stages?: unknown
   timings_ms?: Record<string, number>

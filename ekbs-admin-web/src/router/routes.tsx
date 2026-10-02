@@ -15,7 +15,9 @@ export interface AppRoute {
 
 const Dashboard = lazy(() => import('@/pages/dashboard'))
 const DocList = lazy(() => import('@/pages/docs/DocumentList'))
+const DocTrash = lazy(() => import('@/pages/docs/DocumentTrash'))
 const DocUpload = lazy(() => import('@/pages/docs/DocumentUpload'))
+const DocImport = lazy(() => import('@/pages/import/ImportDirs'))
 const DocDetail = lazy(() => import('@/pages/docs/DocumentDetail'))
 const ParseTasks = lazy(() => import('@/pages/parse/ParseTaskList'))
 const ChunkExplorer = lazy(() => import('@/pages/chunks/ChunkExplorer'))
@@ -33,7 +35,11 @@ const DocAccessList = lazy(() => import('@/pages/logs/DocAccessList'))
 export const ROUTES: AppRoute[] = [
   { path: 'dashboard', Component: Dashboard, perm: 'sys:dashboard:read' },
   { path: 'docs/list', Component: DocList, perm: 'doc:document:read' },
+  { path: 'docs/trash', Component: DocTrash, perm: 'doc:document:read' },
   { path: 'docs/upload', Component: DocUpload, perm: 'doc:document:create' },
+  // 服务器目录导入：与 upload 同权限点，也必须排在 :docId 之前
+  { path: 'docs/import', Component: DocImport, perm: 'doc:document:create' },
+  // 具体 :docId 必须放在 trash/upload/list 之后，避免把固定路径当成 id
   { path: 'docs/:docId', Component: DocDetail, perm: 'doc:document:read' },
   { path: 'parse/tasks', Component: ParseTasks, perm: 'parse:task:read' },
   { path: 'chunks/:docId', Component: ChunkExplorer, perm: 'doc:chunk:read' },

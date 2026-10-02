@@ -11,7 +11,7 @@ describe('菜单按权限过滤（方案 05 §2.1）', () => {
 
   it('只有读权限时看不到上传入口', () => {
     const has = (c: string) => c === 'doc:document:read'
-    expect(flat(filterNav(NAV, has))).toEqual(['文档管理'])
+    expect(flat(filterNav(NAV, has))).toEqual(['文档管理', '回收站'])
   })
 
   it('父节点在没有任何可见子节点时被隐藏', () => {
@@ -31,14 +31,23 @@ describe('菜单按权限过滤（方案 05 §2.1）', () => {
   it('全部权限时六个模块的子项都在', () => {
     const all = new Set(NAV.flatMap((i) => i.children?.map((c) => c.perm!) ?? [i.perm!]))
     const names = flat(filterNav(NAV, (c) => all.has(c)))
-    // 1 个一级（概览）+ 12 个子项
-    expect(names).toHaveLength(13)
+    // 1 个一级（概览）+ 14 个子项（含回收站与目录导入）
+    expect(names).toHaveLength(15)
+  })
+
+  it('目录导入与上传文档同权限点：只有写权限时才出现', () => {
+    const writer = flat(filterNav(NAV, (c) => c === 'doc:document:create'))
+    expect(writer).toEqual(['上传文档', '目录导入'])
+    expect(flat(filterNav(NAV, (c) => c === 'doc:document:read'))).not.toContain('目录导入')
   })
 })
 
 describe('面包屑（方案 05 §2.2）', () => {
   it('二级页面显示「一级 / 二级」', () => {
     expect(buildBreadcrumb('/docs/list')).toEqual(['知识资产', '文档管理'])
+    expect(buildBreadcrumb('/docs/trash')).toEqual(['知识资产', '回收站'])
+    // 目录导入是**固定路径**，不能被 /docs/ 的详情页兜底规则吃成「文档管理」
+    expect(buildBreadcrumb('/docs/import')).toEqual(['知识资产', '目录导入'])
     expect(buildBreadcrumb('/iam/users')).toEqual(['权限与安全', '用户管理'])
   })
 

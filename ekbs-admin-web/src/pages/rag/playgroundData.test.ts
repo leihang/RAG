@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   buildQueryBody,
+  faithfulnessBanner,
   citationRows,
   DEFAULT_PARAMS,
   epochSecondsToIso,
@@ -240,6 +241,7 @@ describe('buildQueryBody 按后端真实字段名下参', () => {
     const body = buildQueryBody('住宿标准', { ...DEFAULT_PARAMS, rerankKeep: 8 })
     expect(body).toEqual({
       query: '住宿标准',
+      mode: 'prose',
       rerank_enabled: true,
       dense_top_k: 50,
       sparse_top_k: 50,
@@ -344,5 +346,57 @@ describe('真实后端报文（实测 /rag/debug/query，2026-09-29）', () => {
   it('故意用原始报文（不归一化）时 perShard 就是 undefined —— 这正是当时的崩溃', () => {
     const raw = realStages as unknown as { dense: { perShard?: unknown } }
     expect(raw.dense.perShard).toBeUndefined()
+  })
+})
+
+describe('faithfulnessBanner（与后端 P0 分级策略一致）', () => {
+  it('未给忠实度报告 → 不渲染', () => {
+    expect(faithfulnessBanner({ ok: undefined })).toBeNull()
+    expect(faithfulnessBanner({ ok: null })).toBeNull()
+  })
+
+  it('通过 → 绿，并带上引用编号与 claim 数', () => {
+    const b = faithfulnessBanner({ ok: true, citedIndices: [1, 2], claimCount: 3 })
+    expect(b?.type).toBe('success')
+    expect(b?.detail).toContain('[1, 2]')
+    expect(b?.detail).toContain('3 条')
+  })
+
+  it('**降级放行**：未通过但没拒答 → 黄（不能误报成拒答）', () => {
+    const b = faithfulnessBanner({
+      ok: false,
+      refused: false,
+      reason: 'unsupported_claim',
+      unsupported: ['474.004万元', '7.69%'],
+      claimCount: 25,
+    })
+    expect(b?.type).toBe('warning')
+    expect(b?.message).toContain('降级放行')
+    expect(b?.detail).toContain('2 个')
+    expect(b?.detail).toContain('人工核对')
+  })
+
+  it('整篇对不上 → 拒答 → 红', () => {
+    const b = faithfulnessBanner({ ok: false, refused: true, reason: 'unsupported_claim' })
+    expect(b?.type).toBe('error')
+    expect(b?.message).toContain('已拒答')
+    expect(b?.detail).toContain('整篇不可信')
+  })
+
+  it('无引用标记 → 拒答 → 红，并说明禁止伪溯源', () => {
+    const b = faithfulnessBanner({ ok: false, refused: true, reason: 'missing_citation' })
+    expect(b?.type).toBe('error')
+    expect(b?.detail).toContain('禁止挂伪溯源引用')
+  })
+})
+
+describe('作答模式进请求体（prose / numeric）', () => {
+  it('默认是业务问答（prose）—— 不加模式时行为与原来完全一致', () => {
+    expect(buildQueryBody('年假有多少天', DEFAULT_PARAMS).mode).toBe('prose')
+  })
+
+  it('取数模式要真的发到后端（否则界面上选了也没用）', () => {
+    const body = buildQueryBody('电梯维保一年多少钱', { ...DEFAULT_PARAMS, mode: 'numeric' })
+    expect(body.mode).toBe('numeric')
   })
 })

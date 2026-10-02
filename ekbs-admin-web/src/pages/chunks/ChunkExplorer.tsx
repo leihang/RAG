@@ -15,10 +15,19 @@ import ClearanceTag from '@/components/ClearanceTag'
 import StatusTag from '@/components/StatusTag'
 import ImpactConfirmModal from '@/pages/docs/ImpactConfirmModal'
 import { getChunkTree, mergeChunk, reembedChunk, splitChunk, updateChunk } from '@/api/parse'
-import type { ChunkNode, ChunkTree } from '@/api/types'
+import type { ChunkNode, ChunkTree, ChunkTreeNode } from '@/api/types'
 
 const TYPE_TEXT: Record<string, string> = {
   parent: '父容器', child: '子块', table: '表格', figure: '图片', summary: '摘要',
+}
+
+function isLeafParent(node: ChunkTreeNode | null | undefined): boolean {
+  return Boolean(node && node.chunk_type === 'parent' && !(node.children?.length))
+}
+
+function typeLabel(node: ChunkNode, leafParent: boolean): string {
+  if (leafParent) return '叶子块（短节）'
+  return TYPE_TEXT[node.chunk_type] ?? node.chunk_type
 }
 
 export default function ChunkExplorer() {
@@ -81,6 +90,7 @@ export default function ChunkExplorer() {
   if (!tree) return <Card>文档不存在或尚未产生分块</Card>
 
   const total = (tree.parents ?? 0) + (tree.children ?? 0)
+  const leafParents = (tree.tree ?? []).filter((p) => !(p.children?.length)).length
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -91,6 +101,11 @@ export default function ChunkExplorer() {
           <StatusTag status={tree.document?.status} />
           <Tag>父块 {tree.parents}</Tag>
           <Tag>子块 {tree.children}</Tag>
+          {leafParents > 0 ? (
+            <Tooltip title="PPT/短节常见：整页短于子块下限时不建同文 child，父块本身作为检索叶子并已入向量。不是解析失败。">
+              <Tag color="blue">叶子父块 {leafParents}</Tag>
+            </Tooltip>
+          ) : null}
           <Tag>合计 {total}</Tag>
           {(tree.orphan_children?.length ?? 0) > 0 ? <Tag color="orange">孤儿块 {tree.orphan_children?.length}</Tag> : null}
           <span />
@@ -101,11 +116,13 @@ export default function ChunkExplorer() {
 
       {tree.tree?.length ? (
         <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
-          <Card title={`父块（${tree.tree.length}）`} style={{ width: 400, flex: 'none' }} styles={{ body: { padding: 0 } }}>
+          <Card title={`分块树（${tree.tree.length}）`} style={{ width: 400, flex: 'none' }} styles={{ body: { padding: 0 } }}>
             <List
               size="small"
               dataSource={tree.tree}
-              renderItem={(p) => (
+              renderItem={(p) => {
+                const leaf = !(p.children?.length)
+                return (
                 <List.Item
                   onClick={() => { setActiveParentId(p.chunk_id); setActiveChunk(p); setEditing(false) }}
                   style={{ cursor: 'pointer', background: activeParentId === p.chunk_id ? '#e6f4ff' : undefined, paddingInline: 16 }}
@@ -114,32 +131,34 @@ export default function ChunkExplorer() {
                     title={<Typography.Text ellipsis style={{ maxWidth: 320 }}>{p.heading_path || '(无标题路径)'}</Typography.Text>}
                     description={
                       <Space size={6} wrap>
-                        <Tag>{TYPE_TEXT[p.chunk_type] ?? p.chunk_type}</Tag>
+                        <Tag color={leaf ? 'blue' : undefined}>{leaf ? '叶子块' : '父容器'}</Tag>
                         <span>{p.token_count ?? 0} tok</span>
-                        <span>子块 {p.children?.length ?? 0}</span>
-                        {/* ⚠️ 父块**按设计**不进向量（它是上下文容器，命中后用来扩展上下文）。
-                            原先对所有 faiss_row 为空的块一律打橙色「未入向量」，用户看到
-                            父块列表整列橙色，就以为"父子块都没向量、向量失败"了（实测反馈）。
-                            只有**叶子块**没向量才是真异常，那才该报警。 */}
-                        {(p.children?.length ?? 0) > 0 ? (
-                          <Tooltip title="父块是上下文容器：检索命中叶子块后用它扩展上下文。按设计不进向量、不进全文索引，真正可检索的是下面的叶子块。">
+                        {!leaf ? <span>子块 {p.children?.length ?? 0}</span> : null}
+                        {/* 有子块的父 = 上下文容器，不进向量；无子块的父 = 叶子，必须进向量 */}
+                        {!leaf ? (
+                          <Tooltip title="父块是上下文容器：检索命中叶子块后用它扩展上下文。按设计不进向量。">
                             <Tag>上下文块</Tag>
                           </Tooltip>
                         ) : p.faiss_row == null ? (
-                          <Tooltip title="这是叶子块（本该进向量），但没有 faiss_row —— 属于异常，需要重新向量化。">
+                          <Tooltip title="叶子块本该进向量，但没有 faiss_row —— 异常，需重新向量化。">
                             <Tag color="orange">未入向量</Tag>
                           </Tooltip>
-                        ) : null}
+                        ) : (
+                          <Tooltip title="短节未切出子块；本块即检索单元，已入向量。">
+                            <Tag color="success">已入向量</Tag>
+                          </Tooltip>
+                        )}
                       </Space>
                     }
                   />
                 </List.Item>
-              )}
+                )
+              }}
             />
           </Card>
 
           <Card
-            title={`子块（${children.length}）`}
+            title={isLeafParent(activeParent) ? '检索单元（短节无子块）' : `子块（${children.length}）`}
             style={{ flex: 1, minWidth: 0 }}
             extra={
               activeChunk?.chunk_type === 'child' ? (
@@ -159,11 +178,26 @@ export default function ChunkExplorer() {
                 </Space>
               ) : (
                 <Typography.Text type="secondary">
-                  {activeChunk ? `${TYPE_TEXT[activeChunk.chunk_type] ?? activeChunk.chunk_type} 不支持在线编辑（后端仅支持 child）` : ''}
+                  {activeChunk
+                    ? isLeafParent(activeParent) && activeChunk.chunk_id === activeParent?.chunk_id
+                      ? '短节叶子块：内容即检索单元（PPT 常见），仅 child 支持在线拆分/编辑'
+                      : `${TYPE_TEXT[activeChunk.chunk_type] ?? activeChunk.chunk_type} 不支持在线编辑（后端仅支持 child）`
+                    : ''}
                 </Typography.Text>
               )
             }
           >
+            {isLeafParent(activeParent) ? (
+              <Empty
+                description={
+                  <span>
+                    本段短于子块下限（约 256 token），未再建同文子块。
+                    <br />
+                    左侧父块本身就是检索叶子，已入向量（见下方详情）。
+                  </span>
+                }
+              />
+            ) : (
             <List
               size="small"
               dataSource={children}
@@ -180,19 +214,20 @@ export default function ChunkExplorer() {
                 </List.Item>
               )}
             />
+            )}
 
             {activeChunk ? (
               <Card size="small" style={{ marginTop: 12 }} title="分块详情">
                 <Descriptions size="small" column={2} bordered>
                   <Descriptions.Item label="chunk_id">{activeChunk.chunk_id}</Descriptions.Item>
-                  <Descriptions.Item label="类型">{TYPE_TEXT[activeChunk.chunk_type] ?? activeChunk.chunk_type}</Descriptions.Item>
+                  <Descriptions.Item label="类型">{typeLabel(activeChunk, isLeafParent(activeParent) && activeChunk.chunk_id === activeParent?.chunk_id)}</Descriptions.Item>
                   <Descriptions.Item label="seq">{activeChunk.seq}</Descriptions.Item>
                   <Descriptions.Item label="token">{activeChunk.token_count ?? '-'}</Descriptions.Item>
                   <Descriptions.Item label="分片">{activeChunk.shard_id ?? '-'}</Descriptions.Item>
                   <Descriptions.Item label="向量行">
                     {activeChunk.faiss_row ??
-                      (activeChunk.chunk_type === 'parent'
-                        ? '父块不参与向量（正常）'
+                      (activeChunk.chunk_type === 'parent' && !isLeafParent(activeParent)
+                        ? '父容器按设计不进向量（正常）'
                         : '未入向量（异常，可点「重新向量化」）')}
                   </Descriptions.Item>
                   <Descriptions.Item label="页码">

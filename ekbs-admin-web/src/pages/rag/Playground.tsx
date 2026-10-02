@@ -11,13 +11,13 @@
  */
 import { useState } from 'react'
 import {
-  Alert, Button, Card, Descriptions, Form, Input, InputNumber, Space, Switch, Table, Tag, Typography, message,
+  Alert, Button, Card, Descriptions, Form, Input, InputNumber, Radio, Space, Switch, Table, Tag, Typography, message,
 } from 'antd'
 import Auth from '@/components/Auth'
 import ClearanceTag from '@/components/ClearanceTag'
 import StagesPanel from './StagesPanel'
 import FigureThumb from '@/components/FigureThumb'
-import { parseStages } from './playgroundData'
+import { faithfulnessBanner, parseStages } from './playgroundData'
 import { debugQuery, debugShards, debugSimulate, type DebugQueryResp, type Citation } from '@/api/rag'
 import { formatMs } from '@/utils/format'
 
@@ -84,6 +84,7 @@ export default function Playground() {
     try {
       setResult(await debugQuery({
         query: v.query,
+        mode: v.mode ?? 'prose',
         conversation_id: conversationId,
         rerank_enabled: Boolean(v.rerank_enabled),
         dense_top_k: v.top_k ?? undefined,
@@ -109,6 +110,16 @@ export default function Playground() {
     finally { setLoading(false) }
   }
 
+  /** 忠实度卡片口径（纯函数，见 playgroundData.faithfulnessBanner） */
+  const banner = faithfulnessBanner({
+    ok: result?.faithfulness?.ok,
+    refused: result?.refused,
+    reason: result?.faithfulness?.reason,
+    unsupported: result?.faithfulness?.unsupported,
+    citedIndices: result?.faithfulness?.cited_indices,
+    claimCount: result?.faithfulness?.claims?.length,
+  })
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       <Card title="检索并生成">
@@ -117,6 +128,17 @@ export default function Playground() {
             <Input.TextArea rows={2} placeholder="如：年假有多少天；下一轮可追问「能介绍详细点吗？」" />
           </Form.Item>
           <Space size={16} wrap align="end">
+            {/*
+              作答模式：prose=业务问答（默认，答案是一段话）；numeric=取数
+              （值/单位/页码 + 抄写校验，宁可 N/A 也不计算，见 ekbs/retrieval/numeric.py）。
+              两种模式在后端各走一条路径、各自独立缓存，互不串答案。
+            */}
+            <Form.Item name="mode" label="作答模式" initialValue="prose" style={{ marginBottom: 0 }}>
+              <Radio.Group>
+                <Radio.Button value="prose">业务问答</Radio.Button>
+                <Radio.Button value="numeric">取数</Radio.Button>
+              </Radio.Group>
+            </Form.Item>
             <Form.Item name="rerank_enabled" label="启用精排" valuePropName="checked" style={{ marginBottom: 0 }}>
               <Switch />
             </Form.Item>
@@ -172,27 +194,60 @@ export default function Playground() {
             </Space>
           </Card>
 
+          {result.numeric ? (
+            <Card title="取数结果（mode=numeric）" style={{ marginTop: 12 }}>
+              <Alert
+                type={result.numeric.verified ? 'success' : 'warning'}
+                showIcon
+                message={
+                  result.numeric.verified
+                    ? `已通过抄写校验：${result.numeric.value ?? '-'} ${result.numeric.unit ?? ''}`
+                    : (result.refusal_reason === 'numeric_na'
+                        ? '返回 N/A（资料未直接给出该指标）'
+                        : '未通过抄写校验（值不在引用片段里，按拒答处理）')
+                }
+                description={
+                  <Space direction="vertical" size={2}>
+                    <span>指标：{result.numeric.indicator || '-'}　页码：{result.numeric.page ?? '-'}</span>
+                    {result.numeric.scope ? <span>口径：{result.numeric.scope}</span> : null}
+                    {result.numeric.quote ? <span>依据片段：{result.numeric.quote}</span> : null}
+                    {result.numeric.reason ? <span>说明：{result.numeric.reason}</span> : null}
+                    {/*
+                      口径歧义必须显式摊开：同一行标签在别处还有不同数值（实测 2024年 vs 2026年
+                      两个值都真实存在、都能过抄写校验），用户得自己确认要哪一行。
+                    */}
+                    {(result.numeric.alternatives?.length ?? 0) > 0 ? (
+                      <span style={{ color: '#d46b08' }}>
+                        另有同口径行的其它数值（请确认要哪一行）：
+                        {result.numeric.alternatives!.map((a) => (
+                          <Tag key={`${a.chunk_id}-${a.value}`} color="orange" style={{ marginLeft: 6 }}>
+                            {a.label} {a.value}（{a.doc_title}
+                            {a.page ? ` 第${a.page}页` : ''}）
+                          </Tag>
+                        ))}
+                      </span>
+                    ) : null}
+                  </Space>
+                }
+              />
+            </Card>
+          ) : null}
+
           {result.faithfulness ? (
             <Card title="忠实度">
+              {/*
+                分级呈现（与后端 P0 策略一致）：
+                * 通过 → 绿；
+                * **降级放行**（规则检查未过，但没有硬拒：答案与引用都还在）→ 黄。
+                  这一类是「数字/量词没能在原文里逐字核对上」，实测表格汇总题会命中
+                  （模型做了单位换算/格式化），旧口径直接整答拒答，把好答案打没了；
+                * 已拒答 → 红。
+              */}
               <Alert
-                type={result.faithfulness.ok ? 'success' : 'error'}
+                type={banner?.type ?? 'error'}
                 showIcon
-                message={result.faithfulness.ok ? '通过（规则型支撑检查）' : '未通过'}
-                description={
-                  result.faithfulness.ok
-                    ? `引用编号：[${(result.faithfulness.cited_indices ?? []).join(', ')}]；可核对 claim ${result.faithfulness.claims?.length ?? 0} 条均落在入选资料中。`
-                    : (
-                      <>
-                        原因：{result.faithfulness.reason || '（未给）'}
-                        {result.faithfulness.reason === 'missing_citation'
-                          ? ' — 答案无 [n]，禁止挂伪溯源引用。'
-                          : null}
-                        {result.faithfulness.reason === 'unsupported_claim'
-                          ? ' — 答案中的数字/量词未在入选分块原文出现。'
-                          : null}
-                      </>
-                    )
-                }
+                message={banner?.message ?? '未通过'}
+                description={banner?.detail ?? null}
               />
               {(result.faithfulness.claims?.length ?? 0) > 0 ? (
                 <Table

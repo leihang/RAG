@@ -42,8 +42,23 @@ export const unpublishDocument = (docId: number, reason?: string) =>
 export const offlineDocument = (docId: number, reason?: string) =>
   http.post(`/docs/documents/${docId}/offline`, { reason }) as Promise<unknown>
 
-export const deleteDocument = (docId: number) =>
-  http.delete(`/docs/documents/${docId}`) as Promise<unknown>
+/** 默认软删进回收站（原件保留 30 天）；`hard: true` 才物理删行并清 raw。 */
+export const deleteDocument = (
+  docId: number,
+  opts: { hard?: boolean; purge_assets?: boolean; reason?: string } = {},
+) =>
+  http.delete(`/docs/documents/${docId}`, {
+    params: {
+      hard: opts.hard ?? false,
+      purge_assets: opts.purge_assets ?? true,
+      reason: opts.reason ?? '',
+    },
+  }) as Promise<unknown>
+
+export const restoreDocument = (docId: number, reason?: string) =>
+  http.post(`/docs/documents/${docId}/restore`, {}, {
+    params: { reason: reason ?? '' },
+  }) as Promise<{ doc_id: number; status: string; hint?: string }>
 
 /** 批量动作（后端按动作分别鉴权）。 */
 /**
@@ -61,8 +76,19 @@ export interface BatchRawResult {
   results: { doc_id: number; ok: boolean; status?: string; error?: string }[]
 }
 
-export const batchDocuments = (docIds: number[], action: string, reason?: string) =>
-  http.post('/docs/documents/batch', { doc_ids: docIds, action, reason }) as Promise<BatchRawResult>
+export const batchDocuments = (
+  docIds: number[],
+  action: string,
+  reason?: string,
+  opts: { hard?: boolean; purge_assets?: boolean } = {},
+) =>
+  http.post('/docs/documents/batch', {
+    doc_ids: docIds,
+    action,
+    reason,
+    hard: opts.hard ?? false,
+    purge_assets: opts.purge_assets ?? true,
+  }) as Promise<BatchRawResult>
 
 /** 上传三段式（方案 §4.4 / §6.5）。 */
 export interface UploadInitBody {
