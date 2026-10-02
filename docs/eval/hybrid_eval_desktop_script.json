@@ -1,0 +1,787 @@
+{
+  "corpus_chunks": 695,
+  "positives": 45,
+  "unresolved_cases": [],
+  "relevant_set_sizes": {
+    "min": 1,
+    "median": 2,
+    "max": 201,
+    "gt_k": 15
+  },
+  "runs": {
+    "A_as_is": {
+      "alpha_sweep": {
+        "0.1": {
+          "recall_at_5": 0.1184,
+          "avg_latency_s": 0.0002,
+          "queries": 45
+        },
+        "0.3": {
+          "recall_at_5": 0.1184,
+          "avg_latency_s": 0.0002,
+          "queries": 45
+        },
+        "0.5": {
+          "recall_at_5": 0.1184,
+          "avg_latency_s": 0.0002,
+          "queries": 45
+        },
+        "0.7": {
+          "recall_at_5": 0.1184,
+          "avg_latency_s": 0.0002,
+          "queries": 45
+        },
+        "0.9": {
+          "recall_at_5": 0.1184,
+          "avg_latency_s": 0.0002,
+          "queries": 45
+        }
+      },
+      "hit_at_k_alpha_0.5_extra": {
+        "1": 0.5778,
+        "3": 0.9111,
+        "5": 0.9556,
+        "10": 1.0
+      },
+      "mrr_alpha_0.5_extra": 0.7433,
+      "per_case_hit_extra": {
+        "contract-ac-amount": {
+          "hit@1": false,
+          "best_rank": 3,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-ac-term": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-ac-site": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-elevator-price": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-elevator-total": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-elevator-term": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-elevator-penalty": {
+          "hit@1": false,
+          "best_rank": 3,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-elevator-parts": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-ac-maint-total": {
+          "hit@1": false,
+          "best_rank": 5,
+          "hit@3": false,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-ac-maint-warranty": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-ac-maint-response": {
+          "hit@1": false,
+          "best_rank": 4,
+          "hit@3": false,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "rule-equipment-code": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "rule-equipment-level": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "rule-shift-purpose": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "form-equipment-stat": {
+          "hit@1": false,
+          "best_rank": 3,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "form-equipment-maint": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "xlsx-energy-july": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "xlsx-budget-header": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "xlsx-night-check": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "iot-dtu": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "iot-alarm-table": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "tech-rag-alternatives": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "tech-long-context": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "course-rag-multimodal": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "ppt-august-report": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "ppt-august-figure": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "ppt-electric-safety": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "night-photos": {
+          "hit@1": false,
+          "best_rank": 3,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-01": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-02": {
+          "hit@1": false,
+          "best_rank": 6,
+          "hit@3": false,
+          "hit@5": false,
+          "hit@10": true
+        },
+        "pp-03": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-04": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-05": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-06": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-07": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-08": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-09": {
+          "hit@1": false,
+          "best_rank": 3,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-10": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-11": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-12": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-13": {
+          "hit@1": false,
+          "best_rank": 6,
+          "hit@3": false,
+          "hit@5": false,
+          "hit@10": true
+        },
+        "pp-14": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-15": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-16": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-17": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        }
+      },
+      "negative_top1_scores": [
+        {
+          "id": "neg-travel-allowance",
+          "top1_score": 0.5
+        },
+        {
+          "id": "neg-annual-leave",
+          "top1_score": 0.5
+        },
+        {
+          "id": "neg-performance",
+          "top1_score": 0.5
+        },
+        {
+          "id": "neg-purchase-approval",
+          "top1_score": 0.5
+        },
+        {
+          "id": "neg-canteen",
+          "top1_score": 0.5
+        },
+        {
+          "id": "neg-fire-drill",
+          "top1_score": 0.5
+        },
+        {
+          "id": "neg-vehicle",
+          "top1_score": 0.5
+        },
+        {
+          "id": "neg-meeting-room",
+          "top1_score": 0.5
+        }
+      ]
+    },
+    "B_jieba": {
+      "alpha_sweep": {
+        "0.1": {
+          "recall_at_5": 0.1199,
+          "avg_latency_s": 0.0005,
+          "queries": 45
+        },
+        "0.3": {
+          "recall_at_5": 0.1124,
+          "avg_latency_s": 0.0005,
+          "queries": 45
+        },
+        "0.5": {
+          "recall_at_5": 0.1049,
+          "avg_latency_s": 0.0005,
+          "queries": 45
+        },
+        "0.7": {
+          "recall_at_5": 0.0855,
+          "avg_latency_s": 0.0005,
+          "queries": 45
+        },
+        "0.9": {
+          "recall_at_5": 0.081,
+          "avg_latency_s": 0.0005,
+          "queries": 45
+        }
+      },
+      "hit_at_k_alpha_0.5_extra": {
+        "1": 0.5333,
+        "3": 0.7778,
+        "5": 0.8667,
+        "10": 0.9111
+      },
+      "mrr_alpha_0.5_extra": 0.6719,
+      "per_case_hit_extra": {
+        "contract-ac-amount": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-ac-term": {
+          "hit@1": false,
+          "best_rank": 6,
+          "hit@3": false,
+          "hit@5": false,
+          "hit@10": true
+        },
+        "contract-ac-site": {
+          "hit@1": false,
+          "best_rank": 6,
+          "hit@3": false,
+          "hit@5": false,
+          "hit@10": true
+        },
+        "contract-elevator-price": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-elevator-total": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-elevator-term": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-elevator-penalty": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-elevator-parts": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-ac-maint-total": {
+          "hit@1": false,
+          "best_rank": 3,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-ac-maint-warranty": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "contract-ac-maint-response": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "rule-equipment-code": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "rule-equipment-level": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "rule-shift-purpose": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "form-equipment-stat": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "form-equipment-maint": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "xlsx-energy-july": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "xlsx-budget-header": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "xlsx-night-check": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "iot-dtu": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "iot-alarm-table": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "tech-rag-alternatives": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "tech-long-context": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "course-rag-multimodal": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "ppt-august-report": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "ppt-august-figure": {
+          "hit@1": false,
+          "best_rank": 5,
+          "hit@3": false,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "ppt-electric-safety": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "night-photos": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-01": {
+          "hit@1": false,
+          "best_rank": 3,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-02": {
+          "hit@1": false,
+          "best_rank": 5,
+          "hit@3": false,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-03": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-04": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-05": {
+          "hit@1": false,
+          "best_rank": null,
+          "hit@3": false,
+          "hit@5": false,
+          "hit@10": false
+        },
+        "pp-06": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-07": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-08": {
+          "hit@1": false,
+          "best_rank": null,
+          "hit@3": false,
+          "hit@5": false,
+          "hit@10": false
+        },
+        "pp-09": {
+          "hit@1": false,
+          "best_rank": null,
+          "hit@3": false,
+          "hit@5": false,
+          "hit@10": false
+        },
+        "pp-10": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-11": {
+          "hit@1": false,
+          "best_rank": 3,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-12": {
+          "hit@1": false,
+          "best_rank": 4,
+          "hit@3": false,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-13": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-14": {
+          "hit@1": false,
+          "best_rank": 2,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-15": {
+          "hit@1": false,
+          "best_rank": null,
+          "hit@3": false,
+          "hit@5": false,
+          "hit@10": false
+        },
+        "pp-16": {
+          "hit@1": true,
+          "best_rank": 1,
+          "hit@3": true,
+          "hit@5": true,
+          "hit@10": true
+        },
+        "pp-17": {
+          "hit@1": false,
+          "best_rank": 4,
+          "hit@3": false,
+          "hit@5": true,
+          "hit@10": true
+        }
+      },
+      "negative_top1_scores": [
+        {
+          "id": "neg-travel-allowance",
+          "top1_score": 0.9107
+        },
+        {
+          "id": "neg-annual-leave",
+          "top1_score": 0.8983
+        },
+        {
+          "id": "neg-performance",
+          "top1_score": 0.831
+        },
+        {
+          "id": "neg-purchase-approval",
+          "top1_score": 0.9061
+        },
+        {
+          "id": "neg-canteen",
+          "top1_score": 0.8888
+        },
+        {
+          "id": "neg-fire-drill",
+          "top1_score": 0.8727
+        },
+        {
+          "id": "neg-vehicle",
+          "top1_score": 0.7496
+        },
+        {
+          "id": "neg-meeting-room",
+          "top1_score": 0.818
+        }
+      ]
+    }
+  }
+}
