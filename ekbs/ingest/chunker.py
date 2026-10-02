@@ -76,6 +76,18 @@ def is_substantive_line(line: str) -> bool:
     return len(stripped) >= 12 and any(ch in stripped for ch in _CONTENT_PUNCT)
 
 
+#: Markdown 标记（`## 标题` / `- 列表` / `1. 序号`）——比对前要剥掉：
+#: 分块器把 `## 项目背景` 存进 heading_path 时**不带 `##`**，不剥就会把每条标题都误判成丢失。
+_MD_MARK_RE = re.compile(r"^[\s>]*(#{1,6}|[-*+]|\d+[.)])[\s]+")
+
+
+def _strip_md_marks(text: str) -> str:
+    """逐行剥掉 Markdown 标记并去掉空白，得到可比对的内容串。"""
+    return re.sub(
+        r"[\s\u3000]", "", "".join(_MD_MARK_RE.sub("", line) for line in (text or "").splitlines())
+    )
+
+
 def content_coverage(
     source_text: str, nodes: Sequence["ChunkNode"]
 ) -> tuple[float, tuple[str, ...]]:
@@ -84,19 +96,20 @@ def content_coverage(
     返回 ``(覆盖率, 丢失的实质内容行)``。为什么要有它：分块把整行当标题时文字会**静默消失**
     （实测交接班制度 22 段丢 11 段：643 字符只剩 206），而空页率/乱码率/空 heading 这些
     闸门**全是 PASS** —— 只有逐行核对能发现。入库时会用它当守卫（见 `ingest/pipeline`）。
+
+    比对前**逐行剥掉 Markdown 标记**：分块器把 ``## 项目背景`` 存进 heading_path 时
+    不带 ``##``，不剥就会把每条 Markdown 标题都误判成"丢失"（守卫天天喊狼来了就没人看了）。
     """
     lines = [line.strip() for line in source_text.splitlines() if line.strip()]
     if not lines:
         return 1.0, ()
     stored = "".join(
-        re.sub(r"[\s\u3000]", "", (node.content or "") + (node.heading_path or "")) for node in nodes
+        _strip_md_marks((node.content or "") + " " + (node.heading_path or "")) for node in nodes
     )
     lost = [
-        line
-        for line in lines
-        if is_substantive_line(line) and re.sub(r"[\s\u3000]", "", line) not in stored
+        line for line in lines if is_substantive_line(line) and _strip_md_marks(line) not in stored
     ]
-    kept = sum(1 for line in lines if re.sub(r"[\s\u3000]", "", line) in stored)
+    kept = sum(1 for line in lines if _strip_md_marks(line) in stored)
     return kept / len(lines), tuple(lost)
 
 
@@ -329,8 +342,14 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
     current_heading = ""
     current_start = 0
     offset = 0
+    #: 每个标题的 (标题文字, 该标题当时的完整路径, 该行原文, 行偏移) —— 收尾时用它兜底
+    #: 找回"从未出现在任何块 heading_path 里"的标题（否则被 pop 掉就永久消失：
+    #: 实测 `6.1 《设施设备台账/统计表》`、`### 设备分组设置` 都是这样丢的）。
+    heading_log: list[tuple[str, str, str, int]] = []
+    heading_emitted = False
 
     def flush(end_offset: int) -> None:
+        nonlocal heading_emitted
         text = "\n".join(buffer).strip()
         if text:
             page_from, page_to = _pages_for(current_start, end_offset, page_map)
@@ -339,25 +358,30 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
                     heading_path=current_heading, text=text, page_from=page_from, page_to=page_to
                 )
             )
+            heading_emitted = True
 
-    def push_heading(level: int, title: str, line_len: int, *, also_body: str | None = None) -> None:
+    def push_heading(
+        level: int, title: str, line_len: int, *, source_line: str | None = None
+    ) -> None:
         """开一个新小节。
 
-        ``also_body``：当**这一行本身就是内容**时（中文制度/合同里 ``第X条 …``、``4.1 …``
-        常常整条就是正文），把整行文字**同时**放进新小节的正文 —— 否则这行只进
-        ``heading_path``，而同级旧标题会被弹出（见下 ``heading_stack.pop()``），
-        结果是**整行文字谁都不产出，静默丢失**。
-        实测：交接班制度 22 段丢 11 段（643 字符只剩 206），而质量闸门全 PASS。
+        ``source_line``：这一行的**原文**。中文制度/合同里 ``第X条 …``、``4.1 …``
+        常常整条就是正文 —— 此时整行文字**同时**进新小节正文（否则同级旧标题被弹出后，
+        整行文字谁都不产出，静默丢失：实测交接班制度 22 段丢 11 段）。
+        即便这一行只是纯标题，它的原文也会被记下来，供"无正文时兜底落库"。
         """
-        nonlocal buffer, current_heading, current_start
+        nonlocal buffer, current_heading, current_start, heading_emitted
         flush(offset)
         buffer = []
         while heading_stack and heading_stack[-1][0] >= level:
             heading_stack.pop()
         heading_stack.append((level, title))
         current_heading = " > ".join(t for _, t in heading_stack)
-        if also_body:
-            buffer.append(also_body)
+        if source_line is not None:
+            heading_log.append((title, current_heading, source_line, offset))
+        heading_emitted = False
+        if source_line and _looks_like_content(source_line.strip()):
+            buffer.append(source_line)
             current_start = offset  # 本行就是正文首行 → 小节起点就是它
         else:
             current_start = offset + line_len + 1
@@ -370,7 +394,7 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
         if match:
             level = len(match.group(1))
             title = match.group(2).strip()
-            push_heading(level, title, len(line))
+            push_heading(level, title, len(line), source_line=line)
         elif clause:
             kind = clause.group(2)
             level = _CLAUSE_LEVEL.get(kind, 3)
@@ -378,15 +402,35 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
             rest = clause.group(3).strip()
             if rest:
                 title = f"{title} {rest}"
-            # 条款行若"本身就是一段内容"，整行也要进正文（否则连同级旧标题一起被弹出丢弃）
-            push_heading(level, title, len(line), also_body=line if _looks_like_content(stripped) else None)
+            push_heading(level, title, len(line), source_line=line)
         elif dotted:
             title = f"{dotted.group(1)} {dotted.group(2).strip()}"
-            push_heading(3, title, len(line), also_body=line if _looks_like_content(stripped) else None)
+            push_heading(3, title, len(line), source_line=line)
         else:
             buffer.append(line)
         offset += len(line) + 1
     flush(offset)
+
+    # 收尾兜底：有些标题（文档末尾的、被同级标题顶掉的）**没有正文**，文字只存在于
+    # heading_stack 里 —— 一旦被 pop 就永久消失。这里只补真正没落库的那些：
+    # 若该标题已经出现在某个块的 heading_path 中（H1 通常如此），就不重复产出，
+    # 免得制造一堆 5 token 的碎片块。
+    emitted_paths = [section.heading_path for section in sections]
+    emitted_text = _strip_md_marks("".join(section.text for section in sections))
+    for title, path, source, head_off in heading_log:
+        if not source.strip() or title in " ".join(emitted_paths):
+            continue
+        if _strip_md_marks(source) in emitted_text:
+            continue
+        page_from, page_to = _pages_for(head_off, head_off + len(source), page_map)
+        sections.append(
+            Section(
+                heading_path=path or title,
+                text=source.strip(),
+                page_from=page_from,
+                page_to=page_to,
+            )
+        )
     return sections
 
 

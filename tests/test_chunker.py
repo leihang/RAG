@@ -287,3 +287,30 @@ def test_content_coverage_flags_missing_substantive_lines() -> None:
     )
     assert ratio2 < 1.0
     assert any("另一段必须在库里" in line for line in lost2)
+
+
+def test_bodyless_headings_still_land_somewhere() -> None:
+    """**没有正文的标题**也必须落库（否则被同级标题顶掉就永久消失）。
+
+    实测：`6.1 《设施设备台账/统计表》` 是文档最后一行、`### 设备分组设置` 后面直接跟
+    另一个同级标题 —— 这类标题的文字只存在于 heading_stack 里，`pop()` 之后就查不到了。
+
+    同时约束**不要过度产出**：H1（如 `# 员工手册`）会被后续每个块的 heading_path 带上，
+    就不该再单独产一个碎片块。
+    """
+    md = (
+        "## 项目背景\n"
+        "系统建设说明。\n"
+        "### 设备分组设置\n"
+        "### 数据查看及告警消除\n"
+    )
+    result = chunk_markdown(md)
+    ratio, lost = content_coverage(md, result.nodes)
+    assert not lost, f"仍有丢失：{lost}"
+    joined = "\n".join(node.content + node.heading_path for node in result.nodes)
+    assert "设备分组设置" in joined and "数据查看及告警消除" in joined
+
+    long_doc = chunk_markdown("# 员工手册\n## 第 1 章 规定事项\n" + "公司制度条款内容说明。" * 30 + "\n")
+    assert all(
+        node.content.strip() != "# 员工手册" for node in long_doc.nodes
+    ), "H1 已被后续 heading_path 覆盖，不该再单独成块（避免碎片块）"
