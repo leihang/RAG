@@ -30,6 +30,7 @@ from ekbs.config import Settings
 from ekbs.db import Database
 from ekbs.errors import EmbeddingUnavailable, ModelUnavailable, RerankUnavailable
 from ekbs.index.faiss_store import ShardIndexManager
+from ekbs.index.figure_faiss import FigureIndex
 from ekbs.index.fts import FtsIndex
 from ekbs.ingest.chunker import retrieval_text
 from ekbs.logging import get_logger
@@ -38,11 +39,23 @@ from ekbs.permission.context import PermContext
 from ekbs.provider.base import LLMProvider, RerankDoc
 from ekbs.provider.registry import Providers
 from ekbs.retrieval.faithfulness import (
+    DEGRADED_UNSUPPORTED,
     REFUSE_MISSING_CITATION,
     REFUSE_UNSUPPORTED_CLAIM,
     assess_faithfulness,
+    mostly_unsupported,
 )
-from ekbs.retrieval.rrf import rrf_fuse, ranks_of
+from ekbs.retrieval.numeric import (
+    MODE_NUMERIC,
+    MODE_PROSE,
+    build_numeric_prompt,
+    find_scope_alternatives,
+    parse_numeric_payload,
+    render_answer,
+    verify_copied,
+    verify_scope,
+)
+from ekbs.retrieval.rrf import alpha_fuse, rrf_fuse, ranks_of
 
 log = get_logger(component="retrieval")
 
@@ -151,6 +164,9 @@ class AnswerResult:
     hallucinated_citations: list[int] = field(default_factory=list)
     #: 生成侧忠实度报告（规则型 claim 支撑检查；调试台面板用）
     faithfulness: dict[str, Any] = field(default_factory=dict)
+    #: **取数模式**的结构化结果（值/单位/页码/原文片段/是否通过抄写校验）。
+    #: 业务问答（prose）下为 None —— 两种模式的答案形态不同，前端据此分别渲染。
+    numeric: dict[str, Any] | None = None
     ttft_ms: int = 0
     total_ms: int = 0
     prompt_tokens: int = 0
@@ -174,6 +190,10 @@ class RetrievalOverrides:
     rerank_keep: int | None = None
     rerank_min_score: float | None = None
     parent_expand: bool | None = None
+    fusion: str | None = None
+    hybrid_alpha: float | None = None
+    multi_query: int | None = None
+    figure_multimodal: bool | None = None
 
     def effective(self, settings: Settings) -> dict[str, Any]:
         cfg = settings.retrieval
@@ -188,19 +208,33 @@ class RetrievalOverrides:
                 cfg.rerank.min_score if self.rerank_min_score is None else self.rerank_min_score
             ),
             "parent_expand": cfg.parent_expand if self.parent_expand is None else self.parent_expand,
+            "fusion": (self.fusion or getattr(cfg, "fusion", "rrf") or "rrf").lower(),
+            "hybrid_alpha": (
+                cfg.hybrid_alpha if self.hybrid_alpha is None else self.hybrid_alpha
+            ),
+            "multi_query": (
+                cfg.multi_query if self.multi_query is None else self.multi_query
+            ),
+            "figure_multimodal": (
+                bool(getattr(cfg, "figure_multimodal", True))
+                if self.figure_multimodal is None
+                else bool(self.figure_multimodal)
+            ),
         }
 
 
 SYSTEM_PROMPT = (
     "你是企业知识库问答助手。只能依据下面提供的资料回答，不得编造。\n"
     "引用资料时必须在句末标注编号，格式如 [1]、[2]。\n"
-    "若资料不足以回答，直接回复「未找到可靠依据」。\n\n"
+    "资料里以【图片】开头的条目是可展示的原图：用户索要照片/图片/截图时，"
+    "必须引用这些编号（界面会展示图片），不要因为无法在文字里嵌入图片就回复「未找到可靠依据」。\n"
+    "若资料完全不足以回答，才直接回复「未找到可靠依据」。\n\n"
     "资料：\n{context}"
 )
 
 #: 提示词版本（进答案缓存键）：**改动 SYSTEM_PROMPT 必须同步 +1**，
 #: 否则旧提示词生成的答案会继续从缓存里被服务。
-PROMPT_REVISION = "v1"
+PROMPT_REVISION = "v3"
 
 
 class RetrievalPipeline:
@@ -216,6 +250,7 @@ class RetrievalPipeline:
         session_store: Any | None = None,
         rewriter: Any | None = None,
         content_guard: Any | None = None,
+        figure_index: FigureIndex | None = None,
     ) -> None:
         self.db = db
         self.settings = settings
@@ -229,10 +264,41 @@ class RetrievalPipeline:
         self.rewriter = rewriter
         # 内容安全闸门（04 §6.4）：L4 输出侧检测未授权文档名
         self.content_guard = content_guard
+        self.figure_index = figure_index
 
     # ------------------------------------------------------------------
     # 查询嵌入（含缓存与「不可用即拒答」）
     # ------------------------------------------------------------------
+
+    async def _multimodal_query_vector(self, query: str) -> list[float] | None:
+        """多模态查询向量（**带缓存**）。
+
+        为什么必须缓存：文本查询向量早就走了 `query_embedding_ttl` 缓存，而这条曾经
+        每次都直连云端 —— 于是**同一个问题每问一次就多打一次多模态嵌入**，在连续提问下
+        把低配额端点打成持续 429（实测 sweep：858 次调用 vs 882 次 429，一轮 A/B 从 7 分钟
+        被拖到 50 分钟）。这不是"要不要图片旁路"的问题，是"别重复付费"的问题。
+
+        键用 :meth:`CacheStore.mm_embed_key`：**与文本嵌入分开命名空间** ——
+        两个向量维度不同（1152 vs 1024），混用会把错误的向量喂进错误的索引。
+        """
+        key = CacheStore.mm_embed_key(query)
+        cached = await self.cache.get(key)
+        if cached is not None:
+            return list(cached)
+        vector = await self.providers.multimodal.embed_text(query)
+        if not vector:
+            return None
+        expected = getattr(self.figure_index, "dim", None)
+        if expected and len(vector) != int(expected):
+            # 维度不符时**不写缓存**：否则会把错的向量缓存 24 小时
+            log.warning(
+                "mm_embed_dim_mismatch", got=len(vector), expected=int(expected)
+            )
+            return None
+        await self.cache.set(
+            key, list(vector), ttl=self.settings.retrieval.cache.query_embedding_ttl
+        )
+        return list(vector)
 
     async def query_vector(self, query: str) -> list[float] | None:
         """返回查询向量；None 表示嵌入不可用（调用方必须拒答，不得降级）。"""
@@ -260,6 +326,11 @@ class RetrievalPipeline:
         self, vector: Sequence[float], perm: PermContext, top_k: int | None = None
     ) -> list[int]:
         """逐分片 FAISS 召回（C1：只查可见分片；顺序稳定以便复现）。"""
+        return [chunk_id for chunk_id, _ in self._dense_recall_scored(vector, perm, top_k)]
+
+    def _dense_recall_scored(
+        self, vector: Sequence[float], perm: PermContext, top_k: int | None = None
+    ) -> list[tuple[int, float]]:
         import numpy as np
 
         query = np.asarray(vector, dtype="float32")
@@ -274,7 +345,7 @@ class RetrievalPipeline:
                 if chunk_id is not None:
                     per_shard.append((score, chunk_id))
         per_shard.sort(key=lambda pair: (-pair[0], pair[1]))
-        return [chunk_id for _, chunk_id in per_shard]
+        return [(chunk_id, score) for score, chunk_id in per_shard]
 
     def _chunk_ids_by_faiss_row(self, shard_id: str, rows: Sequence[int]) -> dict[int, int]:
         """FAISS 命中 → ``chunk_id``；同时做**权限与状态下推**（与 FTS5 路径语义等价）。
@@ -301,14 +372,76 @@ class RetrievalPipeline:
     def _sparse_recall(
         self, query: str, perm: PermContext, top_k: int | None = None
     ) -> list[int]:
-        hits = self.fts.search(
-            query,
-            shard_ids=perm.visible_shard_ids,
-            clearance=perm.clearance,
-            dept_chain=perm.dept_chain,
-            top_k=top_k or self.settings.retrieval.sparse_top_k,
+        return [chunk_id for chunk_id, _ in self._sparse_recall_scored(query, perm, top_k)]
+
+    def _sparse_recall_scored(
+        self,
+        query: str,
+        perm: PermContext,
+        top_k: int | None = None,
+        *,
+        variants: Sequence[str] | None = None,
+    ) -> list[tuple[int, float]]:
+        """BM25 召回；``variants`` 非空时 MultiQuery 多路取最佳（分数已翻转为越高越好）。"""
+        queries = [q for q in (variants or [query]) if (q or "").strip()]
+        if not queries:
+            queries = [query]
+        best: dict[int, float] = {}
+        for q in queries:
+            hits = self.fts.search(
+                q,
+                shard_ids=perm.visible_shard_ids,
+                clearance=perm.clearance,
+                dept_chain=perm.dept_chain,
+                top_k=top_k or self.settings.retrieval.sparse_top_k,
+            )
+            for hit in hits:
+                # bm25 越小越相关 → 取负后越大越好（供 α 融合）
+                score = -float(hit.score)
+                prev = best.get(hit.chunk_id)
+                if prev is None or score > prev:
+                    best[hit.chunk_id] = score
+        return sorted(best.items(), key=lambda pair: (-pair[1], pair[0]))
+
+    def _query_variants(self, query: str, *, limit: int) -> list[str]:
+        if limit <= 1:
+            return [query]
+        if self.rewriter is not None and hasattr(self.rewriter, "expand_variants"):
+            return self.rewriter.expand_variants(query)[:limit]
+        return [query]
+
+    def _figure_recall_scored(
+        self,
+        mm_vector: Sequence[float],
+        perm: PermContext,
+        top_k: int | None = None,
+    ) -> list[tuple[int, float]]:
+        """多模态 figure 旁路召回；命中后按可见分片 + published 过滤（C1）。"""
+        if self.figure_index is None or not mm_vector:
+            return []
+        k = top_k or self.settings.retrieval.dense_top_k
+        hits = self.figure_index.search(mm_vector, k)
+        if not hits:
+            return []
+        chunk_ids = [cid for cid, _ in hits]
+        placeholders = ",".join("?" for _ in chunk_ids)
+        sql = (
+            "SELECT c.chunk_id, c.shard_id FROM ekbs_chunk c "
+            "JOIN ekbs_document d ON d.doc_id = c.doc_id "
+            f"WHERE c.chunk_id IN ({placeholders}) "
+            "AND c.chunk_type = 'figure' "
+            "AND d.status = 'published' "
+            "AND (d.effective_date IS NULL OR d.effective_date <= date('now')) "
+            "AND (d.expire_date IS NULL OR d.expire_date > date('now'))"
         )
-        return [hit.chunk_id for hit in hits]
+        with self.db.sync_connect() as conn:
+            rows = conn.execute(sql, tuple(chunk_ids)).fetchall()
+        allowed = {
+            int(r["chunk_id"])
+            for r in rows
+            if str(r["shard_id"]) in set(perm.visible_shard_ids)
+        }
+        return [(cid, score) for cid, score in hits if cid in allowed]
 
     # ------------------------------------------------------------------
     # 块加载
@@ -391,12 +524,39 @@ class RetrievalPipeline:
         embed_done = time.perf_counter()
 
         # ② 两路召回（FAISS 是同步 C 调用，放线程池；04 §1.5）
-        dense_ids = await asyncio.to_thread(
-            self._dense_recall, vector, perm, params["dense_top_k"]
+        variants = self._query_variants(query, limit=int(params.get("multi_query") or 1))
+        dense_scored = await asyncio.to_thread(
+            self._dense_recall_scored, vector, perm, params["dense_top_k"]
         )
-        sparse_ids = await asyncio.to_thread(
-            self._sparse_recall, query, perm, params["sparse_top_k"]
+        sparse_scored = await asyncio.to_thread(
+            self._sparse_recall_scored,
+            query,
+            perm,
+            params["sparse_top_k"],
+            variants=variants,
         )
+        dense_ids = [chunk_id for chunk_id, _ in dense_scored]
+        sparse_ids = [chunk_id for chunk_id, _ in sparse_scored]
+
+        # ②ʹ figure 多模态第三路（查询文本进同一 MM 模型）
+        figure_ids: list[int] = []
+        figure_scored: list[tuple[int, float]] = []
+        use_figure_mm = (
+            bool(params.get("figure_multimodal"))
+            and self.figure_index is not None
+            and self.providers.multimodal is not None
+        )
+        if use_figure_mm:
+            try:
+                mm_vector = await self._multimodal_query_vector(query)
+                figure_scored = await asyncio.to_thread(
+                    self._figure_recall_scored, mm_vector, perm, params["dense_top_k"]
+                )
+                figure_ids = [chunk_id for chunk_id, _ in figure_scored]
+            except Exception as exc:
+                log.warning("figure_mm_recall_failed", error=str(exc)[:160])
+                result.degraded.append("figure_mm_unavailable")
+
         recall_done = time.perf_counter()
         if collect_debug:
             import numpy as np  # 本模块按需导入 numpy（不在模块顶层引入）
@@ -416,19 +576,46 @@ class RetrievalPipeline:
             }
             result.stage_debug["sparse"] = {
                 "requested_top_k": params["sparse_top_k"],
+                "variants": variants,
                 "hits": [
-                    {"chunk_id": hit.chunk_id, "bm25": round(hit.score, 6), "shard_id": hit.shard_id}
-                    for hit in self.fts.search(
-                        query, shard_ids=perm.visible_shard_ids, clearance=perm.clearance,
-                        dept_chain=perm.dept_chain, top_k=params["sparse_top_k"],
-                    )
+                    {"chunk_id": chunk_id, "score": round(score, 6)}
+                    for chunk_id, score in sparse_scored[: params["sparse_top_k"]]
+                ],
+            }
+            result.stage_debug["figure_mm"] = {
+                "enabled": use_figure_mm,
+                "hits": [
+                    {"chunk_id": chunk_id, "score": round(score, 6)}
+                    for chunk_id, score in figure_scored[: params["dense_top_k"]]
                 ],
             }
 
-        # ③ RRF
-        fused = rrf_fuse([dense_ids, sparse_ids], k=params["rrf_k"])
+        # ③ 融合：默认 RRF（含 figure 第三路）；可切 α 加权（课程 18，仍只融 dense+sparse）
+        fusion = str(params.get("fusion") or "rrf")
+        if fusion == "alpha":
+            fused = alpha_fuse(
+                dense_scored,
+                sparse_scored,
+                alpha=float(params.get("hybrid_alpha") if params.get("hybrid_alpha") is not None else 0.5),
+            )
+            if figure_ids:
+                # α 路径再与 figure 做一次 RRF，避免图模态分数与文本量纲混算
+                fused_ids = [cid for cid, _ in fused]
+                fused = rrf_fuse([fused_ids, figure_ids], k=params["rrf_k"])
+        else:
+            lanes = [dense_ids, sparse_ids]
+            if figure_ids:
+                lanes.append(figure_ids)
+            fused = rrf_fuse(lanes, k=params["rrf_k"])
         dense_ranks = ranks_of(dense_ids)
         sparse_ranks = ranks_of(sparse_ids)
+        if collect_debug:
+            result.stage_debug["fusion"] = {
+                "mode": fusion,
+                "hybrid_alpha": params.get("hybrid_alpha"),
+                "multi_query": variants,
+                "figure_lane": bool(figure_ids),
+            }
         if not fused:
             result.refused = True
             result.refusal_reason = REFUSE_NO_CANDIDATE
@@ -572,6 +759,8 @@ class RetrievalPipeline:
             }
         if params["parent_expand"]:
             selected = await asyncio.to_thread(self._expand_parents, selected, perm)
+        # 正文命中后，把同页的 figure 一并带进上下文（PPT「把照片发出来」依赖这条）
+        selected = await asyncio.to_thread(self._expand_page_figures, selected, perm)
 
         expand_done = time.perf_counter()
         result.chunks = selected
@@ -615,6 +804,110 @@ class RetrievalPipeline:
                 expanded.append(chunk)
         return expanded
 
+    def _expand_page_figures(
+        self,
+        chunks: list[RetrievedChunk],
+        perm: PermContext,
+        *,
+        max_per_anchor: int = 8,
+        max_total: int = 12,
+    ) -> list[RetrievedChunk]:
+        """正文/表格命中后，把**同一文档、页码重叠**的 figure 块并入上下文。
+
+        PPT「计量表更换」正文与电表照片常分属 parent / figure；只靠向量时照片
+        往往排不进 top-k，用户一问「把照片发出来」就会因上下文无图而拒答。
+        """
+        if not chunks:
+            return chunks
+        present = {c.chunk_id for c in chunks}
+        anchors = [
+            c for c in chunks
+            if c.chunk_type != "figure" and c.page_from is not None
+        ]
+        if not anchors:
+            return chunks
+
+        figure_ids: list[int] = []
+        seen_fig: set[int] = set()
+        with self.db.sync_connect() as conn:
+            for anchor in anchors:
+                page_lo = int(anchor.page_from or 0)
+                page_hi = int(anchor.page_to or page_lo)
+                rows = conn.execute(
+                    "SELECT chunk_id FROM ekbs_chunk "
+                    "WHERE doc_id = ? AND chunk_type = 'figure' "
+                    "AND page_from IS NOT NULL "
+                    "AND page_from <= ? AND COALESCE(page_to, page_from) >= ? "
+                    "ORDER BY seq LIMIT ?",
+                    (int(anchor.doc_id), page_hi, page_lo, int(max_per_anchor)),
+                ).fetchall()
+                for row in rows:
+                    cid = int(row["chunk_id"])
+                    if cid in present or cid in seen_fig:
+                        continue
+                    seen_fig.add(cid)
+                    figure_ids.append(cid)
+                    if len(figure_ids) >= max_total:
+                        break
+                if len(figure_ids) >= max_total:
+                    break
+
+        if not figure_ids:
+            return chunks
+
+        figures = self.load_chunks(figure_ids)
+        kept, dropped = self.gate.filter_chunks(
+            perm, [(cid, figures[cid].doc_id) for cid in figures]
+        )
+        allowed = {chunk_id for chunk_id, _ in kept}
+        if dropped:
+            log.info("c5_denied_figure", count=len(dropped), user_id=perm.user_id)
+
+        expanded = list(chunks)
+        # 把插图挂在对应正文锚点后面，方便模型就近引用
+        by_doc_page: dict[tuple[int, int, int], list[RetrievedChunk]] = {}
+        for cid in figure_ids:
+            if cid not in allowed:
+                continue
+            fig = figures[cid]
+            lo = int(fig.page_from or 0)
+            hi = int(fig.page_to or lo)
+            by_doc_page.setdefault((int(fig.doc_id), lo, hi), []).append(fig)
+
+        out: list[RetrievedChunk] = []
+        inserted: set[int] = set()
+        for chunk in expanded:
+            out.append(chunk)
+            if chunk.chunk_type == "figure" or chunk.page_from is None:
+                continue
+            lo = int(chunk.page_from)
+            hi = int(chunk.page_to or lo)
+            for (doc_id, flo, fhi), figs in list(by_doc_page.items()):
+                if doc_id != int(chunk.doc_id):
+                    continue
+                if fhi < lo or flo > hi:
+                    continue
+                for fig in figs:
+                    if fig.chunk_id in inserted or fig.chunk_id in present:
+                        continue
+                    fig.rerank_score = chunk.rerank_score
+                    fig.rrf_score = chunk.rrf_score
+                    out.append(fig)
+                    inserted.add(fig.chunk_id)
+        # 未挂上的（页码对不上）仍追加在末尾，避免丢掉
+        for cid in figure_ids:
+            if cid in allowed and cid not in inserted and cid not in present:
+                out.append(figures[cid])
+                inserted.add(cid)
+        if inserted:
+            log.info(
+                "page_figures_expanded",
+                anchors=len(anchors),
+                figures=len(inserted),
+                user_id=perm.user_id,
+            )
+        return out
+
     # ------------------------------------------------------------------
     # 生成与引用
     # ------------------------------------------------------------------
@@ -623,8 +916,11 @@ class RetrievalPipeline:
     def build_context(chunks: Sequence[RetrievedChunk]) -> str:
         """构造 Prompt 里的资料段：``[n] 标题（第 x 页）: 正文``。
 
+        表格块优先还原为 HTML（课程 19：LLM 对 HTML 表结构理解更好）；失败回退原文。
         编号 → chunk_id 的映射由调用方随请求保存（`00` §2.2）。
         """
+        from ekbs.ingest.table_serialize import information_block_to_html
+
         lines: list[str] = []
         for index, chunk in enumerate(chunks, start=1):
             page = ""
@@ -633,7 +929,18 @@ class RetrievalPipeline:
                     f"（第 {chunk.page_from}-{chunk.page_to} 页）"
                 )
             heading = f"{chunk.heading_path} " if chunk.heading_path else ""
-            lines.append(f"[{index}] {chunk.doc_title}{page} {heading}: {chunk.content}".strip())
+            kind = ""
+            body = chunk.content
+            if chunk.chunk_type == "figure":
+                kind = "【图片】"
+            elif chunk.chunk_type == "table":
+                kind = "【表格】"
+                html = information_block_to_html(chunk.content)
+                if html:
+                    body = html
+            lines.append(
+                f"[{index}] {kind}{chunk.doc_title}{page} {heading}: {body}".strip()
+            )
         return "\n".join(lines)
 
     async def generate(
@@ -717,30 +1024,45 @@ class RetrievalPipeline:
             )
 
         # P0 忠实度：无 [n] 不成溯源；数字/量词须落在入选分块原文中
+        #
+        # 分级处理（实测教训：`2026年7月能耗分析` 这类**表格汇总**问题，模型会做单位换算与
+        # 格式化，旧的"一条对不上就整答拒答 + 清空引用"会把好答案打成拒答 —— 25 条 claim
+        # 误杀 9 条，用户看到的是"答不出来"，而检索其实完全正常）：
+        #   * `missing_citation`：答案根本没标 [n] → **仍然硬拒**（不允许假溯源）；
+        #   * `unsupported_claim` 且占比过高（`mostly_unsupported`）→ **仍然硬拒**（大概整篇是编的）；
+        #   * `unsupported_claim` 占比不高 → **降级**：答案与引用都保留，标 degraded、
+        #     写审计（`faithfulness_degraded`），由界面提示"部分数字未能逐字核对"。
         report = assess_faithfulness(answer_text, chunks)
+        degraded: list[str] = (
+            [f"output_title_masked:{len(leaked_titles)}"] if leaked_titles else []
+        )
         if not report.ok:
+            hard_refuse = report.reason == REFUSE_MISSING_CITATION or mostly_unsupported(report)
             self.gate.record_security_event(
-                "faithfulness_refused",
+                "faithfulness_refused" if hard_refuse else "faithfulness_degraded",
                 user_id=perm.user_id,
-                severity="medium",
+                severity="medium" if hard_refuse else "low",
                 detail={
                     "reason": report.reason,
                     "unsupported": report.unsupported[:10],
+                    "claims": len(report.claims),
                     "model": llm_result.model,
                 },
             )
-            return AnswerResult(
-                answer=answer_text,
-                citations=[],
-                retrieval=retrieval,
-                model=llm_result.model,
-                refused=True,
-                refusal_reason=report.reason,
-                hallucinated_citations=hallucinated,
-                faithfulness=report.as_dict(),
-                degraded=[f"output_title_masked:{len(leaked_titles)}"] if leaked_titles else [],
-                **timing_kw,
-            )
+            if hard_refuse:
+                return AnswerResult(
+                    answer=answer_text,
+                    citations=[],
+                    retrieval=retrieval,
+                    model=llm_result.model,
+                    refused=True,
+                    refusal_reason=report.reason,
+                    hallucinated_citations=hallucinated,
+                    faithfulness=report.as_dict(),
+                    degraded=degraded,
+                    **timing_kw,
+                )
+            degraded.append(f"{DEGRADED_UNSUPPORTED}:{len(report.unsupported)}")
 
         citations = self._post_check_citations(answer_text, chunks, perm)
         return AnswerResult(
@@ -751,8 +1073,162 @@ class RetrievalPipeline:
             refused=False,
             hallucinated_citations=hallucinated,
             faithfulness=report.as_dict(),
-            degraded=[f"output_title_masked:{len(leaked_titles)}"] if leaked_titles else [],
+            degraded=degraded,
             **timing_kw,
+        )
+
+    async def _answer_numeric(
+        self, question: str, retrieval: RetrievalResult, perm: PermContext
+    ) -> AnswerResult:
+        """**取数模式**：类型锁死 + 抄写校验（口径同课程 19，见 :mod:`ekbs.retrieval.numeric`）。
+
+        与业务问答（:meth:`generate`）的三处**刻意差异**：
+
+        1. 用**独立提示词** `NUMERIC_SYSTEM_PROMPT` —— 全局 `SYSTEM_PROMPT` 一个字不动，
+           否则"宁可 N/A 也不解释"的铁律会污染业务问答；
+        2. **不跑自由文本的忠实度校验** `assess_faithfulness`：那是"事后拿规则对账"，
+           对结构化取数值不适用；取而代之的是**更强的抄写校验**（值必须逐字来自它引用的
+           原文片段）。两者互斥但不等价 —— 后者是结构验证，强度更高；
+        3. 拒答语义与业务问答**完全一致**：`refused=True` + `citations=[]`
+           （课程防线 7 与我们既有的"拒答必清引用"是同一条，不新增状态）。
+        """
+        chunks = retrieval.chunks
+        model_ident = self.providers.llm.ref.ident
+        if not chunks:
+            return AnswerResult(
+                answer="未找到可靠依据。",
+                citations=[],
+                retrieval=retrieval,
+                model=model_ident,
+                refused=True,
+                refusal_reason=retrieval.refusal_reason or REFUSE_EMPTY_ANSWER,
+            )
+
+        messages = [
+            {
+                "role": "system",
+                "content": build_numeric_prompt(self.build_context(chunks)),
+            },
+            {"role": "user", "content": question},
+        ]
+        started = time.perf_counter()
+        # JSON 模式：让服务端约束输出形态（课程防线 2/5 的做法）。取数模式**只在**这里用它，
+        # 业务问答不带该字段 —— 请求体逐字不变。
+        response_format = {"type": "json_object"}
+        try:
+            llm_result = await self.providers.llm.generate(
+                messages, response_format=response_format
+            )
+        except ModelUnavailable as exc:
+            log.error("numeric_llm_failed", error=str(exc))
+            return AnswerResult(
+                answer="生成服务暂时不可用，请稍后重试。",
+                citations=[],
+                retrieval=retrieval,
+                model=model_ident,
+                refused=True,
+                refusal_reason="llm_unavailable",
+            )
+        numeric = parse_numeric_payload(llm_result.text)
+        if numeric.parse_error:
+            # 一次修复重试（课程防线 5 的"二次重解析"）：**只修格式，不重新取数**。
+            # 只在"格式失败"时触发 —— 模型按规则返回 N/A 时不重试（重试无意义且多烧一次调用）。
+            log.warning("numeric_parse_retry", model=llm_result.model, detail=numeric.reason)
+            retry_messages = [
+                *messages,
+                {
+                    "role": "user",
+                    "content": "上次的输出不是合法 JSON。只输出一个 JSON 对象，不要任何其它文字或代码块。",
+                },
+            ]
+            try:
+                retry_result = await self.providers.llm.generate(
+                    retry_messages, response_format=response_format
+                )
+            except ModelUnavailable as exc:
+                log.warning("numeric_parse_retry_failed", error=str(exc)[:120])
+            else:
+                retried = parse_numeric_payload(retry_result.text)
+                if not retried.parse_error:
+                    llm_result = retry_result
+                    numeric = retried
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+        def _refuse(reason: str, detail: dict[str, Any]) -> AnswerResult:
+            """取数失败一律走这里：**答案与引用同时清空**，不留"有答案没出处"的中间态。"""
+            self.gate.record_security_event(
+                "numeric_refused",
+                user_id=perm.user_id,
+                severity="low",
+                detail={"reason": reason, "model": llm_result.model, **detail},
+            )
+            return AnswerResult(
+                answer="未找到可靠依据。",
+                citations=[],
+                retrieval=retrieval,
+                model=llm_result.model,
+                refused=True,
+                refusal_reason=reason,
+                numeric=numeric.as_dict(),
+                total_ms=elapsed_ms,
+                prompt_tokens=llm_result.prompt_tokens,
+                completion_tokens=llm_result.completion_tokens,
+            )
+
+        if numeric.is_na:
+            # 格式失败（重试也没修好）与"资料没有该指标"共用拒答，但 reason 里如实区分
+            return _refuse("numeric_na", {"why": numeric.reason[:120], "parse_error": numeric.parse_error})
+
+        verified, cite_index = verify_copied(numeric, chunks)
+        if not verified:
+            # 值不在它引用的片段里 → 要么是编的、要么是算出来的（课程两条铁律都不许）
+            return _refuse(
+                "numeric_unverified",
+                {"value": numeric.value, "quote": numeric.quote[:60]},
+            )
+
+        # 口径（年份/期间/表名）必须也能从引用的分块里逐字核到 —— 编出来的口径
+        # 等于"答非所问还显得权威"，比错的数字更难被发现（README §四 第 79 条）
+        if not verify_scope(numeric, chunks, cite_index):
+            return _refuse(
+                "numeric_invalid_scope",
+                {"scope": numeric.scope[:40], "quote": numeric.quote[:60]},
+            )
+
+        numeric.verified = True
+        numeric.cite_index = cite_index
+        # 歧义披露：同一行标签在别处还有**不同数值**（如 2024年 vs 2026年）→
+        # 不猜、不拒答，把"另有 …"一起给出去，用户自己能看出抄的是哪一行。
+        alternatives = find_scope_alternatives(
+            chunks, quote=numeric.quote, value=numeric.value
+        )
+        if alternatives:
+            numeric.alternatives = alternatives
+        answer_text, _leaked = self._apply_output_guard(render_answer(numeric, cite_index), perm)
+        # 复用既有引用路径：ACL 二次确认 + 页码区间校验，与业务问答同一套（不另写一份）
+        citations = self._post_check_citations(answer_text, chunks, perm)
+        degraded = (
+            [f"numeric_scope_ambiguity:{len(alternatives)}"] if alternatives else []
+        )
+        return AnswerResult(
+            answer=answer_text,
+            citations=citations,
+            retrieval=retrieval,
+            model=llm_result.model,
+            degraded=degraded,
+            numeric=numeric.as_dict(),
+            # 取数模式的"忠实度"由抄写校验承担：显式写清口径，
+            # 免得调试台按业务问答的面板显示成"未通过"（那是另一套判据）
+            faithfulness={
+                "ok": True,
+                "reason": "numeric_copy_verified",
+                "cited_indices": [cite_index] if cite_index else [],
+                "claims": [],
+                "unsupported": [],
+            },
+            total_ms=elapsed_ms,
+            prompt_tokens=llm_result.prompt_tokens,
+            completion_tokens=llm_result.completion_tokens,
         )
 
     def _retrieval_only_answer(
@@ -875,6 +1351,7 @@ class RetrievalPipeline:
         allow_generation: bool = True,
         overrides: RetrievalOverrides | None = None,
         collect_debug: bool = False,
+        mode: str = MODE_PROSE,
     ) -> AnswerResult:
         """检索 + 生成的一条龙（供 API 与钉钉适配器调用）。
 
@@ -908,7 +1385,9 @@ class RetrievalPipeline:
         cache_key = CacheStore.answer_key(
             perm.fingerprint,
             f"{rewrite.rewritten}|{_history_digest(messages)}|gen={int(allow_generation)}"
-            f"|rc={self.retrieval_cache_revision()}",
+            # 模式必须进键：取数模式与业务问答的答案形态完全不同，
+            # 不加这截就会把上一模式的结果（甚至缓存的自由文本）喂给另一个模式。
+            f"|mode={mode}|rc={self.retrieval_cache_revision()}",
         )
         if use_cache and not collect_debug:
             cached = await self.cache.get(cache_key)
@@ -927,6 +1406,7 @@ class RetrievalPipeline:
                 history_used=rewrite.used_history,
                 refused=bool(cached.get("refused", False)),
                 refusal_reason=str(cached.get("refusal_reason", "")),
+                numeric=cached.get("numeric"),
                 degraded=["answer_cache_hit"],
             )
             # 命中缓存也要记这一轮上下文：否则多轮追问会丢掉这一轮（实测踩到）
@@ -936,7 +1416,9 @@ class RetrievalPipeline:
         retrieval = await self.retrieve(
             rewrite.rewritten, perm, overrides=overrides, collect_debug=collect_debug
         )
-        if allow_generation:
+        if allow_generation and mode == MODE_NUMERIC:
+            result = await self._answer_numeric(question, retrieval, perm)
+        elif allow_generation:
             result = await self.generate(question, retrieval, perm, history=messages)
         else:
             result = self._retrieval_only_answer(question, retrieval, perm)
@@ -955,6 +1437,7 @@ class RetrievalPipeline:
                     "refused": result.refused,
                     "refusal_reason": result.refusal_reason,
                     "citations": [c.__dict__ for c in result.citations],
+                    "numeric": result.numeric,
                 },
                 ttl=self.settings.retrieval.cache.answer_ttl,
             )

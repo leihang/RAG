@@ -46,6 +46,9 @@ class QaRequest(BaseModel):
     stream: bool = False
     conversation_id: str | None = None
     use_cache: bool = True
+    #: 作答模式：``prose``（默认，业务问答）| ``numeric``（取数：值/单位/页码 + 抄写校验）。
+    #: 取数模式见 ekbs/retrieval/numeric.py 与 README §四 第 77 条；两种模式各自独立缓存。
+    mode: str = Field(default="prose", pattern="^(prose|numeric)$")
 
 
 class RetrieveRequest(BaseModel):
@@ -192,6 +195,7 @@ async def qa_chat(
         conversation_id=payload.conversation_id,
         use_cache=payload.use_cache,
         allow_generation=allow_generation,
+        mode=payload.mode,
     )
 
     # 审计（append-only；引用只存 hash 与页码）
@@ -233,6 +237,8 @@ async def qa_chat(
         "rerank_top_score": answer.retrieval.top_score,
         "c5_dropped": answer.retrieval.c5_dropped,
         "degraded": [*answer.retrieval.degraded, *answer.degraded],
+        # 取数模式的结构化结果（prose 模式下为 None）
+        "numeric": answer.numeric,
         "perm_fingerprint": perm.fingerprint,
         "visible_shard_count": len(perm.visible_shard_ids),
         "warnings": list(perm.warnings),

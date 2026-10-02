@@ -55,6 +55,8 @@ class RewriteResult:
     rewritten: str
     strategy: str
     used_history: bool = False
+    #: MultiQuery 扩写后的问句列表（含 rewritten；长度由 retrieval.multi_query 控制）
+    variants: list[str] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
@@ -184,27 +186,50 @@ class QueryRewriter:
         self, question: str, history: Sequence[dict[str, str]] = ()
     ) -> RewriteResult:
         if not self.enabled or not history:
-            return RewriteResult(question, question, "off", used_history=False)
+            result = RewriteResult(question, question, "off", used_history=False)
+            result.variants = self.expand_variants(result.rewritten)
+            return result
 
         previous_question = self._last_user_question(history)
         if not previous_question:
-            return RewriteResult(question, question, self.strategy, used_history=False)
+            result = RewriteResult(question, question, self.strategy, used_history=False)
+            result.variants = self.expand_variants(result.rewritten)
+            return result
 
         strategy = self.strategy
         if strategy == "off":
-            return RewriteResult(question, question, "off", used_history=False)
+            result = RewriteResult(question, question, "off", used_history=False)
+            result.variants = self.expand_variants(result.rewritten)
+            return result
         if strategy == "llm" and self.llm is not None and not _is_mock(self.llm):
             rewritten = await self._rewrite_with_llm(question, history)
             if rewritten:
-                return RewriteResult(question, rewritten, "llm", used_history=True)
-            return RewriteResult(question, question, "llm_failed", used_history=False)
+                result = RewriteResult(question, rewritten, "llm", used_history=True)
+                result.variants = self.expand_variants(result.rewritten, original=question)
+                return result
+            result = RewriteResult(question, question, "llm_failed", used_history=False)
+            result.variants = self.expand_variants(result.rewritten)
+            return result
 
         # 启发式：仅在「问题本身不自足」时才并入上一轮，避免污染语义明确的查询
         if _needs_context(question):
             merged = f"{previous_question} {question}".strip()
-            return RewriteResult(question, merged, "heuristic", used_history=True)
-        return RewriteResult(question, question, "heuristic", used_history=False)
+            result = RewriteResult(question, merged, "heuristic", used_history=True)
+            result.variants = self.expand_variants(result.rewritten, original=question)
+            return result
+        result = RewriteResult(question, question, "heuristic", used_history=False)
+        result.variants = self.expand_variants(result.rewritten)
+        return result
 
+    # ------------------------------------------------------------------
+    # 多轮改写用的两个助手
+    #
+    # ⚠️ 它们必须留在**类体内**。上一轮编辑把它们缩进到了模块级函数
+    #    `_keyword_focus` 的 `return` 之后 —— 于是既成了不可达的死代码，
+    #    又没挂到 `QueryRewriter` 上；任何**带历史**的多轮改写都会抛
+    #    `AttributeError: 'QueryRewriter' object has no attribute '_last_user_question'`
+    #    （12 个用例同时红，且线上多轮问答会直接失败）。
+    #    以后再挪这两个方法，请确认缩进层级：4 空格 = 类方法，别落进别的函数体。
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -214,12 +239,8 @@ class QueryRewriter:
                 return str(message["content"]).strip()
         return ""
 
-    async def _rewrite_with_llm(
-        self, question: str, history: Sequence[dict[str, str]]
-    ) -> str:
-        rendered = "\n".join(
-            f"{m.get('role')}: {m.get('content')}" for m in list(history)[-6:]
-        )
+    async def _rewrite_with_llm(self, question: str, history: Sequence[dict[str, str]]) -> str:
+        rendered = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in list(history)[-6:])
         prompt = self.prompt_template.format(history=rendered, question=question)
         try:
             result = await self.llm.generate([{"role": "user", "content": prompt}])
@@ -228,6 +249,54 @@ class QueryRewriter:
             return ""
         text = (result.text or "").strip().splitlines()
         return text[0].strip() if text else ""
+
+    def expand_variants(self, primary: str, *, original: str | None = None) -> list[str]:
+        """MultiQuery：在主查询外再扩若干语义近邻问句（稀疏召回用）。
+
+        不调 LLM：用「去语气词 / 补问句尾 / 保留原问」等确定性变体，
+        数量由 ``retrieval.multi_query`` 控制（1 = 只用主查询）。
+        """
+        limit = int(getattr(self.settings.retrieval, "multi_query", 1) or 1)
+        limit = max(1, min(limit, 5))
+        variants: list[str] = []
+        for candidate in (
+            (primary or "").strip(),
+            (original or "").strip(),
+            _strip_particles(primary),
+            _as_question(primary),
+            _keyword_focus(primary),
+        ):
+            if not candidate or candidate in variants:
+                continue
+            variants.append(candidate)
+            if len(variants) >= limit:
+                break
+        return variants or [(primary or "").strip() or ""]
+
+
+def _strip_particles(text: str) -> str:
+    cleaned = re.sub(
+        r"(请问|麻烦问一下|想问一下|帮我查一下|帮我看看|能不能告诉我|是否可以)",
+        "",
+        text or "",
+    )
+    return cleaned.strip(" ，,。？?！!")
+
+
+def _as_question(text: str) -> str:
+    base = (text or "").strip().rstrip("？?。！!")
+    if not base:
+        return ""
+    if base.endswith(("吗", "呢", "吧")):
+        return base + "？"
+    return base + "是什么？"
+
+
+def _keyword_focus(text: str) -> str:
+    """去掉常见口语外壳，留下可能更贴 chunk 陈述的关键词串。"""
+    cleaned = _strip_particles(text)
+    cleaned = re.sub(r"(是多少|有多少|怎么办|怎么处理|如何规定|的规定)", "", cleaned)
+    return cleaned.strip(" ，,。？?！!")
 
 
 def _needs_context(question: str) -> bool:

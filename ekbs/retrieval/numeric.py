@@ -1,0 +1,394 @@
+"""取数（数值问答）—— 把「数字准确」从**匹配问题**变成**类型问题**（课程 19 口径）。
+
+## 为什么要单独一条路
+
+现有的业务问答是**自由文本 + 事后核对**：允许模型写「约 6 万度」「同比减少 18%」，
+然后拿规则去查这些数字有没有落在资料里。这条路对**换算、四舍五入、派生、张冠李戴**
+四类都判不了（实测：`474.004万元` vs 单元格 `474.004` 这类换算是靠补丁修的，
+而 `25.5万 + 18万` 这种派生值永远核不了）。
+
+课程 19 的做法相反：**不解析数字，只在约束下抄数字** —— 输出空间被锁死成
+`float | int | "N/A"`，模型没有机会算，宁可返回 N/A。两种路线不是谁替代谁：
+
+* **业务问答（prose）**：制度/合同/汇报的解释性提问 —— 答案是一段话，必须保留；
+* **取数（numeric）**：单指标取数（"电梯维保一年多少钱"）—— 答案是一个数 + 出处。
+
+## 三条铁律（与课程一致，也是本模块的全部立场）
+
+1. **不许算**：上下文没直接给出就 N/A，即使能由其它指标算出来也 N/A；
+2. **不许猜**：指标等价性有任何疑问就 N/A（防"数字是真的但答非所问"）；
+3. **抄完要验**：模型给的数必须能在它引用的原文片段里**逐字找到**（见 :func:`verify_copied`）。
+
+第 3 条是我们比课程**更强**的地方：课程的保证来自类型锁死，我们额外要求
+"这个数确实是从这段原文抄的" —— 因此数值模式**不需要**再跑自由文本的忠实度校验
+（那是"事后对账"，这里是"结构验证"，两者互斥但等价强度更高，不构成矛盾）。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any, Sequence
+
+from ekbs.logging import get_logger
+
+log = get_logger(component="retrieval.numeric")
+
+#: 取数用的系统提示词（**与全局 SYSTEM_PROMPT 完全独立**）。
+#:
+#: 为什么必须独立：全局提示词是"业务问答"口径（鼓励解释、鼓励引用图片），
+#: 而这里的铁律是"宁可 N/A 也不解释"。把铁律塞进全局提示词会污染业务问答
+#: （"汇总 7 月能耗"不是单指标题，会被判成无法回答）。
+#: 也正因独立，``PROMPT_REVISION`` **不需要**跟着变（那条规则针对的是全局提示词）。
+NUMERIC_SYSTEM_PROMPT = (
+    "你是财务/运营指标取数助手。**只从下面的资料里抄数字，不做任何计算**。\n"
+    "只输出一个 JSON 对象，不要输出任何其它文字、解释或 Markdown 代码块。\n"
+    '字段：{"value": 数字或 "N/A", "unit": "单位", "page": 页码或 null, '
+    '"quote": "资料里包含该数字的原文片段（逐字复制）", "indicator": "你取的是哪个指标", '
+    '"scope": "该数值的**口径限定词**（年份/月份/期间/表名/对象），如 \"2026年\"、"2024年"、'
+    '\"第4页 用电分析表\"；必须是从资料里逐字复制的限定词；资料里确实没有限定词才留空", '
+    '"reason": "若为 N/A，说明原因"}\n\n'
+    "取值规则（必须遵守）：\n"
+    "1. **禁止计算与推导**：资料未直接给出该指标时，即使能由其它数字算出，也返回 \"N/A\"。\n"
+    "2. **禁止猜测指标**：上下文里所有可能指标都要看实际衡量内容；含义与问题**不完全一致**\n"
+    "   （范围不同、只是相关概念、需要聚合）一律返回 \"N/A\"。有疑问也返回 \"N/A\"。\n"
+    "3. 数字格式：千分位逗号要去掉（1,234,567 → 1234567）；欧陆式逗号当小数点（58,3 → 58.3）；\n"
+    "   括号表示负数（(2,124,837) → -2124837）；单位为千/百万/万/亿时**补零到基本单位**\n"
+    "   （4970.5 千美元 → 4970500；1.2 万度 → 12000），并在 unit 里写明换算后的单位。\n"
+    "4. 币种/口径与问题不符 → \"N/A\"。\n"
+    "5. quote 必须是从资料里**逐字复制**的一段，且里面真的含有这个数字（原样形式）。\n"
+    "6. **scope 是必填口径**：同一个指标往往有多行（2024年/2025年/2026年、不同表），\n"
+    "   你必须把**你取的那一行的口径限定词**原样抄进 scope。资料里确实没有限定词才留空。\n"
+    "7. 资料里没有 → \"N/A\"。\n\n"
+    "示例一（正例）：\n"
+    "问题：2026年电气保养合同的总价是多少？\n"
+    "资料：[1] ……本工程合同总价￥19000元，大写：壹万玖仟元整……\n"
+    '输出：{"value": 19000, "unit": "元", "page": 3, "quote": "本工程合同总价￥19000元", '
+    '"indicator": "电气保养合同总价", "scope": "", "reason": ""}\n\n'
+    "示例二（该 N/A 就 N/A）：\n"
+    "问题：员工每人每年培训经费是多少？\n"
+    "资料：[1] ……公司年度培训总预算 120000 元，覆盖全体员工……\n"
+    '输出：{"value": "N/A", "unit": "", "page": null, "quote": "", "indicator": "人均培训经费", '
+    '"scope": "", "reason": "资料只有总额、没有人数，需计算才能得到人均，按规则返回 N/A"}\n\n'
+    "资料：\n<<CONTEXT>>"
+)  # noqa: E501  （⚠️ 用 <<CONTEXT>> 而不是 {context}：本提示词里全是 JSON 花括号，
+   #                走 str.format 会把这些花括号当占位符 → KeyError: '"value"'。）
+
+
+def build_numeric_prompt(context: str) -> str:
+    """把检索上下文填进取数提示词。
+
+    刻意不用 ``str.format``：提示词里通篇是 JSON 示例（``{"value": ...}``），
+    ``format`` 会把它们当占位符并抛 ``KeyError``（实测踩到）。``replace`` 没这个坑。
+    """
+    return NUMERIC_SYSTEM_PROMPT.replace("<<CONTEXT>>", context or "")
+
+#: 取数模式下的用户名（进答案缓存键，避免与业务问答互相命中）
+MODE_NUMERIC = "numeric"
+MODE_PROSE = "prose"
+
+#: 量级词 → 倍数（按课程"千/百万补零"的规则；顺序敏感：先长后短）
+_SCALES: tuple[tuple[str, float], ...] = (
+    ("万亿", 1e12), ("十亿", 1e9), ("百万", 1e6), ("千万", 1e7),
+    ("千亿", 1e11), ("亿", 1e8), ("万", 1e4), ("千", 1e3),
+)
+
+_NUMBER_TOKEN = re.compile(r"\(?-?\d[\d,\s]*(?:\.\d+)?\)?")
+
+
+@dataclass
+class NumericAnswer:
+    """取数结果。``value is None`` 表示 N/A（拒答）。"""
+
+    value: float | None = None
+    unit: str = ""
+    page: int | None = None
+    quote: str = ""
+    indicator: str = ""
+    #: 口径限定词（年份/期间/表名…）——**必须能从原文逐字核到**，否则拒答：
+    #: 编出来的口径比错的数字更危险（看着权威但答非所问）。
+    scope: str = ""
+    #: 同一行标签下的**其它口径候选**（如"2024年：25178448"）——发现歧义时披露给用户，
+    #: 而不是假装只有一个答案（见 README §四 第 79 条）。
+    alternatives: list[dict[str, Any]] = field(default_factory=list)
+    reason: str = ""
+    raw: str = ""
+    #: 抄写校验命中的引用序号（1-based，对应进上下文的分块顺序）
+    cite_index: int | None = None
+    verified: bool = False
+    #: 输出**不是合法 JSON/缺 value 字段**（= 格式失败，可重试一次）；
+    #: 与"模型按规则返回 N/A"必须区分开 —— 后者重试毫无意义、还多烧一次调用。
+    parse_error: bool = False
+
+    @property
+    def is_na(self) -> bool:
+        return self.value is None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "value": self.value,
+            "unit": self.unit,
+            "page": self.page,
+            "quote": self.quote,
+            "indicator": self.indicator,
+            "scope": self.scope,
+            "alternatives": list(self.alternatives),
+            "reason": self.reason,
+            "verified": self.verified,
+            "cite_index": self.cite_index,
+        }
+
+
+def normalize_number(text: Any, unit: str = "") -> float | None:
+    """把"资料/模型给出的数字字符串"归一成基本单位下的 float（不做任何内容推导）。
+
+    覆盖课程列的四种格式陷阱：千分位逗号、欧陆式逗号当小数点、括号负数、千/百万补零。
+    解析不出来返回 ``None``（调用方据此判 N/A）。
+    """
+    if text is None:
+        return None
+    if isinstance(text, (int, float)) and not isinstance(text, bool):
+        value = float(text)
+    else:
+        raw = str(text).strip().replace("％", "%").replace("，", ",")
+        if not raw or raw.upper() in {"N/A", "NA", "NIL", "无", "未知", "-", "--"}:
+            return None
+        negative = raw.startswith("(") and raw.endswith(")")
+        raw = raw.strip("()").replace("%", "").replace(" ", "")
+        raw = re.sub(r"[^\d,.\-]", "", raw)
+        if not raw:
+            return None
+        if "." not in raw and raw.count(",") >= 1:
+            tail = raw.split(",")[-1]
+            # 一个逗号且后面 1~2 位 → 欧陆式小数；其余当千分位
+            raw = raw.replace(",", "." if (raw.count(",") == 1 and 1 <= len(tail) <= 2) else "")
+        else:
+            raw = raw.replace(",", "")
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        if negative:
+            value = -value
+    # 量级词：模型可能把"千美元"原样写进 unit（课程规则是补零到基本单位）
+    scale = 1.0
+    for word, mult in _SCALES:
+        if word in (unit or ""):
+            scale = mult
+            break
+    return value * scale
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """从模型输出里抠出第一个 JSON 对象（容忍 ```json 包裹与前后噪声）。"""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S)
+    if fence:
+        raw = fence.group(1)
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        payload = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def parse_numeric_payload(text: str) -> NumericAnswer:
+    """解析模型输出 → :class:`NumericAnswer`（解析失败即 N/A，不猜）。"""
+    answer = NumericAnswer(raw=(text or "").strip())
+    payload = _extract_json_object(text)
+    if payload is None:
+        answer.reason = "输出不是合法 JSON"
+        answer.parse_error = True
+        return answer
+    if "value" not in payload:
+        answer.reason = "输出缺少 value 字段"
+        answer.parse_error = True
+        return answer
+    unit = str(payload.get("unit") or "").strip()
+    quote = str(payload.get("quote") or "").strip()
+    indicator = str(payload.get("indicator") or "").strip()
+    scope = str(payload.get("scope") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    page_raw = payload.get("page")
+    try:
+        page = int(page_raw) if page_raw is not None and str(page_raw).strip() != "" else None
+    except (TypeError, ValueError):
+        page = None
+    value = normalize_number(payload.get("value"), unit)
+    return NumericAnswer(
+        value=value,
+        unit=unit,
+        page=page,
+        quote=quote,
+        indicator=indicator,
+        scope=scope,
+        reason=reason or ("未能从资料中直接取得该指标" if value is None else ""),
+        raw=answer.raw,
+    )
+
+
+def _numbers_in(text: str, unit_hint: str = "") -> list[float]:
+    """抽出一段原文里的全部数字（含量级候选），用于"抄写校验"。"""
+    out: list[float] = []
+    for token in _NUMBER_TOKEN.findall(text or ""):
+        base = normalize_number(token)
+        if base is None:
+            continue
+        out.append(base)
+        # 原文可能写"1.2 万"，量级在文字里而不在数字里 —— 把常见量级都列为候选，
+        # 这样"抄的数字"与"原文形式"之间只差一个量级也能验上（不是计算，是等价形式）。
+        for _word, mult in _SCALES:
+            out.append(base * mult)
+    return out
+
+
+def verify_copied(
+    answer: NumericAnswer,
+    chunks: Sequence[Any],
+    *,
+    rel_tol: float = 1e-6,
+) -> tuple[bool, int | None]:
+    """**抄写校验**：模型给的数必须是它引用的原文片段里"逐字存在"的数。
+
+    判定两件事：
+
+    1. ``quote`` 真的出现在某个入选分块的正文里（不是拼出来的）；
+    2. ``value`` 与该片段里的某个数字**在同一量级下相等**（容差只为容忍
+       ``57795.6`` vs ``57795.60`` 这类格式差，不是为了容忍四舍五入 —— 四舍五入
+       在取数模式下应当由模型原样抄，而不是由我们放行）。
+
+    返回 ``(是否通过, 命中的 1-based 引用序号)``。
+    """
+    if answer.is_na:
+        return False, None
+    quote = re.sub(r"\s+", "", answer.quote or "")
+    if not quote:
+        return False, None
+    value = float(answer.value)
+    for index, chunk in enumerate(chunks, start=1):
+        content = re.sub(r"\s+", "", str(getattr(chunk, "content", "") or ""))
+        if not content or quote not in content:
+            continue
+        for candidate in _numbers_in(answer.quote, answer.unit):
+            if abs(candidate - value) <= max(rel_tol * max(abs(value), 1.0), 1e-9):
+                return True, index
+    return False, None
+
+
+def _format_value(value: float) -> str:
+    """人读的数字串：整数带千分位、小数不用科学计数法。
+
+    ``f"{value:g}"`` 会把 26087023 渲染成 ``2.6087e+07`` —— 取数结果的答案文本要给
+    人看，也进审计，科学计数法既难读又容易被当成"没抄准"。结构化字段 ``numeric.value``
+    仍然是精确数值，这里只影响显示。
+    """
+    if value == int(value) and abs(value) < 1e15:
+        return f"{int(value):,}"
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def verify_scope(answer: NumericAnswer, chunks: Sequence[Any], cite_index: int | None) -> bool:
+    """口径必须能从**它引用的那个分块**里逐字核到（空口径视为通过）。
+
+    为什么要单独核：数字抄对了、口径是编的，等于**答非所问还显得权威** ——
+    比错的数字更难被发现。核法抄写校验同一套：子串（去空白）。
+    """
+    scope = re.sub(r"\s+", "", answer.scope or "")
+    if not scope:
+        return True
+    if not 1 <= len(chunks) and cite_index is None:
+        return False
+    target = chunks[(cite_index or 1) - 1] if cite_index else chunks[0]
+    content = re.sub(r"\s+", "", str(getattr(target, "content", "") or ""))
+    return bool(content) and scope in content
+
+
+#: 行标签与数字之间的分隔符（`总用电/度: 26087023` 里的 `: `）
+_LABEL_SEP = re.compile(r"[:：=＝\s\-—/]*$")
+
+
+def find_scope_alternatives(
+    chunks: Sequence[Any],
+    *,
+    quote: str,
+    value: float | None,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """在入选分块里找**同一行标签下的其它数值**（不同口径），用于向用户披露歧义。
+
+    为什么用"行标签"而不是语义：实测（README §四 第 79 条）同一个问题两次返回
+    `26087023`（2026年）与 `25178448`（2024年），两者**都真实存在**、都能过抄写校验 ——
+    规则校验证明不了"抄的是你要的那一行"。这里退一步做**结构性披露**：
+    从已核验的 quote 里取出数字前的标签（如 `总用电/度`），再去其它分块里找同标签的
+    不同数值，作为"另有 …"一起返回。**不猜、不拒答，把歧义摊开给用户看。**
+    """
+    if value is None or not quote:
+        return []
+    flat = re.sub(r"\s+", "", quote)
+    numbers = _NUMBER_TOKEN.findall(flat)
+    if not numbers:
+        return []
+    first = numbers[0]
+    label = flat[: flat.find(first)]
+    label = _LABEL_SEP.sub("", label)
+    if len(label) < 2:  # 标签太短（如"值"）会把无关行也算进来
+        return []
+    label = label[-24:]  # 取尾部，避免把整段前缀当标签
+    found: dict[str, dict[str, Any]] = {}
+    for chunk in chunks:
+        content = re.sub(r"\s+", "", str(getattr(chunk, "content", "") or ""))
+        if not content:
+            continue
+        for match in re.finditer(re.escape(label) + r"[:：=＝]?([0-9][0-9,]*(?:\.\d+)?)", content):
+            raw = match.group(1)
+            candidate = normalize_number(raw)
+            if candidate is None:
+                continue
+            if abs(candidate - float(value)) <= 1e-6 * max(abs(float(value)), 1.0):
+                continue  # 与已选值相同（同一行在别处重复出现）→ 不是歧义
+            key = f"{candidate:g}"
+            found.setdefault(
+                key,
+                {
+                    "value": candidate,
+                    "raw": raw,
+                    "label": label,
+                    "chunk_id": int(getattr(chunk, "chunk_id", 0) or 0),
+                    "doc_title": str(getattr(chunk, "doc_title", "") or ""),
+                    "page": getattr(chunk, "page_from", None),
+                },
+            )
+    return list(found.values())[:limit]
+
+
+def render_answer(answer: NumericAnswer, cite_index: int | None) -> str:
+    """渲染成**人读的一行**（审计与前端都按文本存/显示；结构化值另走 numeric 字段）。"""
+    value = answer.value
+    if value is None:
+        return "未找到可靠依据。"
+    text = _format_value(float(value))
+    if answer.unit:
+        text += f" {answer.unit}"
+    subject = " ".join(x for x in (answer.scope, answer.indicator) if x)
+    head = f"{subject}：" if subject else ""
+    tail = f"（第 {answer.page} 页）" if answer.page else ""
+    marker = f" [{cite_index}]" if cite_index else ""
+    return f"{head}{text}{tail}{marker}"
+
+
+@dataclass
+class NumericRun:
+    """一次取数的完整留痕（进答案缓存与审计）。"""
+
+    payload: NumericAnswer
+    ok: bool = False
+    reason: str = ""
+    extra: dict[str, Any] = field(default_factory=dict)

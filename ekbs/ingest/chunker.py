@@ -239,10 +239,35 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
 def _pages_for(
     start: int, end: int, page_map: Sequence[tuple[int, int, int]] | None
 ) -> tuple[int | None, int | None]:
+    """把字符区间映射到页码。
+
+    ``page_map`` 存的是「每一页正文的起始偏移」``(offset, page, page)``（见
+    :func:`ekbs.ingest.parser._blocks_to_document`）。正确语义是：
+
+        位置 pos 所属页 = 最后一个满足 ``offset <= pos`` 的页码
+
+    旧实现写成 ``start <= offset <= end``（页起点必须落在小节区间内），
+    小节若从页界之后几个字符开始（标题行切分后的常态），就一个页标都框不住，
+    再 fallback 到 ``page_map[0]`` → **整段被标成第 1 页**。
+    开班典礼实测：大量后页内容的 ``page_from`` 都变成 1，并出现虚假的 1–2 跨页。
+    """
     if not page_map:
         return None, None
-    pages = [p for offset, p, _ in page_map if start <= offset <= end] or [page_map[0][1]]
-    return min(pages), max(pages)
+    if end < start:
+        start, end = end, start
+
+    def page_at(pos: int) -> int:
+        page = int(page_map[0][1])
+        for offset, p, _ in page_map:
+            if int(offset) <= pos:
+                page = int(p)
+            else:
+                break
+        return page
+
+    # end 是 flush 时的排他终点（下一行起始）；取 end-1 落在正文最后一个字符上
+    last = end - 1 if end > start else start
+    return page_at(start), page_at(last)
 
 
 def chunk_markdown(
@@ -296,12 +321,11 @@ def chunk_markdown(
 
             # 短节：子块只能切出 1 块且与父块正文相同 → 不建 child。
             # 父块本身就是叶子，按 retrievable 叶子规则入向量，避免同文双索引。
+            # PPT/幻灯片页常见「整节短于 child_min」，_pack 会原样回传 → 必须跳过。
             overlap = int(child_max * OVERLAP_MIN_RATIO)
             child_texts = _pack(parent_text, child_min, child_max, overlap=overlap)
-            if (
-                len(child_texts) == 1
-                and child_texts[0].strip() == parent_text.strip()
-            ):
+            parent_norm = " ".join(parent_text.split())
+            if len(child_texts) == 1 and " ".join(child_texts[0].split()) == parent_norm:
                 continue
             for child_text in child_texts:
                 seq += 1
@@ -355,7 +379,12 @@ def chunk_markdown(
                     heading_path=table_heading,
                     page_from=table.page,
                     page_to=table.page,
-                    figure_id=table.table_id or None,
+                    # ⚠️ 表格**不要**写 `figure_id`。这里原本塞的是 `table.table_id`，
+                    # 而那是"文档内第几张表"的计数器（1、2、3…）。后果是引用表格块时
+                    # 前端看到 figure_id 有值就去渲染图片 → 取不到 → 显示"图不可用"
+                    # （实测 164 个表格块全中）。表格的标识在正文里（`表名: …`），
+                    # 若要单独追踪，应另开 `table_id` 字段而不是借 figure_id。
+                    figure_id=None,
                 )
             )
     return result

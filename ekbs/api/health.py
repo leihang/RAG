@@ -72,32 +72,45 @@ async def readyz(request: Request) -> JSONResponse:
 
 @router.get("/health/deps")
 async def health_deps(request: Request) -> JSONResponse:
-    """真实探测（**会出网**）。结果缓存 60s，避免探针式调用烧 token。"""
+    """真实探测（**会出网**）。**网络探针**缓存 60s 避免探针式调用烧 token。
+
+    ⚠️ 本地计数器（分片数 / 向量数 / 磁盘 / 指纹）**每次现算、不参与缓存**。
+    整包一起缓存过（原实现），后果是：软删一份文档后立刻查 `/health/deps`，
+    仍然显示删除前的向量数 —— 排查"删除到底摘没摘向量"时被它带偏过一次。
+    网络探针才是贵的，本地读几个计数器是免费的，没理由一起缓存。
+    """
     runtime = request.app.state.runtime
     cache = request.app.state.probe_cache
     now = time.time()
     cached = cache.get("all")
+    probes: dict[str, Any] | None = None
     if cached and now - cached[0] < _PROBE_TTL_SECONDS:
-        return JSONResponse(cached[1], status_code=200 if _deps_healthy(cached[1]) else 503)
+        probes = cached[1]
+    if probes is None:
+        embed_ok, llm_ok, rerank_ok = await _probe_models(runtime)
+        dingtalk_ok = await _probe_adapter(runtime)
+        probes = {
+            "embed": embed_ok,
+            "llm": llm_ok,
+            "rerank": rerank_ok,
+            "dingtalk_stream": dingtalk_ok,
+        }
+        cache["all"] = (now, probes)
 
-    embed_ok, llm_ok, rerank_ok = await _probe_models(runtime)
-    dingtalk_ok = await _probe_adapter(runtime)
     payload = {
+        # —— 本地计数：每次现算（删/入库后必须立刻反映）
         "faiss_shards": runtime.shards.count_active(),
         "vectors": runtime.shards.total_vectors(),
-        "embed": embed_ok,
-        "llm": llm_ok,
-        "rerank": rerank_ok,
-        "dingtalk_stream": dingtalk_ok,
         "fingerprint_match": runtime.fingerprint_match(),
         "disk_used_pct": runtime.disk_used_pct(),
         "embed_ident": runtime.providers.embed.ref.ident,
         "llm_ident": runtime.providers.llm.ref.ident,
+        # —— 网络探针：缓存 60s（会出网、会计费）
+        **probes,
     }
-    if runtime.shards.count_active() == 0:
+    if payload["faiss_shards"] == 0:
         # 无 active 分片是「未建分片」而非「不健康」，给 readiness 之外的明确信号
         payload["note"] = "尚无 active 分片（01 §6.3：先用 ekbs.tools.new_shard 建分片）"
-    cache["all"] = (now, payload)
     return JSONResponse(payload, status_code=200 if _deps_healthy(payload) else 503)
 
 

@@ -1,0 +1,53 @@
+{
+  "description": "演示语料金标（配合 python -m ekbs.tools.seed_demo）。重切分后仍有效：用文档标题 + 原文片段，不绑 chunk_id。",
+  "cases": [
+    {
+      "id": "hr-leave-days",
+      "question": "年假有多少天",
+      "user": "demo_alice",
+      "must_hit_doc": "年假管理制度",
+      "must_contain": "入职满 1 年享受 5 天",
+      "k": 5
+    },
+    {
+      "id": "hr-leave-apply",
+      "question": "年假要提前几天申请",
+      "user": "demo_alice",
+      "must_hit_doc": "年假管理制度",
+      "must_contain": "提前 3 个工作日",
+      "k": 5
+    },
+    {
+      "id": "public-attendance",
+      "question": "上班几点前要打卡",
+      "user": "demo_carol",
+      "must_hit_doc": "员工手册（总则）",
+      "must_contain": "上午 9:00 前完成打卡",
+      "k": 5
+    },
+    {
+      "id": "finance-seal",
+      "question": "财务专用章由谁保管",
+      "user": "demo_bob",
+      "must_hit_doc": "财务保密制度",
+      "must_contain": "财务负责人分别保管",
+      "k": 5
+    },
+    {
+      "id": "redline-alice-no-finance",
+      "question": "财务专用章由谁保管",
+      "user": "demo_alice",
+      "must_not_hit_doc": "财务保密制度",
+      "expect_no_hit": true,
+      "k": 10
+    },
+    {
+      "id": "carol-no-hr-leave",
+      "question": "年假有多少天",
+      "user": "demo_carol",
+      "must_not_hit_doc": "年假管理制度",
+      "expect_no_hit": true,
+      "k": 10
+    }
+  ]
+}

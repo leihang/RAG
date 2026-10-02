@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, AsyncIterator, Sequence
 
 import httpx
@@ -302,8 +303,21 @@ class OpenAICompatibleLLMProvider(LLMProvider):
 
     # ------------------------------------------------------------------
 
-    def _body(self, messages: Sequence[dict[str, str]], *, stream: bool, model: str) -> dict[str, Any]:
-        return {
+    def _body(
+        self,
+        messages: Sequence[dict[str, str]],
+        *,
+        stream: bool,
+        model: str,
+        response_format: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """请求体。
+
+        ``response_format`` 只在**显式传入**时带上（如取数模式要 ``{"type": "json_object"}``）：
+        默认 ``None`` = 不带该字段，既有调用（业务问答/流式）的请求体**逐字不变**
+        —— 这是"加能力但不改行为"的边界。
+        """
+        body: dict[str, Any] = {
             "model": model,
             "messages": [dict(m) for m in messages],
             "temperature": self.temperature,
@@ -311,8 +325,14 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             "max_tokens": self.max_tokens,
             "stream": stream,
         }
+        if response_format is not None:
+            body["response_format"] = dict(response_format)
+        return body
 
     async def generate(self, messages: Sequence[dict[str, str]], **kwargs: Any) -> LLMResult:
+        #: 只认 ``response_format``（取数模式要 JSON 模式）；未知 kwargs 忽略，避免调用方
+        #: 以为传了参数就一定生效（历史上就有"发 top_k 但后端只认 dense_top_k"的静默失效）。
+        response_format = kwargs.get("response_format")
         targets = [(self.ref.provider, self.ref.model, self.base_url, self.api_key)]
         if self.fallback.get("provider") and self.fallback.get("model"):
             targets.append(
@@ -333,6 +353,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                 result = await self._generate_once(
                     messages, provider=provider, model=model, base_url=base_url, api_key=api_key,
                     stream=False,
+                    response_format=response_format if isinstance(response_format, dict) else None,
                 )
             except ModelUnavailable as exc:
                 last_error = exc
@@ -354,6 +375,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         base_url: str,
         api_key: str,
         stream: bool,
+        response_format: dict[str, Any] | None = None,
     ) -> LLMResult:
         url = f"{base_url}{COMPATIBLE_PATH}/chat/completions"
         client = self._client or httpx.AsyncClient(timeout=self.timeout_s)
@@ -362,7 +384,9 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             response = await request_with_retry(
                 client, "POST", url, provider=provider, endpoint="chat/completions",
                 kind="llm", max_retries=self.max_retries,
-                json_body=self._body(messages, stream=stream, model=model),
+                json_body=self._body(
+                    messages, stream=stream, model=model, response_format=response_format
+                ),
                 headers=_auth_headers(api_key), base_delay=self.retry_base_delay,
             )
         except CloudError as exc:
@@ -429,3 +453,81 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                             yield str(piece)
                 if not emitted:
                     log.warning("llm_stream_empty", model=self.ref.model)
+
+
+# ---------------------------------------------------------------------------
+# 多模态嵌入（课程 17 / tongyi-embedding-vision-plus）—— **无** OpenAI 兼容端点
+# ---------------------------------------------------------------------------
+
+
+def _image_data_uri(path: Path) -> str:
+    import base64
+
+    suffix = path.suffix.lstrip(".").lower() or "png"
+    if suffix == "jpg":
+        suffix = "jpeg"
+    raw = path.read_bytes()
+    return f"data:image/{suffix};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+def _mm_embedding_from_response(resp: Any, *, dim: int, what: str) -> list[float]:
+    from http import HTTPStatus
+
+    status = getattr(resp, "status_code", None)
+    if status != HTTPStatus.OK:
+        message = getattr(resp, "message", None) or getattr(resp, "code", "") or str(resp)
+        raise ModelUnavailable(f"多模态嵌入失败（{what}）：{message}")
+    output = getattr(resp, "output", None) or {}
+    if isinstance(output, dict):
+        embeddings = output.get("embeddings") or []
+    else:
+        embeddings = getattr(output, "embeddings", None) or []
+    if not embeddings:
+        raise ModelUnavailable(f"多模态嵌入空响应（{what}）")
+    first = embeddings[0]
+    vector = first.get("embedding") if isinstance(first, dict) else getattr(first, "embedding", None)
+    if not isinstance(vector, list) or not vector:
+        raise ModelUnavailable(f"多模态嵌入缺 embedding（{what}）")
+    if dim and len(vector) != dim:
+        raise ModelUnavailable(
+            f"多模态嵌入维度 {len(vector)} ≠ 配置 dim {dim}（模型={what}）"
+        )
+    return [float(x) for x in vector]
+
+
+class DashScopeMultimodalEmbeddingProvider:
+    """DashScope ``MultiModalEmbedding``（与文本 embed 的 OpenAI 兼容端点无关）。"""
+
+    def __init__(
+        self,
+        *,
+        ref: ModelRef,
+        api_key: str,
+        timeout_s: float = 60.0,
+    ) -> None:
+        self.ref = ref
+        self.api_key = api_key
+        self.timeout_s = float(timeout_s)
+
+    def _call(self, payload: list[dict[str, str]]) -> list[float]:
+        import dashscope
+        from dashscope import MultiModalEmbedding
+
+        dashscope.api_key = self.api_key
+        resp = MultiModalEmbedding.call(model=self.ref.model, input=payload, api_key=self.api_key)
+        return _mm_embedding_from_response(
+            resp, dim=int(self.ref.dim or 0), what=self.ref.model
+        )
+
+    async def embed_text(self, text: str) -> list[float]:
+        import asyncio
+
+        return await asyncio.to_thread(self._call, [{"text": text or ""}])
+
+    async def embed_image(self, image_path: str | Path) -> list[float]:
+        import asyncio
+
+        path = Path(image_path)
+        if not path.is_file():
+            raise ModelUnavailable(f"多模态嵌入：图片不存在 {path}")
+        return await asyncio.to_thread(self._call, [{"image": _image_data_uri(path)}])

@@ -29,8 +29,11 @@ from ekbs.ingest.dir_import import (
     ImportPathError,
     enqueue_files,
     list_children,
+    list_descendant_dirs,
     raw_root,
+    resolve_within_raw,
     scan_directory,
+    to_rel,
 )
 from ekbs.ingest.parser import SUFFIX_ENGINES
 from ekbs.logging import get_logger
@@ -89,10 +92,16 @@ async def import_meta(
                 "name": str(r["name"]),
                 # 界面要显示「XX库（N 篇）」，顺手带上省一次请求
                 "document_count": int(r["document_count"] or 0),
+                # 目录导入页要把「密级」默认成该库的 default_level。**必须在这里给**：
+                # 否则界面得另调 `/kb/knowledge-bases`，而那个端点要 `kb:knowledge_base:read`
+                # —— 只有 `doc:document:create` 的角色（如 doc_reviewer）会拿不到，
+                # 于是密级悄悄回落成 L1，导入的文档比预期更"公开"。
+                "default_level": int(r["default_level"] or 1),
             }
             for r in conn.execute(
-                "SELECT k.kb_id, k.code, k.name, "
-                "       (SELECT COUNT(*) FROM ekbs_document d WHERE d.kb_id = k.kb_id) AS document_count "
+                "SELECT k.kb_id, k.code, k.name, k.default_level, "
+                "       (SELECT COUNT(*) FROM ekbs_document d "
+                "        WHERE d.kb_id = k.kb_id AND d.status != 'deleted') AS document_count "
                 "FROM ekbs_kb k ORDER BY k.kb_id"
             )
         ]
@@ -133,14 +142,37 @@ async def import_meta(
 async def import_dirs(
     request: Request,
     path: str = Query(default="", description="raw 下的相对路径，空串表示 raw 根"),
+    recursive: bool = Query(
+        default=False,
+        description="true=返回 path 下全部子孙目录（上传页落盘下拉）；false=只列一层（目录浏览）",
+    ),
     authorization: str | None = Header(default=None),
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """逐层浏览 raw 目录（只列子目录；文件走扫描预览）。"""
+    """浏览 raw 目录。默认只列一层子目录；``recursive=true`` 时扁平列出全部子孙目录。"""
     _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "doc:document:create")
     runtime = request.app.state.runtime
     try:
+        if recursive:
+            rels = list_descendant_dirs(runtime.settings, path)
+            target = resolve_within_raw(runtime.settings, path)
+            return JSONResponse({
+                "rel_path": to_rel(runtime.settings, target),
+                "parent": None,
+                "recursive": True,
+                "dirs": [
+                    {
+                        "name": r.split("/")[-1],
+                        "rel_path": f"{path.rstrip('/')}/{r}" if path.strip("/") else r,
+                        "rel_under": r,
+                        "has_children": False,
+                        "importable_files": 0,
+                    }
+                    for r in rels
+                ],
+                "root": str(raw_root(runtime.settings)),
+            })
         return JSONResponse(list_children(runtime.settings, path))
     except ImportPathError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc

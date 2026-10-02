@@ -44,6 +44,10 @@ def test_docx_tables_become_parsed_table(tmp_path: Path) -> None:
     assert len(tables) == 1
     assert "档次=一档" in tables[0].content
     assert "金额=500" in tables[0].content
+    # 表格块**不得**带 figure_id：那会让前端把表格当图片渲染（取不到图 → "图不可用"）。
+    # 原本这里塞的是 table_id 计数器（1、2、3…），线上 164 个表格块全中。
+    assert tables[0].figure_id is None
+    assert not tables[0].image_path
 
 
 def test_xlsx_sheets_become_parsed_tables(tmp_path: Path) -> None:

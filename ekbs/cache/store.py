@@ -41,6 +41,9 @@ PREFIX_PERM_FP = "ekbs:perm:fp:"
 PREFIX_RETRIEVE = "ekbs:cache:retrieve:"
 PREFIX_ANSWER = "ekbs:cache:answer:"
 PREFIX_EMBED = "ekbs:cache:embed:"
+#: 多模态（图片旁路）的查询向量。**必须与文本嵌入分开**：两者维度不同
+#: （1152 vs 1024），共用一个命名空间会把错误的向量喂给错误的索引。
+PREFIX_MM_EMBED = "ekbs:cache:mm_embed:"
 PREFIX_DOC_META = "ekbs:meta:doc:"
 PREFIX_POLICY_VERSION = "ekbs:perm:policy_version"
 
@@ -86,6 +89,11 @@ class CacheStore:
     @staticmethod
     def embed_key(text: str) -> str:
         return f"{PREFIX_EMBED}{text_sha256(text)}"
+
+    @staticmethod
+    def mm_embed_key(text: str) -> str:
+        """多模态查询向量的键（与 :meth:`embed_key` 分开命名空间，见 PREFIX_MM_EMBED）。"""
+        return f"{PREFIX_MM_EMBED}{text_sha256(text)}"
 
     @staticmethod
     def doc_meta_key(doc_id: int) -> str:

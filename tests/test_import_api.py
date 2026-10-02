@@ -174,6 +174,16 @@ def test_chinese_nested_dirs_are_listed_with_counts(runtime) -> None:
     assert third["dirs"] == []
     assert third["rel_path"] == "人事制度/考勤"
 
+    from ekbs.ingest.dir_import import list_descendant_dirs
+
+    flat = list_descendant_dirs(runtime.settings, "")
+    assert "人事制度" in flat
+    assert "人事制度/考勤" in flat
+    assert "人事制度/薪酬" in flat
+    assert "财务制度" in flat
+    under = list_descendant_dirs(runtime.settings, "人事制度")
+    assert under == ["考勤", "薪酬"] or set(under) == {"考勤", "薪酬"}
+
 
 def test_unsupported_suffixes_are_not_counted_or_scanned(runtime) -> None:
     make_raw_files(runtime, {"a.md": "x", "b.csv": "x", "c.exe": "x", "d.json": "x"})
@@ -397,6 +407,10 @@ async def test_import_meta_exposes_two_lists(client, seeded) -> None:
     assert set(data["upload_blocked"]) == {"html", "ppt"}
     assert data["knowledge_bases"], "要能选知识库"
     assert str(data["raw_root"]).endswith("raw")
+    # 目录导入页要把「密级」默认成该库的 default_level，**必须由 meta 直接给**：
+    # 否则界面得另调 `/kb/knowledge-bases`（要 `kb:knowledge_base:read`），
+    # 只有 `doc:document:create` 的角色拿不到 → 密级悄悄回落 L1（比预期更公开）。
+    assert "default_level" in data["knowledge_bases"][0]
 
 
 async def test_import_scan_blocks_escape_with_403(client, seeded) -> None:

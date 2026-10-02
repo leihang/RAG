@@ -290,3 +290,26 @@ async def test_shards_endpoint_explains_routing(client, playground_headers) -> N
     assert any(item["level"] > body["clearance"] for item in body["registered_shards"]), (
         "登记表里应能看到超出密级的分片（便于解释为什么没被路由到）"
     )
+
+
+async def test_numeric_mode_is_optional_and_validated(client, playground_headers) -> None:
+    """取数模式是**可选路径**：默认不带 mode 时行为不变，非法 mode 被拒。
+
+    这条钉住三件事：① `/rag/debug/query` 的响应里始终有 `numeric` 字段（prose 下为 None）；
+    ② 不传 mode 时仍走业务问答；③ mode 只接受 prose/numeric（Pydantic pattern）。
+    """
+    _runtime, _uid, headers = playground_headers
+    resp = await client.post(
+        "/api/v1/rag/debug/query", headers=headers, json={"query": "年假有多少天"}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "numeric" in body and body["numeric"] is None
+    assert body.get("mode") in (None, "prose")
+    assert body["citations"] is not None
+
+    bad = await client.post(
+        "/api/v1/rag/debug/query", headers=headers,
+        json={"query": "年假有多少天", "mode": "bogus"},
+    )
+    assert bad.status_code == 422

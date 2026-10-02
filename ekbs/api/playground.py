@@ -81,6 +81,8 @@ class DebugRequest(BaseModel):
     rerank_keep: int | None = Field(default=None, ge=1, le=100)
     rerank_min_score: float | None = Field(default=None, ge=0.0, le=1.0)
     parent_expand: bool | None = None
+    #: 作答模式：prose（默认）| numeric（取数模式，见 ekbs/retrieval/numeric.py）
+    mode: str = Field(default="prose", pattern="^(prose|numeric)$")
 
     def overrides(self) -> RetrievalOverrides:
         return RetrievalOverrides(
@@ -222,6 +224,7 @@ async def debug_query(
         use_cache=False,
         overrides=payload.overrides(),
         collect_debug=True,
+        mode=payload.mode,
     )
     result = answer.retrieval
     await _record_history(
@@ -250,6 +253,8 @@ async def debug_query(
             "model": answer.model,
             "prompt_tokens": answer.prompt_tokens,
             "completion_tokens": answer.completion_tokens,
+            # 取数模式（mode=numeric）的结构化结果：值/单位/页码/原文片段/是否通过抄写校验
+            "numeric": answer.numeric,
             "citations": [
                 {
                     "cite_index": c.cite_index, "chunk_id": c.chunk_id, "doc_title": c.doc_title,

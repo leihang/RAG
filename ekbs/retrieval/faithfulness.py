@@ -4,7 +4,12 @@
 
 1. **无引用不成溯源**：答案里没有 ``[n]`` 时，不得把全部候选块挂成 citations。
 2. **数字/量词须落在资料里**：从答案抽出关键 claim，必须在入选分块原文中出现；
-   否则整答视为不可靠（``unsupported_claim``）。
+   否则记为 ``unsupported_claim``。
+
+⚠️ 关于第 2 条的**判定强度**（实测教训）：比对必须容忍单位与格式化差异，否则
+**表格类语料会把好答案整篇误杀** —— 见 ``_SPECIFIC_NUMBER_RE`` 的说明。
+而且 ``unsupported_claim`` **不再等同"整答拒答"**（调用方按 ``mostly_unsupported``
+决定是否硬拒）：归因差异可降级，整篇对不上才拒。
 
 不做 NLI / 语义蕴含（成本高、难测）；先把「明显胡编数字」挡掉。
 """
@@ -13,10 +18,25 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Sequence
 
 #: 答案里的引用标记（与 pipeline._CITATION_RE 同口径）
 _CITATION_RE = re.compile(r"\[(\d+)\]")
+
+#: 百分比（用于「7.69% ↔ 0.0769」这类换算：表格里常把百分比存成小数）
+_PERCENT_RE = re.compile(r"([0-9][0-9,]*(?:\.\d+)?)\s*[%％]")
+
+#: 「够特异」的数字主体：带千分位、带小数点、或 ≥3 位整数。
+#:
+#: 为什么需要它：答案里的数字**带单位/经过格式化**，而资料里是**原始单元格值**。
+#: 实测（`2026年7月能耗分析.xlsx`）：答案写「474.004万元」，表格单元格里是 `474.004`；
+#: 答案写「7.69%」，单元格里是 `0.0769` 或 `7.69`。按整串子串比对必然全部失败，
+#: 结果是**好答案被判"编造"**（实测 25 条 claim 里误杀 9 条）。
+#:
+#: 刻意**只取**这些够特异的形态：1~2 位整数（如「28万元」里的 28）在长文里几乎必中，
+#: 拿它做匹配等于把校验放空 —— 那几条就让它留在 unsupported 里（配合降级策略不误杀整答）。
+_SPECIFIC_NUMBER_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+|\d{3,}")
 
 _UNITS = (
     r"天|日|年|月|周|小时|分钟|元|万元|亿元|%|％|页|条|款|项|章|节|次|人|名|份|篇|级"
@@ -34,6 +54,15 @@ _CLAIM_RE = re.compile(
 
 REFUSE_MISSING_CITATION = "missing_citation"
 REFUSE_UNSUPPORTED_CLAIM = "unsupported_claim"
+
+#: 软降级的标记前缀（写进 ``AnswerResult.degraded``，供界面提示与审计分组）
+DEGRADED_UNSUPPORTED = "unsupported_claim"
+
+#: `unsupported` 占比达到该值、且 claim 数不少于下限时，**仍按拒答处理**：
+#: 降级不等于放行 —— 归因差异（单位/千分位）可以容忍，"整篇数字都对不上"必须挡住。
+UNSUPPORTED_REFUSE_RATIO = 0.6
+UNSUPPORTED_REFUSE_MIN_CLAIMS = 3
+
 
 
 @dataclass
@@ -109,19 +138,70 @@ def build_evidence(chunks: Sequence[object]) -> str:
     return "\n".join(parts)
 
 
+def _plain(value: Decimal) -> str:
+    """Decimal → 普通十进制字符串（去掉多余的 0 与科学计数法）。"""
+    text = format(value.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def numeric_cores(claim: str) -> list[str]:
+    """claim 里「够特异」的数字主体（含百分比的等价值），用于单位/格式无关的匹配。
+
+    ``474.004万元`` → ``["474.004"]``；``7.69%`` → ``["7.69", "0.0769"]``；
+    ``5,960,922度`` → ``["5960922"]``；``28万元`` → ``[]``（见 _SPECIFIC_NUMBER_RE 的说明）。
+    """
+    cores: list[str] = []
+    for match in _SPECIFIC_NUMBER_RE.finditer(claim or ""):
+        core = match.group(0).replace(",", "")
+        if core and core not in cores:
+            cores.append(core)
+    for match in _PERCENT_RE.finditer(claim or ""):
+        raw = match.group(1).replace(",", "")
+        try:
+            frac = Decimal(raw) / Decimal(100)
+        except (InvalidOperation, ValueError, ArithmeticError):
+            continue
+        for candidate in (_plain(frac),):
+            if candidate and candidate not in cores:
+                cores.append(candidate)
+    return cores
+
+
 def claim_supported(claim: str, evidence: str) -> bool:
-    """claim 归一化后是否作为子串出现在证据里。"""
+    """claim 归一化后是否**可被资料支撑**。
+
+    三级判定（由严到宽）：
+
+    1. 原串（去空白）子串 —— 最强；
+    2. 去掉千分位后子串 —— 容忍 ``1,234`` ↔ ``1234``；
+    3. **数字主体在资料里出现过** —— 容忍单位与格式化差异（``474.004万元`` ↔ ``474.004``、
+       ``7.69%`` ↔ ``0.0769``）。第 3 级只看"够特异"的数字，见 _SPECIFIC_NUMBER_RE。
+    """
     needle = re.sub(r"\s+", "", claim)
     hay = re.sub(r"\s+", "", evidence or "")
     if not needle:
         return True
     if needle in hay:
         return True
-    # 容忍千分位：1,234 ↔ 1234
     compact = needle.replace(",", "")
-    if compact != needle and compact in hay.replace(",", ""):
+    hay_nocomma = hay.replace(",", "")
+    if compact != needle and compact in hay_nocomma:
         return True
+    for core in numeric_cores(claim):
+        if core in hay_nocomma:
+            return True
     return False
+
+
+def mostly_unsupported(report: FaithfulnessReport) -> bool:
+    """`unsupported` 占比是否高到"不该放行"（整篇数字对不上 = 大概是编的）。"""
+    total = len(report.claims)
+    if total < UNSUPPORTED_REFUSE_MIN_CLAIMS:
+        return False
+    return (len(report.unsupported) / total) >= UNSUPPORTED_REFUSE_RATIO
+
 
 
 def assess_faithfulness(answer: str, chunks: Sequence[object]) -> FaithfulnessReport:

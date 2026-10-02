@@ -41,6 +41,15 @@ retrieval:
     keep: 5
     min_score: 0.30
   parent_expand: true
+  # 与生产一致（README §七：dev 与生产的检索参数逐字一致，只差 provider）。
+  # 选 alpha/0.85 的实测依据见 config/application.cloud.yaml 同字段注释（README §四 第 75 条）。
+  fusion: alpha
+  hybrid_alpha: 0.85
+  doc2query_enabled: true
+  doc2query_max: 4
+  multi_query: 3
+  # figure 多模态旁路索引（课程 17）：图片向量与文本 embed 维度不同，单独 FAISS + RRF 第三路
+  figure_multimodal: true
   # 查询改写（00 §2.1 的第一步，多轮对话时启用）；策略：off | heuristic | llm
   # heuristic：含指代 / 追问展开用语（详细、继续…）/ 过短时并入上一轮问题
   query_rewrite:
@@ -63,6 +72,11 @@ models:
     batch_size: 10
     timeout_s: 30
     max_retries: 3
+  multimodal_embed:
+    provider: mock         # 开发（生产 dashscope / tongyi-embedding-vision-plus @1152）
+    model: mock-mm-embed-v1
+    dim: 64
+    timeout_s: 60
   llm:
     provider: mock         # 开发（生产 dashscope / qwen-max）
     model: mock-llm-v1

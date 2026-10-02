@@ -1,0 +1,17 @@
+{
+  "description": "负例题：**这 16 份语料里根本没有答案**的问题，用来量「增强」是不是同时带来了「噪声」—— 正例只看命中率，看不出把无关内容顶进 Top-k 的代价。判读方式不是 Hit@k（正例那套），而是看**Top-1 的 rerank 分数**与是否命中预期外的文档；配合 python -m ekbs.tools.eval_switch_sweep 使用。",
+  "expectation": {
+    "healthy": "Top-1 rerank 分数落在「域内无答案」带（实测过 <0.60 会被 min_score 拦下），且 Top-5 里不出现高密级/无关文档",
+    "warning": "某开关打开后负例题的 Top-1 分数明显上抬或开始出现无关文档 → 该开关在注入噪声"
+  },
+  "cases": [
+    { "id": "neg-travel-allowance", "question": "员工出差住宿费报销标准上限是多少" },
+    { "id": "neg-annual-leave", "question": "员工年假有多少天" },
+    { "id": "neg-performance", "question": "绩效考核系数怎么计算的" },
+    { "id": "neg-purchase-approval", "question": "采购申请需要谁审批" },
+    { "id": "neg-canteen", "question": "食堂一周的菜单怎么安排的" },
+    { "id": "neg-fire-drill", "question": "消防演练多长时间组织一次" },
+    { "id": "neg-vehicle", "question": "公司车辆使用要怎么申请" },
+    { "id": "neg-meeting-room", "question": "会议室预订流程是怎样的" }
+  ]
+}

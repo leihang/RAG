@@ -71,8 +71,14 @@ async def test_kb_level_deny_hides_document(seeded) -> None:
     alice_id = user_id_of(runtime.db, "demo_alice")
     with runtime.db.sync_connect() as conn:
         kb_id = int(conn.execute("SELECT kb_id FROM ekbs_kb LIMIT 1").fetchone()["kb_id"])
+        # ⚠️ 必须**(a) 限定密级 (b) 带 ORDER BY**：
+        #    C5 的第 2 步（密级）在 kb 之前，取到 L3 文档就会以 reason='level' 拒绝，
+        #    掩盖本用例要验的 kb 步；而 `LIMIT 1` 不带 ORDER BY 时返回哪一行由
+        #    **执行计划**决定 —— 本轮新增 idx_doc_deleted 后就改取到了 L3 文档而误红。
         doc_id = int(
-            conn.execute("SELECT doc_id FROM ekbs_document LIMIT 1").fetchone()["doc_id"]
+            conn.execute(
+                "SELECT doc_id FROM ekbs_document WHERE level <= 2 ORDER BY doc_id LIMIT 1"
+            ).fetchone()["doc_id"]
         )
         conn.execute(
             "INSERT INTO ekbs_acl_entry(object_type, object_id, subject_type, subject_id, "
@@ -184,8 +190,11 @@ async def test_document_acl_expired_and_malformed_are_ignored(seeded) -> None:
     runtime, _ = seeded
     alice_id = user_id_of(runtime.db, "demo_alice")
     with runtime.db.sync_connect() as conn:
+        # 同上：挑一份 Alice 密级读得到的文档，否则会在密级步就拒，验不到"过期 ACL 不生效"
         doc_id = int(
-            conn.execute("SELECT doc_id FROM ekbs_document LIMIT 1").fetchone()["doc_id"]
+            conn.execute(
+                "SELECT doc_id FROM ekbs_document WHERE level <= 2 ORDER BY doc_id LIMIT 1"
+            ).fetchone()["doc_id"]
         )
         conn.execute(
             "INSERT INTO ekbs_acl_entry(object_type, object_id, subject_type, subject_id, "
@@ -227,8 +236,11 @@ async def test_document_facts_tolerates_bad_json(seeded) -> None:
     """visible_dept_ids 存了坏 JSON 时按「无部门限制」处理，不抛异常（防御性）。"""
     runtime, _ = seeded
     with runtime.db.sync_connect() as conn:
+        # 任意文档都行，但必须带 ORDER BY：不带时取哪一行由执行计划决定（加索引就会变）
         doc_id = int(
-            conn.execute("SELECT doc_id FROM ekbs_document LIMIT 1").fetchone()["doc_id"]
+            conn.execute("SELECT doc_id FROM ekbs_document ORDER BY doc_id LIMIT 1").fetchone()[
+                "doc_id"
+            ]
         )
         conn.execute(
             "UPDATE ekbs_document SET visible_dept_ids = 'not-json' WHERE doc_id = ?", (doc_id,)

@@ -128,7 +128,12 @@ async def test_fts_rows_follow_the_migration(l3) -> None:
         ).fetchall()
     assert {str(r["shard_id"]) for r in rows} == {"kb_hr_L3"}
 
-    # 三方对账：FTS 行数 == 已发布子块数 == FAISS 向量数
+    # 三方对账：FTS **去重后的块数** == 已发布子块数 == FAISS 向量数
+    #
+    # ⚠️ 不能再拿 `runtime.fts.count()`（总行数）对账：Doc2Query 会给**同一个 chunk_id**
+    #    追加若干「假设问句」行（`ekbs/ingest/doc2query.py`，同 chunk_id、不同 content），
+    #    所以总行数天然大于块数（实测 79 vs 23）。要验的契约是「每个可检索子块都在 FTS 里」，
+    #    按 **distinct chunk_id**（且限定已发布子块）对账才与 block 数一一对应。
     with runtime.db.sync_connect() as conn:
         children = int(
             conn.execute(
@@ -136,7 +141,15 @@ async def test_fts_rows_follow_the_migration(l3) -> None:
                 "WHERE c.chunk_type = 'child' AND d.status = 'published'"
             ).fetchone()[0]
         )
-    assert runtime.fts.count() == children
+        fts_chunks = int(
+            conn.execute(
+                "SELECT COUNT(DISTINCT CAST(f.chunk_id AS INTEGER)) FROM ekbs_chunk_fts f "
+                "JOIN ekbs_chunk c ON c.chunk_id = CAST(f.chunk_id AS INTEGER) "
+                "JOIN ekbs_document d ON d.doc_id = c.doc_id "
+                "WHERE c.chunk_type = 'child' AND d.status = 'published'"
+            ).fetchone()[0]
+        )
+    assert fts_chunks == children
     # 迁移后旧分片里的陈旧向量仍在（IndexFlatIP 不支持删除，见 changes.py 的说明），
     # 因此 total_vectors() ≥ children 才是正确契约；关键是它们**召不回**：
     staleness = runtime.shards.total_vectors() - children

@@ -1,0 +1,185 @@
+{
+  "description": "16 份真实语料（~/Desktop 的 PDF-标准 / PPT-混合 / doc文档 / pdf-扫描 / xlsx表格，doc_id 31-46）的金标题集。用「文档标题 + 原文片段」定位，不绑 chunk_id —— 重切分后仍有效。配套：python -m ekbs.tools.eval_retrieval --golden docs/eval/golden_corpus16.json；开关对比用 python -m ekbs.tools.eval_switch_sweep。",
+  "corpus": {
+    "documents": 16,
+    "note": "中央空调循环水处理合同有两份（doc 31 PDF-标准、doc 40 pdf-扫描）内容重复，涉及它的用例只用 must_contain 不绑 must_hit_doc，否则会因召回「另一份」而误判。",
+    "known_issues": [
+      "doc 35 表格编号在标题与正文里不一致（XIWY vs XJWY）—— 源文件自身问题。",
+      "doc 41 的「3.RAG多模态数据处理」只在小节标题里出现（正文是「4.RAG调优」）。该题在基线里 below_threshold 拒答，**但不是召回问题**：实测该块稠密召回命中、RRF 排名第 3、精排第 2（0.570），只是整批候选分数偏低（top1 0.583）被阈值切掉 —— 属于「精排对『只有标题』的证据打分偏低」，非「标题没进嵌入」（`chunker.retrieval_text` 一直是 `heading + 正文`，见其 docstring 里「住宿标准」那次实测）。"
+    ]
+  },
+  "cases": [
+    {
+      "id": "contract-ac-amount",
+      "question": "中央空调循环水处理合同的工程总价是多少钱",
+      "must_contain": "26000.00",
+      "k": 5
+    },
+    {
+      "id": "contract-ac-term",
+      "question": "中央空调循环水处理合同的有效期是多久",
+      "must_contain": "本合同有效期为一年",
+      "k": 5
+    },
+    {
+      "id": "contract-ac-site",
+      "question": "循环水处理合同的项目名称是哪个商场",
+      "must_contain": "大学城熙街三期购物中心",
+      "k": 5
+    },
+    {
+      "id": "contract-elevator-price",
+      "question": "电梯维护保养每台每月多少钱",
+      "must_contain": "300元/台/月",
+      "k": 5
+    },
+    {
+      "id": "contract-elevator-total",
+      "question": "电梯维保合同一年总费用是多少",
+      "must_contain": "439200.00",
+      "k": 5
+    },
+    {
+      "id": "contract-elevator-term",
+      "question": "电梯维护保养合同的合同期限",
+      "must_contain": "2026年1月01日至2026年12月31日",
+      "k": 5
+    },
+    {
+      "id": "contract-elevator-penalty",
+      "question": "电梯维保考核不合格几次甲方可以解除合同",
+      "must_contain": "连续三次考核不合格",
+      "k": 5
+    },
+    {
+      "id": "contract-elevator-parts",
+      "question": "电梯维保里免费更换零部件的单价上限是多少",
+      "must_contain": "400元",
+      "k": 5
+    },
+    {
+      "id": "contract-ac-maint-total",
+      "question": "空调保养合同的总价是多少",
+      "must_contain": "19000",
+      "k": 5
+    },
+    {
+      "id": "contract-ac-maint-warranty",
+      "question": "空调保养工程的质保期是多久",
+      "must_contain": "质保期1年",
+      "k": 5
+    },
+    {
+      "id": "contract-ac-maint-response",
+      "question": "空调设备故障乙方要在几小时内到场",
+      "must_contain": "24小时",
+      "k": 5
+    },
+    {
+      "id": "rule-equipment-code",
+      "question": "设备编号是怎么组成的",
+      "must_contain": "设备的类别",
+      "k": 5
+    },
+    {
+      "id": "rule-equipment-level",
+      "question": "设备管理等级用什么符号表示",
+      "must_contain": "罗马数字",
+      "k": 5
+    },
+    {
+      "id": "rule-shift-purpose",
+      "question": "交接班管理制度的目的",
+      "must_contain": "确保运维工作的连续开展",
+      "k": 5
+    },
+    {
+      "id": "form-equipment-stat",
+      "question": "设施设备统计表的表格编号是多少",
+      "must_contain": "XJWY-QR-GC-002",
+      "k": 5,
+      "note": "原件标题为 XIWY-QR-GC-002、正文为 XJWY-QR-GC-002（源文件自身不一致，勿当系统问题）"
+    },
+    {
+      "id": "form-equipment-maint",
+      "question": "设施设备维保记录的表格编号",
+      "must_contain": "XIWY-QR-GC-004",
+      "k": 5
+    },
+    {
+      "id": "xlsx-energy-july",
+      "question": "2026年7月的用电分析表",
+      "must_contain": "熙街2026年7月用电分析表",
+      "k": 5
+    },
+    {
+      "id": "xlsx-budget-header",
+      "question": "2026年度预算填报模板的表头有哪些项目",
+      "must_contain": "项目（收入成本均含税）",
+      "k": 5
+    },
+    {
+      "id": "xlsx-night-check",
+      "question": "夜间品质巡检记录表的表格编号是多少",
+      "must_contain": "XJWY-PZ-01",
+      "k": 5
+    },
+    {
+      "id": "iot-dtu",
+      "question": "熙物联系统里哪些设备用DTU网络通讯",
+      "must_contain": "DTU网络通讯",
+      "k": 5
+    },
+    {
+      "id": "iot-alarm-table",
+      "question": "物联网告警信息里漏水告警怎么处理",
+      "must_contain": "漏水告警",
+      "k": 5
+    },
+    {
+      "id": "tech-rag-alternatives",
+      "question": "哪些技术被宣称可以替代RAG",
+      "must_contain": "LLMWiki",
+      "k": 5
+    },
+    {
+      "id": "tech-long-context",
+      "question": "超长上下文技术的局限",
+      "must_contain": "超长上下文",
+      "k": 5
+    },
+    {
+      "id": "course-rag-multimodal",
+      "question": "开班典礼里讲的RAG多模态数据处理",
+      "must_contain": "RAG多模态数据处理",
+      "k": 5
+    },
+    {
+      "id": "ppt-august-report",
+      "question": "2026年8月工作汇报里工程部的能耗管理情况",
+      "must_hit_doc": "2026年8月工作汇报-工程",
+      "must_contain": "能耗管理",
+      "k": 5
+    },
+    {
+      "id": "ppt-august-figure",
+      "question": "2026年8月工作汇报里的图表",
+      "must_hit_doc": "2026年8月工作汇报-工程",
+      "must_contain": "[图片]",
+      "k": 5
+    },
+    {
+      "id": "ppt-electric-safety",
+      "question": "电气基础和用电安全的培训内容",
+      "must_hit_doc": "5、电气基础和用电安全",
+      "k": 5
+    },
+    {
+      "id": "night-photos",
+      "question": "夜查记录表里的现场照片",
+      "must_hit_doc": "夜查记录表-雷航（20260930)",
+      "must_contain": "[图片]",
+      "k": 5
+    }
+  ]
+}

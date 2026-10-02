@@ -1,0 +1,107 @@
+{
+  "description": "**同义改写**金标题集：问法贴近真人、刻意不与原文共享关键词 —— 用它才量得出稠密/稀疏/Doc2Query/MultiQuery 的**语义**差异。原 golden_corpus16.json 的问法与原文高度重合（正例 top 分中位 0.980），只能测退化、测不出小幅提升（README §四 第 73 条）。期望片段逐条用 SQL 验证过确实存在于语料。",
+  "cases": [
+    {
+      "id": "pp-01",
+      "question": "电梯一年要花多少保养费",
+      "must_contain": "439200.00",
+      "k": 5
+    },
+    {
+      "id": "pp-02",
+      "question": "空调设备坏了多久得有人上门",
+      "must_contain": "24小时",
+      "k": 5
+    },
+    {
+      "id": "pp-03",
+      "question": "公共设备是怎么编号的",
+      "must_contain": "设备的类别",
+      "k": 5
+    },
+    {
+      "id": "pp-04",
+      "question": "报修系统报警了怎么排查",
+      "must_contain": "告警/报警信息",
+      "k": 5
+    },
+    {
+      "id": "pp-05",
+      "question": "晚上巡夜主要看什么",
+      "must_contain": "夜间品质巡检记录表",
+      "k": 5
+    },
+    {
+      "id": "pp-06",
+      "question": "这几个月的电费跟去年比怎么样",
+      "must_contain": "能耗管理1-6月电费",
+      "k": 5
+    },
+    {
+      "id": "pp-07",
+      "question": "中央空调的水处理合同是谁跟谁签的",
+      "must_contain": "重庆卓越城市运营服务有限责任公司",
+      "k": 5
+    },
+    {
+      "id": "pp-08",
+      "question": "明年的预算表要填哪些东西",
+      "must_contain": "项目（收入成本均含税）",
+      "k": 5
+    },
+    {
+      "id": "pp-09",
+      "question": "电梯保养干得不好会有什么后果",
+      "must_contain": "连续三次考核不合格",
+      "k": 5
+    },
+    {
+      "id": "pp-10",
+      "question": "交接班要注意哪些事",
+      "must_contain": "确保运维工作的连续开展",
+      "k": 5
+    },
+    {
+      "id": "pp-11",
+      "question": "把全部资料一次塞给模型有什么问题",
+      "must_contain": "超长上下文",
+      "k": 5
+    },
+    {
+      "id": "pp-12",
+      "question": "有没有能取代 RAG 的新办法",
+      "must_contain": "LLMWiki",
+      "k": 5
+    },
+    {
+      "id": "pp-13",
+      "question": "工程部这个月都干了些什么",
+      "must_contain": "能耗管理",
+      "k": 5
+    },
+    {
+      "id": "pp-14",
+      "question": "电梯换零件要不要另外加钱",
+      "must_contain": "400元",
+      "k": 5
+    },
+    {
+      "id": "pp-15",
+      "question": "高压配电房用什么方式联网",
+      "must_contain": "DTU网络通讯",
+      "k": 5
+    },
+    {
+      "id": "pp-16",
+      "question": "空调保养验收完多久付款",
+      "must_contain": "30 日内",
+      "k": 5
+    },
+    {
+      "id": "pp-17",
+      "question": "水处理合同一共分几次付钱",
+      "must_contain": "13000.00",
+      "k": 5
+    }
+  ]
+}

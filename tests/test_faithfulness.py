@@ -8,10 +8,15 @@ from types import SimpleNamespace
 import pytest
 
 from ekbs.retrieval.faithfulness import (
+    DEGRADED_UNSUPPORTED,
     REFUSE_MISSING_CITATION,
     REFUSE_UNSUPPORTED_CLAIM,
+    ClaimCheck,
+    FaithfulnessReport,
     assess_faithfulness,
+    claim_supported,
     extract_claims,
+    mostly_unsupported,
 )
 from ekbs.retrieval.pipeline import RetrievalPipeline
 from tests.conftest import user_id_of
@@ -100,40 +105,104 @@ def test_post_check_citations_empty_without_markers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_generate_refuses_unsupported_claim(seeded) -> None:
-    """合法 [1] + 编造数字 → 整答 refused=unsupported_claim，citations 清空。"""
+async def _stub_generate(runtime, alice, *, question: str, text: str, retrieve_q: str):
+    """用假 LLM 跑一次 generate（不调云端），返回 (answer, retrieval)。"""
     from ekbs.provider.base import LLMResult
-
-    runtime, _ = seeded
-    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
 
     class FakeLLM:
         ref = runtime.providers.llm.ref
 
         async def generate(self, messages, **kwargs):
-            return LLMResult(
-                text="市内交通补贴上限为 600 元 [1]。",
-                model="faithfulness-test",
-            )
+            return LLMResult(text=text, model="faithfulness-test")
 
     original = runtime.pipeline.providers.llm
     runtime.pipeline.providers.llm = FakeLLM()  # type: ignore[assignment]
     try:
-        retrieval = await runtime.pipeline.retrieve("年假有多少天", alice)
+        retrieval = await runtime.pipeline.retrieve(retrieve_q, alice)
         if not retrieval.chunks:
             pytest.skip("demo 语料未召回，跳过集成断言")
-        evidence = " ".join(c.content for c in retrieval.chunks)
-        if "600" in evidence.replace(",", ""):
-            pytest.skip("召回块碰巧含 600，换问题再测")
-        answer = await runtime.pipeline.generate("补贴多少", retrieval, alice)
+        return await runtime.pipeline.generate(question, retrieval, alice), retrieval
     finally:
         runtime.pipeline.providers.llm = original  # type: ignore[assignment]
+
+
+@pytest.mark.asyncio
+async def test_generate_degrades_low_ratio_unsupported_claim(seeded) -> None:
+    """**降级而非拒答**：少量数字核对不上时，答案与引用都要保留。
+
+    实测教训：`2026年7月能耗分析` 这类表格汇总问题，模型会做单位换算/格式化，
+    旧策略"一条对不上就整答拒答 + 清空引用"会把好答案打成拒答（25 条 claim 误杀 9 条）。
+    """
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    answer, retrieval = await _stub_generate(
+        runtime, alice, question="补贴多少", text="市内交通补贴上限为 888 元 [1]。",
+        retrieve_q="年假有多少天",
+    )
+    evidence = " ".join(c.content for c in retrieval.chunks).replace(",", "")
+    if "888" in evidence:
+        pytest.skip("召回块碰巧含 888，换数字再测")
+
+    assert answer.refused is False, "少量存疑数字不应整答拒答"
+    assert answer.citations, "降级时引用必须保留 —— 否则用户看不到出处"
+    assert answer.refusal_reason == ""
+    assert any(d.startswith(DEGRADED_UNSUPPORTED) for d in answer.degraded), answer.degraded
+    # 报告仍然如实记录（审计/调试台可查）
+    assert answer.faithfulness.get("ok") is False
+    assert any("888" in u for u in answer.faithfulness.get("unsupported", []))
+
+
+@pytest.mark.asyncio
+async def test_generate_refuses_mostly_unsupported_claim(seeded) -> None:
+    """降级**不等于放行**：整篇数字都对不上时仍然硬拒（大概是编的）。"""
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    answer, retrieval = await _stub_generate(
+        runtime, alice,
+        question="补贴多少",
+        text="上限为 888 元 [1]，下限为 777 元 [1]，另计 666 元 [1]。",
+        retrieve_q="年假有多少天",
+    )
+    evidence = " ".join(c.content for c in retrieval.chunks).replace(",", "")
+    if sum(1 for n in ("888", "777", "666") if n in evidence) >= 2:
+        pytest.skip("召回块碰巧含多数数字，换数字再测")
 
     assert answer.refused is True
     assert answer.refusal_reason == REFUSE_UNSUPPORTED_CLAIM
     assert answer.citations == []
-    assert answer.faithfulness.get("ok") is False
-    assert any("600" in u for u in answer.faithfulness.get("unsupported", []))
+
+
+def test_unit_and_format_differences_are_tolerated() -> None:
+    """单位/格式化差异**不算编造**（实测：答案 474.004万元 vs 单元格 474.004）。"""
+    evidence = "表名: 用电分析 合计=474.004 同比=0.0769 总量=5,960,922"
+    assert claim_supported("474.004万元", evidence) is True
+    assert claim_supported("7.69%", evidence) is True
+    assert claim_supported("5,960,922度", evidence) is True
+    assert claim_supported("7.69%", "同比=7.69") is True
+
+
+def test_short_numbers_still_require_real_support() -> None:
+    """1~2 位整数不参与「数字主体」匹配，避免把校验放空（28 在长文里几乎必中）。"""
+    assert claim_supported("28万元", "合计=474.004") is False
+    assert claim_supported("999.999万元", "合计=474.004") is False
+
+
+def test_mostly_unsupported_threshold() -> None:
+    """比例阈值：≥3 条 claim 且 ≥60% 对不上才判「整篇不可信」。"""
+    def _report(unsupported: int, total: int) -> FaithfulnessReport:
+        claims = [
+            ClaimCheck(text=f"c{i}", supported=i >= unsupported) for i in range(total)
+        ]
+        return FaithfulnessReport(
+            ok=False,
+            claims=claims,
+            unsupported=[c.text for c in claims if not c.supported],
+            reason=REFUSE_UNSUPPORTED_CLAIM,
+        )
+
+    assert mostly_unsupported(_report(1, 3)) is False   # 1/3：降级
+    assert mostly_unsupported(_report(2, 3)) is True    # 2/3：硬拒
+    assert mostly_unsupported(_report(1, 2)) is False   # claim 数不足下限 → 不判整篇
 
 
 @pytest.mark.asyncio

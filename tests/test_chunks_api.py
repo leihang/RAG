@@ -72,9 +72,12 @@ def fts_content_for(runtime, chunk_id: int) -> str:
 async def test_permissions_by_role(client, seeded) -> None:
     """`05` §3.4：read（SA/KA/DR/AU）、update（SA/KA/DR）、reembed（仅 SA/KA）。"""
     runtime, _ = seeded
-    doc_id = 1
     with runtime.db.sync_connect() as conn:
-        doc_id = int(conn.execute("SELECT doc_id FROM ekbs_document LIMIT 1").fetchone()["doc_id"])
+        doc_id = int(
+            conn.execute("SELECT doc_id FROM ekbs_document ORDER BY doc_id LIMIT 1").fetchone()[
+                "doc_id"
+            ]
+        )
     chunk_id = child_of(runtime, "年假管理制度")
 
     end_user = headers_for(user_id_of(runtime.db, "demo_alice"))
@@ -105,7 +108,7 @@ async def test_tree_and_detail(client, admin) -> None:
     runtime, user_id = admin
     headers = headers_for(user_id)
     with runtime.db.sync_connect() as conn:
-        doc_id = int(conn.execute("SELECT doc_id FROM ekbs_document LIMIT 1").fetchone()["doc_id"])
+        doc_id = int(conn.execute("SELECT doc_id FROM ekbs_document ORDER BY doc_id LIMIT 1").fetchone()["doc_id"])
     tree = (await client.get(f"/api/v1/chunks/documents/{doc_id}/tree", headers=headers)).json()
     assert tree["parents"] >= 1 and tree["children"] >= 1
     assert tree["tree"][0]["children"], "父块下应挂着子块"
@@ -308,7 +311,8 @@ async def test_revectorize_document_rebuilds_shard(client, admin) -> None:
     with runtime.db.sync_connect() as conn:
         doc_id = int(
             conn.execute(
-                "SELECT doc_id FROM ekbs_document WHERE status='published' LIMIT 1"
+                "SELECT doc_id FROM ekbs_document WHERE status='published' "
+                "ORDER BY doc_id LIMIT 1"
             ).fetchone()["doc_id"]
         )
     response = await client.post(
@@ -324,7 +328,7 @@ async def test_export_jsonl_and_csv(client, admin) -> None:
     runtime, user_id = admin
     headers = headers_for(user_id)
     with runtime.db.sync_connect() as conn:
-        doc_id = int(conn.execute("SELECT doc_id FROM ekbs_document LIMIT 1").fetchone()["doc_id"])
+        doc_id = int(conn.execute("SELECT doc_id FROM ekbs_document ORDER BY doc_id LIMIT 1").fetchone()["doc_id"])
     jsonl = await client.get(
         f"/api/v1/chunks/documents/{doc_id}/export?fmt=jsonl", headers=headers
     )
