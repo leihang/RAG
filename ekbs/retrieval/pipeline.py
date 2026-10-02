@@ -51,6 +51,7 @@ from ekbs.retrieval.numeric import (
     build_numeric_prompt,
     find_scope_alternatives,
     parse_numeric_payload,
+    question_pins_scope,
     render_answer,
     verify_copied,
     verify_scope,
@@ -1202,6 +1203,10 @@ class RetrievalPipeline:
         alternatives = find_scope_alternatives(
             chunks, quote=numeric.quote, value=numeric.value
         )
+        if alternatives and question_pins_scope(question, numeric.scope):
+            # 问题自带了口径（"2026年总用电量…"）且与返回口径相符 → 用户已指明哪一行，
+            # 再挂"另有 2024 年…"是噪声，收声。
+            alternatives = []
         if alternatives:
             numeric.alternatives = alternatives
         answer_text, _leaked = self._apply_output_guard(render_answer(numeric, cite_index), perm)

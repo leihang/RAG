@@ -479,3 +479,41 @@ async def test_numeric_mode_discloses_scope_alternatives(seeded, monkeypatch) ->
     assert result.refused is False
     assert result.numeric and result.numeric.get("alternatives"), "歧义必须被披露出来"
     assert any(d.startswith("numeric_scope_ambiguity") for d in result.degraded)
+
+
+def test_question_pinning_suppresses_ambiguity_noise() -> None:
+    """问题自带口径且与返回口径相符 → 不再提示"另有…"（用户已指明哪一行）。
+
+    只做"相符就收声"：问题说 2026 而返回 2024 时披露照旧 ——
+    那种情形更需要用户看见；模型到底选错没有属语义判断，不由规则断言。
+    """
+    from ekbs.retrieval.numeric import question_pins_scope
+
+    assert question_pins_scope("2026年总用电量是多少度", "2026年") is True
+    assert question_pins_scope("第4页的用电量", "第 4 页 用电分析表") is True
+    assert question_pins_scope("2025年3月的电费", "2025年") is True
+    # 问题没提口径 → 照旧披露（这正是最初那次 2024/2026 混答的场景）
+    assert question_pins_scope("总用电量是多少度", "2026年") is False
+    # 问题提的口径与返回口径不符 → 也照旧披露
+    assert question_pins_scope("2024年总用电量", "2026年") is False
+    assert question_pins_scope("电梯维保一年总费用", "") is False
+
+
+async def test_pinned_question_does_not_disclose_alternatives(seeded, monkeypatch) -> None:
+    """管线上：问题钉了口径 → 不披露、也不打降级标记。"""
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    value, quote = await _real_quote(runtime, alice, "年假有多少天")
+    monkeypatch.setattr(
+        "ekbs.retrieval.pipeline.find_scope_alternatives",
+        lambda *a, **k: [{"value": 999999.0, "label": "x", "chunk_id": 1, "doc_title": "t", "page": 1}],
+    )
+    payload = {"value": value, "unit": "天", "quote": quote, "scope": "2026年"}
+    result = await _with_stub_llm(
+        runtime, json.dumps(payload, ensure_ascii=False),
+        lambda: runtime.pipeline.answer(
+            "2026年的年假有多少天", alice, mode="numeric", use_cache=False
+        ),
+    )
+    assert result.numeric and not result.numeric.get("alternatives")
+    assert not any(d.startswith("numeric_scope_ambiguity") for d in result.degraded)

@@ -367,7 +367,7 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
 
 | # | 事项 | 为什么必须先定 |
 |---|---|---|
-| 0 | ~~嵌入文本是否包含小节标题路径~~ ✅ **已定：包含**（2026-10-02 复核：`chunker.retrieval_text()` = `heading + 正文`，docstring 已给出理由与实测）；**`06` §3 待补一句把这个口径写死** | — | 
+| 0 | ~~嵌入文本是否包含小节标题路径~~ ✅ **已定：包含**，并已写进本仓库实现规格 [`docs/spec/20`](docs/spec/20-ingest-chunking.md) 阶段 6（`chunker.retrieval_text()` = `heading + 正文`，含理由与影响面）。**`方案/06` §3 仍需补同样一句**（该文档不在本机，需你/文档负责人同步） | — | 
 | 1 | ~~embedding + rerank 模型选型~~ ✅ **已定**：`qwen3.7-text-embedding-flash@1024` + `qwen3.7-text-rerank`（LLM 维持 `qwen-max`），配置已切、分片已按新模型重建 | 仍需同步 `00` D2/D3 与 `01` §7 的文字（见 §四 第 34 条） |
 | 2 | ~~云端 key~~ ✅ **已提供并跑通**（`DASHSCOPE_API_KEY` 走环境变量） | — |
 | 3 | **合规书面确认**（`00` §7）：入库即全量语料出网 | 开 `corpus_egress_ack=true` 才允许真实语料入库；当前 false |

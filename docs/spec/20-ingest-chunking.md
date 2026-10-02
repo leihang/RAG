@@ -17,9 +17,25 @@
 | 3 | 清洗 10 步 | 解析产物全文 + 结构 | 规范化文本 + 图表占位 + PII 标记（**不改原文**） | 单篇失败 `failed`；空页率/乱码率超线整篇退回人工复核；单表失败只跳过该表并记录（来源：06 §1.7） |
 | 4 | 表格序列化 | `structure.json` 的表格对象 + 前后相邻结构位置 | 每个表格的 `information_block` 换行拼接文本 | 单表失败跳过并记录（来源：06 §1.7）；不用页码取上下文（来源：06 §4.3） |
 | 5 | 四层分块 | 清洗后文本 + 表格/图占位 | `ekbs_chunk` 行（`parent`/`child`/`table`/`figure`） | 不产生空块、不产生只有标点的块（来源：02 TC-INDEX-029）；两次入库 `seq` 与顺序必须完全一致（来源：02 TC-INDEX-033） |
-| 6 | 云端嵌入 | chunk 文本（批量） | 向量 + `ekbs_chunk.embedding_fingerprint` | 入库期失败 → 排队重试 + 退避，**不影响在线查询**（来源：00 §2.3）；维度 1024、L2 归一化、无 NaN（来源：06 §1.2 阶段 4）；`batch_size=20`、`max_retries=3`（来源：01 §7） |
+| 6 | 云端嵌入 | **标题路径 + 正文**（批量）—— 唯一口径 `chunker.retrieval_text()` | 向量 + `ekbs_chunk.embedding_fingerprint` | 入库期失败 → 排队重试 + 退避，**不影响在线查询**（来源：00 §2.3）；维度 1024、L2 归一化、无 NaN（来源：06 §1.2 阶段 4）；`batch_size=20`、`max_retries=3`（来源：01 §7） |
 | 7 | 写索引 | 向量 + chunk 行 | FAISS 分片文件 + `ekbs_chunk.faiss_row` + `ekbs_chunk_fts` 行 + `ekbs_shard.vector_count` | `ekbs_chunk` 与 `ekbs_chunk_fts` **必须同一事务**（来源：02 TC-INDEX-015）；SQLite 每 200 行提交一次（来源：02 TC-INDEX-027）；FAISS 先写 `.new` 再原子 rename（来源：06 §2.4） |
 | 8 | 门禁 + 发布 | 全部分片与元数据 | `status='published'` | `ntotal == vector_count`（来源：02 TC-INDEX-013）；三方一致性（来源：03 §5.4）；PII 命中阻断 `published`（来源：02 TC-GOV-028）；解析成功率 ≥98%、空页率 ≤1%、乱码率 ≤0.5%、表格还原率 ≥95%、页码连续性 100%（来源：01 §12、06 §1.7） |
+
+**阶段 6 的口径（2026-10-02 定稿：包含小节标题路径）**
+
+嵌入文本 = ``chunker.retrieval_text(heading_path, content)`` = ``f"{heading}\n{body}"``，
+即**小节标题路径 + 正文**，两段用换行连接；``ekbs_chunk.content`` 本身不变（正文照旧）。
+入库（`ekbs/ingest/pipeline.py`）、分片迁移（`ekbs/permission/changes.py`）、
+索引重建（`ekbs/tools/rebuild_shard.py`）三处都调用同一个函数 —— **口径必须唯一**，
+任何一处不同都会让同一分片里混进两套向量语义。
+
+为什么必须带上标题：制度/合同类文件的关键限定词常常只在小节标题里（如「第二条 **住宿标准**」，
+正文写的是「一线城市每晚不超过 600 元…」）。只嵌入正文时，查询「住宿标准」与这段正文
+**没有任何共享词**，稠密召回直接落空（历史实测踩到）。FTS 侧另有 `heading_path_tok` 列
+（见 §FTS 一节），两路一致。
+
+影响面：**改这个口径必须全量重嵌**（只重建分片、不重新解析）。此前 `06` §3 未规定该口径，
+本行即为本仓库的定稿；方案侧文档需同步一句同样的话。
 
 ### 1.2 `ekbs_document.status` 状态机
 取值（Schema 唯一来源）：`pending | parsing | indexing | published | failed | offline`（来源：01 §5.2）

@@ -315,6 +315,30 @@ def verify_scope(answer: NumericAnswer, chunks: Sequence[Any], cite_index: int |
 _LABEL_SEP = re.compile(r"[:：=＝\s\-—/]*$")
 
 
+#: 问题里可能**自带**的"期间/位置"限定词：年份、年月、月、日、第N页、季度、Q1。
+_QUALIFIER_RE = re.compile(
+    r"\d{4}\s*年|\d{1,2}\s*月|\d{4}(?![\d年])|第\s*\d+\s*页|第\s*[一二三四1-4]\s*季度|[Qq][1-4]|\d{1,2}\s*日"
+)
+
+
+def question_pins_scope(question: str, scope: str) -> bool:
+    """问题是否**自带**了与本次返回口径相符的限定词。
+
+    相符 → 用户已经指明要哪一行，"另有 2024 年…"这类提示只是噪声，不再披露；
+    不相符（或问题压根没提口径）→ 照旧披露，用户能看出"抄的"和"问的"可能不是同一行。
+
+    只做"相符就收声"这一件事，**不做反向判断**：问题说 2026 而返回 2024 时，
+    披露照旧（那种情形更需要用户看见），但不由规则去断言模型选错了 —— 那属语义判断。
+    """
+    quals = {re.sub(r"\s+", "", q) for q in _QUALIFIER_RE.findall(question or "")}
+    if not quals:
+        return False
+    scope_norm = re.sub(r"\s+", "", scope or "")
+    if not scope_norm:
+        return False
+    return any(q and q in scope_norm for q in quals)
+
+
 def find_scope_alternatives(
     chunks: Sequence[Any],
     *,
