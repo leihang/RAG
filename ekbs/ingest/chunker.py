@@ -46,6 +46,59 @@ _DOTTED_HEADING_RE = re.compile(r"^(\d+(?:\.\d+)+)\s+(\S.*)$")
 _CLAUSE_LEVEL = {"章": 2, "节": 3, "条": 3, "款": 4, "项": 4}
 _SENTENCE_END = "。！？；.!?;\n"
 
+#: 条款/编号行 —— 这类行**本身就是内容**，最容易被"当标题"吞掉
+_CLAUSE_LIKE_RE = re.compile(
+    r"^\s*(第[一二三四五六七八九十百千零〇两\d]+[章节条款项]|\d+(?:\.\d+)+\s|\d+[．.、])"
+)
+#: 「标题行同时也是正文」的判据：短标题（如 `第一条 年假天数`）只当标题，
+#: 而"整条就是内容"的行（带句读/很长）必须**同时**进正文，否则整行文字会消失。
+_CONTENT_PUNCT = "。；！？：，,;"
+_HEADING_BODY_MIN_CHARS = 12
+_HEADING_BODY_LONG_CHARS = 40
+
+
+def _looks_like_content(stripped: str) -> bool:
+    """这一行是否"本身就是内容"（而不是纯标题）。"""
+    if len(stripped) >= _HEADING_BODY_LONG_CHARS:
+        return True
+    return len(stripped) >= _HEADING_BODY_MIN_CHARS and any(
+        ch in stripped for ch in _CONTENT_PUNCT
+    )
+
+
+def is_substantive_line(line: str) -> bool:
+    """丢了就应算缺陷的"实质内容行"（页眉/页码/水印不会命中）。"""
+    stripped = line.strip()
+    if len(stripped) < 8:
+        return False
+    if _CLAUSE_LIKE_RE.match(stripped):
+        return True
+    return len(stripped) >= 12 and any(ch in stripped for ch in _CONTENT_PUNCT)
+
+
+def content_coverage(
+    source_text: str, nodes: Sequence["ChunkNode"]
+) -> tuple[float, tuple[str, ...]]:
+    """**零丢失不变量**：源文本每行是否都出现在某个块的 ``content ∪ heading_path`` 里。
+
+    返回 ``(覆盖率, 丢失的实质内容行)``。为什么要有它：分块把整行当标题时文字会**静默消失**
+    （实测交接班制度 22 段丢 11 段：643 字符只剩 206），而空页率/乱码率/空 heading 这些
+    闸门**全是 PASS** —— 只有逐行核对能发现。入库时会用它当守卫（见 `ingest/pipeline`）。
+    """
+    lines = [line.strip() for line in source_text.splitlines() if line.strip()]
+    if not lines:
+        return 1.0, ()
+    stored = "".join(
+        re.sub(r"[\s\u3000]", "", (node.content or "") + (node.heading_path or "")) for node in nodes
+    )
+    lost = [
+        line
+        for line in lines
+        if is_substantive_line(line) and re.sub(r"[\s\u3000]", "", line) not in stored
+    ]
+    kept = sum(1 for line in lines if re.sub(r"[\s\u3000]", "", line) in stored)
+    return kept / len(lines), tuple(lost)
+
 
 #: 词表文件（~11 MB）属于**部署物**不是源码，放 `var/` 下（git 忽略）。
 #: 取不到时**不报错**：回退到 tiktoken 并告警一次，保证分块链路不被词表问题打断。
@@ -287,7 +340,15 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
                 )
             )
 
-    def push_heading(level: int, title: str, line_len: int) -> None:
+    def push_heading(level: int, title: str, line_len: int, *, also_body: str | None = None) -> None:
+        """开一个新小节。
+
+        ``also_body``：当**这一行本身就是内容**时（中文制度/合同里 ``第X条 …``、``4.1 …``
+        常常整条就是正文），把整行文字**同时**放进新小节的正文 —— 否则这行只进
+        ``heading_path``，而同级旧标题会被弹出（见下 ``heading_stack.pop()``），
+        结果是**整行文字谁都不产出，静默丢失**。
+        实测：交接班制度 22 段丢 11 段（643 字符只剩 206），而质量闸门全 PASS。
+        """
         nonlocal buffer, current_heading, current_start
         flush(offset)
         buffer = []
@@ -295,7 +356,11 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
             heading_stack.pop()
         heading_stack.append((level, title))
         current_heading = " > ".join(t for _, t in heading_stack)
-        current_start = offset + line_len + 1
+        if also_body:
+            buffer.append(also_body)
+            current_start = offset  # 本行就是正文首行 → 小节起点就是它
+        else:
+            current_start = offset + line_len + 1
 
     for line in markdown.splitlines():
         stripped = line.strip()
@@ -313,10 +378,11 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
             rest = clause.group(3).strip()
             if rest:
                 title = f"{title} {rest}"
-            push_heading(level, title, len(line))
+            # 条款行若"本身就是一段内容"，整行也要进正文（否则连同级旧标题一起被弹出丢弃）
+            push_heading(level, title, len(line), also_body=line if _looks_like_content(stripped) else None)
         elif dotted:
             title = f"{dotted.group(1)} {dotted.group(2).strip()}"
-            push_heading(3, title, len(line))
+            push_heading(3, title, len(line), also_body=line if _looks_like_content(stripped) else None)
         else:
             buffer.append(line)
         offset += len(line) + 1

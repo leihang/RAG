@@ -32,6 +32,7 @@ from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE, retrievable_chunk_ids
 from ekbs.ingest import token_calib
 from ekbs.ingest.clean import clean_markdown
 from ekbs.ingest.chunker import (
+    content_coverage,
     CHILD_MAX_TOKENS,
     CHILD_MIN_TOKENS,
     ChunkNode,
@@ -66,6 +67,10 @@ class IngestResult:
     #: 校准 `TC-INDEX-004` 的一对真值；比值 >1 表示本地偏低。0 表示该模型没上报 usage。
     cloud_tokens: int = 0
     local_tokens: int = 0
+    #: **零丢失不变量**：源文本行出现在某个块（content ∪ heading_path）里的比例，
+    #: 以及"像正文却没进库"的行数。正常应为 1.0 / 0 —— 小于 1 说明分块吃掉了内容。
+    content_coverage: float = 1.0
+    content_lost_lines: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -78,6 +83,8 @@ class IngestResult:
             "figure_vectors_failed": self.figure_vectors_failed,
             "cloud_tokens": self.cloud_tokens,
             "local_tokens": self.local_tokens,
+            "content_coverage": self.content_coverage,
+            "content_lost_lines": self.content_lost_lines,
             "status": self.status,
             "checksum": self.checksum,
         }
@@ -175,6 +182,8 @@ class IngestPipeline:
             figure_vectors_failed = 0
             cloud_tokens = 0
             local_tokens = 0
+            content_ratio = 1.0
+            lost_lines = ()
             # 代码文件走**代码感知分块**（按函数/类切，path+符号进 heading_path）：
             # 定长/Markdown 分块会把函数从中间切断，代码检索效果很差。
             if is_code_source(source_path):
@@ -201,6 +210,19 @@ class IngestPipeline:
                     figures=figures,
                     tables=tables,
                     doc_title=title,
+                )
+            # **零丢失守卫**：分块把"整行当标题"时文字会静默消失（实测 22 段丢 11 段，
+            # 而空页率/乱码率/空 heading 全 PASS）。这里逐行核对，丢实质内容就打警告 +
+            # 写进 IngestResult，让"静默丢内容"变成可见故障。
+            content_ratio, lost_lines = content_coverage(markdown, chunking.nodes)
+            if lost_lines:
+                log.warning(
+                    "chunk_content_lost",
+                    doc_id=doc_id,
+                    coverage=round(content_ratio, 4),
+                    lost=len(lost_lines),
+                    samples=list(lost_lines[:3]),
+                    hint="这些行没进任何块（content∪heading_path），检索不到；看 chunker 的标题判据",
                 )
             self._insert_chunks(doc_id, shard_id, chunking.nodes)
             child_ids = self._child_chunk_ids(doc_id)
@@ -234,6 +256,8 @@ class IngestPipeline:
             figure_vectors_failed=figure_vectors_failed,
             cloud_tokens=cloud_tokens,
             local_tokens=local_tokens,
+            content_coverage=content_ratio,
+            content_lost_lines=len(lost_lines),
             status="published",
             checksum=checksum,
         )

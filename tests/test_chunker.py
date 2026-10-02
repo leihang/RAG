@@ -9,6 +9,7 @@ from ekbs.ingest.chunker import (
     PARENT_MAX_TOKENS,
     PARENT_MIN_TOKENS,
     chunk_markdown,
+    content_coverage,
     count_tokens,
     ensure_heading_path,
     split_sections,
@@ -223,3 +224,66 @@ def test_chunk_markdown_does_not_collapse_later_pages_to_page_one() -> None:
     assert by_heading["导师介绍"].page_from == 2
     assert by_heading["几种典型企业类别"].page_from == 3
     assert all(n.page_from != 1 or "开班典礼" in n.heading_path for n in result.parents)
+
+
+# ---------------------------------------------------------------- 零丢失（2026-10-02 实测事故）
+
+
+def test_single_line_clauses_are_not_swallowed() -> None:
+    """``第X条 …`` 整条就是内容时，**必须也进正文**。
+
+    实测事故：交接班制度 22 段里 11 段丢失（643 字符只剩 206），而空页率/乱码率/空 heading
+    这些闸门**全是 PASS** —— 因为分块器把 `第X条 …` / `4.1 …` 整行当标题，连续多条时
+    同级旧标题被弹出，**除最后一条外整行文字谁都不产出**。修复前这种三行文档产出 **0 个块**。
+    """
+    md = (
+        "第一条 员工年假天数按司龄确定：满一年五天。\n"
+        "第二条 申请须提前三个工作日提交。\n"
+        "第三条 未休年假折算标准按月工资计算。\n"
+    )
+    result = chunk_markdown(md)
+    assert result.nodes, "单行成条的制度必须产出块（修复前是 0 个块）"
+    ratio, lost = content_coverage(md, result.nodes)
+    assert ratio == 1.0 and not lost
+    joined = "\n".join(node.content for node in result.nodes)
+    assert "满一年五天" in joined and "三个工作日" in joined and "按月工资计算" in joined
+
+
+def test_dotted_clauses_are_not_swallowed() -> None:
+    """``4.1 …`` 这类半角点条款同样不能丢（全角点 ``4．`` 本来走正文，不受影响）。"""
+    md = (
+        "4． 制度\n"
+        "4.1 值班人员应认真遵守公司的各项规范制度，接班人应提前15分钟到达现场。\n"
+        "4.2 接班人员未能到岗，值班人员必须坚持岗位并汇报。\n"
+    )
+    result = chunk_markdown(md)
+    ratio, lost = content_coverage(md, result.nodes)
+    assert ratio == 1.0, f"覆盖率 {ratio:.0%}，丢失 {lost[:2]}"
+    joined = "\n".join(node.content for node in result.nodes)
+    assert "接班人应提前15分钟" in joined and "必须坚持岗位并汇报" in joined
+
+
+def test_short_clause_title_keeps_behaviour_without_duplication() -> None:
+    """短标题（如 ``第一条 年假天数``）保持"只当标题" —— 不把标题文字复制进正文。
+
+    判据是"这一行本身像不像内容"（带句读且 ≥12 字，或 ≥40 字）。短标题既省 token，
+    也避免了 `heading_path` 与 `content` 无谓重复。
+    """
+    md = "第一条 年假天数\n员工年假天数按司龄确定：满一年五天。\n"
+    result = chunk_markdown(md)
+    assert result.nodes[0].content.strip() == "员工年假天数按司龄确定：满一年五天。"
+    assert "第一条 年假天数" in result.nodes[0].heading_path
+
+
+def test_content_coverage_flags_missing_substantive_lines() -> None:
+    """覆盖率函数要把"丢了且像正文"的行报出来（页眉/页码这类不该报）。"""
+    md = "一、值班要求\n接班人应提前十五分钟到达现场并完成检查。\n"
+    result = chunk_markdown(md)
+    ratio, lost = content_coverage(md, result.nodes)
+    assert ratio == 1.0 and not lost
+
+    ratio2, lost2 = content_coverage(
+        md + "另一段必须在库里的实质内容，含句读。\n", result.nodes
+    )
+    assert ratio2 < 1.0
+    assert any("另一段必须在库里" in line for line in lost2)
