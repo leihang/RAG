@@ -36,6 +36,11 @@ numpy==2.1.3
 jieba==0.42.1
 rank-bm25==0.2.2
 tiktoken==0.8.0
+# tokenizers：只用于**本地 token 计数**（尺寸判定/指标/成本估算），不参与向量计算。
+# 词表文件不进仓库：部署后跑一次 `python -m ekbs.tools.fetch_tokenizer`，
+# 它会把 Qwen 的 tokenizer.json 下到 var/models/（探测顺序见 chunker.tokenizer_path）。
+# 取不到时 count_tokens 会回退到 tiktoken 并告警，/health/deps 的 token_counter 会显示口径。
+tokenizers==0.23.2
 
 # ---- 云端模型 SDK（出网，见 01 §11 白名单）----
 openai==1.54.4

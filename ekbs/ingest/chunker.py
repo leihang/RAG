@@ -47,15 +47,103 @@ _CLAUSE_LEVEL = {"章": 2, "节": 3, "条": 3, "款": 4, "项": 4}
 _SENTENCE_END = "。！？；.!?;\n"
 
 
-def count_tokens(text: str) -> int:
-    """token 近似计数。
+#: 词表文件（~11 MB）属于**部署物**不是源码，放 `var/` 下（git 忽略）。
+#: 取不到时**不报错**：回退到 tiktoken 并告警一次，保证分块链路不被词表问题打断。
+_TOKENIZER_ENV = "EKBS_TOKENIZER_PATH"
 
-    优先用 tiktoken（`02` TC-INDEX-004 要求与云端 usage 校准）；不可用时退化为
-    「中文按字、英文按词」的估算，并**不缓存**（估算函数必须便宜）。
+_QWEN_TOKENIZER = None
+_QWEN_UNAVAILABLE_LOGGED = False
+
+
+def tokenizer_path():
+    """探测可用的 Qwen 词表文件。
+
+    语义：``EKBS_TOKENIZER_PATH`` **显式指定即权威**（指定了就不再看默认位置）——
+    运维可以借此固定路径，或指向不存在的路径来**主动禁用**（此时会回退到 tiktoken 并告警）。
+    未指定时按 `<repo>/var/models/qwen-tokenizer.json` → `~/.ekbs/qwen-tokenizer.json` 探测。
+    """
+    import os
+    import pathlib
+
+    env = os.environ.get(_TOKENIZER_ENV, "").strip()
+    if env:
+        path = pathlib.Path(env).expanduser()
+        return path if path.is_file() else None
+    for candidate in (
+        pathlib.Path(__file__).resolve().parents[2] / "var" / "models" / "qwen-tokenizer.json",
+        pathlib.Path.home() / ".ekbs" / "qwen-tokenizer.json",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _qwen_encoding():
+    """懒加载 Qwen 分词器（进程内只加载一次）；不可用返回 ``None``。"""
+    global _QWEN_TOKENIZER, _QWEN_UNAVAILABLE_LOGGED
+    if _QWEN_TOKENIZER is not None:
+        return _QWEN_TOKENIZER
+    path = tokenizer_path()
+    if path is None:
+        return None
+    try:
+        from tokenizers import Tokenizer
+
+        _QWEN_TOKENIZER = Tokenizer.from_file(str(path))
+        log.info("token_counter_ready", counter="qwen", path=str(path))
+        return _QWEN_TOKENIZER
+    except Exception as exc:  # noqa: BLE001 - 词表问题不该打断入库
+        if not _QWEN_UNAVAILABLE_LOGGED:
+            log.warning(
+                "token_counter_qwen_unavailable", path=str(path), error=str(exc)[:160],
+                hint="将回退到 tiktoken；用 ekbs.tools.fetch_tokenizer 重新取词表",
+            )
+            _QWEN_UNAVAILABLE_LOGGED = True
+        return None
+
+
+def active_token_counter() -> str:
+    """当前生效的计数口径（排障与 TC-INDEX-004 校准都要看它）。"""
+    if _qwen_encoding() is not None:
+        return f"qwen:{tokenizer_path()}"
+    try:  # pragma: no cover
+        import tiktoken  # noqa: F401
+
+        return "tiktoken:cl100k_base"
+    except Exception:  # pragma: no cover
+        return "heuristic:cjk"
+
+
+def reset_tokenizer_cache() -> None:
+    """清空词表缓存（**测试用**；口径在进程内只解析一次，生产环境不需要重解析）。"""
+    global _QWEN_TOKENIZER, _QWEN_UNAVAILABLE_LOGGED
+    _QWEN_TOKENIZER = None
+    _QWEN_UNAVAILABLE_LOGGED = False
+
+
+def count_tokens(text: str) -> int:
+    """本地 token 估算（尺寸判定/指标/成本用，**不参与向量计算**）。
+
+    为什么需要它：分块决策发生在**解析上传时**（那时还没有云端答案），质量指标又要对每个块
+    都算 —— 不可能每切一个候选就调一次嵌入 API。所以本地必须有一个**便宜且可离线**的估算，
+    代价是它只是**代理**，必须按 `02` TC-INDEX-004 与云端 `usage.total_tokens` 校准。
+
+    取词顺序（从上到下，命中即用）：
+
+    1. **Qwen 分词器**（`tokenizers` + `tokenizer.json`）——与线上嵌入模型同源家族，
+       实测把偏差从 −35% 收敛到 −11%。路径解析见 :func:`tokenizer_path`；
+    2. `tiktoken` 的 `cl100k_base`（**回退**，会告警一次）——它是 OpenAI 嵌入模型的同源词表，
+       对 Qwen 系模型系统性偏低（200 段真实文本实测 −35%，中文散文 +9%、数字表格 −42%）；
+    3. 「中文按字、英文按词」的启发式（最后兜底，偏差最大，仅保证有数可用）。
+
+    换嵌入模型时必须重做校准：`ekbs_shard.embedding_fingerprint` 就是那个锚点。
     """
     if not text:
         return 0
-    try:  # pragma: no cover - 取决于是否装 tiktoken 与网络
+    qwen = _qwen_encoding()
+    if qwen is not None:
+        return len(qwen.encode(text, add_special_tokens=False).ids)
+    try:  # pragma: no cover - 取决于是否装 tiktoken
         import tiktoken
 
         encoding = tiktoken.get_encoding("cl100k_base")

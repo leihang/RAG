@@ -36,9 +36,19 @@ CLAUSE_PLAIN = """年假管理制度
 """
 
 
-def _long_doc(sections: int = 5, body_chars: int = 1600) -> str:
-    """每个小节的正文都足够大（≈1160 token），因此每个小节各自成为一个合规模块的父块。"""
-    body = "公司制度条款内容说明。" * (body_chars // 10)
+def _long_doc(sections: int = 5, body_tokens: int = 1200) -> str:
+    """每个小节的正文**按 token 造**（≈``body_tokens``），因此每个小节各自成为一个合规模块的父块。
+
+    为什么按 token 而不是按字符：token 数取决于**当前生效的计数口径**（`02` TC-INDEX-004
+    校准的那个口径）。按字符造会把夹具与该口径绑死 —— 换词表后同样的字符数算出不同 token，
+    测试就会假失败（实测：换 Qwen 词表后 1600 字符只剩 960 token < `PARENT_MIN_TOKENS`）。
+    """
+    if body_tokens <= 0:
+        raise ValueError("body_tokens 必须为正")
+    unit = "公司制度条款内容说明。"
+    body = ""
+    while count_tokens(body) < body_tokens:
+        body += unit
     parts = ["# 员工手册"]
     for index in range(sections):
         parts.append(f"\n## 第 {index + 1} 章 规定事项\n\n{body}\n")
@@ -95,7 +105,7 @@ def test_short_document_leaves_parent_as_leaf() -> None:
 
 def test_long_parent_still_splits_into_children() -> None:
     """够长的父块仍切出多个 child，并挂上 parent_index。"""
-    result = chunk_markdown(_long_doc(sections=1, body_chars=2400))
+    result = chunk_markdown(_long_doc(sections=1, body_tokens=2400))
     assert result.children, "长小节应有子块"
     for child in result.children:
         assert child.parent_index is not None
@@ -129,7 +139,7 @@ def test_long_document_respects_token_bounds() -> None:
 
 def test_adjacent_children_share_overlap() -> None:
     """同一父块下相邻子块必须有 12%+ 尾部重叠（TC-INDEX-003）。"""
-    result = chunk_markdown(_long_doc(sections=1, body_chars=2400))
+    result = chunk_markdown(_long_doc(sections=1, body_tokens=2400))
     by_parent: dict[int, list] = {}
     for child in result.children:
         assert child.parent_index is not None

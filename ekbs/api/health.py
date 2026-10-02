@@ -25,6 +25,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from ekbs.ingest.chunker import active_token_counter
 from ekbs.logging import get_logger
 
 router = APIRouter(tags=["health"])
@@ -105,6 +106,10 @@ async def health_deps(request: Request) -> JSONResponse:
         "disk_used_pct": runtime.disk_used_pct(),
         "embed_ident": runtime.providers.embed.ref.ident,
         "llm_ident": runtime.providers.llm.ref.ident,
+        # 本地 token 计数口径（与 TC-INDEX-004 校准直接相关）：
+        # 期望是 `qwen:<path>`；若是 `tiktoken:cl100k_base` 说明词表没就位，
+        # 尺寸判定/质量指标会偏（实测 -35%），这里显式暴露以免"悄悄降级"。
+        "token_counter": active_token_counter(),
         # —— 网络探针：缓存 60s（会出网、会计费）
         **probes,
     }

@@ -98,7 +98,7 @@ failed ──人工复核/重试成功──> published
 | L2 条款块 | `child` | 是（主力检索单元） | 256 ~ 384（±5 token 容差） | 相邻子块重叠 **12% ~ 15%**（样本偏差 ≤1%） |
 | L3 结构化块 | `table` / `figure` | 是 | 表格**不设子块上限**，整块 | 不参与文本层切分 |
 
-（来源：06 §3.2、02 TC-INDEX-001/002/003）token 用本地 `tiktoken` 近似计数，但必须先按 TC-INDEX-004 校准：与云端 `text-embedding-v4` 的 `usage.total_tokens` 偏差 ≤5%，否则先调计数口径（来源：02 TC-INDEX-004、06 §3.2）。子块上限取 384（而非 512）的附带理由：天然落在 rerank `max_length=512` 以内（来源：06 §3.6 #12）。
+（来源：06 §3.2、02 TC-INDEX-001/002/003）token 用**本地代理**计数（当前口径 = Qwen 词表：部署时跑一次 `python -m ekbs.tools.fetch_tokenizer` 取到 `var/models/qwen-tokenizer.json`；取不到则回退 `tiktoken cl100k_base` 并告警，`/health/deps.token_counter` 会显示实际口径），且必须先按 TC-INDEX-004 校准（`python -m ekbs.tools.token_calibration --fail-over 5`）：与云端 `text-embedding-v4` 的 `usage.total_tokens` 偏差 ≤5%，否则先调计数口径（来源：02 TC-INDEX-004、06 §3.2）。子块上限取 384（而非 512）的附带理由：天然落在 rerank `max_length=512` 以内（来源：06 §3.6 #12）。
 
 ### 3.2 切分算法（对每个 L1 章节；前一步能定边界就不进下一步）
 ```python
