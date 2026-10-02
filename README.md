@@ -367,7 +367,7 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
 
 | # | 事项 | 为什么必须先定 |
 |---|---|---|
-| 0 | ~~嵌入文本是否包含小节标题路径~~ ✅ **已定：包含**，并已写进本仓库实现规格 [`docs/spec/20`](docs/spec/20-ingest-chunking.md) 阶段 6（`chunker.retrieval_text()` = `heading + 正文`，含理由与影响面）。**`方案/06` §3 仍需补同样一句**（该文档不在本机，需你/文档负责人同步） | — | 
+| 0 | ~~嵌入文本是否包含小节标题路径~~ ✅ **已定：包含**，并已写进本仓库实现规格 [`docs/spec/20`](docs/spec/20-ingest-chunking.md) 阶段 6（`chunker.retrieval_text()` = `heading + 正文`，含理由与影响面）。**`方案/06` §3.2 已于 2026-10-02 补上**（v3.0.1，含理由/实现约束/影响面）—— 该文档在**仓库外** `~/Documents/工作学习/AI项目/文档及说明/RAG维护文档/方案/`（`.gitignore` 把 `方案/` 排除，它是独立交付物，所以那次改动不进本仓库历史；改动前已备份到 `/tmp/06-数据治理与高级分片.orig.md`） | — | 
 | 1 | ~~embedding + rerank 模型选型~~ ✅ **已定**：`qwen3.7-text-embedding-flash@1024` + `qwen3.7-text-rerank`（LLM 维持 `qwen-max`），配置已切、分片已按新模型重建 | 仍需同步 `00` D2/D3 与 `01` §7 的文字（见 §四 第 34 条） |
 | 2 | ~~云端 key~~ ✅ **已提供并跑通**（`DASHSCOPE_API_KEY` 走环境变量） | — |
 | 3 | **合规书面确认**（`00` §7）：入库即全量语料出网 | 开 `corpus_egress_ack=true` 才允许真实语料入库；当前 false |
