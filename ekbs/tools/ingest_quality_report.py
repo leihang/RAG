@@ -45,7 +45,9 @@ def _load_docs(
         params.append(status)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = (
-        "SELECT doc_id, title, status FROM ekbs_document"
+        # page_count = **源文件页数**：算"真丢页率"的分母。只看块覆盖到的页码，
+        # 尾部的空白/未解析页是看不见的（实测 doc 41：源 55 页）。
+        "SELECT doc_id, title, status, page_count, source_path FROM ekbs_document"
         + where
         + " ORDER BY doc_id"
     )
@@ -83,7 +85,8 @@ def _print_human(report) -> None:
         gate = "PASS" if p.ok else "FAIL"
         print(f"[{gate}] doc_id={p.doc_id}  {p.title or '(无标题)'}  status={p.status}")
         empty = (
-            f"{p.empty_page_rate:.2%}（{p.empty_pages}/{p.page_count}）"
+            f"{p.empty_page_rate:.2%}（{p.empty_pages}/{p.page_count}"
+            f"，已排除只有图/表的 {p.visual_pages} 页）"
             if p.pages_applicable
             else "N/A"
         )
@@ -100,6 +103,13 @@ def _print_human(report) -> None:
         print(
             f"  L1 乱码={p.garbled_rate:.3%}  空页={empty}  表格存活={table}  页码连续={cont}"
         )
+        if p.lost_pages:
+            # 与「空页率」分开报：空页 = "正文短"（PPT 过渡页/封面多属此类，已按图文页放过）；
+            # 零产出页 = "一个块都没有" —— 那才可能是真丢内容，必须人工对源文件核。
+            print(
+                f"  ⚠ 零产出页 {len(p.lost_pages)}/{p.source_page_count}"
+                f"（{p.lost_page_rate:.1%}）：{p.lost_pages[:12]}"
+            )
         print(
             f"  L2 叶子={c.leaf_chunks}/{c.total_chunks}  "
             f"双索引={c.dual_index_pairs}（{c.dual_index_rate:.1%}）  "
@@ -108,6 +118,9 @@ def _print_human(report) -> None:
             f"token p50/p90={c.token_p50}/{c.token_p90}"
         )
         for w in p.warnings:
+            # 零产出页已由上面那行结构化输出，这里跳过免得同一件事打印两遍
+            if w.startswith("零产出页"):
+                continue
             print(f"  ⚠ {w}")
     if report.failed_doc_ids:
         print("-" * 72)

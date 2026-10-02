@@ -60,6 +60,14 @@ class ParseQuality:
     page_max: int | None = None
     missing_pages: list[int] = field(default_factory=list)
     page_continuity_ok: bool = True
+    #: 有内容、但内容只有图或表（正文短）的页 —— **不算空页**（见 empty 的判定）
+    visual_pages: int = 0
+    #: 源文件页数（`ekbs_document.page_count`）。有它才能算**真丢页**：
+    #: 只按"块覆盖到的页码"算，尾部的空白/未解析页是看不见的。
+    source_page_count: int | None = None
+    #: 源文件页数范围内**一个块都没有**的页（不是"正文短"，是"完全没产出"）→ 需人工对源文件核
+    lost_pages: list[int] = field(default_factory=list)
+    lost_page_rate: float | None = None
     table_count: int = 0
     table_nonempty: int = 0
     table_survival_rate: float | None = None
@@ -184,6 +192,8 @@ def assess_parse_quality(
     title: str,
     status: str,
     chunks: Sequence[Mapping[str, Any]],
+    source_page_count: int | None = None,
+    slide_based: bool = False,
     thresholds: Thresholds | None = None,
 ) -> ParseQuality:
     """从已入库分块评估解析/清洗质量（不依赖磁盘 parse 产物）。"""
@@ -198,17 +208,43 @@ def assess_parse_quality(
     page_min: int | None = None
     page_max: int | None = None
     continuity_ok = True
+    visual_page_set: set[int] = set()
     if pages_applicable:
         page_min = min(coverage)
         page_max = max(coverage)
+        # 「有图 / 有表」的页不算空页：正文短不等于没内容。
+        # PPT 的章节过渡页、扫描件的插图页都是这一类（实测 doc 33/41 的闸门假警报全来自这里）。
+        for row in chunks:
+            if str(row.get("chunk_type") or "") not in ("figure", "table"):
+                continue
+            pf = row.get("page_from")
+            if pf is None:
+                continue
+            pt = row.get("page_to")
+            start = int(pf)
+            end = int(pt) if pt is not None else start
+            if end < start:
+                start, end = end, start
+            visual_page_set.update(range(start, end + 1))
         empty_pages = sum(
-            1 for _p, chars in coverage.items() if chars < thr.empty_page_char_threshold
+            1
+            for page, chars in coverage.items()
+            if chars < thr.empty_page_char_threshold and page not in visual_page_set
         )
         expected = set(range(page_min, page_max + 1))
         missing = sorted(expected - set(coverage))
         continuity_ok = not missing
 
     empty_rate = (empty_pages / len(coverage)) if coverage else 0.0
+
+    # 真丢页：以**源文件页数**为分母（而不是"块覆盖范围"），尾部空白/未解析页才看得见
+    lost_pages: list[int] = []
+    lost_rate: float | None = None
+    if pages_applicable and source_page_count and int(source_page_count) > 0:
+        total = int(source_page_count)
+        have = set(coverage)
+        lost_pages = [p for p in range(1, total + 1) if p not in have]
+        lost_rate = len(lost_pages) / total
 
     table_rows = [c for c in chunks if str(c.get("chunk_type") or "") == "table"]
     table_nonempty = sum(1 for c in table_rows if str(c.get("content") or "").strip())
@@ -227,6 +263,10 @@ def assess_parse_quality(
         replacement_chars=bad,
         garbled_rate=rate,
         pages_applicable=pages_applicable,
+        visual_pages=len(visual_page_set & set(coverage)),
+        source_page_count=source_page_count,
+        lost_pages=lost_pages,
+        lost_page_rate=lost_rate,
         page_count=len(coverage),
         empty_pages=empty_pages,
         empty_page_rate=empty_rate,
@@ -241,10 +281,14 @@ def assess_parse_quality(
 
     garbled_ok = rate <= thr.garbled_rate_max
     empty_ok: bool | None
-    if pages_applicable:
-        empty_ok = empty_rate <= thr.empty_page_rate_max
+    if slide_based or not pages_applicable:
+        # 幻灯片类（.ppt/.pptx）**不做空页率准出**：幻灯片以图/标题为主，
+        # 拿"页面正文长度"这条为页面型文档设计的准出线去卡它是**指标误用**
+        # （实测 doc 33 的章节过渡页反复触发假警报）。
+        # 记 N/A 而不是 True —— 不假装它通过了，报告里写清为什么。
+        empty_ok = None
     else:
-        empty_ok = None  # 无页码（纯文本/Office 常见）→ N/A
+        empty_ok = empty_rate <= thr.empty_page_rate_max
     table_ok: bool | None
     if table_rate is None:
         table_ok = None
@@ -261,9 +305,21 @@ def assess_parse_quality(
         report.warnings.append(
             f"页码不连续：缺失 {missing[:20]}{'…' if len(missing) > 20 else ''}（WARN，不阻断）"
         )
+    if slide_based:
+        report.warnings.append(
+            "幻灯片类文档（.ppt/.pptx）：空页率**不作准出**（该指标为页面型文档设计）；"
+            "请改看零产出页与图表抽取情况"
+        )
     if empty_ok is False:
         report.warnings.append(
-            f"空页率 {empty_rate:.2%} > {thr.empty_page_rate_max:.0%}（空页 {empty_pages}/{len(coverage)}）"
+            f"空页率 {empty_rate:.2%} > {thr.empty_page_rate_max:.0%}"
+            f"（空页 {empty_pages}/{len(coverage)}；已排除只有图/表的页 {len(visual_page_set & set(coverage))} 页）"
+        )
+    if lost_pages:
+        report.warnings.append(
+            f"零产出页 {len(lost_pages)}/{source_page_count}：{lost_pages[:20]}"
+            " —— 这些页**一个块都没有**，可能是源文件空白页，也可能是解析丢失，需对源文件核"
+            "（WARN，不阻断）"
         )
     if not garbled_ok:
         report.warnings.append(
@@ -370,11 +426,19 @@ def assess_document(
     title: str,
     status: str,
     chunks: Sequence[Mapping[str, Any]],
+    source_page_count: int | None = None,
+    slide_based: bool = False,
     thresholds: Thresholds | None = None,
 ) -> DocQualityReport:
     return DocQualityReport(
         parse=assess_parse_quality(
-            doc_id=doc_id, title=title, status=status, chunks=chunks, thresholds=thresholds
+            doc_id=doc_id,
+            title=title,
+            status=status,
+            chunks=chunks,
+            source_page_count=source_page_count,
+            slide_based=slide_based,
+            thresholds=thresholds,
         ),
         chunks=assess_chunk_stats(doc_id=doc_id, title=title, chunks=chunks),
     )
@@ -399,6 +463,12 @@ def assess_batch(
             title=str(doc.get("title") or ""),
             status=str(doc.get("status") or ""),
             chunks=chunks,
+            # 源文件页数（`ekbs_document.page_count`）→ 真丢页率的分母
+            source_page_count=(
+                int(doc["page_count"]) if doc.get("page_count") is not None else None
+            ),
+            # 幻灯片类文档由**源文件扩展名**判定（`source_path` 由调用方放进 doc 行）
+            slide_based=str(doc.get("source_path") or "").lower().endswith((".ppt", ".pptx")),
             thresholds=thr,
         )
         report.docs.append(item)

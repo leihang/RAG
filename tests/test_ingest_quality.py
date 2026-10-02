@@ -272,3 +272,75 @@ async def test_eval_retrieval_on_seeded(seeded) -> None:
     assert by_id["carol-no-hr-leave"].hit is True
     assert by_id["hr-leave-days"].hit is True
     assert report.hit_at_k >= 0.8
+
+
+# ---------------------------------------------------------------- 空页/丢页的判读（2026-10-02）
+
+
+def _page_chunk(page: int, content: str, chunk_type: str = "parent", **extra) -> dict:
+    row = {
+        "chunk_id": page * 10 + (1 if chunk_type == "parent" else 2),
+        "parent_id": None,
+        "chunk_type": chunk_type,
+        "content": content,
+        "token_count": 10,
+        "heading_path": "h",
+        "page_from": page,
+        "page_to": page,
+        "figure_id": None,
+        "image_path": "parse/x/images/a.png" if chunk_type == "figure" else None,
+        "faiss_row": 1,
+    }
+    row.update(extra)
+    return row
+
+
+def test_page_with_only_an_image_is_not_empty() -> None:
+    """只有图/表的页不算空页 —— 正文短不等于没内容。
+
+    实测：PPT 的插图页、扫描件的图片页，正文可能只有 `[图片 0758f1b17b1d]`（17 字 < 20），
+    旧实现把它记成"空页"，导致 doc 33/41 反复假警报。
+    """
+    chunks = [
+        # 第 1 页正文充足，不参与"空页"判定
+        _page_chunk(1, "这是一段足够长的正文，用来把第一页撑过空页阈值，避免干扰本用例。" * 2, "parent"),
+        # 第 2 页正文只有 17 字（<20），但它有图 → 不该算空页
+        _page_chunk(2, "[图片 abcdef012345]", "figure"),
+    ]
+    report = assess_parse_quality(doc_id=1, title="t", status="published", chunks=chunks)
+    assert report.visual_pages == 1
+    assert report.empty_pages == 0, "有图的页不该计入空页"
+
+
+def test_lost_pages_use_source_page_count_as_denominator() -> None:
+    """零产出页的分母是**源文件页数** —— 只按块覆盖范围算，尾部空白/未解析页看不见。"""
+    chunks = [_page_chunk(1, "第一页正文"),
+              _page_chunk(2, "第二页正文")]
+    report = assess_parse_quality(
+        doc_id=1, title="t", status="published", chunks=chunks, source_page_count=5
+    )
+    assert report.lost_pages == [3, 4, 5]
+    assert report.lost_page_rate == pytest.approx(0.6)
+    assert any("零产出页" in w for w in report.warnings)
+
+
+def test_slide_based_documents_skip_empty_page_gate() -> None:
+    """幻灯片类文档不做空页率准出（指标误用），记 N/A 而不是假装通过。"""
+    chunks = [_page_chunk(1, "封面"), _page_chunk(2, "01 PART"), _page_chunk(3, "02 PART")]
+    report = assess_parse_quality(
+        doc_id=1, title="deck.pptx", status="published", chunks=chunks, slide_based=True
+    )
+    assert report.empty_page_rate > EMPTY_PAGE_RATE_MAX, "前提：它确实超线了"
+    assert report.checks["empty_page_ok"] is None, "幻灯片类应记 N/A"
+    assert report.ok is True, "N/A 不算失败"
+    assert any("幻灯片类" in w for w in report.warnings)
+
+
+def test_page_documents_still_gated_on_empty_pages() -> None:
+    """页面型文档（PDF/docx）照旧受准出约束 —— 豁免只给幻灯片，不是放宽所有人。"""
+    chunks = [_page_chunk(1, "封面"), _page_chunk(2, "a"), _page_chunk(3, "b")]
+    report = assess_parse_quality(
+        doc_id=1, title="report.pdf", status="published", chunks=chunks, slide_based=False
+    )
+    assert report.checks["empty_page_ok"] is False
+    assert report.ok is False
