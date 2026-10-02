@@ -455,6 +455,59 @@ def _resolve_dir(value: str, base: Path) -> str:
     return str(path if path.is_absolute() else (base / path).resolve())
 
 
+#: 各嵌入模型**官方支持**的输出维度与「最大行数」（来源：百炼《通用文本向量同步接口》
+#: 与《OpenAI 兼容-Embedding》文档，2026-10-03 核对）。
+#:
+#: 为什么必须本地校验：**传不支持的维度不会报错，而是静默按默认 1024 返回**
+#: （实测 `dimensions=1536/2048` → 返回 1024）。配置与实际向量一旦不一致，
+#: 就踩上 C3「禁止混用向量」，而且要等检索异常才暴露。
+EMBED_SUPPORTED_DIMS: dict[str, frozenset[int]] = {
+    "qwen3.7-text-embedding-flash": frozenset({1024, 768, 512, 256}),
+    "qwen3.7-text-embedding": frozenset({2560, 2048, 1536, 1024, 768, 512, 256}),
+    "text-embedding-v4": frozenset({2048, 1536, 1024, 768, 512, 256, 128, 64}),
+    "text-embedding-v3": frozenset({1024, 768, 512, 256, 128, 64}),
+    "text-embedding-v2": frozenset({1536}),
+    "text-embedding-v1": frozenset({1536}),
+}
+#: 官方「最大行数」：输入为**字符串列表**时单请求最多几条。
+#: ⚠️ 2026-10-03 实测 API 当前容忍到 **25** 条（50 条报 `batch size ... should not be larger than 25`），
+#: 但**以官方文档为准（20）**；运行时不顶满，见配置里的 `batch_size`。
+EMBED_MAX_ROWS: dict[str, int] = {
+    "qwen3.7-text-embedding-flash": 20,
+    "qwen3.7-text-embedding": 20,
+    "text-embedding-v4": 10,
+    "text-embedding-v3": 10,
+    "text-embedding-v2": 25,
+    "text-embedding-v1": 25,
+}
+#: 官方「单行最大 token 数」
+EMBED_MAX_ROW_TOKENS: dict[str, int] = {
+    "qwen3.7-text-embedding-flash": 128_000,
+    "qwen3.7-text-embedding": 128_000,
+    "text-embedding-v4": 8_192,
+    "text-embedding-v3": 8_192,
+    "text-embedding-v2": 2_048,
+    "text-embedding-v1": 2_048,
+}
+
+
+def validate_embed_model_settings(model: str, dim: int, batch_size: int) -> None:
+    """校验嵌入模型的维度与批量（**未知模型跳过**，不挡自研/测试 provider）。"""
+    allowed = EMBED_SUPPORTED_DIMS.get(model)
+    if allowed and int(dim) not in allowed:
+        raise ConfigError(
+            f"models.embed.dim={dim} 不被 {model} 支持（官方支持：{sorted(allowed)}）。"
+            f"⚠️ 传不支持的维度**不会报错**，API 会静默按默认 1024 返回 —— "
+            f"那会让配置与向量不一致（C3 禁止混用向量）。"
+        )
+    max_rows = EMBED_MAX_ROWS.get(model)
+    if max_rows and int(batch_size) > max_rows:
+        raise ConfigError(
+            f"models.embed.batch_size={batch_size} 超过 {model} 的官方最大行数 {max_rows}"
+            f"（单行最大 {EMBED_MAX_ROW_TOKENS.get(model, 0)} token）。建议留余量，不顶满。"
+        )
+
+
 def load_settings(
     path: str | Path | None = None,
     *,
@@ -519,6 +572,11 @@ def load_settings(
     settings = Settings(**data)
     settings.config_path = config_path.resolve()
     settings.repo_root = repo_root
+
+    # 嵌入模型的维度/批量必须落在官方支持范围内 —— 失败要**启动时就炸**，而不是检索时才怪
+    validate_embed_model_settings(
+        settings.models.embed.model, settings.models.embed.dim, settings.models.embed.batch_size
+    )
 
     # 非 dev 环境的监听地址硬约束（04 §7.2）；dev 只告警，便于本机联调
     if settings.server.host not in {"127.0.0.1", "::1", "localhost"} and not settings.is_dev:

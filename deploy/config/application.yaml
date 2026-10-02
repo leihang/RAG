@@ -78,7 +78,8 @@ models:
     model: qwen3.7-text-embedding-flash
     dim: 1024              # 与本地备选 bge-m3 同维，便于迁移
     # 单请求上限**按模型不同**：v4/v3=10、本模型=20（已实测）。换模型必须同步改。
-    batch_size: 20
+    # 官方最大行数 20（单行最大 128,000 token）；运行取 16 留余量，不顶满
+    batch_size: 16
     timeout_s: 30
     max_retries: 3
   llm:

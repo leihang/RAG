@@ -78,3 +78,53 @@ def test_fetch_tool_default_dest_is_under_var_models() -> None:
 
     assert DEFAULT_DEST.parts[-3:] == ("var", "models", "qwen-tokenizer.json")
     assert pathlib.Path("var").exists()
+
+
+# ---------------------------------------------------------------- 嵌入模型的官方参数边界
+
+
+def test_embed_dim_must_be_supported_by_the_model() -> None:
+    """维度必须落在官方支持集合内 —— 传不支持的值**不会报错**，API 静默按 1024 返回。
+
+    实测（2026-10-03）：`dimensions=1536/2048` → 返回 1024；`256/512/768/1024` 正常。
+    若不拦，配置写 1536 而向量是 1024 → C3「禁止混用向量」被踩，且要等检索异常才暴露。
+    """
+    from ekbs.config import ConfigError, validate_embed_model_settings
+
+    model = "qwen3.7-text-embedding-flash"
+    for good in (1024, 768, 512, 256):
+        validate_embed_model_settings(model, good, 16)  # 不抛即通过
+    for bad in (1536, 2048, 4096):
+        with pytest.raises(ConfigError, match="不支持"):
+            validate_embed_model_settings(model, bad, 16)
+
+
+def test_embed_batch_size_cannot_exceed_documented_max_rows() -> None:
+    """批量不能超过官方「最大行数」（flash=20；实测 API 容忍 25，但以文档为准）。"""
+    from ekbs.config import ConfigError, validate_embed_model_settings
+
+    validate_embed_model_settings("qwen3.7-text-embedding-flash", 1024, 20)
+    with pytest.raises(ConfigError, match="最大行数"):
+        validate_embed_model_settings("qwen3.7-text-embedding-flash", 1024, 21)
+    # v4 更严（10 行）
+    with pytest.raises(ConfigError, match="最大行数"):
+        validate_embed_model_settings("text-embedding-v4", 1024, 11)
+
+
+def test_unknown_model_skips_embed_validation() -> None:
+    """未知模型（自研/测试 provider）不挡 —— 校验只覆盖官方清单里的模型。"""
+    from ekbs.config import validate_embed_model_settings
+
+    validate_embed_model_settings("某个自研模型", 999, 999)
+
+
+def test_shipped_config_uses_headroom_below_documented_max_rows() -> None:
+    """随仓库交付的配置**不顶满**官方上限：batch_size 应 < 官方最大行数。"""
+    from ekbs.config import EMBED_MAX_ROWS, load_settings
+
+    settings = load_settings()
+    model = settings.models.embed.model
+    limit = EMBED_MAX_ROWS.get(model)
+    if limit is None:
+        pytest.skip(f"{model} 不在官方清单里")
+    assert settings.models.embed.batch_size < limit, "运行时留余量，别贴官方上限"
