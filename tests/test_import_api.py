@@ -395,16 +395,17 @@ async def test_import_endpoints_require_permission(client, seeded) -> None:
 
 
 async def test_import_meta_exposes_two_lists(client, seeded) -> None:
-    """界面要先知道「目录导入能收 63 种、上传只能收 11 种」，否则用户挑完文件才吃 422。"""
+    """界面要先知道「目录导入能收 65 种、上传只能收 12 种」，否则用户挑完文件才吃 422。"""
     runtime, _ = seeded
     admin = grant_role(runtime, "demo_alice", "super_admin")
     resp = await client.get("/api/v1/import/meta", headers=headers_for(admin))
     assert resp.status_code == 200, resp.text
     data = resp.json()
-    assert len(data["dir_extensions"]) == 63
-    assert len(data["upload_extensions"]) == 11
+    assert len(data["dir_extensions"]) == 65
+    assert len(data["upload_extensions"]) == 12
     assert "py" in data["dir_extensions"] and "py" not in data["upload_extensions"]
-    assert set(data["upload_blocked"]) == {"html", "ppt"}
+    assert set(data["upload_blocked"]) == {"ppt"}
+    assert "html" in data["upload_extensions"], "html 已实现解析，上传应放行"
     assert data["knowledge_bases"], "要能选知识库"
     assert str(data["raw_root"]).endswith("raw")
     # 目录导入页要把「密级」默认成该库的 default_level，**必须由 meta 直接给**：

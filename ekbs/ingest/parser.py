@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path, PurePath
 from typing import Any, Iterator, NamedTuple, Sequence
 
@@ -86,6 +87,8 @@ SUFFIX_ENGINES: dict[str, str] = {
     ".markdown": "text",
     ".txt": "text",
     ".docx": "docx",
+    ".html": "html",
+    ".htm": "html",
     ".xlsx": "xlsx",
     ".pdf": "mineru",
     ".png": "mineru",
@@ -154,6 +157,8 @@ def parse_file(
         return _parse_pptx(target, assets_dir=assets_dir)
     if engine == "xls":
         return _parse_xls(target, assets_dir=assets_dir)
+    if engine == "html":
+        return _parse_html(target, assets_dir=assets_dir)
     if engine == "mineru":
         return _parse_mineru(target, assets_dir=assets_dir)
     raise ParserUnavailable(f"未知解析引擎：{engine}")
@@ -175,6 +180,139 @@ def _rows_to_pipe_markdown(rows: list[list[str]]) -> str:
 _IMAGE_EXTS = frozenset({
     "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "emf", "wmf",
 })
+
+
+class _HtmlStructuredParser(HTMLParser):
+    """把 HTML 转成"带结构的纯文本"：保留标题层级/列表/表格，剥掉其余标签。
+
+    为什么需要它（实测缺口）：`.html` 原先没有专门解析器，落到 `text` 引擎后
+    **整行标签原样入库**（实测 `content` 里就是 `<html><body><h1>交接班制度</h1>…`），
+    既污染检索词项又占 token。这里用标准库解析，**不引入新依赖**。
+    """
+
+    #: 这些标签里的内容整段丢弃（脚本/样式不是正文）
+    #: `<head>` 整段跳过（title/meta/link/style/script 都不是正文）
+    _SKIP = {"head", "script", "style", "noscript", "template"}
+    _HEADINGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
+    #: 这些标签起新的一行
+    _BLOCK = {"p", "div", "section", "article", "br", "li", "tr", "blockquote", "pre"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.lines: list[str] = []
+        self.tables: list[list[list[str]]] = []
+        self._buffer: list[str] = []
+        self._skip_depth = 0
+        self._heading_level = 0
+        self._in_cell = False
+        self._row: list[str] = []
+        self._table: list[list[str]] | None = None
+        self._cell: list[str] = []
+
+    # -- 小工具 -------------------------------------------------------
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """归一化空白：`&nbsp;` 解出来的是 **NBSP(\xa0)**，留着他会导致
+        "费用\xa0100" 这类文本在检索里匹配不上（词项被切断），所以换成普通空格并压掉连续空白。"""
+        return re.sub(r"[ \t\xa0]+", " ", text).strip()
+
+    def _flush(self, *, level: int = 0) -> None:
+        text = self._normalize("".join(self._buffer))
+        self._buffer = []
+        if not text:
+            return
+        self.lines.append(("#" * level + " " + text) if level else text)
+
+    # -- HTMLParser 回调 ---------------------------------------------
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag = tag.lower()
+        if tag in self._SKIP:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if tag in self._HEADINGS:
+            self._flush()
+            self._heading_level = self._HEADINGS[tag]
+        elif tag == "table":
+            self._flush()
+            self._table = []
+        elif tag in {"td", "th"}:
+            self._in_cell = True
+            self._cell = []
+        elif tag in self._BLOCK:
+            self._flush()
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._SKIP:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if self._skip_depth:
+            return
+        if tag in self._HEADINGS:
+            self._flush(level=self._heading_level or 1)
+            self._heading_level = 0
+        elif tag in {"td", "th"}:
+            self._row.append(self._normalize("".join(self._cell)))
+            self._cell = []
+            self._in_cell = False
+        elif tag == "tr" and self._table is not None:
+            if any(cell for cell in self._row):
+                self._table.append(list(self._row))
+            self._row = []
+        elif tag == "table":
+            if self._table:
+                self.tables.append(self._table)
+            self._table = None
+            self._flush()
+        elif tag in self._BLOCK:
+            self._flush()
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth or not data:
+            return
+        if self._in_cell:
+            # 单元格文字只进表格：否则会**同时**出现在正文与表格里（实测重复）
+            self._cell.append(data)
+            return
+        self._buffer.append(data)
+
+    def close(self) -> None:  # noqa: D102 - 收尾
+        super().close()
+        self._flush()
+
+
+def _parse_html(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
+    """`.html` / `.htm` —— 剥标签，保留标题、列表与表格结构。
+
+    输出与其它解析器同一契约：``markdown`` 里表格用 ``[表格 N]`` 占位，
+    真实表格进 ``tables``（序列化由 pipeline 统一做）。
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:  # pragma: no cover - 文件读不到
+        raise ParserUnavailable(f"读取 .html 失败：{exc}") from exc
+
+    parser = _HtmlStructuredParser()
+    parser.feed(raw)
+    parser.close()
+
+    lines = list(parser.lines)
+    tables: list[ParsedTable] = []
+    for seq, rows in enumerate(parser.tables, start=1):
+        body = _rows_to_pipe_markdown(rows)
+        if not body:
+            continue
+        caption = rows[0][0] if rows and rows[0] else ""
+        tables.append(ParsedTable(body=body, caption=caption, page=None, table_id=str(seq)))
+        lines.append(f"[表格 {seq}]")
+    figures: list[ParsedFigure] = []  # 内联 <img> 暂不落盘（本地/相对路径不可信）
+    markdown = "\n".join(lines).strip() + "\n" if lines else ""
+    return ParsedDocument(
+        markdown=markdown, engine="html", source_path=str(path),
+        figures=figures, tables=tables,
+    )
 
 
 def _parse_text(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
@@ -870,6 +1008,14 @@ def _mineru_env() -> dict[str, str]:
             env[MODELSCOPE_CACHE_ENV] = str(candidate)
     return env
 MINERU_TIMEOUT_ENV = "EKBS_MINERU_TIMEOUT"
+#: MinerU 失败重试次数（默认 2；偶发失败实测存在，见 `_parse_mineru` 注释）
+MINERU_ATTEMPTS_ENV = "EKBS_MINERU_ATTEMPTS"
+
+
+def _subprocess_tail(completed: "subprocess.CompletedProcess[str]", *, lines: int = 3) -> str:
+    """子进程 stderr/stdout 的末尾几行 —— 拼进异常消息，别把真实原因吞掉。"""
+    text = (completed.stderr or "").strip() or (completed.stdout or "").strip()
+    return " / ".join(text.splitlines()[-lines:])[:400] or "（无输出）"
 
 
 def _mineru_bin() -> str:
@@ -947,32 +1093,49 @@ def _parse_mineru(path: Path, *, assets_dir: Path | None = None) -> ParsedDocume
     env = _mineru_env()
 
     with tempfile.TemporaryDirectory(prefix="ekbs-mineru-") as out_dir:
-        try:
-            completed = subprocess.run(
-                [binary, "-p", str(path), "-o", out_dir],
-                capture_output=True, text=True, timeout=timeout, env=env, check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ParserUnavailable(f"MinerU 解析超时（>{timeout:.0f}s）：{path.name}") from exc
-        if completed.returncode != 0:
-            tail = (completed.stderr or completed.stdout or "").strip().splitlines()[-3:]
-            raise ParserUnavailable(
-                f"MinerU 解析失败（退出码 {completed.returncode}）：{path.name}；" + " / ".join(tail)
-            )
+        # **重试是必要的**：MinerU 的失败是偶发的（实测同一份 PDF 第 1 次"未产出任何产物"、
+        # 第 2 次完全正常；16 份批量跑里也出现过 2 次）。而失败信息原先只报"未产出可识别的结果"，
+        # 把真实原因（权限/模型/内存）全吞了 —— 排查时极易误判成"没装/模型不在"。
+        # 所以：① 每次失败都把子进程输出的尾部带进异常；② 默认重试一次。
+        attempts = max(1, int(os.environ.get(MINERU_ATTEMPTS_ENV) or 2))
+        last_reason = ""
+        content_list = None
+        markdown_file = None
+        auto = Path(out_dir)
+        for attempt in range(1, attempts + 1):
+            try:
+                completed = subprocess.run(
+                    [binary, "-p", str(path), "-o", out_dir],
+                    capture_output=True, text=True, timeout=timeout, env=env, check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                last_reason = f"MinerU 解析超时（>{timeout:.0f}s）"
+                if attempt < attempts:
+                    log.warning("mineru_retry", file=path.name, attempt=attempt, reason=last_reason)
+                    continue
+                raise ParserUnavailable(f"{last_reason}：{path.name}") from exc
 
-        # 产物目录：<out>/<stem>/auto（无 auto 时退化为 <out>/<stem>）
-        base = Path(out_dir) / path.stem
-        auto = base / "auto"
-        if not auto.is_dir():
-            auto = base if base.is_dir() else Path(out_dir)
-        content_list = _find_output(auto, f"{path.stem}_content_list.json")
-        markdown_file = _find_output(auto, f"{path.stem}.md")
+            tail = _subprocess_tail(completed)
+            if completed.returncode != 0:
+                last_reason = f"MinerU 解析失败（退出码 {completed.returncode}）：{tail}"
+            else:
+                # 产物目录：<out>/<stem>/auto（无 auto 时退化为 <out>/<stem>）
+                base = Path(out_dir) / path.stem
+                auto = base / "auto" if (base / "auto").is_dir() else (base if base.is_dir() else Path(out_dir))
+                content_list = _find_output(auto, f"{path.stem}_content_list.json")
+                markdown_file = _find_output(auto, f"{path.stem}.md")
+                if content_list is not None or markdown_file is not None:
+                    break
+                last_reason = f"MinerU 未产出可识别的结果（既无 content_list.json 也无 .md）：{tail}"
+            if attempt < attempts:
+                log.warning("mineru_retry", file=path.name, attempt=attempt, reason=last_reason[:200])
+        if content_list is None and markdown_file is None:
+            raise ParserUnavailable(
+                f"{last_reason}｜文件：{path.name}｜"
+                f"（已尝试 {attempts} 次；模型缓存 {env.get(MODELSCOPE_CACHE_ENV) or '未设置'}）"
+            )
 
         if content_list is None:
-            if markdown_file is None:
-                raise ParserUnavailable(
-                    f"MinerU 未产出可识别的结果（既无 content_list.json 也无 .md）：{path.name}"
-                )
             # 回落：只有 Markdown（此时拿不到页码，page_map 留空 —— 不伪造页码）
             log.warning("mineru_content_list_missing", file=path.name, fallback="markdown")
             return ParsedDocument(

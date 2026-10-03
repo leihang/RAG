@@ -228,7 +228,9 @@ async def test_upload_init_still_rejects_truly_unsupported(seeded) -> None:
     app = create_app(runtime.settings)
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
-            for name in ("木马.exe", "网页.html ", "演示.ppt．", "没有后缀"):
+            # `.html` 自 2026-10-03 起已支持（标准库解析）—— 不能再当"真不支持"的例子；
+            # 换成仍无解析分支的 `.ppt`（白名单里有、解析器没有 → 上传接口 422）
+            for name in ("木马.exe", "演示.ppt ", "培训.ppt．", "没有后缀"):
                 resp = await c.post(
                     "/api/v1/docs/upload/init",
                     headers=headers,

@@ -250,3 +250,77 @@ def test_mineru_env_leaves_default_when_dir_absent(monkeypatch, tmp_path) -> Non
     monkeypatch.setattr(parser, "_repo_mineru_models_dir", lambda: tmp_path / "not-there")
     assert "MODELSCOPE_CACHE" not in parser._mineru_env()
 
+
+
+# ---------------------------------------------------------------------------
+# 偶发失败的重试 + 不许把真实原因吞掉（2026-10-03 实测补充）
+# ---------------------------------------------------------------------------
+
+
+def test_mineru_retries_once_then_succeeds(tmp_path: Path, fake_env, monkeypatch) -> None:
+    """**首次无产物、第二次成功** → 必须自动重试（实测偶发失败真实存在）。
+
+    证据：同一份 PDF 在批量跑里出现过 2 次"未产出任何产物"，重跑即正常；
+    而这条路径原先**没有重试**，一次抖动就判整篇文档入库失败。
+    """
+    retry_body = """#!/bin/sh
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -p) SRC="$2"; shift 2 ;;
+        -o) OUT="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    STEM="$(basename "$SRC")"; STEM="${STEM%.*}"
+    COUNT_FILE="$FAKE_COUNT"
+    N=0; [ -f "$COUNT_FILE" ] && N="$(cat "$COUNT_FILE")"
+    N=$((N + 1)); echo "$N" > "$COUNT_FILE"
+    if [ "$N" -lt 2 ]; then
+      echo "transient: no output produced" >&2
+      exit 0
+    fi
+    mkdir -p "$OUT/$STEM/auto"
+    cp "$FAKE_PAYLOAD" "$OUT/$STEM/auto/${STEM}_content_list.json"
+    exit 0
+    """
+    fake_env(body=retry_body)
+    monkeypatch.setenv("FAKE_COUNT", str(tmp_path / "count"))
+    source = tmp_path / "抖动.pdf"
+    source.write_bytes(b"%PDF-1.4 fake")
+
+    parsed = parse_file(source)
+
+    assert parsed.engine == "mineru"
+    assert "员工年假管理制度" in parsed.markdown, "第二次尝试的产物必须被采纳"
+    assert (tmp_path / "count").read_text().strip() == "2", "应该恰好重试一次"
+
+
+def test_mineru_failure_message_carries_the_real_reason(tmp_path: Path, fake_env, monkeypatch) -> None:
+    """失败必须带上子进程输出的尾部 —— 否则排查只能靠猜（这次就误判了两次）。"""
+    no_output = """#!/bin/sh
+    echo "PermissionError: [Errno 1] Operation not permitted: '/Users/x/.cache/modelscope'" >&2
+    exit 0
+    """
+    fake_env(body=no_output)
+    monkeypatch.setenv("EKBS_MINERU_ATTEMPTS", "1")   # 不重试，直接看报错
+    source = tmp_path / "无产物.pdf"
+    source.write_bytes(b"%PDF-1.4 fake")
+
+    with pytest.raises(ParserUnavailable) as excinfo:
+        parse_file(source)
+    message = str(excinfo.value)
+    assert "PermissionError" in message, f"真实原因被吞了：{message}"
+    assert "modelscope" in message
+    assert "已尝试 1 次" in message and "模型缓存" in message
+
+
+def test_mineru_exit_code_failure_keeps_stderr_tail(tmp_path: Path, fake_env, monkeypatch) -> None:
+    """非零退出码：沿用原有行为（带 stderr 尾部），重试次数用尽后抛出。"""
+    fake_env(body=FAILING_MINERU)
+    monkeypatch.setenv("EKBS_MINERU_ATTEMPTS", "2")
+    source = tmp_path / "坏文件.pdf"
+    source.write_bytes(b"%PDF-1.4 fake")
+
+    with pytest.raises(ParserUnavailable) as excinfo:
+        parse_file(source)
+    assert "model download failed" in str(excinfo.value)

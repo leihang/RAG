@@ -68,12 +68,13 @@ def test_legacy_office_formats_are_now_supported() -> None:
 def test_formats_without_a_parser_branch_are_not_whitelisted() -> None:
     """配置白名单里有、但**解析器仍未实现**的格式，不能进默认白名单。
 
-    `.ppt`（需 LibreOffice）与 `.html`（未做正文提取）目前都没有分支 —— 它们进白名单
-    只会把原始内容当文本塞进知识库。等实现了对应分支，把它们加进 `SUFFIX_ENGINES`，
+    `.ppt`（需 LibreOffice）目前仍没有分支；`.html` 已于 2026-10-03 实现
+      （标准库解析，剥标签 + 保留标题/列表/表格）—— 它们进白名单
+    只会把原始内容当文本塞进知识库。等实现了对应分支，把它加进 `SUFFIX_ENGINES`，
     本用例会自动放行（同一份名单驱动 CLI 与 API 两侧，见 `docs.py` 的取交集）。
     """
     tool = _import_tool()
-    unimplemented = {".ppt", ".html"}
+    unimplemented = {".ppt"}
     leaked = sorted(unimplemented & set(tool.DEFAULT_EXTENSIONS))
     assert not leaked, f"这些格式没有解析分支，不该进默认白名单：{leaked}"
 
@@ -81,7 +82,7 @@ def test_formats_without_a_parser_branch_are_not_whitelisted() -> None:
 def test_every_whitelisted_suffix_has_an_engine() -> None:
     """白名单里每个扩展名都要能映射到引擎，且引擎名是已知的四种之一。"""
     # 引擎名必须与 parser.parse_file 里的分支一一对应（新增引擎时同步这里）
-    known = {"text", "docx", "xlsx", "mineru", "doc", "pptx", "xls"}
+    known = {"text", "docx", "xlsx", "mineru", "doc", "pptx", "xls", "html"}
     for suffix, engine in SUFFIX_ENGINES.items():
         assert suffix.startswith("."), f"扩展名要带点：{suffix}"
         assert engine in known, f"{suffix} 指向未知引擎 {engine}"
@@ -100,19 +101,20 @@ _EXPECTED_ENGINE_COUNTS = {
     "xls": 1,      # 旧版 Excel（xlrd）
     "xlsx": 1,
     "pptx": 1,
+    "html": 2,     # .html/.htm（标准库解析，保留标题/列表/表格）
     "text": 54,    # 51 种代码后缀 + .md/.markdown/.txt
 }
 
 
 def test_parser_capability_inventory_is_pinned() -> None:
-    """解析器能力清单（63 种）与各引擎数量锁定，防止"悄悄多/少了几个格式"。"""
+    """解析器能力清单（65 种）与各引擎数量锁定，防止清单被悄悄改动。"""
     from collections import Counter
 
     counts = Counter(SUFFIX_ENGINES.values())
     assert dict(counts) == _EXPECTED_ENGINE_COUNTS, (
         f"解析器能力清单变了：{dict(counts)} ≠ {_EXPECTED_ENGINE_COUNTS}"
     )
-    assert len(SUFFIX_ENGINES) == sum(_EXPECTED_ENGINE_COUNTS.values()) == 63
+    assert len(SUFFIX_ENGINES) == sum(_EXPECTED_ENGINE_COUNTS.values()) == 65
 
 
 def test_code_suffixes_are_all_parseable_as_text() -> None:
@@ -129,8 +131,8 @@ def test_code_suffixes_are_all_parseable_as_text() -> None:
 def test_upload_api_is_config_intersection_and_is_narrower_than_cli(tmp_path) -> None:
     """**上传接口（HTTP）比批量导入（CLI）窄** —— 这条差异必须写在用例里，不能靠记忆。
 
-    * CLI：白名单 = `SUFFIX_ENGINES`（63 种）
-    * HTTP：白名单 = `配置 file_ext_whitelist` ∩ `SUFFIX_ENGINES` = **11 种**
+    * CLI：白名单 = `SUFFIX_ENGINES`（65 种）
+    * HTTP：白名单 = `配置 file_ext_whitelist` ∩ `SUFFIX_ENGINES` = **12 种**
 
     配置里只有 13 项且**不含任何代码后缀**，所以经 HTTP 上传不了代码文件
     （`.py` 等会被 422 拒掉），代码知识库目前只能走 CLI 批量导入。
@@ -149,10 +151,11 @@ def test_upload_api_is_config_intersection_and_is_narrower_than_cli(tmp_path) ->
     uploadable = configured & parseable
 
     assert uploadable == {
-        "pdf", "docx", "doc", "pptx", "xlsx", "xls", "txt", "md", "png", "jpg", "jpeg",
+        "pdf", "docx", "doc", "pptx", "xlsx", "xls", "txt", "md", "html",
+          "png", "jpg", "jpeg",
     }, f"上传接口可收格式变了：{sorted(uploadable)}"
-    # 配置允许但解析器没实现 —— 这两个会在接口层被 422 且给出原因
-    assert configured - parseable == {"ppt", "html"}
+    # 配置允许但解析器没实现 —— 它会在接口层被 422 且给出原因
+    assert configured - parseable == {"ppt"}
     # 关键差异：代码后缀在解析器里、却不在配置里 ⇒ HTTP 收不了
     code_like = {"py", "ts", "go", "java", "sql", "sh"}
     assert code_like <= parseable and not (code_like & configured)
@@ -160,7 +163,7 @@ def test_upload_api_is_config_intersection_and_is_narrower_than_cli(tmp_path) ->
 
 
 def test_config_whitelist_entries_are_all_known_gaps_or_implemented() -> None:
-    """配置白名单里每一项要么解析器已实现，要么是**已知未实现**（`.ppt`/`.html`）。
+    """配置白名单里每一项要么解析器已实现，要么是**已知未实现**（`.ppt`）。
 
     新增"配置里有、解析器没有"的格式时，这里会失败 —— 提醒你它会在上传时被
     422（而不是静默收下再变乱码），要么补解析分支，要么从配置里删掉。
@@ -170,7 +173,7 @@ def test_config_whitelist_entries_are_all_known_gaps_or_implemented() -> None:
     settings = load_settings(REPO_CONFIG)
     configured = {str(e).lower().lstrip(".") for e in settings.limits["file_ext_whitelist"]}
     parseable = {s.lstrip(".") for s in SUFFIX_ENGINES}
-    assert configured - parseable == {"ppt", "html"}, (
+    assert configured - parseable == {"ppt"}, (
         "配置里出现了新的『允许但未实现』格式："
         f"{sorted(configured - parseable)}（补解析分支或改本用例的已知清单）"
     )
