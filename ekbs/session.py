@@ -49,14 +49,40 @@ DEFAULT_MAX_TURNS = 6
 DEFAULT_TTL_SECONDS = 7200
 
 
+#: 意图标签（②「理解意图」的第一步；当前是启发式，`mode` 仍允许调用方覆盖）
+INTENT_FACTUAL = "factual"
+INTENT_NUMERIC = "numeric"
+INTENT_FIGURE = "figure"
+INTENT_PROCEDURE = "procedure"
+
+_NUMERIC_HINTS = ("多少", "多少钱", "金额", "总价", "单价", "合计", "总计", "费用", "报价", "预算", "电价", "用量")
+_FIGURE_HINTS = ("图片", "照片", "截图", "图纸", "图样", "现场图")
+_PROCEDURE_HINTS = ("怎么办", "怎么处理", "如何", "流程", "步骤", "哪些规定", "怎么交接")
+
+
 @dataclass
 class RewriteResult:
+    """改写结果。**两类改写分开存放**（这是 2026-10-03 的设计调整）：
+
+    * ① **上下文改写** → :attr:`rewritten`（把"它/这个/详细说说"补成自包含查询）
+    * ② **意图理解** → :attr:`intent`
+    * 变体**分两侧**：BM25 要**词面变体**（别名/编号/关键词），稠密要**语义变体**（自然语言改写）。
+      把同一种变体塞给两侧是错的 —— 关键词碎片喂给嵌入通常更差（实测过）
+      。:attr:`variants` 是历史字段，等价于 :attr:`sparse_variants`，保留以免破坏调用方。
+    """
+
     original: str
     rewritten: str
     strategy: str
     used_history: bool = False
-    #: MultiQuery 扩写后的问句列表（含 rewritten；长度由 retrieval.multi_query 控制）
+    #: 兼容字段：等价于 `sparse_variants`（旧调用方仍在用）
     variants: list[str] = field(default_factory=list)
+    #: ② 意图（factual / numeric / figure / procedure）
+    intent: str = INTENT_FACTUAL
+    #: 词面变体（BM25 用）：含 rewritten，长度由 `retrieval.multi_query` 控制
+    sparse_variants: list[str] = field(default_factory=list)
+    #: 语义变体（稠密用）：自然语言改写，长度由 `retrieval.dense_multi_query` 控制
+    dense_variants: list[str] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
@@ -187,39 +213,33 @@ class QueryRewriter:
     ) -> RewriteResult:
         if not self.enabled or not history:
             result = RewriteResult(question, question, "off", used_history=False)
-            result.variants = self.expand_variants(result.rewritten)
+            self._fill_variants(result)
             return result
 
         previous_question = self._last_user_question(history)
         if not previous_question:
             result = RewriteResult(question, question, self.strategy, used_history=False)
-            result.variants = self.expand_variants(result.rewritten)
-            return result
+            return self._fill_variants(result)
 
         strategy = self.strategy
         if strategy == "off":
             result = RewriteResult(question, question, "off", used_history=False)
-            result.variants = self.expand_variants(result.rewritten)
-            return result
+            return self._fill_variants(result)
         if strategy == "llm" and self.llm is not None and not _is_mock(self.llm):
             rewritten = await self._rewrite_with_llm(question, history)
             if rewritten:
                 result = RewriteResult(question, rewritten, "llm", used_history=True)
-                result.variants = self.expand_variants(result.rewritten, original=question)
-                return result
+                return self._fill_variants(result)
             result = RewriteResult(question, question, "llm_failed", used_history=False)
-            result.variants = self.expand_variants(result.rewritten)
-            return result
+            return self._fill_variants(result)
 
         # 启发式：仅在「问题本身不自足」时才并入上一轮，避免污染语义明确的查询
         if _needs_context(question):
             merged = f"{previous_question} {question}".strip()
             result = RewriteResult(question, merged, "heuristic", used_history=True)
-            result.variants = self.expand_variants(result.rewritten, original=question)
-            return result
+            return self._fill_variants(result)
         result = RewriteResult(question, question, "heuristic", used_history=False)
-        result.variants = self.expand_variants(result.rewritten)
-        return result
+        return self._fill_variants(result)
 
     # ------------------------------------------------------------------
     # 多轮改写用的两个助手
@@ -250,14 +270,76 @@ class QueryRewriter:
         text = (result.text or "").strip().splitlines()
         return text[0].strip() if text else ""
 
-    def expand_variants(self, primary: str, *, original: str | None = None) -> list[str]:
+    def _variant_limit(self, key: str, explicit: int | None) -> int:
+        """变体条数：**显式 limit 优先**，否则读配置。
+
+        为什么必须支持显式 limit：检索调试台用 `RetrievalOverrides` 按请求调参，
+        若这里再按**进程级配置**截断一次，override 就被悄悄吞掉（实测：台面上调成 3，
+        实际只出 1 条变体）。
+        """
+        value = explicit if explicit is not None else getattr(self.settings.retrieval, key, 1)
+        return max(1, min(int(value or 1), 5))
+
+    def expand_dense_variants(
+        self, primary: str, *, original: str | None = None, limit: int | None = None
+    ) -> list[str]:
+        """**语义变体**（稠密召回用）：自然语言改写，不是关键词碎片。
+
+        为什么不复用 `expand_variants`（那是给 BM25 的）：`_keyword_focus` 之类的产物
+        被嵌入模型编码后语义会被拉偏（实测过"关键词碎片喂嵌入更差"）。这里只做
+        **语义等价的自然语言改写**（去口语外壳 / 补成完整问句 / 保留用户原始措辞）。
+        """
+        cap = self._variant_limit("dense_multi_query", limit)
+        variants: list[str] = []
+        for candidate in (
+            (primary or "").strip(),          # 改写后的自包含查询（首选）
+            (original or "").strip(),         # 用户原始措辞（可能更贴文档用词）
+            _strip_particles(primary),        # 去掉"请问/帮我查一下"这类外壳
+            _as_question(primary),            # 补成完整问句
+        ):
+            if not candidate or candidate in variants:
+                continue
+            variants.append(candidate)
+            if len(variants) >= cap:
+                break
+        return variants or [(primary or "").strip() or ""]
+
+    def detect_intent(self, question: str) -> str:
+        """启发式意图识别（② 的第一步；调用方仍可用 `mode` 覆盖）。
+
+        只做**保守**判断：命中明确的取数/找图/流程词才给标签，否则一律 `factual` ——
+        误判比不判更糟（取数路径有独立提示词与更严的校验）。
+        """
+        text = (question or "").strip()
+        if any(hint in text for hint in _FIGURE_HINTS):
+            return INTENT_FIGURE
+        if any(hint in text for hint in _NUMERIC_HINTS):
+            return INTENT_NUMERIC
+        if any(hint in text for hint in _PROCEDURE_HINTS):
+            return INTENT_PROCEDURE
+        return INTENT_FACTUAL
+
+    def _fill_variants(self, result: RewriteResult) -> RewriteResult:
+        """把三类字段一次填好（保持 `variants` 与 `sparse_variants` 同步）。"""
+        result.intent = self.detect_intent(result.rewritten or result.original)
+        result.sparse_variants = self.expand_variants(
+            result.rewritten, original=result.original
+        )
+        result.variants = list(result.sparse_variants)  # 兼容
+        result.dense_variants = self.expand_dense_variants(
+            result.rewritten, original=result.original
+        )
+        return result
+
+    def expand_variants(
+        self, primary: str, *, original: str | None = None, limit: int | None = None
+    ) -> list[str]:
         """MultiQuery：在主查询外再扩若干语义近邻问句（稀疏召回用）。
 
         不调 LLM：用「去语气词 / 补问句尾 / 保留原问」等确定性变体，
         数量由 ``retrieval.multi_query`` 控制（1 = 只用主查询）。
         """
-        limit = int(getattr(self.settings.retrieval, "multi_query", 1) or 1)
-        limit = max(1, min(limit, 5))
+        cap = self._variant_limit("multi_query", limit)
         variants: list[str] = []
         for candidate in (
             (primary or "").strip(),
@@ -269,7 +351,7 @@ class QueryRewriter:
             if not candidate or candidate in variants:
                 continue
             variants.append(candidate)
-            if len(variants) >= limit:
+            if len(variants) >= cap:
                 break
         return variants or [(primary or "").strip() or ""]
 

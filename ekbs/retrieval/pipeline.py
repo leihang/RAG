@@ -201,6 +201,7 @@ class RetrievalOverrides:
     fusion: str | None = None
     hybrid_alpha: float | None = None
     multi_query: int | None = None
+    dense_multi_query: int | None = None
     figure_multimodal: bool | None = None
 
     def effective(self, settings: Settings) -> dict[str, Any]:
@@ -222,6 +223,11 @@ class RetrievalOverrides:
             ),
             "multi_query": (
                 cfg.multi_query if self.multi_query is None else self.multi_query
+            ),
+            "dense_multi_query": (
+                getattr(cfg, "dense_multi_query", 1)
+                if self.dense_multi_query is None
+                else self.dense_multi_query
             ),
             "figure_multimodal": (
                 bool(getattr(cfg, "figure_multimodal", True))
@@ -418,7 +424,20 @@ class RetrievalPipeline:
         if limit <= 1:
             return [query]
         if self.rewriter is not None and hasattr(self.rewriter, "expand_variants"):
-            return self.rewriter.expand_variants(query)[:limit]
+            # 传显式 limit：否则会再按**进程级配置**截断一次，把调试台的 override 吞掉
+            return self.rewriter.expand_variants(query, limit=limit)[:limit]
+        return [query]
+
+    def _dense_query_variants(self, query: str, *, limit: int) -> list[str]:
+        """**稠密侧**变体：语义改写（不是关键词碎片）。
+
+        与 `_query_variants`（BM25 用）分开 —— 把 `_keyword_focus` 那种碎片喂给嵌入模型
+        会把语义拉偏。没有 rewriter 或未实现时退化为单查询（保持旧行为）。
+        """
+        if limit <= 1:
+            return [query]
+        if self.rewriter is not None and hasattr(self.rewriter, "expand_dense_variants"):
+            return self.rewriter.expand_dense_variants(query, limit=limit)[:limit] or [query]
         return [query]
 
     def _figure_recall_scored(
@@ -536,9 +555,32 @@ class RetrievalPipeline:
 
         # ② 两路召回（FAISS 是同步 C 调用，放线程池；04 §1.5）
         variants = self._query_variants(query, limit=int(params.get("multi_query") or 1))
-        dense_scored = await asyncio.to_thread(
-            self._dense_recall_scored, vector, perm, params["dense_top_k"]
+        # 稠密多查询：每个语义变体各嵌一次、各召回一路，再**用 RRF 融合**。
+        # 为什么不平均向量：变体越多平均向量越糊（把多个语义中心折中），实测更差。
+        # 单变体（默认 dense_multi_query=1）时就是 `vector` 那一路，**与旧行为完全一致**。
+        dense_variants = self._dense_query_variants(
+            query, limit=int(params.get("dense_multi_query") or 1)
         )
+        dense_vectors = [vector]
+        for variant in dense_variants[1:]:
+            extra = await self.query_vector(variant)
+            if extra is None:
+                log.warning("dense_variant_embed_failed", variant_len=len(variant))
+                continue
+            dense_vectors.append(extra)
+        dense_lanes = []
+        for dense_vector in dense_vectors:
+            lane = await asyncio.to_thread(
+                self._dense_recall_scored, dense_vector, perm, params["dense_top_k"]
+            )
+            dense_lanes.append(lane)
+        if len(dense_lanes) > 1:
+            dense_scored = rrf_fuse(
+                [[chunk_id for chunk_id, _ in lane] for lane in dense_lanes],
+                k=params["rrf_k"],
+            )
+        else:
+            dense_scored = dense_lanes[0]
         sparse_scored = await asyncio.to_thread(
             self._sparse_recall_scored,
             query,
@@ -1586,6 +1628,7 @@ class RetrievalPipeline:
             f":{cfg.rerank.keep}:{cfg.rerank.min_score}",
             f"llm={getattr(llm, 'ident', '')}",
             f"k={cfg.dense_top_k}:{cfg.sparse_top_k}:{cfg.rrf_k}:{int(cfg.parent_expand)}",
+            f":mq={cfg.multi_query}:{getattr(cfg, 'dense_multi_query', 1)}",
             f"rw={getattr(cfg.query_rewrite, 'strategy', '')}",
             f"prompt={PROMPT_REVISION}",
         ]

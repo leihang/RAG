@@ -93,8 +93,16 @@ def test_counters_land_in_sqlite_table(db, settings) -> None:
     assert rows["conv:c1"] == 1
 
 
-async def test_api_returns_429_when_user_limit_hit(seeded) -> None:
-    """超限返回 429 + Retry-After（而不是把请求打到云端烧钱）。"""
+async def test_api_returns_429_when_user_limit_hit(seeded, monkeypatch) -> None:
+    """超限返回 429 + Retry-After（而不是把请求打到云端烧钱）。
+
+    **时钟冻结**：本用例靠"1 秒窗口内第 2 次请求被拦"。而窗口按墙钟走 —— 若首个请求
+    耗时超过 1 秒（全量跑、机器忙时很常见），窗口已重置、第 2 次就被放行。
+    实测这条在全量里偶发失败过 3 次（单独跑必过）。生产逻辑不动，只冻结测试时钟。
+    """
+    from ekbs import ratelimit as ratelimit_module
+
+    monkeypatch.setattr(ratelimit_module.time, "time", lambda: 1_700_000_000.0)
     runtime, _ = seeded
     runtime.settings.limits = {"global_qps": 0, "per_user_qps": 1, "per_conversation_qps": 0}
     app = create_app(runtime.settings)

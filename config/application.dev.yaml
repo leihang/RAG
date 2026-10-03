@@ -48,6 +48,8 @@ retrieval:
   doc2query_enabled: true
   doc2query_max: 4
   multi_query: 3
+  # 稠密侧多查询数（1=关）。离线/mock：保持原行为
+  dense_multi_query: 1
   # figure 多模态旁路索引（课程 17）：图片向量与文本 embed 维度不同，单独 FAISS + RRF 第三路
   figure_multimodal: true
   # 查询改写（00 §2.1 的第一步，多轮对话时启用）；策略：off | heuristic | llm

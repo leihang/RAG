@@ -138,6 +138,10 @@ class RetrievalCfg(_Section):
     doc2query_max: int = 4
     #: MultiQuery：稀疏召回并行的改写问句数（1=关闭；建议 3）
     multi_query: int = 1
+    #: **稠密侧**多查询数（1 = 关，保持原有单查询行为）。为什么与 `multi_query` 分开：
+    #: 两侧需要的"变体"不是同一种东西 —— BM25 要词面变体（别名/编号/关键词），
+    #: 稠密要语义变体（自然语言改写）。分开才能独立 A/B，且默认不改变生产行为。
+    dense_multi_query: int = 1
     #: figure 图片进多模态旁路索引，检索时作为 RRF 第三路（课程 17）
     figure_multimodal: bool = True
 

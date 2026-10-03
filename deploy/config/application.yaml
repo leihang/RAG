@@ -41,6 +41,9 @@ retrieval:
   dense_top_k: 30
   sparse_top_k: 30
   rrf_k: 60
+  multi_query: 3            # 稀疏侧多查询（词面变体）
+  # 稠密侧多查询（1=关）。**待完整语料 A/B 通过再开**：会改变检索结果与答案缓存版本。
+  dense_multi_query: 1
   rerank:
     enabled: true          # 开关；实测后可关闭
     provider: dashscope

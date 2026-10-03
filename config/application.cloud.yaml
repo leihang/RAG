@@ -87,6 +87,8 @@ retrieval:
   doc2query_max: 4
   # MultiQuery：稀疏侧并行问句数（1=关；3=扩写后多路 BM25 再融合）
   multi_query: 3
+  # 稠密侧多查询数（1=关）。本机联调：开启以便 A/B（向量与稀疏各 3）
+  dense_multi_query: 3
   # figure 多模态旁路（课程 17 / tongyi-embedding-vision-plus）：与文本 embed 分索引
   figure_multimodal: true
   # 查询改写（00 §2.1 的第一步，多轮对话时启用）；策略：off | heuristic | llm
