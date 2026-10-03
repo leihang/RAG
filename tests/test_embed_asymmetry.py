@@ -96,8 +96,65 @@ def test_model_ref_default_variant_keeps_ident_unchanged() -> None:
     assert ref.ident == "dashscope/qwen3.7-text-embedding-flash@qwen3.7-text-embedding-flash#1024"
 
 
-def test_shipped_config_defaults_to_symmetric() -> None:
-    """随仓库交付的配置默认**不开**不对称编码（开启需要重灌 + A/B 验证）。"""
+def test_rollout_policy_local_on_production_template_off() -> None:
+    """发布策略：**本机测试环境已开（2026-10-03 A/B 后），生产模板仍关**。
+
+    为什么这条要钉住：开启会改变全部 chunk 向量 ⇒ 必须重灌/重建分片。
+    生产模板（`deploy/`）在跑完**完整语料**的 A/B 之前不许悄悄跟着开。
+    """
     from ekbs.config import load_settings
 
-    assert load_settings().models.embed.asymmetry is False
+    assert load_settings("deploy/config/application.yaml").models.embed.asymmetry is False
+    assert load_settings("config/application.cloud.yaml").models.embed.asymmetry is True
+
+
+def test_migration_tool_can_start_despite_fingerprint_mismatch(settings) -> None:
+    """换模型/编码变体后，**修复工具**必须还能启动 —— 否则死锁。
+
+    实测死锁：分片登记的是对称指纹，当前模型是 `+asym` → `Runtime.create` 在
+    `load_active(strict=True)` 抛 `EmbeddingFingerprintMismatch`，
+    于是服务起不来、`rebuild_shard` 也起不来（连 `--dry-run` 都不行）。
+    修法：`Runtime.create(strict_shards=False)` **只给迁移工具**用；服务永远严格。
+    """
+    import pytest
+
+    from ekbs.db import Database
+    from ekbs.errors import EmbeddingFingerprintMismatch
+    from ekbs.runtime import Runtime
+
+    db = Database(settings)
+    db.apply_schema()
+    with db.sync_connect() as conn:
+        conn.execute(
+            "INSERT INTO ekbs_shard (shard_id, level, dept_code, dim, embedding_fingerprint, "
+            "faiss_path, vector_count, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("kb_all_L1", 1, "all", 1024, "stale-fingerprint", "var/index/kb_all_L1.faiss", 0, "active"),
+        )
+        conn.commit()
+
+    with pytest.raises(EmbeddingFingerprintMismatch):
+        Runtime.create(settings, service="test", strict_shards=True)
+
+    runtime = Runtime.create(settings, service="test", strict_shards=False)
+    try:
+        assert runtime.shards.registry(), "注册表仍应可见（工具要靠它列出待重建分片）"
+    finally:
+        import asyncio
+
+        asyncio.run(runtime.aclose())
+
+
+def test_bare_string_is_rejected_instead_of_embedded_per_character() -> None:
+    """防呆：把裸字符串传给 `embed()` 会被当成"一串文本"**逐字**嵌入 —— 又费钱又错。
+
+    实测踩到过：查询侧误写 `embed(question)`，云端收到的是把问题拆成单字的一批文本，
+    返回一堆向量，下游余弦计算直接类型错。
+    """
+    import pytest
+
+    with pytest.raises(TypeError, match="文本列表"):
+        asyncio.run(_provider(asymmetric=False).embed("交接班制度"))  # type: ignore[arg-type]
+    # 单条接口照常可用
+    with respx.mock:
+        respx.post(EMBED_URL).mock(return_value=httpx.Response(200, json=_body()))
+        assert len(asyncio.run(_provider(asymmetric=False).embed_one("交接班制度"))) == 1024

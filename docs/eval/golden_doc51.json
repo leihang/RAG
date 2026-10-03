@@ -1,0 +1,69 @@
+{
+  "description": "当前语料（doc 51 交接班管理制度，15 个块）的不对称编码 A/B 问题集；must_contain 为答案所在块的原文片段。n 小，仅作方向性判断。",
+  "corpus": {
+    "documents": 1,
+    "note": "doc 51；16 篇语料导回后应改用 docs/eval/golden_corpus16.json"
+  },
+  "cases": [
+    {
+      "id": "handover-late",
+      "question": "接班人没有按时到岗怎么办？",
+      "must_contain": "必须坚持岗位",
+      "k": 5
+    },
+    {
+      "id": "handover-drunk",
+      "question": "接班的人喝了酒还能不能交接班？",
+      "must_contain": "应拒绝交班",
+      "k": 5
+    },
+    {
+      "id": "handover-early",
+      "question": "交接班要提前多久到现场？",
+      "must_contain": "提前15分钟",
+      "k": 5
+    },
+    {
+      "id": "handover-equipment",
+      "question": "设备方面交接班要交接哪些内容？",
+      "must_contain": "设备缺陷和检修情况",
+      "k": 5
+    },
+    {
+      "id": "handover-workorder",
+      "question": "今天没干完的维修工单怎么交接？",
+      "must_contain": "未完结工单",
+      "k": 5
+    },
+    {
+      "id": "handover-urgent",
+      "question": "停水停电这类重要事项怎么交接？",
+      "must_contain": "停水停电",
+      "k": 5
+    },
+    {
+      "id": "handover-sign",
+      "question": "交接完之后需要在哪签字？",
+      "must_contain": "交接签字",
+      "k": 5
+    },
+    {
+      "id": "handover-supervise",
+      "question": "谁负责督促交接班工作的执行？",
+      "must_contain": "班长负责督促",
+      "k": 5
+    },
+    {
+      "id": "handover-inspect",
+      "question": "这个制度的执行由谁检查监督？",
+      "must_contain": "检查监督执行",
+      "k": 5
+    },
+    {
+      "id": "handover-unfinished",
+      "question": "交班人怎么跟接班人说明本班没做完的工作？",
+      "must_contain": "本班未完成的工作事项",
+      "k": 5
+    }
+  ]
+}

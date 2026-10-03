@@ -61,8 +61,21 @@ class Runtime:
 
     @classmethod
     def create(
-        cls, settings: Settings | None = None, *, service: str = "api", init_schema: bool = False
+        cls,
+        settings: Settings | None = None,
+        *,
+        service: str = "api",
+        init_schema: bool = False,
+        strict_shards: bool = True,
     ) -> "Runtime":
+        """``strict_shards=False`` **只给迁移工具用**（如 `rebuild_shard`）。
+
+        为什么需要：换嵌入模型/编码变体后，分片登记的指纹与新模型不一致 ——
+        而"重嵌重建"这个唯一的修复手段本身也要先建 Runtime。严格模式会让
+        **服务和修复工具一起被拒**（实测死锁：`load_active` 抛
+        `EmbeddingFingerprintMismatch`，连 `--dry-run` 都跑不起来）。
+        服务进程永远保持 ``True``（C3：拒绝启动，绝不混用向量）。
+        """
         settings = settings or load_settings()
         configure_logging(settings, service)
         settings.ensure_dirs()
@@ -103,7 +116,17 @@ class Runtime:
         # 启动自检②：分片指纹一致性（C3）。全部不符 → 拒绝启动。
         active = shards.registry()
         if active:
-            shards.load_active(strict=True)
+            if strict_shards:
+                shards.load_active(strict=True)
+            else:
+                # 迁移工具模式：跳过指纹不一致的分片（它们正是待重建对象），其余照常加载
+                loaded = shards.load_active(strict=False)
+                log.warning(
+                    "shards_loaded_non_strict",
+                    registered=len(active),
+                    loaded=len(loaded),
+                    hint="迁移工具模式：指纹不一致的分片将被重建",
+                )
             log.info("shards_loaded", count=len(active), dim=shards.dim)
 
         sessions = SessionStore(db, settings)

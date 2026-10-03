@@ -100,7 +100,11 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = load_settings()
     configure_logging(settings, "tools")
-    runtime = Runtime.create(settings, service="tools", init_schema=True)
+    # **非严格**加载：本工具正是用来修"指纹不一致"的 —— 严格模式会把修复手段本身拒之门外
+    # （实测死锁：登记指纹 ≠ 当前模型 → Runtime.create 抛 EmbeddingFingerprintMismatch）
+    runtime = Runtime.create(
+        settings, service="tools", init_schema=True, strict_shards=False
+    )
     try:
         targets = (
             [row.shard_id for row in runtime.shards.registry()]

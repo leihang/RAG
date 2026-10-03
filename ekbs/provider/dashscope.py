@@ -141,6 +141,13 @@ class DashScopeEmbeddingProvider(EmbeddingProvider):
     async def _embed_with_type(
         self, texts: Sequence[str], text_type: str
     ) -> list[list[float]]:
+        if isinstance(texts, str):
+            # 防呆：传裸字符串会被当成"一串文本"逐字嵌入 —— 白烧钱且结果错得离谱。
+            # 实测踩过一次（查询侧误传 question 字符串）。要单条请用 embed_one/embed_query。
+            raise TypeError(
+                "embed() 需要文本列表；单条请用 embed_one()/embed_query()"
+                "（传裸字符串会逐字嵌入，既费钱又错）"
+            )
         items = list(texts)
         if not items:
             return []
