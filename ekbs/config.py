@@ -192,6 +192,11 @@ class LLMCfg(_Section):
     temperature: float = 0.1
     top_p: float = 0.8
     max_tokens: int = 2048
+    #: **输入**（prompt）token 上限：0 = 不限制。为什么必须有它：资料块 + 多轮记忆 +
+    #: 问题是一起塞给模型的，而模型窗口有限（qwen-max 最大输入 30,720）。实测最坏情况
+    #: （5 个表格块 × 2048 + 10 轮 × (答 2048 + 问 2000)）≈ 40k+ ⇒ 不设上限会直接超窗。
+    #: 取值按"本地 Qwen 计数 × 最坏偏差比 1.19 < 模型上限"来留余量（见 yaml 注释）。
+    max_input_tokens: int = 0
     timeout_s: int = 120
     max_retries: int = 2
     fallback: LLMFallbackCfg = Field(default_factory=LLMFallbackCfg)

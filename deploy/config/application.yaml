@@ -93,6 +93,9 @@ models:
     temperature: 0.1
     top_p: 0.8
     max_tokens: 2048
+    # 输入上限：模型窗口 30,720，本地 Qwen 计数 × 最坏偏差 1.19 ⇒ 取 20,000
+    # （云端约 23.8k，留 ~23% 余量）。超预算时的裁剪优先级：最旧轮次 → 排名最低的块 → 截断。
+    max_input_tokens: 20000
     timeout_s: 120
     max_retries: 2
     fallback:              # 主模型不可用时启用（见 00 §2.3）
@@ -160,8 +163,8 @@ adapter:
 
 # ---------- 多轮会话（04 §5.2；落库表 ekbs_session_ctx，见 01 §5.5）----------
 session:
-  context_max_turns: 6               # 多轮上下文最多保留 6 轮
-  context_ttl_seconds: 7200          # 会话 2 小时过期（按 ekbs_session_ctx.updated_at 判定）
+  context_max_turns: 10               # 多轮上下文最多保留 6 轮
+  context_ttl_seconds: 604800          # 会话 2 小时过期（按 ekbs_session_ctx.updated_at 判定）
   group_share_context: false         # 群聊不共享上下文（默认）
 
 # ---------- 限流与输入闸门（04 §5.2）----------

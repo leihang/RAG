@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Sequence
 
 from ekbs.cache.store import CacheStore
@@ -32,7 +32,7 @@ from ekbs.errors import EmbeddingUnavailable, ModelUnavailable, RerankUnavailabl
 from ekbs.index.faiss_store import ShardIndexManager
 from ekbs.index.figure_faiss import FigureIndex
 from ekbs.index.fts import FtsIndex
-from ekbs.ingest.chunker import retrieval_text
+from ekbs.ingest.chunker import count_tokens, retrieval_text
 from ekbs.logging import get_logger
 from ekbs.permission.acl import DocumentGate
 from ekbs.permission.context import PermContext
@@ -65,6 +65,9 @@ REFUSE_NO_SHARD = "no_visible_shard"
 REFUSE_EMBED_UNAVAILABLE = "embedding_unavailable"
 REFUSE_NO_CANDIDATE = "no_candidate"
 REFUSE_BELOW_THRESHOLD = "below_threshold"
+#: 预算裁剪时，"最后一块"低于这个 token 数就不再截断（再截就没信息了）
+_BUDGET_MIN_CHUNK_TOKENS = 128
+
 REFUSE_ALL_DENIED = "all_denied_by_c5"
 REFUSE_EMPTY_ANSWER = "empty_answer"
 REFUSE_NO_BASIS = "no_basis_in_context"
@@ -172,6 +175,10 @@ class AnswerResult:
     total_ms: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    #: 上下文预算裁剪痕迹（可观测性：丢了几块 / 几轮、是否截断）
+    dropped_chunks: int = 0
+    dropped_history: int = 0
+    context_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -947,6 +954,79 @@ class RetrievalPipeline:
             )
         return "\n".join(lines)
 
+    def _context_budget(self) -> int:
+        """prompt 的 token 上限（0 = 不限制）。"""
+        return int(getattr(self.settings.models.llm, "max_input_tokens", 0) or 0)
+
+    def _fit_prompt(
+        self,
+        chunks: Sequence[RetrievedChunk],
+        history: Sequence[dict[str, str]],
+        question: str,
+        *,
+        system_tokens: int,
+    ) -> tuple[list[RetrievedChunk], list[dict[str, str]], dict[str, Any]]:
+        """把「资料 + 记忆 + 问题」压进上下文预算，返回裁剪后的三者与统计。
+
+        为什么要它：资料块、多轮记忆、问题**是一起塞给模型的**，而模型窗口有限
+        （qwen-max 最大输入 30,720）。实测最坏情况（5 个表格块 × 2048 + 10 轮 ×
+        （答 2048 + 问 2000））≈ 4 万 token ⇒ 不设上限会直接超窗，且原先**没有任何兜底**。
+
+        **牺牲顺序**（先丢谁）：① 最旧的轮次 → ② 排名最低的块 → ③ 截断最后剩下的块。
+        理由：资料是答案的**唯一依据**（忠实度校验盯着它），记忆只是辅助；而排名最低的块
+        本来就在 `keep` 边缘。**永远保留**：最近 1 轮 + 至少 1 个块（哪怕被截断）。
+        """
+        budget = self._context_budget()
+        stats: dict[str, Any] = {
+            "budget": budget, "dropped_chunks": 0, "dropped_history": 0,
+            "truncated": False, "prompt_tokens": 0,
+        }
+        kept_chunks = list(chunks)
+        kept_history = list(history)
+        if not kept_chunks:
+            return kept_chunks, kept_history, stats
+
+        # 固定开销：系统提示（不含资料，调用方已渲染好）+ 问题 + 一点格式余量
+        # 注意**不要在模板上做 .format()** —— 取数提示词里有 JSON 花括号，会被当成占位符
+        base = int(system_tokens) + count_tokens(question) + 64
+
+        def total() -> int:
+            return (
+                base
+                + count_tokens(self.build_context(kept_chunks))
+                + sum(count_tokens(str(m.get("content") or "")) for m in kept_history)
+            )
+
+        stats["prompt_tokens"] = total()
+        if budget <= 0:
+            return kept_chunks, kept_history, stats
+
+        # ① 丢最旧的轮次（按"轮"成对丢，避免把 user/assistant 拆散）
+        while kept_history and total() > budget:
+            step = 2 if len(kept_history) >= 2 else 1
+            kept_history = kept_history[step:]
+            stats["dropped_history"] += step
+        # ② 丢排名最低的块（保留至少 1 个）
+        while len(kept_chunks) > 1 and total() > budget:
+            kept_chunks.pop()
+            stats["dropped_chunks"] += 1
+        # ③ 只剩 1 个块仍超预算 → 截断正文（保开头，明确标注，别让模型以为内容就这些）
+        while kept_chunks and total() > budget:
+            body = kept_chunks[-1].content
+            if count_tokens(body) <= _BUDGET_MIN_CHUNK_TOKENS:
+                break
+            shorter = body[: max(64, int(len(body) * 0.75))]
+            if len(shorter) >= len(body):
+                break
+            kept_chunks[-1] = replace(
+                kept_chunks[-1], content=shorter + "\n…（内容超上下文预算，已截断）"
+            )
+            stats["truncated"] = True
+        stats["prompt_tokens"] = total()
+        if stats["dropped_chunks"] or stats["dropped_history"] or stats["truncated"]:
+            log.warning("prompt_budget_trimmed", **stats)
+        return kept_chunks, kept_history, stats
+
     async def generate(
         self,
         question: str,
@@ -967,6 +1047,11 @@ class RetrievalPipeline:
                 refusal_reason=retrieval.refusal_reason or REFUSE_EMPTY_ANSWER,
             )
 
+        # **上下文预算**：资料 + 记忆 + 问题一起裁（保证至少 1 块 + 最近 1 轮）
+        chunks, history, budget = self._fit_prompt(
+            chunks, history, question,
+            system_tokens=count_tokens(SYSTEM_PROMPT.format(context="")),
+        )
         messages: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT.format(context=self.build_context(chunks))}
         ]
@@ -1078,6 +1163,9 @@ class RetrievalPipeline:
             hallucinated_citations=hallucinated,
             faithfulness=report.as_dict(),
             degraded=degraded,
+            dropped_chunks=int(budget["dropped_chunks"]),
+            dropped_history=int(budget["dropped_history"]),
+            context_truncated=bool(budget["truncated"]),
             **timing_kw,
         )
 
@@ -1108,6 +1196,12 @@ class RetrievalPipeline:
                 refusal_reason=retrieval.refusal_reason or REFUSE_EMPTY_ANSWER,
             )
 
+        chunks, _numeric_history, _numeric_budget = self._fit_prompt(
+            chunks, (), question,
+            system_tokens=count_tokens(build_numeric_prompt("")),
+        )
+        if _numeric_budget["dropped_chunks"] or _numeric_budget["truncated"]:
+            log.warning("prompt_budget_trimmed_numeric", **_numeric_budget)
         messages = [
             {
                 "role": "system",

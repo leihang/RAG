@@ -134,6 +134,9 @@ models:
     temperature: 0.1
     top_p: 0.8
     max_tokens: 2048
+    # 输入上限：模型窗口 30,720，本地 Qwen 计数 × 最坏偏差 1.19 ⇒ 取 20,000
+    # （云端约 23.8k，留 ~23% 余量）。超预算时的裁剪优先级：最旧轮次 → 排名最低的块 → 截断。
+    max_input_tokens: 20000
     timeout_s: 120
     max_retries: 2
     fallback:              # 主模型不可用时启用（00 §2.3）；开发环境无 fallback
@@ -219,8 +222,8 @@ adapter:
   request_timeout_seconds: 30
 
 session:
-  context_max_turns: 6
-  context_ttl_seconds: 7200
+  context_max_turns: 10
+  context_ttl_seconds: 604800
   group_share_context: false
 
 # ---------- 上传行为（05 §6.5）----------
