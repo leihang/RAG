@@ -119,14 +119,32 @@ _TOKENIZER_ENV = "EKBS_TOKENIZER_PATH"
 
 _QWEN_TOKENIZER = None
 _QWEN_UNAVAILABLE_LOGGED = False
+#: 当前生效口径的标识（`qwen:sdk:<path>` 等），见 `active_token_counter()`
+_QWEN_COUNTER_LABEL = ""
 
 
-def tokenizer_path():
-    """探测可用的 Qwen 词表文件。
+def sdk_vocab_file():
+    """官方 `dashscope` SDK **随包自带**的 Qwen 词表（`dashscope/resources/qwen.tiktoken`）。
 
-    语义：``EKBS_TOKENIZER_PATH`` **显式指定即权威**（指定了就不再看默认位置）——
-    运维可以借此固定路径，或指向不存在的路径来**主动禁用**（此时会回退到 tiktoken 并告警）。
-    未指定时按 `<repo>/var/models/qwen-tokenizer.json` → `~/.ekbs/qwen-tokenizer.json` 探测。
+    为什么优先用它：**离线、零下载、与 SDK 同版本**。实测与 HF 的 Qwen3-Embedding
+    `tokenizer.json` 在语料/英文/代码/表格/编号/emoji 上**计数逐条相同**（同一套词表），
+    所以改用它可以替掉一个部署物（11 MB 词表）+ 一个依赖（`tokenizers`）+ 一次下载步骤。
+    """
+    import pathlib
+
+    try:
+        import dashscope  # 嵌入/生成都靠它，已在 requirements 里
+    except Exception:  # noqa: BLE001
+        return None
+    path = pathlib.Path(dashscope.__file__).resolve().parent / "resources" / "qwen.tiktoken"
+    return path if path.is_file() else None
+
+
+def tokenizer_source():
+    """返回 ``(词表文件, 口径标识)``；取不到返回 ``None``。
+
+    优先级：① `EKBS_TOKENIZER_PATH` **显式指定即权威**（指向不存在的路径 = 主动禁用）；
+    ② 官方 SDK 自带词表；③ 本地部署的 `tokenizer.json`（老装机兼容）。
     """
     import os
     import pathlib
@@ -134,44 +152,83 @@ def tokenizer_path():
     env = os.environ.get(_TOKENIZER_ENV, "").strip()
     if env:
         path = pathlib.Path(env).expanduser()
-        return path if path.is_file() else None
-    for candidate in (
+        return (path, f"qwen:env:{path}") if path.is_file() else None
+    candidate = sdk_vocab_file()
+    if candidate is not None:
+        return candidate, f"qwen:sdk:{candidate}"
+    for fallback in (
         pathlib.Path(__file__).resolve().parents[2] / "var" / "models" / "qwen-tokenizer.json",
         pathlib.Path.home() / ".ekbs" / "qwen-tokenizer.json",
     ):
-        if candidate.is_file():
-            return candidate
+        if fallback.is_file():
+            return fallback, f"qwen:file:{fallback}"
     return None
 
 
+def tokenizer_path():
+    """当前词表文件路径（取不到返回 ``None``）—— 保留给工具与测试用。"""
+    source = tokenizer_source()
+    return source[0] if source else None
+
+
+class _QwenCounter:
+    """统一两种词表格式的计数接口。
+
+    * `.tiktoken`（官方格式）→ SDK 自带实现 `QwenTokenizer.encode()`，返回 **id 列表**
+    * `.json`（HF 格式）→ `tokenizers.Tokenizer.encode().ids`
+    """
+
+    def __init__(self, kind: str, path, impl) -> None:
+        self.kind = kind
+        self.path = path
+        self.impl = impl
+
+    def count(self, text: str) -> int:
+        if self.kind == "sdk":
+            return len(self.impl.encode(text))
+        return len(self.impl.encode(text, add_special_tokens=False).ids)
+
+
 def _qwen_encoding():
-    """懒加载 Qwen 分词器（进程内只加载一次）；不可用返回 ``None``。"""
-    global _QWEN_TOKENIZER, _QWEN_UNAVAILABLE_LOGGED
+    """懒加载 Qwen 计数器（进程内只加载一次）；不可用返回 ``None``。"""
+    global _QWEN_TOKENIZER, _QWEN_UNAVAILABLE_LOGGED, _QWEN_COUNTER_LABEL
     if _QWEN_TOKENIZER is not None:
         return _QWEN_TOKENIZER
-    path = tokenizer_path()
-    if path is None:
+    source = tokenizer_source()
+    if source is None:
         return None
+    path, label = source
     try:
-        from tokenizers import Tokenizer
+        if path.suffix == ".tiktoken":
+            from dashscope.tokenizers.qwen_tokenizer import QwenTokenizer
 
-        _QWEN_TOKENIZER = Tokenizer.from_file(str(path))
-        log.info("token_counter_ready", counter="qwen", path=str(path))
+            _QWEN_TOKENIZER = _QwenCounter("sdk", path, QwenTokenizer(str(path)))
+        else:
+            from tokenizers import Tokenizer
+
+            _QWEN_TOKENIZER = _QwenCounter("file", path, Tokenizer.from_file(str(path)))
+        _QWEN_COUNTER_LABEL = label
+        log.info("token_counter_ready", counter=label)
         return _QWEN_TOKENIZER
     except Exception as exc:  # noqa: BLE001 - 词表问题不该打断入库
         if not _QWEN_UNAVAILABLE_LOGGED:
             log.warning(
                 "token_counter_qwen_unavailable", path=str(path), error=str(exc)[:160],
-                hint="将回退到 tiktoken；用 ekbs.tools.fetch_tokenizer 重新取词表",
+                hint="回退 tiktoken；官方词表随 dashscope 包，损坏时重装该包即可",
             )
             _QWEN_UNAVAILABLE_LOGGED = True
         return None
 
 
 def active_token_counter() -> str:
-    """当前生效的计数口径（排障与 TC-INDEX-004 校准都要看它）。"""
+    """当前生效的计数口径（排障与 TC-INDEX-004 校准都要看它）。
+
+    形如 `qwen:sdk:<词表路径>` / `qwen:file:<路径>` / `qwen:env:<路径>`，
+    或回退时的 `tiktoken:cl100k_base` / `heuristic:cjk`。
+    **它同时是校准的绑定项**：换词表口径 = 旧校准失效（见 `ekbs.ingest.token_calib`）。
+    """
     if _qwen_encoding() is not None:
-        return f"qwen:{tokenizer_path()}"
+        return _QWEN_COUNTER_LABEL
     try:  # pragma: no cover
         import tiktoken  # noqa: F401
 
@@ -182,9 +239,10 @@ def active_token_counter() -> str:
 
 def reset_tokenizer_cache() -> None:
     """清空词表缓存（**测试用**；口径在进程内只解析一次，生产环境不需要重解析）。"""
-    global _QWEN_TOKENIZER, _QWEN_UNAVAILABLE_LOGGED
+    global _QWEN_TOKENIZER, _QWEN_UNAVAILABLE_LOGGED, _QWEN_COUNTER_LABEL
     _QWEN_TOKENIZER = None
     _QWEN_UNAVAILABLE_LOGGED = False
+    _QWEN_COUNTER_LABEL = ""
 
 
 def count_tokens(text: str) -> int:
@@ -196,8 +254,8 @@ def count_tokens(text: str) -> int:
 
     取词顺序（从上到下，命中即用）：
 
-    1. **Qwen 分词器**（`tokenizers` + `tokenizer.json`）——与线上嵌入模型同源家族，
-       实测把偏差从 −35% 收敛到 −11%。路径解析见 :func:`tokenizer_path`；
+    1. **Qwen 词表**：默认取官方 `dashscope` SDK 自带的 `qwen.tiktoken`（离线、零下载、随包）；
+       也可用 `EKBS_TOKENIZER_PATH` 指向 HF 的 `tokenizer.json`。两种词表实测**计数逐条相同**，与线上嵌入模型同源家族，把偏差从 −35% 收敛到 −11%。
     2. `tiktoken` 的 `cl100k_base`（**回退**，会告警一次）——它是 OpenAI 嵌入模型的同源词表，
        对 Qwen 系模型系统性偏低（200 段真实文本实测 −35%，中文散文 +9%、数字表格 −42%）；
     3. 「中文按字、英文按词」的启发式（最后兜底，偏差最大，仅保证有数可用）。
@@ -208,7 +266,7 @@ def count_tokens(text: str) -> int:
         return 0
     qwen = _qwen_encoding()
     if qwen is not None:
-        return len(qwen.encode(text, add_special_tokens=False).ids)
+        return qwen.count(text)
     try:  # pragma: no cover - 取决于是否装 tiktoken
         import tiktoken
 

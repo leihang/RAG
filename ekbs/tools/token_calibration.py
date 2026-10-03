@@ -182,7 +182,7 @@ def local_counters(with_calibration: bool = False):
 
         settings = load_settings()
         calibration = token_calib.load(
-            settings.data_dir, _current_fingerprint(settings)
+            settings.data_dir, _current_fingerprint(settings), chunker.active_token_counter()
         )
         if calibration:
             factor = calibration.factor
@@ -271,12 +271,31 @@ def from_records(*, min_samples: int) -> int:
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    matched = [e for e in entries if not fingerprint or e.get("fingerprint") == fingerprint]
-    print(f"\n记录 {len(entries)} 条；匹配当前模型指纹 {len(matched)} 条（fingerprint={fingerprint[:24]}…）")
+    chunker = importlib.import_module("ekbs.ingest.chunker")   # 与 from_files 同样的晚绑定
+    counter = chunker.active_token_counter()
+    matched = [
+        e for e in entries
+        if (not fingerprint or e.get("fingerprint") == fingerprint)
+        and (not e.get("counter") or e.get("counter") == counter)
+    ]
+    print(
+        f"\n记录 {len(entries)} 条；匹配当前「模型指纹 + 计数口径」{len(matched)} 条"
+        f"（fingerprint={fingerprint[:24]}…，counter={counter}）"
+    )
+    if len(matched) < len(entries):
+        legacy = sum(1 for e in entries if not e.get("counter"))
+        print(
+            f"  说明：被排除 {len(entries) - len(matched)} 条"
+            + (f"（其中 {legacy} 条是升级前写的、没有计数口径字段 —— 2026-10-03 起计入绑定）"
+               if legacy else "（计数口径或模型指纹不符）")
+            + "；入库 ≥3 篇后重跑本工具即可重建系数。"
+        )
     print(f"  {'doc':>5}{'云端真值':>10}{'本地估算':>10}{'比例':>8}")
     for e in matched:
         print(f"  {e['doc_id']:>5}{e['cloud_tokens']:>10}{e['local_tokens']:>10}{e['ratio']:>8.3f}")
-    calibration = token_calib.summarize(settings.data_dir, fingerprint, min_samples=min_samples)
+    calibration = token_calib.summarize(
+        settings.data_dir, fingerprint, counter=counter, min_samples=min_samples
+    )
     if calibration is None:
         print(f"\n样本不足 {min_samples} 条（或数据不全）→ 暂不写系数（避免单篇把全局口径带偏）")
         return 0

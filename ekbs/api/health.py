@@ -131,7 +131,11 @@ def _token_calibration(runtime: Any) -> dict[str, Any] | None:
     """当前嵌入指纹下的校准系数（没校准/换模型后返回 None）。"""
     from ekbs.ingest import token_calib
 
-    calibration = token_calib.load(runtime.settings.data_dir, runtime.providers.embed.ref.fingerprint)
+    calibration = token_calib.load(
+        runtime.settings.data_dir,
+        runtime.providers.embed.ref.fingerprint,
+        active_token_counter(),      # 口径不符 → 返回 None（旧系数不得复用）
+    )
     return calibration.as_dict() if calibration else None
 
 

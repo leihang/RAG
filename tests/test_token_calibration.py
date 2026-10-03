@@ -11,6 +11,8 @@ Qwen 词表后 −11%），而它决定**分块尺寸**、质量指标与成本�
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -120,3 +122,69 @@ def test_provider_usage_defaults_are_per_instance() -> None:
     first.usage_total = 7
     assert first.pop_usage() == (7, 0)
     assert second.pop_usage() == (0, 0)
+
+
+# ---------------------------------------------------------------- 计数口径绑定（2026-10-03）
+
+
+def test_calibration_is_bound_to_the_counter_identity(tmp_path) -> None:
+    """**换计数口径 = 旧校准失效**。
+
+    为什么必须这样：local_tokens 是由计数器算出来的，换了词表（官方 SDK / HF json /
+    tiktoken 回退）同一个文档的 local_tokens 就变了；只绑嵌入指纹的话旧系数会被
+    **静默沿用**，校准名不副实 —— 实测本地计数在不同口径间能差 1.69 倍。
+    """
+    token_calib.record(
+        tmp_path, doc_id=1, fingerprint="fp", counter="qwen:sdk:a.tiktoken",
+        cloud_tokens=1000, local_tokens=800,
+    )
+    token_calib.record(
+        tmp_path, doc_id=2, fingerprint="fp", counter="qwen:sdk:a.tiktoken",
+        cloud_tokens=1000, local_tokens=800,
+    )
+    token_calib.record(
+        tmp_path, doc_id=3, fingerprint="fp", counter="qwen:sdk:a.tiktoken",
+        cloud_tokens=1000, local_tokens=800,
+    )
+    same = token_calib.summarize(tmp_path, "fp", counter="qwen:sdk:a.tiktoken")
+    assert same is not None and same.counter == "qwen:sdk:a.tiktoken"
+    token_calib.write_factor(tmp_path, same)
+    assert token_calib.load(tmp_path, "fp", "qwen:sdk:a.tiktoken") is not None
+
+    # 换成别的口径：记录与系数都必须失效
+    assert token_calib.summarize(tmp_path, "fp", counter="tiktoken:cl100k_base") is None
+    assert token_calib.load(tmp_path, "fp", "tiktoken:cl100k_base") is None
+    assert token_calib.calibrated_tokens(100, tmp_path, "fp", "tiktoken:cl100k_base") == 100, (
+        "口径不符时必须原样返回，绝不假装校准过"
+    )
+
+
+def test_records_persist_the_counter(tmp_path) -> None:
+    """记录里必须落下 counter 字段（否则事后无法判断该用哪套系数）。"""
+    entry = token_calib.record(
+        tmp_path, doc_id=7, fingerprint="fp", counter="qwen:file:/tmp/x.json",
+        cloud_tokens=500, local_tokens=400,
+    )
+    assert entry is not None and entry["counter"] == "qwen:file:/tmp/x.json"
+    stored = json.loads(token_calib.records_path(tmp_path).read_text(encoding="utf-8").splitlines()[0])
+    assert stored["counter"] == "qwen:file:/tmp/x.json"
+
+
+def test_legacy_calibration_without_counter_is_excluded_when_counter_required(tmp_path) -> None:
+    """**严格一致**：要求某个计数口径时，没有 counter 字段的旧记录/旧系数一律失效。
+
+    理由：无法证明旧系数是在当前口径下算出来的（口径不同时 local_tokens 能差 1.69 倍）。
+    不传 `counter` 时（工具做历史报告）仍可读出来。
+    """
+    token_calib.record(tmp_path, doc_id=1, fingerprint="fp", cloud_tokens=100,
+                       local_tokens=80)
+    for doc_id in (2, 3):
+        token_calib.record(tmp_path, doc_id=doc_id, fingerprint="fp", cloud_tokens=100,
+                           local_tokens=80)
+    calibration = token_calib.summarize(tmp_path, "fp", counter="qwen:sdk:new")
+    assert calibration is None, "显式要求新口径时，旧的无口径记录不该被算进来"
+    legacy = token_calib.summarize(tmp_path, "fp")
+    assert legacy is not None and legacy.factor == 1.25, "不带口径查询时仍可作历史报告"
+    token_calib.write_factor(tmp_path, legacy)
+    assert token_calib.load(tmp_path, "fp") is not None
+    assert token_calib.load(tmp_path, "fp", "qwen:sdk:new") is None, "无口径的旧系数必须失效"

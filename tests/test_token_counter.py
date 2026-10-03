@@ -128,3 +128,61 @@ def test_shipped_config_uses_headroom_below_documented_max_rows() -> None:
     if limit is None:
         pytest.skip(f"{model} 不在官方清单里")
     assert settings.models.embed.batch_size < limit, "运行时留余量，别贴官方上限"
+
+
+# ---------------------------------------------------------------- 官方词表（2026-10-03）
+
+
+def test_official_sdk_vocab_is_the_default_counter() -> None:
+    """默认口径必须来自**官方 dashscope SDK 自带词表**（随包、离线、与 SDK 同版本）。
+
+    为什么改成它：实测它与 HF 的 Qwen3-Embedding `tokenizer.json` **计数逐条相同**，
+    却省掉一个部署物（11 MB 词表）+ 一次下载步骤（`ekbs.tools.fetch_tokenizer` 变为可选）。
+    """
+    from ekbs.ingest.chunker import sdk_vocab_file
+
+    monkeypatch_free = sdk_vocab_file()
+    if monkeypatch_free is None:
+        pytest.skip("本机 dashscope 包未带 resources/qwen.tiktoken")
+    reset_tokenizer_cache()
+    counter = active_token_counter()
+    assert counter.startswith("qwen:sdk:"), counter
+    assert "qwen.tiktoken" in counter
+
+
+def test_env_override_still_wins_over_official_vocab(monkeypatch) -> None:
+    """`EKBS_TOKENIZER_PATH` 仍是**最高优先级**（可固定到 HF 词表，或指向不存在的路径来禁用）。"""
+    monkeypatch.setenv("EKBS_TOKENIZER_PATH", "/nonexistent/tokenizer.json")
+    reset_tokenizer_cache()
+    assert active_token_counter() == "tiktoken:cl100k_base"
+
+
+def test_official_and_hf_vocab_agree_when_both_present() -> None:
+    """两种词表（官方 `.tiktoken` vs HF `.json`）计数应完全一致 —— 不一致就说明同源假设破了。
+
+    这条是"能不能安心换口径"的证据：本机两者都在时逐条比对。
+    """
+    import pathlib
+
+    from ekbs.ingest.chunker import _QwenCounter, sdk_vocab_file
+
+    hf_vocab = (
+        pathlib.Path(__file__).resolve().parents[1] / "var" / "models" / "qwen-tokenizer.json"
+    )
+    sdk_vocab = sdk_vocab_file()
+    if sdk_vocab is None or not hf_vocab.is_file():
+        pytest.skip("本机缺少其中一个词表（官方 .tiktoken 或 var/models/qwen-tokenizer.json）")
+    tokenizers = pytest.importorskip("tokenizers")
+    from dashscope.tokenizers.qwen_tokenizer import QwenTokenizer
+
+    sdk = _QwenCounter("sdk", sdk_vocab, QwenTokenizer(str(sdk_vocab)))
+    hf = _QwenCounter("file", hf_vocab, tokenizers.Tokenizer.from_file(str(hf_vocab)))
+    samples = [
+        "接班人员未能到岗，值班人员必须坚持岗位，并向领导汇报。",
+        "XJWY-GC-01-01 XJ-01-11-1F02 XIWY-QR-GC-002",
+        "| 司龄 | 天数 |\n|---|---|\n| 1年 | 5 |",
+        "The quick brown fox jumps over the lazy dog.",
+        "def handover(shift):\n    return shift",
+    ]
+    for text in samples:
+        assert sdk.count(text) == hf.count(text), f"两种词表不一致：{text[:24]}"

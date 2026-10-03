@@ -61,6 +61,10 @@ class Calibration:
     #: 逐篇比例的中位数（与 factor 对照看）：factor 是按量加权，**会被最大的那篇主导**
     #: （实测：一篇 18.8 万 token 的 xlsx 把系数拉到 1.0002，而另一篇真实比例是 1.073）
     median_ratio: float = 1.0
+    #: **计数口径标识**（`active_token_counter()`，如 `qwen:sdk:<path>`）。
+    #: 为什么也要绑：换词表口径（SDK 词表 / HF 词表 / tiktoken 回退）会改变 local_tokens，
+    #: 只绑嵌入指纹的话旧系数会**静默沿用**，校准就名不副实了。
+    counter: str = ""
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     @property
@@ -86,6 +90,7 @@ def record(
     fingerprint: str,
     cloud_tokens: int,
     local_tokens: int,
+    counter: str = "",
 ) -> dict[str, Any] | None:
     """记一条文档级校准记录（append-only）。``cloud_tokens<=0`` 或 ``local_tokens<=0`` 时跳过。"""
     if cloud_tokens <= 0 or local_tokens <= 0:
@@ -94,6 +99,7 @@ def record(
         "ts": datetime.now().isoformat(timespec="seconds"),
         "doc_id": int(doc_id),
         "fingerprint": fingerprint,
+        "counter": counter,
         "cloud_tokens": int(cloud_tokens),
         "local_tokens": int(local_tokens),
         "ratio": round(cloud_tokens / local_tokens, 4),
@@ -113,15 +119,20 @@ def record(
 
 
 def summarize(
-    data_dir: pathlib.Path | str, fingerprint: str | None = None, *, min_samples: int = MIN_SAMPLES
+    data_dir: pathlib.Path | str,
+    fingerprint: str | None = None,
+    *,
+    counter: str | None = None,
+    min_samples: int = MIN_SAMPLES,
 ) -> Calibration | None:
-    """从记录聚合出系数（只统计同一指纹；样本不足返回 None）。"""
+    """从记录聚合出系数（**只统计同一嵌入指纹 + 同一计数口径**；样本不足返回 None）。"""
     path = records_path(data_dir)
     if not path.is_file():
         return None
     cloud = local = samples = 0
     ratios: list[float] = []
     matched_fingerprint = fingerprint or ""
+    matched_counter = counter or ""
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -132,8 +143,12 @@ def summarize(
             continue
         if fingerprint and entry.get("fingerprint") != fingerprint:
             continue
+        if counter and str(entry.get("counter") or "") != counter:
+            continue
         if not fingerprint:
             matched_fingerprint = str(entry.get("fingerprint") or "")
+        if not counter:
+            matched_counter = str(entry.get("counter") or "")
         cloud += int(entry.get("cloud_tokens") or 0)
         local += int(entry.get("local_tokens") or 0)
         ratio = entry.get("ratio")
@@ -151,6 +166,7 @@ def summarize(
         cloud_tokens=cloud,
         local_tokens=local,
         median_ratio=round(statistics.median(ratios), 4) if ratios else 1.0,
+        counter=matched_counter,
     )
 
 
@@ -163,8 +179,12 @@ def write_factor(data_dir: pathlib.Path | str, calibration: Calibration) -> path
     return path
 
 
-def load(data_dir: pathlib.Path | str, fingerprint: str | None = None) -> Calibration | None:
-    """读当前系数；指纹不符（=换了嵌入模型）返回 None —— 旧系数不得复用。"""
+def load(
+    data_dir: pathlib.Path | str,
+    fingerprint: str | None = None,
+    counter: str | None = None,
+) -> Calibration | None:
+    """读当前系数；**指纹或计数口径不符**一律返回 None —— 旧系数不得复用。"""
     path = factor_path(data_dir)
     if not path.is_file():
         return None
@@ -175,6 +195,11 @@ def load(data_dir: pathlib.Path | str, fingerprint: str | None = None) -> Calibr
     stored = str(payload.get("fingerprint") or "")
     if fingerprint and stored and stored != fingerprint:
         return None
+    stored_counter = str(payload.get("counter") or "")
+    # 与 summarize **同一口径**：要求某个计数口径时，"没有口径字段"的旧系数一律失效
+    # （无法证明它是在当前口径下算出来的；系数目前只用于展示与工具报告，宁严勿混）
+    if counter and stored_counter != counter:
+        return None
     return Calibration(
         fingerprint=stored,
         factor=float(payload.get("factor") or 1.0),
@@ -183,11 +208,16 @@ def load(data_dir: pathlib.Path | str, fingerprint: str | None = None) -> Calibr
         local_tokens=int(payload.get("local_tokens") or 0),
         median_ratio=float(payload.get("median_ratio") or payload.get("factor") or 1.0),
         updated_at=str(payload.get("updated_at") or ""),
+        counter=stored_counter,
     )
 
 
-def calibrated_tokens(local_tokens: int, data_dir: pathlib.Path | str,
-                      fingerprint: str | None = None) -> int:
-    """把本地计数换算成"云端当量"（无系数时原样返回 —— 绝不假装校准过）。"""
-    calibration = load(data_dir, fingerprint)
+def calibrated_tokens(
+    local_tokens: int,
+    data_dir: pathlib.Path | str,
+    fingerprint: str | None = None,
+    counter: str | None = None,
+) -> int:
+    """把本地计数换算成「云端当量」（无系数时原样返回 —— 绝不假装校准过）。"""
+    calibration = load(data_dir, fingerprint, counter)
     return calibration.calibrated(local_tokens) if calibration else int(local_tokens)

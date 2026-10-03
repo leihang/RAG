@@ -37,6 +37,10 @@ jieba==0.42.1
 rank-bm25==0.2.2
 tiktoken==0.8.0
 # tokenizers：只用于**本地 token 计数**（尺寸判定/指标/成本估算），不参与向量计算。
+# 2026-10-03 起**默认不再需要它**：计数口径默认走 `dashscope` SDK 自带的
+# `resources/qwen.tiktoken`（离线、随包、与 SDK 同版本；实测与 HF 词表计数逐条相同）。
+# 保留此依赖只是为了支持"固定到 HF 词表"这条可选路径（EKBS_TOKENIZER_PATH 指向 .json）；
+# 想精简依赖可以删掉它 —— 届时 .json 路径会告警并回退 tiktoken。
 # 词表文件不进仓库：部署后跑一次 `python -m ekbs.tools.fetch_tokenizer`，
 # 它会把 Qwen 的 tokenizer.json 下到 var/models/（探测顺序见 chunker.tokenizer_path）。
 # 取不到时 count_tokens 会回退到 tiktoken 并告警，/health/deps 的 token_counter 会显示口径。

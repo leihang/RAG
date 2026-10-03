@@ -32,6 +32,7 @@ from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE, retrievable_chunk_ids
 from ekbs.ingest import token_calib
 from ekbs.ingest.clean import clean_markdown
 from ekbs.ingest.chunker import (
+    active_token_counter,
     content_coverage,
     CHILD_MAX_TOKENS,
     CHILD_MIN_TOKENS,
@@ -459,6 +460,9 @@ class IngestPipeline:
                 self.settings.data_dir,
                 doc_id=doc_id,
                 fingerprint=self.providers.embed.ref.fingerprint,
+                # 计数口径也要绑：换词表（SDK/HF/tiktoken 回退）会改变 local_tokens，
+                # 只绑嵌入指纹的话旧系数会被静默沿用
+                counter=active_token_counter(),
                 cloud_tokens=int(cloud_tokens),
                 local_tokens=local_tokens,
             )

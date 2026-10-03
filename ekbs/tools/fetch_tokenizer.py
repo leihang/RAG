@@ -1,4 +1,9 @@
-"""取本地 token 计数的 Qwen 词表（`tokenizer.json`）—— 部署一次性动作。
+"""取本地 token 计数的 Qwen 词表（`tokenizer.json`）—— **可选的固定词表路径**。
+
+> 2026-10-03 起：默认口径已改用**官方 `dashscope` SDK 自带的 `qwen.tiktoken`**
+> （离线、零下载、与 SDK 同版本；实测与这里的 HF 词表**计数逐条相同**）。
+> 所以本脚本**不再是部署必需**，只在你想把口径固定到 HF 词表时使用：
+> 跑一次本脚本，然后把 `EKBS_TOKENIZER_PATH` 指向 `var/models/qwen-tokenizer.json`。
 
 ## 为什么需要这个脚本
 
