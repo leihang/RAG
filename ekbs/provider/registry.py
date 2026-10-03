@@ -43,7 +43,10 @@ class Providers:
 
 def build_embedding(settings: Settings, secrets: Secrets) -> EmbeddingProvider:
     cfg = settings.models.embed
-    ref = model_ref(cfg.provider, cfg.model, dim=cfg.dim, version=cfg.version)
+    # 不对称编码开关 → 同时进 `variant`（改指纹，强制重建，避免新旧向量混用）
+    asymmetric = bool(getattr(cfg, "asymmetry", False))
+    variant = "asym" if asymmetric else ""
+    ref = model_ref(cfg.provider, cfg.model, dim=cfg.dim, version=cfg.version, variant=variant)
     if cfg.provider == "mock":
         return MockEmbeddingProvider(dim=cfg.dim, provider=ref.provider, model=ref.model)
     if cfg.provider == "dashscope":
@@ -53,6 +56,7 @@ def build_embedding(settings: Settings, secrets: Secrets) -> EmbeddingProvider:
         return DashScopeEmbeddingProvider(
             ref=ref, api_key=secrets.get("DASHSCOPE_API_KEY"), base_url=cfg.base_url,
             batch_size=cfg.batch_size, timeout_s=cfg.timeout_s, max_retries=cfg.max_retries,
+            asymmetric=asymmetric,
         )
     raise ConfigError(
         f"未知的嵌入 provider：{cfg.provider}（可选：{'/'.join(KNOWN_PROVIDERS)}；"

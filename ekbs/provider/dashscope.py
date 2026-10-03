@@ -89,8 +89,13 @@ class DashScopeEmbeddingProvider(EmbeddingProvider):
         max_retries: int = 3,
         retry_base_delay: float = 1.0,
         client: httpx.AsyncClient | None = None,
+        asymmetric: bool = False,
     ) -> None:
         self.ref = ref
+        #: 查询/文档**不对称编码**（DashScope `text_type`）。实测该参数确实生效
+        #: （`document` 与默认向量余弦 0.916），但**开启会改变全部 chunk 向量**：
+        #: 必须全量重灌，且 `ref.variant` 要带上 `asym` 让指纹变化（C3：禁止混用向量）。
+        self.asymmetric = bool(asymmetric)
         self.api_key = api_key
         self.base_url = resolve_base_url(base_url, DEFAULT_BASE_URL)
         self.retry_base_delay = retry_base_delay
@@ -122,23 +127,34 @@ class DashScopeEmbeddingProvider(EmbeddingProvider):
         return httpx.AsyncClient(timeout=self.timeout_s), True
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        items = list(texts)
-        if not items:
-            return []
-        vectors: list[list[float]] = []
-        client, owned = self._http()
-        try:
-            for start in range(0, len(items), self.batch_size):
-                batch = items[start : start + self.batch_size]
-                vectors.extend(await self._embed_batch(client, batch))
-        finally:
-            if owned:
-                await client.aclose()
-        return vectors
+        return await self._embed_with_type(texts, "document")
 
     async def embed_one(self, text: str) -> list[float]:
         vectors = await self.embed([text])
         return vectors[0]
+
+    async def embed_query(self, text: str) -> list[float]:
+        """查询侧嵌入：不对称编码开启时用 ``text_type=query``。"""
+        vectors = await self._embed_with_type([text], "query")
+        return vectors[0]
+
+    async def _embed_with_type(
+        self, texts: Sequence[str], text_type: str
+    ) -> list[list[float]]:
+        items = list(texts)
+        if not items:
+            return []
+        vectors: list[list[float]] = []
+        api_text_type = text_type if self.asymmetric else None
+        client, owned = self._http()
+        try:
+            for start in range(0, len(items), self.batch_size):
+                batch = items[start : start + self.batch_size]
+                vectors.extend(await self._embed_batch(client, batch, text_type=api_text_type))
+        finally:
+            if owned:
+                await client.aclose()
+        return vectors
 
     def pop_usage(self) -> tuple[int, int]:
         """取走并清零累计的云端用量，返回 ``(total_tokens, calls)``。
@@ -150,14 +166,23 @@ class DashScopeEmbeddingProvider(EmbeddingProvider):
         self.usage_total, self.usage_calls = 0, 0
         return total, calls
 
-    async def _embed_batch(self, client: httpx.AsyncClient, batch: Sequence[str]) -> list[list[float]]:
+    async def _embed_batch(
+        self,
+        client: httpx.AsyncClient,
+        batch: Sequence[str],
+        *,
+        text_type: str | None = None,
+    ) -> list[list[float]]:
         url = f"{self.base_url}{COMPATIBLE_PATH}/embeddings"
-        body = {
+        body: dict[str, Any] = {
             "model": self.ref.model,
             "input": list(batch),
             "dimensions": int(self.ref.dim or 1024),
             "encoding_format": "float",
         }
+        if text_type:
+            # 查询/文档不对称编码（DashScope 扩展字段，OpenAI 兼容端点接受）
+            body["text_type"] = text_type
         try:
             response = await request_with_retry(
                 client, "POST", url, provider="dashscope", endpoint="embeddings",

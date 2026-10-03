@@ -87,8 +87,14 @@ class CacheStore:
         return f"{PREFIX_ANSWER}{fingerprint}:{text_sha256(question)}"
 
     @staticmethod
-    def embed_key(text: str) -> str:
-        return f"{PREFIX_EMBED}{text_sha256(text)}"
+    def embed_key(text: str, variant: str = "") -> str:
+        """查询向量缓存键。
+
+        ``variant`` 传**模型指纹**：查询向量是「哪个模型、哪种编码变体」算出来的，
+        不带它就会在开启/关闭不对称编码（`text_type`）后**命中旧向量**，新旧语义混用。
+        """
+        suffix = f"{variant}:" if variant else ""
+        return f"{PREFIX_EMBED}{suffix}{text_sha256(text)}"
 
     @staticmethod
     def mm_embed_key(text: str) -> str:

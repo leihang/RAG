@@ -303,12 +303,15 @@ class RetrievalPipeline:
 
     async def query_vector(self, query: str) -> list[float] | None:
         """返回查询向量；None 表示嵌入不可用（调用方必须拒答，不得降级）。"""
-        key = CacheStore.embed_key(query)
+        # 缓存键带上模型指纹：开启/关闭不对称编码（text_type）后指纹会变，
+        # 不带它就会命中"另一种编码"算出来的旧向量（语义混用，静默错搜）。
+        key = CacheStore.embed_key(query, variant=self.providers.embed.ref.fingerprint)
         cached = await self.cache.get(key)
         if cached is not None:
             return list(cached)
         try:
-            vector = await self.providers.embed.embed_one(query)
+            # 查询侧用 embed_query（不对称编码时为 text_type=query；对称时等价 embed_one）
+            vector = await self.providers.embed.embed_query(query)
         except EmbeddingUnavailable:
             raise
         except Exception as exc:  # 云端超时/限流等一并以「嵌入不可用」处理

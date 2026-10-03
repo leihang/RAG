@@ -80,6 +80,11 @@ models:
     # 单请求上限**按模型不同**：v4/v3=10、本模型=20（已实测）。换模型必须同步改。
     # 官方最大行数 20（单行最大 128,000 token）；运行取 16 留余量，不顶满
     batch_size: 16
+    # 查询/文档**不对称编码**（DashScope text_type）：查询发 query、入库发 document。
+    # 实测该参数生效（document 与默认向量余弦 0.916），但**开启会改变全部 chunk 向量**：
+    # 必须全量重灌；指纹会自动带上 `+asym`，避免新旧向量混用（C3 禁止混用向量）。
+    # 采用前应先用金标题集 A/B（Hit@5 / MRR）证明有效，再全量重建。
+    asymmetry: false
     timeout_s: 30
     max_retries: 3
   llm:

@@ -39,21 +39,38 @@ class ModelRef:
     model: str
     version: str = ""
     dim: int | None = None
+    #: 同一模型的**编码变体**（如查询/文档不对称编码 `asym`）。
+    #: 为什么它必须进 ``ident``/``fingerprint``：变体会改变**向量语义** ——
+    #: 若新旧向量落在同一分片里就踩 C3「禁止混用向量」。带上它之后
+    #: ``/readyz`` 的 `fingerprint_match` 会立刻变 False，强制重建，而不是静默混用。
+    variant: str = ""
 
     @property
     def ident(self) -> str:
-        return MODEL_IDENT_TEMPLATE.format(
+        base = MODEL_IDENT_TEMPLATE.format(
             provider=self.provider, model=self.model, version=self.version, dim=self.dim
         )
+        return f"{base}+{self.variant}" if self.variant else base
 
     @property
     def fingerprint(self) -> str:
         return hashlib.sha256(self.ident.encode("utf-8")).hexdigest()
 
 
-def model_ref(provider: str, model: str, *, dim: int | None = None, version: str | None = None) -> ModelRef:
+def model_ref(
+    provider: str,
+    model: str,
+    *,
+    dim: int | None = None,
+    version: str | None = None,
+    variant: str = "",
+) -> ModelRef:
     return ModelRef(
-        provider=provider, model=model, version=version or derive_version(model), dim=dim
+        provider=provider,
+        model=model,
+        version=version or derive_version(model),
+        dim=dim,
+        variant=variant,
     )
 
 
@@ -106,6 +123,11 @@ class EmbeddingProvider(Protocol):
     async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
 
     async def embed_one(self, text: str) -> list[float]: ...
+
+    async def embed_query(self, text: str) -> list[float]:
+        """**查询侧**嵌入。默认与 ``embed_one`` 相同；支持不对称编码的 provider
+        （DashScope `text_type=query`）应覆写它 —— 查询与文档用不同编码时检索更好。"""
+        return await self.embed_one(text)
 
 
 @runtime_checkable

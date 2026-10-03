@@ -150,9 +150,13 @@ class EmbedCfg(_Section):
     #: 00 §3.1 的模型标识是 ``<provider>/<model>@<version>#<dim>``，但配置文件里没有 version 键。
     #: 未显式给出时由 :func:`ekbs.provider.base.derive_version` 从 model 名推导（如 text-embedding-v4 → v4）。
     version: str | None = None
-    batch_size: int = 20
+    batch_size: int = 16
     timeout_s: int = 30
     max_retries: int = 3
+    #: 查询/文档**不对称编码**（DashScope `text_type`）：查询用 `query`、入库用 `document`。
+    #: 实测该参数生效（`document` 与默认向量余弦 0.916）。**开启会改变全部 chunk 向量** ⇒
+    #: 必须全量重灌；指纹会带上 `+asym`（见 registry），避免新旧向量混用（C3）。
+    asymmetry: bool = False
 
 
 class MultimodalEmbedCfg(_Section):
