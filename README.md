@@ -356,6 +356,8 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
 | D3 | `04` §5.3 / §7.3 | `StreamRunner` 在建立连接**之前**就 `set_connected(True)`，而 SDK 连接失败只 sleep 重试、永不抛异常 | `/readyz` 长期**谎报就绪** |
 | D4 | `04` §5.3 / §7.3 | `StreamState.reconnect_count` 没有任何自增点 | `/readyz` 与 `/health/deps` 的该指标恒为 0（假指标） |
 | D5 | `04` §10.1 | 把 `topapi/v2/user/getuserinfo` 标成「旧版兼容模式，默认关闭」——它其实是当前 H5 免登的**官方主链路** | 免登可能被误判为不可用 |
+| 87 | **换嵌入模型/编码变体时，「修复手段」与「启动自检」互相死锁**：`Runtime.create` 无条件 `shards.load_active(strict=True)`，于是分片指纹一旦与当前模型不符（换模型、换维度、开 `text_type` 不对称编码都会），**服务起不来（正确），但 `rebuild_shard` 这个唯一的修复工具也起不来（错误）** —— 实测 `python -m ekbs.tools.rebuild_shard --shard-id kb_all_L1 --dry-run` 直接抛 `EmbeddingFingerprintMismatch: kb_all_L1 嵌入指纹与当前模型不一致：登记 c0b1f49e… ≠ 当前 d2583d29…`，连 dry-run 都跑不了。 | 迁移路径被自己堵死：要修就得先起服务、要起服务就得先修（生产上表现为「换个模型整站起不来」） | `Runtime.create(..., strict_shards=False)`（**只给迁移工具**，服务进程永远严格），`rebuild_shard` 用它；用例 `test_migration_tool_can_start_despite_fingerprint_mismatch` 钉住「严格抛异常 / 非严格能起」两端。顺带确认守卫有效：切换后 `/readyz` 的 `embed_fingerprint_match=false`、服务拒绝启动 —— 这是**对的**，绝不静默混用新旧向量 |
+| 88 | **两个「静默出错」的小陷阱（都在这一轮踩到）**。① `DashScopeEmbeddingProvider.embed()` 收到**裸字符串**时按「一串文本」逐项迭代 → 把问题拆成**单个字**各嵌一次（又费钱又离谱）：实测查询侧误写 `embed(question)` 后下游余弦计算直接类型错。② 新工具的 `--json` 输出被 structlog **默认打到 stdout** 污染（正式配置是打到 stderr）→ 管道里 `json.loads` 报 `Extra data: line 1 column 5`，根因是工具没调 `configure_logging`。 | 都会让自动化/评测拿到**错数据却不报错**（①花冤枉钱，②解析失败或读到脏数据） | ① `embed()` 遇到 `str` 直接 `TypeError` 并提示改用 `embed_one()/embed_query()`（用例钉住）；② 工具统一 `configure_logging(settings, "tools")`，并在 docstring 写明 `--json` 的 stdout 只放 JSON |
 
 另有 9 条（路径/事件名/字段口径不实：`contact/v3/departments/lists` 未核实到、
 事件名应为 `org_dept_create/modify/remove`、`isInAtList==false` 也能收群消息无依据、
