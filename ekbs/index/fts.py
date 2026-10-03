@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Sequence
 
 from ekbs.db import Database
@@ -20,11 +22,73 @@ from ekbs.logging import get_logger
 
 log = get_logger(component="fts")
 
+#: **用户词典**（部署物，不是源码）：把语料里的编号/术语加成整词。
+#: 实测动机：`XJWY-GC-01-01` 被切成 `['xjwy','-','gc','-','01','-','01']`（7 个碎片）、
+#: `XJ-01-11-1F02` 同样 7 片 —— 碎片进倒排索引等于精确匹配失效。
+#: 候选用 `ekbs.tools.build_userdict` 挖（含噪声过滤 + 人工评审），再由 `ekbs.tools.rebuild_fts`
+#: 重建 `content_tok`（**只重建 FTS，不动向量**）。
+_USERDICT_ENV = "EKBS_USERDICT_PATH"
+_USERDICT_STATE: str | None = None
+
+
+def userdict_path() -> Path | None:
+    """用户词典路径：环境变量 → ``<repo>/var/dict/userdict.txt`` → ``~/.ekbs/userdict.txt``。"""
+    explicit = os.environ.get(_USERDICT_ENV)
+    candidates = (
+        [Path(explicit)]
+        if explicit
+        else [
+            Path(__file__).resolve().parents[2] / "var/dict/userdict.txt",
+            Path.home() / ".ekbs" / "userdict.txt",
+        ]
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def ensure_userdict(*, force: bool = False) -> str:
+    """惰性加载 jieba 用户词典，返回状态串（供 ``/health/deps.fts_userdict`` 与日志）。
+
+    词典是**可选增强**：缺失或格式坏掉都**不能拖垮检索链路**（与 Qwen 词表同样的取舍），
+    但状态必须能看见 —— 否则"以为加了词典、其实没生效"。
+    """
+    global _USERDICT_STATE
+    if _USERDICT_STATE is not None and not force:
+        return _USERDICT_STATE
+    path = userdict_path()
+    if path is None:
+        _USERDICT_STATE = "none"
+        return _USERDICT_STATE
+    try:
+        import jieba
+
+        words = sum(
+            1
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        jieba.load_userdict(str(path))
+        _USERDICT_STATE = f"{path} ({words} 词)"
+        log.info("fts_userdict_loaded", path=str(path), words=words)
+    except Exception as exc:  # noqa: BLE001
+        _USERDICT_STATE = f"error:{exc}"
+        log.warning("fts_userdict_failed", path=str(path), error=str(exc))
+    return _USERDICT_STATE
+
+
+def reset_userdict_state() -> None:
+    """清掉"已加载"标记（测试用；注意 jieba 全局词典本身无法卸载）。"""
+    global _USERDICT_STATE
+    _USERDICT_STATE = None
+
 
 def tokenize(text: str) -> list[str]:
     """jieba 分词（写入与查询两侧共用，口径必须一致）。"""
     import jieba
 
+    ensure_userdict()
     return [token.strip().lower() for token in jieba.lcut(text or "") if token.strip()]
 
 

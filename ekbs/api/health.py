@@ -25,6 +25,8 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from ekbs.index.fts import ensure_userdict as _ensure_userdict
+
 from ekbs.ingest.chunker import active_token_counter
 from ekbs.logging import get_logger
 
@@ -110,6 +112,9 @@ async def health_deps(request: Request) -> JSONResponse:
         # 期望是 `qwen:<path>`；若是 `tiktoken:cl100k_base` 说明词表没就位，
         # 尺寸判定/质量指标会偏（实测 -35%），这里显式暴露以免"悄悄降级"。
         "token_counter": active_token_counter(),
+        # FTS 预分词用的 jieba 用户词典（编号/术语加成整词）：缺失时显示 none，
+        # 避免"以为加了词典、其实没生效"
+        "fts_userdict": fts_userdict_status(),
         # 校准状态：系数与样本数（`02` TC-INDEX-004）。factor 缺失 = 还没校准过或换了模型，
         # 此时 token 指标只是"本地估算"，别当成云端当量。
         "token_calibration": _token_calibration(runtime),
@@ -187,3 +192,11 @@ async def _probe_adapter(runtime: Any) -> bool:
         return str(response.json().get("status")) == "ready"
     except Exception:
         return False
+
+
+def fts_userdict_status() -> str:
+    """jieba 用户词典状态（路径 + 词条数；缺失为 ``none``）。"""
+    try:
+        return _ensure_userdict()
+    except Exception as exc:  # noqa: BLE001
+        return f"error:{exc}"
