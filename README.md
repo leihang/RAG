@@ -422,6 +422,13 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
    顺带修掉两处跨层不一致：**扩展名白名单两张皮**、**「可检索」口径散落 8 处**（后者会让重建分片悄悄丢代码/图片向量）。
    **仍需你定**：`代码文件/` 目录（142MB `.pptx`、`.doc`、317 页中芯国际研报 PDF）是否纳入代码知识库；
    合规闸仍是 `corpus_egress_ack=false`，真实语料仍不能入库。
+9. **私有远端 + 托管 CI（待办，2026-10-24 记录）**：仓库当前没有 `git remote` —— 代码与全部提交历史
+   只有本机一份，这是比"没有 CI"更大的单点风险。建议顺序：
+   ① 先加一个**私有远端**（GitHub private / GitLab / 自建 bare repo / NAS），哪怕只为备份；
+   ② 之后再加一个 CI job 跑 `bash scripts/ci.sh`（与本地 CI、`acceptance.sh` 第 4 步同口径；
+      ubuntu runner 即可，`deploy/` 下的 macOS 专属脚本不进 CI）。
+   当前本机门禁已生效：pre-commit（commit=ruff+卫生，pre-push=全量 pytest）、`scripts/ci.sh`、
+   `scripts/acceptance.sh`（第 4 步即本地 CI 门禁）。
 
 ---
 
