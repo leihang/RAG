@@ -43,6 +43,10 @@ deploy/config/node.env.example
 # ---- 一次性的交付报表与 Excel 临时文件 ----
 # 维护/交接文档（独立交付物，不入代码库；要在仓库里保留就删掉这两行）
 RAG维护文档/
+# ---- 三份独立交付物（不入代码库，本地保留）----
+EKBS方案评估报告-*.md
+RAG企业知识库使用说明.docx
+正式方案-v4/
 
 # 管理台前端（ekbs-admin-web）：依赖与构建产物都不入库
 ekbs-admin-web/node_modules/
