@@ -177,4 +177,3 @@ def test_config_whitelist_entries_are_all_known_gaps_or_implemented() -> None:
         "配置里出现了新的『允许但未实现』格式："
         f"{sorted(configured - parseable)}（补解析分支或改本用例的已知清单）"
     )
-

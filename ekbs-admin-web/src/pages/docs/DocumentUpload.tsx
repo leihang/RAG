@@ -6,6 +6,7 @@
  * - 分片大小 / 并发 / 重试：取自 `/import/meta` 的 `upload.*`
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ColumnsType } from 'antd/es/table'
 import {
   Alert, Button, Card, Form, Input, Modal, Progress, Select, Space, Table, Tag, TreeSelect, Typography, message,
 } from 'antd'
@@ -49,6 +50,18 @@ type DestFolder = {
 }
 const FALLBACK_EXT = ['pdf', 'docx', 'doc', 'pptx', 'xlsx', 'xls', 'txt', 'md', 'png', 'jpg', 'jpeg']
 
+/** 管理知识库表格的行（与 `kbs` state 同型；抽出来给 columns 用，避免 render 参数写窄了）。 */
+type KbRow = {
+  kb_id: number
+  code: string
+  name: string
+  default_level?: number
+  document_count?: number
+  owner_user_id?: number | null
+  owner_nick?: string | null
+  owner_dingtalk_userid?: string | null
+}
+
 type TaskStatus = 'pending' | 'waiting' | 'hashing' | 'uploading' | 'success' | 'instant' | 'failed'
 
 interface UploadTask {
@@ -81,9 +94,7 @@ export default function DocumentUpload() {
   const [tasks, setTasks] = useState<UploadTask[]>([])
   const [running, setRunning] = useState(false)
   const [allowed, setAllowed] = useState<string[]>(FALLBACK_EXT)
-  const [kbs, setKbs] = useState<
-    { kb_id: number; code: string; name: string; default_level?: number; document_count?: number; owner_user_id?: number | null; owner_nick?: string | null; owner_dingtalk_userid?: string | null }[]
-  >([])
+  const [kbs, setKbs] = useState<KbRow[]>([])
   const [foldersByKb, setFoldersByKb] = useState<Record<number, DestFolder[]>>({})
   // 「加载中」与「加载完了但一个库都没有」必须分开：清库之后列表为空是**合法状态**，
   // 早期用 `loading={!kbs.length}` 会让首次启动永远转圈，看不到「去新建」的提示。
@@ -704,10 +715,10 @@ export default function DocumentUpload() {
           size="small"
           pagination={false}
           dataSource={kbs}
-          columns={[
+          columns={([
             {
               title: '名称', dataIndex: 'name', width: 220,
-              render: (v: string, r: { kb_id: number; name: string }) => (
+              render: (v: string, r: KbRow) => (
                 <Typography.Text
                   editable={{
                     onChange: (next: string) => {
@@ -738,7 +749,7 @@ export default function DocumentUpload() {
             { title: '默认密级', dataIndex: 'default_level', width: 90, render: (v: number) => `L${v}` },
             {
               title: '操作', width: 80,
-              render: (_: unknown, r: { kb_id: number; name: string }) => (
+              render: (_: unknown, r: KbRow) => (
                 <a
                   style={{ color: '#ff4d4f' }}
                   onClick={() => {
@@ -755,7 +766,7 @@ export default function DocumentUpload() {
                 </a>
               ),
             },
-          ]}
+          ] as ColumnsType<KbRow>)}
         />
       </Modal>
 

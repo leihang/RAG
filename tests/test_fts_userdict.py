@@ -65,7 +65,7 @@ def test_fragmentation_without_userdict_in_a_fresh_process() -> None:
 
     code = (
         "import sys; sys.path.insert(0, r'%s');"
-        "from ekbs.index.fts import tokenize;" 
+        "from ekbs.index.fts import tokenize;"
         "print(len(tokenize('XJWY-GC-01-01')))"
     ) % str(pathlib.Path(__file__).resolve().parents[1])
     env = {**__import__("os").environ, "EKBS_USERDICT_PATH": "/nonexistent/userdict.txt"}

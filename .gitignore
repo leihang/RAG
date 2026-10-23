@@ -52,6 +52,7 @@ RAG企业知识库使用说明.docx
 ekbs-admin-web/node_modules/
 ekbs-admin-web/dist/
 ekbs-admin-web/.vite/
+ekbs-admin-web/*.tsbuildinfo
 
 # 根目录误装的前端依赖
 node_modules/

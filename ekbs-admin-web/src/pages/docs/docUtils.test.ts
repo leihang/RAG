@@ -295,4 +295,3 @@ describe('批量结果归一化（后端真实报文）', () => {
     expect(normalizeBatchResult(undefined)).toEqual({ succeeded: 0, failed: [] })
   })
 })
-

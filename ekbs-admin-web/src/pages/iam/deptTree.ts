@@ -162,7 +162,7 @@ export function buildUserOrgTree(
     let current: DeptNode | undefined = dept
     while (current) {
       keep.add(current.dept_id)
-      const parentId = current.parent_dept_id
+      const parentId: number | null | undefined = current.parent_dept_id
       current = parentId != null ? byId.get(parentId) : undefined
     }
   }

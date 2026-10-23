@@ -67,6 +67,9 @@ cd ekbs-admin-web && npm install && npm run build && cd ..
 
 # 上线接收检查（一次命令出 READY / NOT-READY 结论）
 bash scripts/acceptance.sh
+
+# 本地 CI 门禁（ruff + pytest + 前端 typecheck/vitest/build，与远端 CI 同口径）
+bash scripts/ci.sh
 ```
 
 ---
@@ -155,6 +158,8 @@ MinerU 进程内存峰值很高（`正式方案-v4/00-架构定稿与决策台�
 - **`pyproject.toml` 打包注释**：`packages.find` 的注释解释了为什么不能只写 `packages = ["ekbs"]`
   （非 editable 安装/打包会漏 10 个子包）。
 - **`ekbs-admin-web/node_modules` 很大**：git 已忽略，不要 `git add`。
+- **pre-commit 钩子需装一次**：`.venv/bin/pre-commit install --hook-type pre-commit --hook-type pre-push`；
+  commit 只跑 ruff + 基础卫生，pre-push 才跑全量 pytest（约 85s）。
 
 ---
 
@@ -180,6 +185,7 @@ MinerU 进程内存峰值很高（`正式方案-v4/00-架构定稿与决策台�
 git diff --stat                           # 检查改动范围
 ```
 
+- 一条命令跑全量门禁：`bash scripts/ci.sh`（ruff + pytest + 前端 typecheck/vitest/build）。
 - 如果改了 `config/`，同步检查 `deploy/config/application.yaml`。
 - 如果改了检索/权限，跑 `bash scripts/dev_smoke.sh --with-qa --redline`（两条红线：无凭证问答 401、
   越权检索不泄漏；不带 `--redline` 时只跑前者）。

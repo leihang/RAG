@@ -310,4 +310,3 @@ def test_small_images_do_not_consume_ocr_budget(sample_pptx: Path, tmp_path: Pat
 
     assert len(calls) == 2, calls
     assert any(f.ocr_text for f in parsed.figures), "跳过的小图不该吃掉预算"
-
