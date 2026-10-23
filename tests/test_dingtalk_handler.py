@@ -39,7 +39,6 @@ from ekbs.dingtalk.token import TOKEN_PATH
 from ekbs.dingtalk.inbox import MessageInbox
 from ekbs.idempotency import IdempotencyGuard
 from ekbs.ratelimit import RateLimiter
-from tests.conftest import user_id_of
 
 DING_BASE = "https://api.dingtalk.com"
 API_BASE = "http://127.0.0.1:8000"
@@ -352,7 +351,7 @@ async def test_message_quota_error_is_skipped(handler) -> None:
 
 @respx.mock
 async def test_non_text_message_is_ignored(handler) -> None:
-    routes = mock_dingtalk()
+    _ = mock_dingtalk()  # 注册回环路由（本用例不校验路由计数）
     api = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
     code, _ = await handler.process(
         {"data": payload(msgtype="picture", text="")}

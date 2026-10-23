@@ -78,7 +78,7 @@ async def personal_upload(
     )
     try:
         content = base64.b64decode(payload.content_base64, validate=True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         return JSONResponse({"message": "文件内容无法读取"}, status_code=422)
     runtime = request.app.state.runtime
     try:

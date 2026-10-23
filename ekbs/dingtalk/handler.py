@@ -24,7 +24,7 @@ import base64
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 import httpx
 

@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import pytest
 
 from ekbs.ingest.doc2query import fts_doc2query_rows, generate_questions
 from ekbs.ingest.table_serialize import information_block_to_html, serialize_table_body
 from ekbs.retrieval.pipeline import RetrievalOverrides, RetrievalPipeline
-from ekbs.retrieval.rrf import alpha_fuse, rrf_fuse
+from ekbs.retrieval.rrf import alpha_fuse
 from ekbs.session import QueryRewriter
 from tests.conftest import user_id_of
 
@@ -102,9 +101,6 @@ def test_build_context_uses_html_for_tables() -> None:
 
 
 def test_multiquery_expand_variants() -> None:
-    from ekbs.config import Settings
-
-    settings = Settings()
     # bypass full settings load — patch retrieval attrs on a lightweight stub
     class _R:
         multi_query = 3

@@ -173,7 +173,6 @@ async def test_api_pii_is_masked_before_audit(client, headers, seeded) -> None:
 async def test_api_injection_degrades_to_retrieval_only(client, headers, seeded) -> None:
     """L3：疑似注入 → 仍返回可溯源资料，但**不调用 LLM**。"""
     runtime, _ = seeded
-    calls_before = len(runtime.providers.llm.calls)
     # 这个问题既命中注入特征（"扮演…管理员"），又能正常检索到年假制度 ——
     # 才验证得了「降级但不拒答」这条路径
     response = await client.post(

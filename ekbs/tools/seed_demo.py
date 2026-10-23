@@ -23,11 +23,13 @@ import asyncio
 import sys
 from typing import Any
 
-from ekbs.config import Secrets, Settings, load_settings
+from ekbs.config import Settings, load_settings
 from ekbs.db import Database
 from ekbs.ingest.pipeline import IngestPipeline
 from ekbs.logging import configure_logging, get_logger
 from ekbs.runtime import Runtime
+# 权限点与角色授权统一来自 ekbs.rbac_catalog（单一来源，避免与迁移工具漂移）
+from ekbs.rbac_catalog import BUILTIN_ROLES, PERMISSIONS as BUILTIN_PERMISSIONS, ROLE_GRANTS
 from ekbs.tools.sync_org import import_fixture
 
 log = get_logger(component="tools.seed_demo")
@@ -63,14 +65,6 @@ DEMO_USERS = [
         "dept_ids": ["1"], "primary_dept_id": "1", "title": "平台管理员",
     },
 ]
-
-BUILTIN_ROLES = [
-    ("super_admin", "超级管理员"), ("kb_admin", "知识库管理员"), ("doc_reviewer", "文档审核员"),
-    ("auditor", "审计员"), ("end_user", "普通用户"),
-]
-
-# 权限点与角色授权统一来自 ekbs.rbac_catalog（单一来源，避免与迁移工具漂移）
-from ekbs.rbac_catalog import BUILTIN_ROLES, PERMISSIONS as BUILTIN_PERMISSIONS, ROLE_GRANTS
 
 DEMO_DOCS: list[dict[str, Any]] = [
     {

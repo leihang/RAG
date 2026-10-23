@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -26,7 +25,6 @@ from ekbs.api.auth import (
 )
 from ekbs.api.qa import _authenticate
 from ekbs.logging import get_logger
-from ekbs.permission.acl import DocumentFacts
 
 router = APIRouter(tags=["assets"])
 log = get_logger(component="api.assets")

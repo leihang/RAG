@@ -232,7 +232,6 @@ async def test_acl_grant_and_revoke_take_effect(client, kb_admin) -> None:
     elevated = (await client.get("/api/v1/perm/me", headers=headers_for(alice))).json()
     assert "kb_finance_L3" in elevated["visible_shards"]
 
-    acl_id = created.json()["object_id"] and created.json().get("object_id")
     listing = (await client.get("/api/v1/perm/acl?object_id=kb_finance_L3", headers=headers)).json()
     entry = next(item for item in listing["items"] if item["object_id"] == "kb_finance_L3")
     revoked = await client.delete(f"/api/v1/perm/acl/{entry['acl_id']}", headers=headers)

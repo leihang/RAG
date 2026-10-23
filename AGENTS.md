@@ -47,6 +47,9 @@
 # 单个测试文件
 .venv/bin/python -m pytest tests/test_retrieval.py -q
 
+# 静态检查（ruff；配置在 pyproject.toml，先只开 E4/E7/E9/F）
+.venv/bin/ruff check .
+
 # 起四服务（开发机）
 export EKBS_CONFIG=config/application.dev.yaml
 bash scripts/dev_services.sh start all
@@ -173,6 +176,7 @@ MinerU 进程内存峰值很高（`正式方案-v4/00-架构定稿与决策台�
 
 ```bash
 .venv/bin/python -m pytest tests/ -q      # 必须全绿
+.venv/bin/ruff check .                    # 静态检查（E4/E7/E9/F）
 git diff --stat                           # 检查改动范围
 ```
 

@@ -361,7 +361,6 @@ async def test_upload_without_kb_is_rejected_with_actionable_message(seeded) -> 
     而错误文案又被状态码兜底盖住，看不出真正原因。
     接口这层的契约要守住：**原因必须是一句能指导操作的话**。
     """
-    from ekbs.api.app import create_app
 
     runtime, app, client, headers = await _upload_client(seeded)
     async with app.router.lifespan_context(app):
@@ -391,7 +390,6 @@ async def test_upload_preserves_folder_structure(seeded) -> None:
     用户反馈「上传文件夹时文件夹被分离了，只上传文件」——因为后端原来用
     `Path(filename).stem` 当标题、落盘只用 basename，整段目录都被丢掉。
     """
-    from ekbs.api.app import create_app
 
     runtime, app, client, headers = await _upload_client(seeded)
     async with app.router.lifespan_context(app):
@@ -453,7 +451,6 @@ async def test_failed_upload_leaves_no_orphan_file(seeded) -> None:
     """
     from pathlib import Path
 
-    from ekbs.api.app import create_app
     from ekbs.ingest.parser import normalize_suffix
 
     runtime, app, client, headers = await _upload_client(seeded)
@@ -493,7 +490,6 @@ async def test_upload_hash_is_streamed_not_whole_file(seeded, monkeypatch) -> No
     """
     from pathlib import Path
 
-    from ekbs.api.app import create_app
 
     runtime, app, client, headers = await _upload_client(seeded)
 
@@ -531,7 +527,6 @@ async def test_upload_rejects_l2_without_dept_up_front(seeded) -> None:
     「L2 文档未指定 visible_dept_ids」只出现在 worker 日志里。
     上传成功与入库成功是两件事，界面上必须能区分。
     """
-    from ekbs.api.app import create_app
 
     runtime, app, client, headers = await _upload_client(seeded)
     # 显式关闭 L4 闸，不依赖配置文件默认值（2026-10-09 测试期配置已全开）
@@ -674,7 +669,6 @@ async def test_upload_lands_under_kb_code_not_sha_dir(seeded) -> None:
     """
     from pathlib import Path
 
-    from ekbs.api.app import create_app
 
     runtime, app, client, headers = await _upload_client(seeded)
     body = b"kb-layout-check"
@@ -736,7 +730,6 @@ async def test_chunk_size_hint_comes_from_config(seeded) -> None:
     原先写死 `5 * 1024 * 1024`：配置里没有 `upload` 段、方案要的是 8 MB，
     界面拿到的提示与实际配置对不上（"改了配置没生效"这类问题的典型来源）。
     """
-    from ekbs.api.app import create_app
 
     runtime, app, client, headers = await _upload_client(seeded)
     expected = int(runtime.settings.upload.chunk_size_mb) * 1024 * 1024

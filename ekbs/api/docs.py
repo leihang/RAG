@@ -317,7 +317,7 @@ async def publish_document(
         "doc:document:publish",
     )
     runtime = _runtime(request)
-    doc = _load_document(runtime, doc_id)
+    _load_document(runtime, doc_id)
     with runtime.db.sync_connect() as conn:
         chunks = int(
             conn.execute(

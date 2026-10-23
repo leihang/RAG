@@ -108,7 +108,6 @@ UI_TEXT_MAP: dict[str, str] = {
     "Request body": "请求体",
     "Responses": "响应",
     "Response body": "响应体",
-    "Responses": "响应",
     "Code": "状态码",
     "Details": "详情",
     "Description": "说明",

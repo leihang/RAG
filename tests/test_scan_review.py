@@ -63,10 +63,11 @@ def test_prepare_scan_draft_writes_files(tmp_path: Path) -> None:
 
 
 def test_prepare_and_upgrade_merge_continued_tables(tmp_path: Path) -> None:
-    html = (
-        lambda city: f"<table><tr><td>城市</td><td>标准</td></tr>"
-        f"<tr><td>{city}</td><td>500</td></tr></table>"
-    )
+    def html(city: str) -> str:
+        return (
+            f"<table><tr><td>城市</td><td>标准</td></tr>"
+            f"<tr><td>{city}</td><td>500</td></tr></table>"
+        )
     rel, stats = prepare_scan_draft(
         data_dir=tmp_path,
         doc_id=7,

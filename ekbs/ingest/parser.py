@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path, PurePath
@@ -73,7 +74,7 @@ def parse_markdown(text: str, *, engine: str = "text") -> ParsedDocument:
     return ParsedDocument(markdown=text, engine=engine)
 
 
-from ekbs.ingest.code_chunker import CODE_SUFFIXES as _CODE_SUFFIXES
+from ekbs.ingest.code_chunker import CODE_SUFFIXES as _CODE_SUFFIXES  # noqa: E402 —— 延迟导入：parser 被 chunker 等模块反引，放顶层会拉起重依赖
 
 #: 扩展名 → 解析引擎。**这是"解析器真正支持的格式"的唯一权威**。
 #:

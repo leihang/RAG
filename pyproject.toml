@@ -25,3 +25,15 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+# 目标版本与 .venv 保持一致（Python 3.11，见 requirements.txt 头部说明）
+target-version = "py311"
+line-length = 120
+# 只查 Python；文档里的示例代码块按"示意"处理，不当可运行代码要求
+extend-exclude = ["*.md", "var", "var-cloud"]
+
+[tool.ruff.lint]
+# 先只开「零争议」规则：语法错误 / 未定义名 / 未使用 import·变量 / 重复定义。
+# E501（行宽）、UP、B、SIM 等存量较多，清理完再逐批放开，避免一次性全仓格式化。
+select = ["E4", "E7", "E9", "F"]

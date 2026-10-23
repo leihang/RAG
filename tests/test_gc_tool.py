@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pytest
 
-from ekbs.db import Database
 from ekbs.tools.gc import purge, scan
 
 

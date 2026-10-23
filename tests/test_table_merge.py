@@ -110,9 +110,10 @@ def test_skip_merge_when_too_long() -> None:
 
 
 def test_chain_merge_three_pages() -> None:
-    rows = lambda start: _html(
-        [["姓名", "金额"]] + [[f"人{i}", str(i * 10)] for i in range(start, start + 2)]
-    )
+    def rows(start: int) -> str:
+        return _html(
+            [["姓名", "金额"]] + [[f"人{i}", str(i * 10)] for i in range(start, start + 2)]
+        )
     tables = [
         TableInput(body=rows(0), caption="名册", page=1, table_id="1"),
         TableInput(body=rows(2), caption="", page=2, table_id="2"),

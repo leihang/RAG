@@ -26,6 +26,7 @@ __all__ = [
     "RetrievalPipeline",
     "RetrievalResult",
     "RetrievedChunk",
+    "alpha_fuse",
     "ranks_of",
     "rrf_fuse",
 ]

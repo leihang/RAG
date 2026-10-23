@@ -192,6 +192,8 @@ def create_adapter_app(settings: Settings, secrets: Secrets) -> FastAPI:
             task = asyncio.create_task(
                 create_stream_task(_app, settings, secrets, state)()
             )
+            # 显式持有引用：asyncio 只弱引用任务，局部变量出栈后可能被 GC 提前回收
+            _app.state.stream_task = task
             state.mark_started()
             log.info("stream_task_launched", note="连接状态以收到首个回调为准（不谎报就绪）")
         yield

@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 

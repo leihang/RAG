@@ -39,14 +39,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from ekbs.config import Secrets, Settings, load_settings
+from ekbs.config import Settings, load_settings
 from ekbs.errors import ConfigError, EkbsError
 from ekbs.index.shard import parse_shard_id, resolve_shard_for_document
 from ekbs.ingest.chunker import FigureInput, TableInput

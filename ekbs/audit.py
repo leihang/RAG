@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import uuid
 from dataclasses import dataclass
-from typing import Sequence
 
 from ekbs.db import Database
 from ekbs.logging import get_logger

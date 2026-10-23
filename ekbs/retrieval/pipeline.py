@@ -36,12 +36,11 @@ from ekbs.ingest.chunker import count_tokens, retrieval_text
 from ekbs.logging import get_logger
 from ekbs.permission.acl import DocumentGate
 from ekbs.permission.context import PermContext
-from ekbs.provider.base import LLMProvider, RerankDoc
+from ekbs.provider.base import RerankDoc
 from ekbs.provider.registry import Providers
 from ekbs.retrieval.faithfulness import (
     DEGRADED_UNSUPPORTED,
     REFUSE_MISSING_CITATION,
-    REFUSE_UNSUPPORTED_CLAIM,
     assess_faithfulness,
     clause_mismatches,
     mostly_unsupported,
@@ -695,7 +694,6 @@ class RetrievalPipeline:
             )
             return result
 
-        rerank_cfg = self.settings.retrieval.rerank
         rerank_enabled = bool(params["rerank_enabled"]) and self.providers.rerank is not None
         shortlist = [chunk_id for chunk_id, _ in fused[: params["rerank_top_n"]]]
         result.candidate_count = len(shortlist)

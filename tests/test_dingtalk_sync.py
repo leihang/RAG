@@ -24,7 +24,6 @@ from ekbs.dingtalk.org_events import PERSONNEL_EVENTS, event_type_of, user_ids_o
 from ekbs.dingtalk.sync import OrgSyncService, build_sync_service
 from ekbs.errors import ConfigError, ModelUnavailable
 from ekbs.observability import metrics as m
-from tests.conftest import user_id_of
 
 LEGACY = "https://oapi.dingtalk.com"
 NEW = "https://api.dingtalk.com"

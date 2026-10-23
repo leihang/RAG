@@ -122,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(rerank_cfg, "enabled", False) and getattr(rerank_cfg, "model", ""):
         targets.append(
             (f"重排 {rerank_cfg.model}",
-             f"https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+             "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
              {"model": rerank_cfg.model,
               "input": {"query": "自检", "documents": ["甲", "乙"]},
               "parameters": {"top_n": 1}})

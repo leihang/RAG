@@ -315,9 +315,9 @@ def from_records(*, min_samples: int) -> int:
         f"\n  已写入 {written}（绑定指纹，换模型自动失效）"
     )
     print(
-        f"  复核方式：校准后偏差应≈0%（系数就是按它算的）；真正要看的是"
-        f"\n    python -m ekbs.tools.token_calibration --source files --segments 200"
-        f"  ← 用**独立样本**验证校准是否泛化"
+        "  复核方式：校准后偏差应≈0%（系数就是按它算的）；真正要看的是"
+        "\n    python -m ekbs.tools.token_calibration --source files --segments 200"
+        "  ← 用**独立样本**验证校准是否泛化"
     )
     return 0
 

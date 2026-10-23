@@ -25,7 +25,6 @@ import argparse
 import asyncio
 import sys
 import time
-from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger

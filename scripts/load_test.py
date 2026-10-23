@@ -349,7 +349,7 @@ def main() -> int:
 
     users = provision_users(args.concurrency, args.config)
     total_planned = args.concurrency * args.rounds if not args.duration else None
-    print(f"== 压测 ==")
+    print("== 压测 ==")
     print(f"  模式={args.mode}  并发={args.concurrency}  用户={len(users)}  "
           f"{'轮数=' + str(args.rounds) + f'（共 {total_planned} 请求）' if total_planned else f'时长={args.duration}s'}")
     print(f"  API pid={api_pid}  基线采样中…")

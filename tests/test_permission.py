@@ -160,7 +160,6 @@ async def test_c5_deny_entry_beats_department_match(seeded) -> None:
 
 async def test_c5_allows_cross_department_via_shard_acl(seeded) -> None:
     """K6 修正：跨部门文档在 06 §2.2 是靠 shard 级 allow 授权的，闸门必须认这条路径。"""
-    from ekbs.permission.acl import AclEntry
 
     runtime, _ = seeded
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))

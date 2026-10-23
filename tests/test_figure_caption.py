@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
 
 from ekbs.ingest.figure_caption import (
     CAPTION_CACHE_VERSION,

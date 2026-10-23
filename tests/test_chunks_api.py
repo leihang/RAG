@@ -103,8 +103,6 @@ async def test_permissions_by_role(client, seeded) -> None:
 
 
 async def test_tree_and_detail(client, admin) -> None:
-    runtime, (rt, user_id) = admin, admin
-    runtime, _ = admin[0], None
     runtime, user_id = admin
     headers = headers_for(user_id)
     with runtime.db.sync_connect() as conn:
@@ -257,7 +255,6 @@ async def test_merge_with_next_sibling(client, admin, seeded) -> None:
     body = "本条规定了具体事项。" * 200  # 足够长 → 一个父块下切出多个子块
     from ekbs.ingest.pipeline import IngestPipeline
 
-    summary = None
     with runtime.db.sync_connect() as conn:
         kb_id = int(conn.execute("SELECT kb_id FROM ekbs_kb LIMIT 1").fetchone()["kb_id"])
     pipeline = IngestPipeline(

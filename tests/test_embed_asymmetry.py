@@ -116,7 +116,6 @@ def test_migration_tool_can_start_despite_fingerprint_mismatch(settings) -> None
     于是服务起不来、`rebuild_shard` 也起不来（连 `--dry-run` 都不行）。
     修法：`Runtime.create(strict_shards=False)` **只给迁移工具**用；服务永远严格。
     """
-    import pytest
 
     from ekbs.db import Database
     from ekbs.errors import EmbeddingFingerprintMismatch
@@ -150,7 +149,6 @@ def test_bare_string_is_rejected_instead_of_embedded_per_character() -> None:
     实测踩到过：查询侧误写 `embed(question)`，云端收到的是把问题拆成单字的一批文本，
     返回一堆向量，下游余弦计算直接类型错。
     """
-    import pytest
 
     with pytest.raises(TypeError, match="文本列表"):
         asyncio.run(_provider(asymmetric=False).embed("交接班制度"))  # type: ignore[arg-type]

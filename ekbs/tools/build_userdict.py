@@ -221,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     lines = [
-        f"# jieba 用户词典候选（自动生成，**需人工过一遍**）",
+        "# jieba 用户词典候选（自动生成，**需人工过一遍**）",
         f"# 来源: {'+'.join(sources)}　语料字符数: {characters}　生成条目: {len(rows)}",
         "# 格式（正式词典 var/dict/userdict.txt）：每行 `词 词频 [词性]`，UTF-8，`#` 开头为注释",
         "# ⚠️ 加错词（跨词边界的串）会**降低**检索质量，所以不能自动上线",

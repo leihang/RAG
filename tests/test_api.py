@@ -15,7 +15,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from ekbs.api.app import create_app
-from tests.conftest import TEST_INTERNAL_TOKEN, make_client, user_id_of
+from tests.conftest import TEST_INTERNAL_TOKEN, user_id_of
 
 
 @pytest.fixture

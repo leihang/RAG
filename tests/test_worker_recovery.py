@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from ekbs.worker import requeue_orphans
 
