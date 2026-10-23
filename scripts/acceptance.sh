@@ -39,7 +39,7 @@ for arg in "$@"; do
   case "$arg" in
     --quick)    QUICK=1 ;;
     --json)     JSON=1 ;;
-    --no-tests) NO_TESTS=1 ;;   # 供脚本自身的用例使用（避免 pytest 里嵌套跑 pytest）
+    --no-tests) NO_TESTS=1 ;;   # 供脚本自身的用例使用（避免 pytest 里嵌套跑 pytest/本地 CI）
     *) echo "未知参数：$arg"; exit 2 ;;
   esac
 done
@@ -117,23 +117,19 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-stage "4. 契约测试（离线用例，不出网）"
+stage "4. 本地 CI 门禁（ruff + 契约测试 + 前端，脚本：scripts/ci.sh）"
 if [ "$NO_TESTS" = 1 ]; then
-  s "--no-tests：跳过契约测试"
+  s "--no-tests：跳过本地 CI 门禁"
 elif [ -x "$PY" ]; then
-  # 两个坑都踩过，注释留在这里免得重犯：
-  #   ① 不要用 `| tail -N` 取汇总行 —— 缓冲交错时汇总行可能不在最后几行；
-  #   ② **不要再传 `-q`**：pyproject 的 addopts 里已有 `-q`，再传一次就是 `-qq`，
-  #      而 pytest 在双 quiet 下**会抑制汇总行**（表现为"明明全绿却读不到 passed"）。
-  test_out="$("$PY" -m pytest tests/ 2>&1)"
-  summary="$(printf '%s\n' "$test_out" | grep -oE '[0-9]+ (passed|failed|error)[^\n]*' | tail -1)"
-  if printf '%s' "$summary" | grep -qE '^[0-9]+ passed'; then
-    p "pytest 全绿：${summary}"
+  # 单一口径：静态检查/契约测试/前端与 scripts/ci.sh 完全一致，
+  # 避免「acceptance 过了但 ci.sh 挂了」这种两套标准。
+  if bash "$ROOT/scripts/ci.sh"; then
+    p "本地 CI 全绿（ruff + pytest + 前端 typecheck/vitest/build）"
   else
-    f "pytest 未全绿：${summary:-无汇总输出}"
+    f "本地 CI 未通过（见上方 ci.sh 的 FAIL 项）"
   fi
 else
-  s "无 python，跳过契约测试"
+  s "无 python，跳过本地 CI 门禁"
 fi
 
 # ---------------------------------------------------------------------------
