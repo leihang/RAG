@@ -65,6 +65,7 @@ export function parseTaskId(row: ParseTaskRow | null | undefined): number | null
 export const PARSE_STATUSES = [
   'pending',
   'parsing',
+  'review',
   'indexing',
   'published',
   'failed',
@@ -74,6 +75,7 @@ export const PARSE_STATUSES = [
 export const STATUS_LABEL: Record<string, string> = {
   pending: '待解析',
   parsing: '解析中',
+  review: '待复核',
   indexing: '索引中',
   published: '已发布',
   failed: '失败',
@@ -115,6 +117,10 @@ const RETRY_BLOCKED = new Set(['parsing', 'indexing', 'published'])
 export function canRetryTask(status?: string | null): boolean {
   const s = String(status ?? '')
   return s !== '' && !RETRY_BLOCKED.has(s)
+}
+
+export function canReviewTask(status?: string | null): boolean {
+  return String(status ?? '') === 'review'
 }
 
 export function retryBlockedReason(status?: string | null): string {

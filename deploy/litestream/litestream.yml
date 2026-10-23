@@ -1,0 +1,44 @@
+# =============================================================================
+# Litestream 连续归档配置 —— 00 v4.0 D15 / 08 §2（3-2-1 灾备）
+# -----------------------------------------------------------------------------
+# 作用：把 SQLite 的 WAL 帧**连续**归档到副本端 —— DB 层 RPO 从「日备 24h」
+#       压缩到「趋近 0」（00 v4.0 §4 的「SQLite ≤1min」即由本机制承担）。
+#
+# 安装：brew install litestream
+# 位置：/opt/ekbs/etc/litestream.yml（install.sh 拷贝；权限 600，含副本端凭据时不入 git）
+# 服务：deploy/litestream/com.ekbs.litestream.plist（launchd 常驻，KeepAlive）
+# 验证：deploy/scripts/restore_litestream.sh（每季度恢复演练 M15 必跑）
+#
+# 注意：litestream 只管 ekbs.db；FAISS 分片与 raw/parse 文件由
+#       backup.sh（日备）+ rsync 镜像（15min 周期）承担，三者合起来才是完整 3-2-1。
+# =============================================================================
+
+dbs:
+  - path: /data/ekbs/index/ekbs.db
+
+    # 可回滚窗口：7 天（对齐 backup.sh 日备留存；更长窗口靠日备/周备层）
+    retention: 168h
+    # 快照间隔（默认 24h）：快照+WAL 链即任意时间点恢复
+    snapshot-interval: 24h
+
+    replicas:
+      # ① 本机第二目录 —— 最快恢复来源（防误删/误写，**不防**磁盘故障）
+      - type: file
+        path: /data/ekbs/litestream/ekbs.db
+
+      # ② NAS（同楼异电，3-2-1 的第二跳）——先把 NAS 挂载到 /Volumes/ekbs-nas 再取消注释
+      # - type: file
+      #   path: /Volumes/ekbs-nas/litestream/ekbs.db
+
+      # ③ 异地对象存储（3-2-1 的第三跳；S3 兼容，凭据经环境变量注入，禁止明文写入本文件）
+      #    需要的环境变量（放 ~/.ekbs/secrets.env，随 launchd 注入）：
+      #      LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY
+      #      LITESTREAM_S3_ENDPOINT / LITESTREAM_S3_REGION
+      # - type: s3
+      #   bucket: ekbs-dr
+      #   path: litestream/ekbs.db
+      #   endpoint: ${LITESTREAM_S3_ENDPOINT}
+      #   region: ${LITESTREAM_S3_REGION}
+
+# 监控钩子（可选）：归档落后即说明第二跳断流 —— 应告警（接入 ekbs 告警后可取消注释）
+# addr: ":9090"

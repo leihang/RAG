@@ -203,10 +203,13 @@ def test_config_satisfies_preflight_hard_assertions() -> None:
     assert settings.server.host == "127.0.0.1"
     assert settings.adapter.host == "127.0.0.1"
     assert settings.server.workers == 1
-    # WARN 级：首期 L4 不入库、C5 未验收前 L3 不入库、合规闸未开
-    assert settings.permission.l4_enabled is False
-    assert settings.permission.l3_ingest_enabled is False
-    assert settings.permission.corpus_egress_ack is False
+    # WARN 级（preflight 只提示不阻断）：三个闸门当前处于**测试期全开**状态 ——
+    # 2026-10-09 用户确认「全部打开，因为要测试」（合规书暂缓补）。
+    # 闸门开合属部署决策，本条只断言「可解析且为布尔」；
+    # 具体值的回归看 deploy 配置与 00 §7 的合规口径。
+    assert isinstance(settings.permission.l4_enabled, bool)
+    assert isinstance(settings.permission.l3_ingest_enabled, bool)
+    assert isinstance(settings.permission.corpus_egress_ack, bool)
 
 
 def test_smoke_probed_routes_are_registered() -> None:
@@ -228,7 +231,7 @@ def test_smoke_probed_routes_are_registered() -> None:
 
 
 def test_schema_path_matches_install_and_smoke_expectations() -> None:
-    """`install.sh` 从 `$APP_DIR/sql/001_init.sql` 建库；smoke 期望 29 张表。"""
+    """`install.sh` 从 `$APP_DIR/sql/001_init.sql` 建库；smoke 期望 32 张表。"""
     from ekbs.db import EXPECTED_TABLES, EXPECTED_TRIGGERS
     from tests.conftest import DEV_CONFIG
     from ekbs.config import load_settings
@@ -236,7 +239,7 @@ def test_schema_path_matches_install_and_smoke_expectations() -> None:
     settings = load_settings(DEV_CONFIG)
     assert settings.schema_sql_path == REPO / "sql" / "001_init.sql"
     assert settings.schema_sql_path.is_file()
-    assert EXPECTED_TABLES == 29
+    assert EXPECTED_TABLES == 32
     assert EXPECTED_TRIGGERS == 12
 
     deploy_copy = REPO / "deploy" / "sql" / "001_init.sql"
@@ -435,3 +438,13 @@ def test_dev_services_accepts_multiple_service_names() -> None:
     assert result.returncode == 0
     for service in ("api", "dingtalk", "worker", "scheduler"):
         assert service in result.stdout
+
+
+def test_dev_services_refuses_dual_worker_restart() -> None:
+    """停不干净不得再起；禁止靠删 worker.lock 清锁（inode 分裂 → 双 worker）。"""
+    script = (REPO / "scripts" / "dev_services.sh").read_text(encoding="utf-8")
+    assert "list_worker_pids" in script
+    assert "跳过启动以免双开" in script
+    assert "禁止删除" in script and "worker.lock" in script
+    assert "kill_pid_wait" in script
+    assert "保留 pidfile" in script or "未删 pidfile" in script

@@ -16,7 +16,8 @@
 * 旧版路径的鉴权是 **URL 查询参数** ``?access_token=``，不是新版的头部。
 
 **防重放**：``code`` 官方是一次性且 5 分钟有效，因此本模块额外做一次本地一次性消费
-（``ekbs_cache`` 记已用 code），避免网络层重放导致同一 code 换两次身份（`04` §3.4）。
+（持久化在 ``ekbs_msg_dedup``，**不是**可清空的 ``ekbs_cache``），
+避免网络层重放导致同一 code 换两次身份（`04` §3.4）。
 """
 
 from __future__ import annotations
@@ -35,9 +36,7 @@ log = get_logger(component="dingtalk.auth")
 
 LEGACY_BASE_URL = "https://oapi.dingtalk.com"
 USERINFO_PATH = "/topapi/v2/user/getuserinfo"
-#: 官方：authCode 5 分钟有效、一次性
-CODE_TTL_SECONDS = 300
-CODE_USED_KEY = "ekbs:dt:authcode_used:{code_hash}"
+#: 官方：authCode 5 分钟有效、一次性；本地一次性消费记录持久化在 ekbs_msg_dedup（见 _consume_code）
 
 
 class DingTalkAuthService:
@@ -108,16 +107,30 @@ class DingTalkAuthService:
     # ------------------------------------------------------------------
 
     async def _consume_code(self, code: str) -> bool:
-        """一次性消费：同一 authCode 只能换一次身份（04 §3.4 的防重放）。"""
-        if self.cache is None:
-            return True
+        """一次性消费：同一 authCode 只能换一次身份（04 §3.4 的防重放）。
+
+        持久化在 ``ekbs_msg_dedup``（与消息幂等同表，``dt_authcode:`` 前缀区分），
+        ``INSERT ON CONFLICT`` 原子判定「首次使用」。**不放 ekbs_cache**——
+        缓存的语义是「可随时清空」，而「这个 code 已用过」是安全事实：
+        清缓存 = 解除防重放（v4.0 评估 P1 修复；与 ``IdempotencyGuard`` 同源论证）。
+        留存由 ``msg_dedup_cleanup`` 作业负责（7 天 ≫ 官方 5 分钟有效期，安全方向）。
+        """
+        import asyncio
         import hashlib
 
-        key = CODE_USED_KEY.format(code_hash=hashlib.sha256(code.encode()).hexdigest()[:32])
-        if await self.cache.get(key) is not None:
-            return False
-        await self.cache.set(key, {"used": True}, ttl=CODE_TTL_SECONDS)
-        return True
+        key = "dt_authcode:" + hashlib.sha256(code.encode()).hexdigest()[:32]
+
+        def _insert_once() -> bool:
+            with self.db.sync_connect() as conn:
+                cursor = conn.execute(
+                    "INSERT INTO ekbs_msg_dedup(msg_id, created_at) VALUES (?, datetime('now'))"
+                    " ON CONFLICT(msg_id) DO NOTHING",
+                    (key,),
+                )
+                conn.commit()
+                return int(cursor.rowcount or 0) == 1
+
+        return await asyncio.to_thread(_insert_once)
 
     async def _exchange(self, code: str) -> dict:
         token = await self.token_client.get_token()

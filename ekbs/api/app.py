@@ -19,12 +19,14 @@ from ekbs.api import (
     assets,
     auth_routes,
     chunks,
+    discovery,
     docs,
     health,
     imports,
     kb,
     parse_tasks,
     perm_admin,
+    personal,
     playground,
     qa,
     ui,
@@ -72,9 +74,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(ui.router)         # 问答调试台 /ui
     # 管理台前端：优先托管 ekbs-admin-web 的构建产物（方案 05 §6.9）；
-    # 产物不存在时保持旧的免构建单页，管理入口不会消失。
+    # 产物不存在时才挂旧的免构建单页 —— **绝不能两个同时占 /admin**，
+    # 否则刷新偶发落到旧页（无侧栏、告警原文堆在一起），用户会以为坏了。
     app.state.admin_web_dir = admin_web.install_admin_web(app, resolved)
-    app.include_router(admin_ui.router)   # 旧的免构建单页（/admin 有新产物时让位）
+    if app.state.admin_web_dir is None:
+        app.include_router(admin_ui.router)
+    else:
+        # 旧页改挂旁路，联调/对照仍可打开；日常入口只走 SPA
+        app.include_router(admin_ui.router, prefix="/legacy")
     for prefix in ROUTE_PREFIXES:
         app.include_router(qa.router, prefix=prefix)
         app.include_router(auth_routes.router, prefix=prefix)
@@ -87,6 +94,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(perm_admin.router, prefix=prefix)
         app.include_router(imports.router, prefix=prefix)
         app.include_router(kb.router, prefix=prefix)
+        app.include_router(discovery.router, prefix=prefix)
+        app.include_router(personal.router, prefix=prefix)
 
     # 必须在 include_router 之后：中文化需要遍历 app.routes 取每个接口的 docstring
     install_docs(app)

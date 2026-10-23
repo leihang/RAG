@@ -225,7 +225,7 @@ async def test_output_leak_masks_unauthorized_document_title(seeded) -> None:
 
         async def generate(self, messages, **kwargs):
             return LLMResult(
-                text="根据《财务保密制度》第二条，财务专用章由财务负责人保管 [1]。",
+                text="根据《财务保密制度》，财务专用章由财务负责人保管 [1]。",
                 model="leaky-test",
             )
 

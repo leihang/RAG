@@ -7,7 +7,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Alert, Button, Card, Form, Input, Modal, Progress, Select, Space, Table, Tag, Typography, message,
+  Alert, Button, Card, Form, Input, Modal, Progress, Select, Space, Table, Tag, TreeSelect, Typography, message,
 } from 'antd'
 import { InboxOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
@@ -22,6 +22,10 @@ import {
   uploadStatus,
 } from '@/api/doc'
 import { http } from '@/api/client'
+import { buildKbTargetTree, formatKbTarget, isPersonalCode, parseKbTarget, personalOwnerId } from '@/components/kbTargetTree'
+import { personalOwnerText } from '@/utils/personalKb'
+import DeptPicker from '@/components/DeptPicker'
+import ViewerPicker from '@/components/ViewerPicker'
 import { formatBytes } from '@/utils/format'
 import { formatExtList, normalizeExt } from '@/utils/fileExt'
 import { MAX_FOLDER_FILES, filesFromDataTransfer, relPathOf, sortByRelPath } from '@/utils/fileDrop'
@@ -35,6 +39,14 @@ import { initialLevelForKb, joinUploadDest } from './docUtils'
  * 拿不到列表时不拦（让后端 422 说话），而不是把用户的文件挡在本地。
  */
 const MAX_MB = 500
+
+type DestFolder = {
+  path: string
+  level: number | null
+  visible_dept_ids: string[]
+  viewer_user_ids: number[]
+  policy_from: string | null
+}
 const FALLBACK_EXT = ['pdf', 'docx', 'doc', 'pptx', 'xlsx', 'xls', 'txt', 'md', 'png', 'jpg', 'jpeg']
 
 type TaskStatus = 'pending' | 'waiting' | 'hashing' | 'uploading' | 'success' | 'instant' | 'failed'
@@ -70,8 +82,9 @@ export default function DocumentUpload() {
   const [running, setRunning] = useState(false)
   const [allowed, setAllowed] = useState<string[]>(FALLBACK_EXT)
   const [kbs, setKbs] = useState<
-    { kb_id: number; code: string; name: string; default_level?: number; document_count?: number }[]
+    { kb_id: number; code: string; name: string; default_level?: number; document_count?: number; owner_user_id?: number | null; owner_nick?: string | null; owner_dingtalk_userid?: string | null }[]
   >([])
+  const [foldersByKb, setFoldersByKb] = useState<Record<number, DestFolder[]>>({})
   // 「加载中」与「加载完了但一个库都没有」必须分开：清库之后列表为空是**合法状态**，
   // 早期用 `loading={!kbs.length}` 会让首次启动永远转圈，看不到「去新建」的提示。
   const [kbLoaded, setKbLoaded] = useState(false)
@@ -81,43 +94,151 @@ export default function DocumentUpload() {
   const [concurrency, setConcurrency] = useState(3)
   const [maxRetry, setMaxRetry] = useState(3)
   const [chunkMb, setChunkMb] = useState(8)
-  /** 当前知识库下已有的子目录（供「保存到文件夹」点选） */
-  const [destFolders, setDestFolders] = useState<string[]>([])
+  /** 各部门库下的文件夹，挂在目标知识库这棵折叠树上。 */
+  const [creatingFolder, setCreatingFolder] = useState(false)
+  const [folderModalOpen, setFolderModalOpen] = useState(false)
+  /** 非空时弹窗是在改已有文件夹，不再新建。 */
+  const [folderEditPath, setFolderEditPath] = useState<string | null>(null)
+  const [newFolderName, setNewFolderName] = useState('')
+  const [newFolderLevel, setNewFolderLevel] = useState(2)
+  const [newFolderDepts, setNewFolderDepts] = useState<string[]>([])
+  const [newFolderViewers, setNewFolderViewers] = useState<number[]>([])
   const [kbForm] = Form.useForm<{ code: string; name: string; default_level: number }>()
   const fileRef = useRef<HTMLInputElement>(null)
   const dirRef = useRef<HTMLInputElement>(null)
-  const [form] = Form.useForm<{ kb_id?: number; level: number; dept_ids?: string; dest_folder?: string }>()
+  const [form] = Form.useForm<{
+    kb_id?: number
+    level: number
+    dept_ids?: string[]
+    dest_folder?: string
+    viewer_user_ids?: number[]
+  }>()
+  const watchedKbId = Form.useWatch('kb_id', form)
+  const watchedDest = Form.useWatch('dest_folder', form)
 
   const loadDestFolders = useCallback(async (kbId: number | undefined) => {
     const kb = kbs.find((k) => k.kb_id === kbId)
-    if (!kb?.code) {
-      setDestFolders([])
+    if (!kb?.code || isPersonalCode(kb.code)) {
+      if (kbId != null) setFoldersByKb((prev) => ({ ...prev, [kbId]: [] }))
       return
     }
     try {
-      // recursive：一次拿齐该库下全部已有子目录，供下拉选择
+      // 新库还没上传过时目录不存在，后端 404。这里自己当成空列表。
       const res = (await http.get('/import/dirs', {
         params: { path: kb.code, recursive: true },
+        skipErrorToast: true,
       })) as {
-        dirs?: { name?: string; rel_path?: string; rel_under?: string }[]
+        dirs?: {
+          rel_under?: string
+          rel_path?: string
+          name?: string
+          level?: number | null
+          visible_dept_ids?: string[]
+          viewer_user_ids?: number[]
+          policy_from?: string | null
+        }[]
       }
-      const rows = res.dirs ?? []
-      const opts = rows
-        .map((r) => {
-          const under = String(r.rel_under || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
-          if (under) return under
-          const full = String(r.rel_path || r.name || '').replace(/\\/g, '/')
+      const opts: DestFolder[] = (res.dirs ?? [])
+        .map((row) => {
+          const under = String(row.rel_under || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+          const full = String(row.rel_path || row.name || '').replace(/\\/g, '/')
           const prefix = `${kb.code}/`
-          return full.startsWith(prefix) ? full.slice(prefix.length) : full === kb.code ? '' : (r.name || '')
+          const path = under || (full.startsWith(prefix) ? full.slice(prefix.length) : full)
+          if (!path || path === kb.code) return null
+          return {
+            path,
+            level: row.level ?? null,
+            visible_dept_ids: row.visible_dept_ids ?? [],
+            viewer_user_ids: row.viewer_user_ids ?? [],
+            policy_from: row.policy_from ?? null,
+          }
         })
-        .filter(Boolean)
-        .sort((a, b) => a.localeCompare(b, 'zh-CN'))
-      setDestFolders(opts)
+        .filter((row): row is DestFolder => row != null)
+        .sort((a, b) => a.path.localeCompare(b.path, 'zh-CN'))
+      setFoldersByKb((prev) => ({ ...prev, [kb.kb_id]: opts }))
+      const selectedKb = form.getFieldValue('kb_id') as number | undefined
+      const current = String(form.getFieldValue('dest_folder') ?? '')
+      if (selectedKb === kb.kb_id && current && !opts.some((row) => row.path === current)) {
+        form.setFieldValue('dest_folder', '')
+      }
     } catch {
-      // 库根目录尚不存在（从未上传过）→ 空列表
-      setDestFolders([])
+      setFoldersByKb((prev) => ({ ...prev, [kb.kb_id]: [] }))
+      const selectedKb = form.getFieldValue('kb_id') as number | undefined
+      const current = String(form.getFieldValue('dest_folder') ?? '')
+      if (selectedKb === kb.kb_id && current) {
+        form.setFieldValue('dest_folder', '')
+      }
     }
-  }, [kbs])
+  }, [kbs, form])
+
+  const openFolderModal = (folder?: DestFolder) => {
+    setFolderEditPath(folder?.path ?? null)
+    setNewFolderName(folder?.path ?? '')
+    setNewFolderLevel(folder?.level ?? 2)
+    setNewFolderDepts(folder?.visible_dept_ids ?? [])
+    setNewFolderViewers(folder?.viewer_user_ids ?? [])
+    setFolderModalOpen(true)
+  }
+
+  const removeFolder = async (folderPath: string) => {
+    const kbId = form.getFieldValue('kb_id') as number | undefined
+    const kb = kbs.find((k) => k.kb_id === kbId)
+    if (!kb?.code) return
+    if (!window.confirm(`删除文件夹「${folderPath}」？里面有文件时会拒绝。`)) return
+    try {
+      await http.delete('/import/dirs', {
+        params: { path: `${kb.code}/${folderPath}` },
+        skipErrorToast: true,
+      })
+      message.success('已删除文件夹')
+      if (String(form.getFieldValue('dest_folder') ?? '') === folderPath) {
+        form.setFieldValue('dest_folder', '')
+      }
+      await loadDestFolders(kb.kb_id)
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const createFolderFromModal = async () => {
+    const kbId = form.getFieldValue('kb_id') as number | undefined
+    const kb = kbs.find((k) => k.kb_id === kbId)
+    if (!kb?.code) {
+      message.warning('请先选择目标知识库')
+      return
+    }
+    const name = (folderEditPath ?? newFolderName).trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+    if (!name) {
+      message.warning('请填写文件夹名')
+      return
+    }
+    const personal = kb.code.startsWith('personal-')
+    if (!personal && newFolderLevel >= 2 && newFolderDepts.length === 0) {
+      message.error(`密级 L${newFolderLevel} 必须选择可见部门`)
+      return
+    }
+    setCreatingFolder(true)
+    try {
+      await http.post('/import/dirs', {
+        path: `${kb.code}/${name}`,
+        ...(personal ? {} : {
+          level: newFolderLevel,
+          visible_dept_ids: newFolderDepts,
+          viewer_user_ids: newFolderViewers,
+        }),
+      }, { skipErrorToast: true })
+      message.success(folderEditPath ? `已更新文件夹 ${name} 的权限` : `已建立文件夹 ${name}`)
+      setFolderModalOpen(false)
+      setFolderEditPath(null)
+      setNewFolderName('')
+      await loadDestFolders(kb.kb_id)
+      form.setFieldValue('dest_folder', name)
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setCreatingFolder(false)
+    }
+  }
 
   useEffect(() => {
     // 准入清单与知识库列表都以后端为准。
@@ -162,9 +283,21 @@ export default function DocumentUpload() {
   }, [form])
 
   useEffect(() => {
-    const kbId = form.getFieldValue('kb_id') as number | undefined
-    if (kbLoaded && kbId) void loadDestFolders(kbId)
-  }, [kbLoaded, kbs, form, loadDestFolders])
+    if (!kbLoaded) return
+    for (const kb of kbs) {
+      if (!isPersonalCode(kb.code)) void loadDestFolders(kb.kb_id)
+    }
+  }, [kbLoaded, kbs, loadDestFolders])
+
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return
+      const kbId = form.getFieldValue('kb_id') as number | undefined
+      if (kbId) void loadDestFolders(kbId)
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => document.removeEventListener('visibilitychange', onVis)
+  }, [form, loadDestFolders])
 
   const patch = useCallback((key: string, delta: Partial<UploadTask>) => {
     setTasks((prev) => prev.map((t) => (t.key === key ? { ...t, ...delta } : t)))
@@ -238,7 +371,7 @@ export default function DocumentUpload() {
 
   const uploadOne = async (
     task: UploadTask,
-    opts: { level: number; deptIds: string[]; kbId?: number; destFolder?: string },
+    opts: { level: number; deptIds: string[]; kbId?: number; destFolder?: string; viewerIds: number[] },
   ) => {
     patch(task.key, { status: 'hashing', percent: 0 })
     const checksum = await sha256(task.file)
@@ -262,6 +395,7 @@ export default function DocumentUpload() {
       kb_id: opts.kbId ?? null,
       level: opts.level,
       visible_dept_ids: opts.deptIds,
+      viewer_user_ids: opts.viewerIds,
     })
     if (init.instant) {
       patch(task.key, { status: 'instant', percent: 100, docId: init.doc_id })
@@ -314,13 +448,40 @@ export default function DocumentUpload() {
   const startAll = async () => {
     const values = await form.validateFields()
     if (!values.kb_id) { message.warning('请先选择目标知识库'); return }
-    const deptIds = (values.dept_ids ?? '').split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean)
-    // L2/L3 必须给可见部门（方案 00 §3.2）：后端也会在 init 阶段拒，
-    // 但在这里先拦能省一次往返，也不会留下"上传成功但解析失败"的困惑
-    if (Number(values.level) >= 2 && deptIds.length === 0) {
-      message.error(`密级 L${values.level} 必须填「可见部门 ID」（如 102）；L2/L3 不能不给部门。若要全公司可见请选 L1`)
+    const target = kbs.find((k) => k.kb_id === values.kb_id)
+    const personal = isPersonalCode(target?.code)
+    const destFolders = foldersByKb[values.kb_id] ?? []
+    const dest = personal ? '' : String(values.dest_folder ?? '').replace(/^\/+|\/+$/g, '')
+    const folder = destFolders.find((row) => row.path === dest)
+    const hasOwnDept = (folder?.visible_dept_ids.length ?? 0) > 0
+    if (!personal && !hasOwnDept) {
+      message.error(dest
+        ? '这个文件夹还没有自己的部门和密级。点「修改权限」写好后再上传。'
+        : '请先新建文件夹，在弹窗里写上密级和部门，再选中它上传。')
       return
     }
+    const ownerId = personalOwnerId(target) ?? 0
+    const rawDepts = personal
+      ? [`user:${ownerId}`]
+      : (hasOwnDept ? folder?.visible_dept_ids : values.dept_ids)
+    const deptIds = (Array.isArray(rawDepts) ? rawDepts : String(rawDepts ?? '').split(/[,，\s]+/))
+      .map((s) => String(s).trim())
+      .filter(Boolean)
+    const level = personal ? 2 : (hasOwnDept ? Number(folder?.level) : Number(values.level))
+    // L2/L3 必须给可见部门（方案 00 §3.2）：后端也会在 init 阶段拒，
+    // 但在这里先拦能省一次往返，也不会留下"上传成功但解析失败"的困惑
+    if (personal && !(ownerId > 0)) {
+      message.error('这个个人库没有归属用户，不能投喂')
+      return
+    }
+    if (!personal && level >= 2 && deptIds.length === 0) {
+      message.error(`密级 L${level} 必须选择可见部门；L2/L3 不能不给部门。若要全公司可见请选 L1`)
+      return
+    }
+    const viewerIds = personal
+      ? []
+      : (hasOwnDept ? (folder?.viewer_user_ids ?? []) : (values.viewer_user_ids ?? []))
+        .map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
     setRunning(true)
     // **并发池**：同时最多跑 `concurrency` 个文件（方案 §6.5 默认 3）。
     // 原来是 for-await 串行，界面上的「并发数」形同虚设。
@@ -335,10 +496,11 @@ export default function DocumentUpload() {
         if (!task) return
         try {
           await uploadOne(task, {
-            level: values.level,
+            level,
             deptIds,
             kbId: values.kb_id,
-            destFolder: values.dest_folder,
+            destFolder: dest,
+            viewerIds,
           })
         } catch (err) {
           // 单文件失败不影响其他文件（§6.5 失败隔离）
@@ -363,6 +525,39 @@ export default function DocumentUpload() {
   )
   const okCount = useMemo(() => tasks.filter((t) => t.status === 'success' || t.status === 'instant').length, [tasks])
   const failCount = useMemo(() => tasks.filter((t) => t.status === 'failed').length, [tasks])
+  const targetTree = useMemo(() => buildKbTargetTree(
+    kbs,
+    Object.fromEntries(Object.entries(foldersByKb).map(([id, rows]) => [
+      Number(id),
+      rows.map((folder) => {
+        const deptCount = folder.visible_dept_ids.length
+        const mark = folder.level == null
+          ? '未设置'
+          : deptCount === 0
+            ? `密级沿用上级 L${folder.level}，部门未设置`
+            : `L${folder.level} · 部门 ${deptCount} 个 · 额外 ${folder.viewer_user_ids.length} 人`
+        return { path: folder.path, mark }
+      }),
+    ])),
+    personalOwnerText,
+  ), [kbs, foldersByKb])
+  const destFolders = foldersByKb[watchedKbId ?? -1] ?? []
+  const chooseTarget = (raw: string | undefined) => {
+    const parsed = parseKbTarget(raw)
+    if (!parsed) {
+      form.setFieldValue('kb_id', undefined)
+      form.setFieldValue('dest_folder', '')
+      return
+    }
+    const kb = kbs.find((item) => item.kb_id === parsed.kbId)
+    const previous = form.getFieldValue('kb_id') as number | undefined
+    form.setFieldValue('kb_id', parsed.kbId)
+    form.setFieldValue('dest_folder', isPersonalCode(kb?.code) ? '' : parsed.dest)
+    if (previous !== parsed.kbId && kb && !isPersonalCode(kb.code)) {
+      const initial = initialLevelForKb(kbs, parsed.kbId)
+      if (initial) form.setFieldValue('level', initial)
+    }
+  }
 
   const submitKb = async () => {
     const v = await kbForm.validateFields()
@@ -383,6 +578,18 @@ export default function DocumentUpload() {
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Alert
+        type="info"
+        showIcon
+        message="本页从浏览器上传文件"
+        description={
+          <span>
+            若文件已在服务器 raw 目录，请用{' '}
+            <a onClick={() => navigate('/docs/import')}>目录导入</a>
+            （批量登记进待解析队列，不经过本机上传）。
+          </span>
+        }
+      />
       <Modal
         title="新建知识库"
         open={kbModalOpen}
@@ -428,6 +635,46 @@ export default function DocumentUpload() {
           </Form.Item>
         </Form>
       </Modal>
+      <Modal
+        title={folderEditPath ? '修改文件夹权限' : '新建文件夹'}
+        open={folderModalOpen}
+        onCancel={() => { setFolderModalOpen(false); setFolderEditPath(null) }}
+        onOk={() => void createFolderFromModal()}
+        confirmLoading={creatingFolder}
+        okText={folderEditPath ? '保存' : '建立并选中'}
+        destroyOnClose
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Input
+            value={newFolderName}
+            placeholder="例如 工程部"
+            disabled={folderEditPath != null}
+            onChange={(e) => setNewFolderName(e.target.value)}
+          />
+          {kbs.some((k) => k.kb_id === watchedKbId && k.code.startsWith('personal-')) ? (
+            <Typography.Text type="secondary">个人库文件夹不另设密级和部门。</Typography.Text>
+          ) : (
+            <>
+              <Select
+                style={{ width: '100%' }}
+                value={newFolderLevel}
+                onChange={setNewFolderLevel}
+                options={[
+                  { value: 1, label: 'L1 公开（全公司可见）' },
+                  { value: 2, label: 'L2 内部（须指定部门）' },
+                  { value: 3, label: 'L3 秘密（须指定部门）' },
+                  { value: 4, label: 'L4 机密（首期不入库）' },
+                ]}
+              />
+              <DeptPicker value={newFolderDepts} onChange={setNewFolderDepts} />
+              <ViewerPicker value={newFolderViewers} onChange={setNewFolderViewers} />
+              <Typography.Text type="secondary">
+                密级、部门和额外可查看的人记在这个文件夹上。之后传到这里，不用再选一遍。
+              </Typography.Text>
+            </>
+          )}
+        </Space>
+      </Modal>
       <Alert
         type="info"
         showIcon
@@ -446,7 +693,7 @@ export default function DocumentUpload() {
         open={kbManageOpen}
         onCancel={() => setKbManageOpen(false)}
         footer={null}
-        width={660}
+        width={900}
       >
         <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
           code 是给命令行与接口用的稳定标识，建成后不可改（历史记录里记的是它）；名称随时可改。
@@ -480,6 +727,13 @@ export default function DocumentUpload() {
               ),
             },
             { title: 'code', dataIndex: 'code', width: 120 },
+            {
+              title: '归属',
+              width: 220,
+              ellipsis: true,
+              render: (_: unknown, r: { code: string; owner_user_id?: number | null; owner_nick?: string | null; owner_dingtalk_userid?: string | null }) =>
+                personalOwnerText(r) || '—',
+            },
             { title: '文档数', dataIndex: 'document_count', width: 80, render: (v: number) => v ?? 0 },
             { title: '默认密级', dataIndex: 'default_level', width: 90, render: (v: number) => `L${v}` },
             {
@@ -539,41 +793,29 @@ export default function DocumentUpload() {
         </div>
       </Card>
 
-      <Card title="2. 目标与密级">
-        <Form form={form} layout="vertical" initialValues={{ level: 2 }} style={{ maxWidth: 560 }}>
-          <Form.Item label="目标知识库" required tooltip="上传到的知识库；没有合适的就点右边「新建」">
+      <Card title="2. 目标">
+        <Form form={form} layout="vertical" initialValues={{ level: 2, dest_folder: '' }} style={{ maxWidth: 720 }}>
+          <Form.Item label="目标知识库" required tooltip="部门库展开后选择文件夹。个人库收在最下面，选中后直接投喂。">
             <Space.Compact style={{ width: '100%' }}>
-              <Form.Item
-                name="kb_id"
-                noStyle
-                rules={[{ required: true, message: '请选择或新建一个知识库（留空会被拒 422）' }]}
-              >
-                <Select
-                  style={{ width: 'calc(100% - 88px)' }}
-                  placeholder={
-                    !kbLoaded
-                      ? '正在加载知识库列表…'
-                      : kbs.length
-                        ? '请选择知识库'
-                        : '还没有知识库，点右边「新建」'
-                  }
-                  loading={!kbLoaded}
-                  // 显示**名称**优先：code 是给命令行的，界面上不该拿它当主标识
-                  options={kbs.map((k) => ({
-                    value: k.kb_id,
-                    label: `${k.name}${k.document_count ? `（${k.document_count} 篇）` : ''}`,
-                    title: `code=${k.code}`,
-                  }))}
-                  onChange={(kbId: number) => {
-                    // 知识库的「该库默认密级」= 上传页密级的初值（见 docUtils.initialLevelForKb）。
-                    // 它不决定任何一份文档的真实密级：用户随后改「本文档密级」只改这一批文档。
-                    const initial = initialLevelForKb(kbs, kbId)
-                    if (initial) form.setFieldValue('level', initial)
-                    form.setFieldValue('dest_folder', undefined)
-                    void loadDestFolders(kbId)
-                  }}
-                />
-              </Form.Item>
+              <TreeSelect
+                style={{ width: 'calc(100% - 160px)' }}
+                treeData={targetTree}
+                treeDefaultExpandAll={false}
+                treeNodeFilterProp="title"
+                showSearch
+                allowClear
+                loading={!kbLoaded}
+                styles={{ popup: { root: { maxHeight: 360, overflow: 'auto' } } }}
+                placeholder={
+                  !kbLoaded
+                    ? '正在加载知识库列表…'
+                    : kbs.length
+                      ? '展开后选择知识库或文件夹'
+                      : '还没有知识库，点右边「新建」'
+                }
+                value={formatKbTarget(watchedKbId, watchedDest)}
+                onChange={(raw) => chooseTarget(raw == null ? undefined : String(raw))}
+              />
               <Button style={{ width: 88 }} onClick={() => setKbModalOpen(true)}>
                 新建
               </Button>
@@ -583,44 +825,86 @@ export default function DocumentUpload() {
             </Space.Compact>
           </Form.Item>
           <Form.Item
-            name="dest_folder"
-            label="保存到文件夹"
-            tooltip="相对知识库根目录。从下拉选择已有目录；选「知识库根目录」则直接落在库根。最终路径：raw/<知识库>/<此文件夹>/<文件相对路径>。"
-            normalize={(v) => {
-              if (v == null || v === '') return undefined
-              return String(v).trim().replace(/^\/+|\/+$/g, '').replace(/\\/g, '/') || undefined
-            }}
+            name="kb_id"
+            hidden
+            rules={[{ required: true, message: '请选择或新建一个知识库（留空会被拒 422）' }]}
           >
-            <Select
-              allowClear
-              showSearch
-              placeholder={destFolders.length ? '知识库根目录（或不选 / 点选已有文件夹）' : '暂无子文件夹，将保存到知识库根目录'}
-              optionFilterProp="label"
-              options={destFolders.map((p) => ({ value: p, label: p }))}
-              notFoundContent={destFolders.length ? '无匹配文件夹' : '该知识库下还没有子文件夹'}
-            />
+            <Input />
           </Form.Item>
-          <Typography.Paragraph type="secondary" style={{ marginTop: -8, fontSize: 12 }}>
-            「选择文件夹」是选<strong>本机待上传</strong>的源目录；这里的「保存到文件夹」是服务器上已有的落盘目录（下拉选择）。
-          </Typography.Paragraph>
-          <Form.Item
-            name="level"
-            label="本文档密级"
-            tooltip="这一批上传的文档按它入库（每份文档可以不同，改的是这一批）。初值取自所选知识库的「该库默认密级」，不要就直接改这里 —— 改这里不会改知识库设置。L1 全公司可见；L2/L3 还必须填下面的部门。"
-            rules={[{ required: true, message: '请选择密级' }]}
-          >
-            <Select
-              options={[
-                { value: 1, label: 'L1 公开（全公司可见）' },
-                { value: 2, label: 'L2 内部（须指定部门）' },
-                { value: 3, label: 'L3 秘密（须指定部门）' },
-                { value: 4, label: 'L4 机密（首期不入库）' },
-              ]}
-            />
+          <Form.Item name="dest_folder" hidden>
+            <Input />
           </Form.Item>
-          <Form.Item name="dept_ids" label="可见部门 ID（逗号分隔）" tooltip="L1 可留空（全公司可见）；L2/L3 必填，否则不会入库。">
-            <Input placeholder="102,103" />
-          </Form.Item>
+          {(() => {
+            const kb = kbs.find((item) => item.kb_id === watchedKbId)
+            if (!kb) return null
+            const personal = isPersonalCode(kb?.code)
+            if (personal) {
+              return (
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message={`投喂到${personalOwnerText(kb ?? {}) || '这个人'}的私有库`}
+                  description="只有本人能检索。不用再选文件夹、密级、部门或额外可查看的人。"
+                />
+              )
+            }
+            const dest = String(watchedDest ?? '')
+            const folder = destFolders.find((row) => row.path === dest)
+            const ready = (folder?.visible_dept_ids.length ?? 0) > 0
+            return (
+              <>
+                <Space style={{ marginBottom: 8 }}>
+                  <Button
+                    htmlType="button"
+                    onClick={() => {
+                      const kbId = form.getFieldValue('kb_id') as number | undefined
+                      void loadDestFolders(kbId)
+                    }}
+                  >
+                    刷新
+                  </Button>
+                  <Button htmlType="button" onClick={() => openFolderModal()}>
+                    新建文件夹
+                  </Button>
+                  {folder ? (
+                    <Button htmlType="button" danger onClick={() => void removeFolder(folder.path)}>
+                      删除当前文件夹
+                    </Button>
+                  ) : null}
+                </Space>
+                {folder && ready ? (
+                  <Alert
+                    type="success"
+                    showIcon
+                    style={{ marginBottom: 16 }}
+                    message={`按文件夹「${folder.path}」入库：L${folder.level}，可见部门 ${folder.visible_dept_ids.length} 个，额外可查看 ${folder.viewer_user_ids.length} 人`}
+                    description="权限只记在文件夹上，这里不再选一遍。"
+                    action={(
+                      <Button htmlType="button" size="small" onClick={() => openFolderModal(folder)}>
+                        修改权限
+                      </Button>
+                    )}
+                  />
+                ) : (
+                  <Alert
+                    type="info"
+                    showIcon
+                    style={{ marginBottom: 16 }}
+                    message={folder ? `文件夹「${folder.path}」还没有自己的部门` : '先新建或选中文件夹'}
+                    description={folder
+                      ? '密级和部门在「修改权限」里写。不会沿用上级文件夹的部门。'
+                      : '密级、部门和额外可查看的人只在新建文件夹时填写。'}
+                    action={folder ? (
+                      <Button htmlType="button" size="small" onClick={() => openFolderModal(folder)}>
+                        修改权限
+                      </Button>
+                    ) : undefined}
+                  />
+                )}
+              </>
+            )
+          })()}
           <Form.Item
             label="并发数"
             tooltip="同时上传几个文件。同一个文件是切片后依次传的，这里不控制分片大小。调大上传更快，但同时占用更多带宽；网络不稳时调小更稳。"

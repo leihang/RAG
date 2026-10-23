@@ -32,6 +32,7 @@ log = get_logger(component="dingtalk.directory")
 LEGACY_BASE_URL = "https://oapi.dingtalk.com"
 NEW_BASE_URL = "https://api.dingtalk.com"
 
+AUTH_SCOPES_PATH = "/auth/scopes"
 DEPT_LISTSUB_PATH = "/topapi/v2/department/listsub"
 DEPT_GET_PATH = "/topapi/v2/department/get"
 USER_LIST_PATH = "/topapi/v2/user/list"
@@ -81,6 +82,23 @@ class LeaveRecord:
     leave_time: str = ""
     leave_reason: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AuthScopes:
+    """应用的通讯录授权范围（``GET /auth/scopes``）。
+
+    可见范围不是全公司时，``authed_dept`` 里没有根部门 1，直接 ``listsub(1)`` 会 50004。
+    这时只能同步这里点名的部门和用户。
+    """
+
+    authed_dept_ids: list[int] = field(default_factory=list)
+    authed_user_ids: list[str] = field(default_factory=list)
+    auth_user_field: list[str] = field(default_factory=list)
+
+    @property
+    def limited(self) -> bool:
+        return bool(self.authed_dept_ids or self.authed_user_ids)
 
 
 class DingTalkDirectoryClient:
@@ -167,6 +185,28 @@ class DingTalkDirectoryClient:
         if code in {40014, 42001, 40001}:
             raise ConfigError(f"{message}（access_token 无效或过期）")
         raise ModelUnavailable(message)
+
+    # ------------------------------------------------------------------
+    # 授权范围
+    # ------------------------------------------------------------------
+
+    async def fetch_auth_scopes(self) -> AuthScopes:
+        """当前应用被授权的部门与用户（不是全公司时，根部门会 50004）。"""
+        token = await self.token_client.get_token()
+        url = f"{self.legacy_base}{AUTH_SCOPES_PATH}?access_token={token}"
+        payload = await self._call("GET", url)
+        self._raise_on_legacy_error(payload, AUTH_SCOPES_PATH)
+        org = payload.get("auth_org_scopes") or {}
+        dept_ids = []
+        for item in org.get("authed_dept") or []:
+            text = str(item).strip()
+            if text.lstrip("-").isdigit():
+                dept_ids.append(int(text))
+        user_ids = [str(item).strip() for item in (org.get("authed_user") or []) if str(item).strip()]
+        fields = [str(item) for item in (payload.get("auth_user_field") or [])]
+        return AuthScopes(
+            authed_dept_ids=dept_ids, authed_user_ids=user_ids, auth_user_field=fields
+        )
 
     # ------------------------------------------------------------------
     # 部门

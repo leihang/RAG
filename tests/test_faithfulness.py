@@ -15,6 +15,7 @@ from ekbs.retrieval.faithfulness import (
     FaithfulnessReport,
     assess_faithfulness,
     claim_supported,
+    clause_mismatches,
     extract_claims,
     mostly_unsupported,
 )
@@ -232,3 +233,14 @@ async def test_generate_refuses_missing_citation(seeded) -> None:
     assert answer.refused is True
     assert answer.refusal_reason == REFUSE_MISSING_CITATION
     assert answer.citations == []
+
+
+def test_clause_number_must_match_cited_heading() -> None:
+    chunks = [
+        _chunk("提前三个工作日。", heading="年假制度 > 第三条 申请"),
+        _chunk("满一年五天。", heading="年假制度 > 第一条 天数"),
+    ]
+    assert clause_mismatches("依据第三条，须提前申请 [1]。", chunks) == []
+    assert clause_mismatches("依据第3条，须提前申请 [1]。", chunks) == []
+    assert clause_mismatches("依据第五条，须提前申请 [1]。", chunks) == ["第5条"]
+    assert clause_mismatches("年假为 5 天 [1]。", chunks) == []

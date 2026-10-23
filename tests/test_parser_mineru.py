@@ -110,6 +110,38 @@ def test_mineru_blocks_map_to_markdown_and_pages(tmp_path: Path, fake_env) -> No
     assert parsed.page_map[0][0] == 0, "第一页首块偏移应为 0"
 
 
+def test_mineru_merges_continued_tables_across_pages(tmp_path: Path) -> None:
+    """同表跨页拆成两块时，清洗步应合成一张（正文只留一个占位）。"""
+    from ekbs.ingest.parser import _blocks_to_document
+
+    blocks = [
+        {"type": "text", "text": "附录", "text_level": 1, "page_idx": 0},
+        {
+            "type": "table",
+            "table_caption": ["差旅标准"],
+            "table_body": (
+                "<table><tr><td>城市</td><td>标准</td></tr>"
+                "<tr><td>北京</td><td>500</td></tr></table>"
+            ),
+            "page_idx": 0,
+        },
+        {
+            "type": "table",
+            "table_caption": ["续表"],
+            "table_body": (
+                "<table><tr><td>城市</td><td>标准</td></tr>"
+                "<tr><td>上海</td><td>480</td></tr></table>"
+            ),
+            "page_idx": 1,
+        },
+    ]
+    parsed = _blocks_to_document(blocks, tmp_path / "x.pdf", markdown_file=None)
+    assert len(parsed.tables) == 1
+    assert "北京" in parsed.tables[0].body and "上海" in parsed.tables[0].body
+    assert parsed.tables[0].caption == "差旅标准"
+    assert parsed.markdown.count("[表格 ") == 1
+
+
 def test_mineru_persisted_figures_do_not_pollute_markdown(
     tmp_path: Path, fake_env, monkeypatch
 ) -> None:
@@ -229,6 +261,7 @@ def test_mineru_env_points_model_cache_into_repo(monkeypatch, tmp_path) -> None:
     env = parser._mineru_env()
     assert env["MODELSCOPE_CACHE"] == str(models)
     assert env["MINERU_MODEL_SOURCE"] == "modelscope"
+    assert env["ORT_DISABLE_TELEMETRY"] == "1"
 
 
 def test_mineru_env_respects_explicit_settings(monkeypatch, tmp_path) -> None:
@@ -315,7 +348,7 @@ def test_mineru_failure_message_carries_the_real_reason(tmp_path: Path, fake_env
 
 
 def test_mineru_exit_code_failure_keeps_stderr_tail(tmp_path: Path, fake_env, monkeypatch) -> None:
-    """非零退出码：沿用原有行为（带 stderr 尾部），重试次数用尽后抛出。"""
+    """非零退出码且无产物：沿用原有行为（带 stderr 尾部），重试次数用尽后抛出。"""
     fake_env(body=FAILING_MINERU)
     monkeypatch.setenv("EKBS_MINERU_ATTEMPTS", "2")
     source = tmp_path / "坏文件.pdf"
@@ -324,3 +357,34 @@ def test_mineru_exit_code_failure_keeps_stderr_tail(tmp_path: Path, fake_env, mo
     with pytest.raises(ParserUnavailable) as excinfo:
         parse_file(source)
     assert "model download failed" in str(excinfo.value)
+
+
+def test_mineru_sigabrt_after_output_is_accepted(tmp_path: Path, fake_env, monkeypatch) -> None:
+    """macOS 实测：MinerU 写完 content_list 后常以 -6（SIGABRT）退出——有产物应直接采纳。"""
+    abort_after_write = """#!/bin/sh
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -p) SRC="$2"; shift 2 ;;
+        -o) OUT="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    STEM="$(basename "$SRC")"; STEM="${STEM%.*}"
+    mkdir -p "$OUT/$STEM/auto"
+    cp "$FAKE_PAYLOAD" "$OUT/$STEM/auto/${STEM}_content_list.json"
+    printf '# ok\\n' > "$OUT/$STEM/auto/${STEM}.md"
+    echo "Processing pages: 100%" >&2
+    # 模拟收尾 SIGABRT（Python subprocess 记为 returncode -6）
+    kill -ABRT $$
+    """
+    fake_env(body=abort_after_write)
+    monkeypatch.setenv("EKBS_MINERU_ATTEMPTS", "2")
+    monkeypatch.setenv("FAKE_COUNT", str(tmp_path / "count-unused"))
+    source = tmp_path / "空调保养合同.pdf"
+    source.write_bytes(b"%PDF-1.4 fake")
+
+    parsed = parse_file(source)
+
+    assert parsed.engine == "mineru"
+    assert "员工年假管理制度" in parsed.markdown
+    assert len(parsed.tables) >= 1

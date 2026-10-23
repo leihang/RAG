@@ -21,6 +21,9 @@ from ekbs.dingtalk.client import (
     CARD_DELIVER_PATH,
     CARD_STREAMING_PATH,
     GROUP_SEND_PATH,
+    MEDIA_UPLOAD_PATH,
+    MSG_KEY_IMAGE,
+    OAPI_BASE_URL,
     OTO_SEND_PATH,
     DingTalkOpenApiClient,
 )
@@ -33,6 +36,7 @@ from ekbs.dingtalk.handler import (
     StreamMessageHandler,
 )
 from ekbs.dingtalk.token import TOKEN_PATH
+from ekbs.dingtalk.inbox import MessageInbox
 from ekbs.idempotency import IdempotencyGuard
 from ekbs.ratelimit import RateLimiter
 from tests.conftest import user_id_of
@@ -154,6 +158,7 @@ async def test_success_single_chat_streams_card(handler, cards) -> None:
     assert request.headers["X-Internal-User-Id"]
     body = json.loads(request.content)
     assert body["question"] == "年假有多少天" and body["conversation_id"] == "cid-1"
+    assert body.get("mode") == "auto"
 
     assert routes["create"].call_count == 1 and routes["deliver"].call_count == 1
     stream_calls = [json.loads(call.request.content) for call in routes["stream"].calls]
@@ -186,22 +191,92 @@ async def test_unknown_user_gets_polite_reply_without_asking_api(handler) -> Non
 
 
 @respx.mock
-async def test_api_failure_is_retryable_and_releases_idempotency(handler, runtime) -> None:
-    """API 5xx：ACK 非 200 + 释放幂等行，让钉钉重投能被重新受理。"""
+async def test_api_failure_retries_via_inbox_backoff(handler, runtime) -> None:
+    """API 5xx（D16）：ACK 非 200 + inbox 记 failed；退避到期后重投能被重新受理。"""
     mock_dingtalk()
-    respx.post(API_URL).mock(return_value=httpx.Response(503, json={"detail": "down"}))
-    code, message = await handler.process({"data": payload(msg_id="retry-1")})
+    api = respx.post(API_URL).mock(return_value=httpx.Response(503, json={"detail": "down"}))
+    code, _ = await handler.process({"data": payload(msg_id="retry-1")})
     assert code == ACK_RETRY
     with runtime.db.sync_connect() as conn:
         row = conn.execute(
-            "SELECT 1 FROM ekbs_msg_dedup WHERE msg_id = 'retry-1'"
+            "SELECT status, next_retry_at FROM ekbs_msg_inbox WHERE msg_id = 'retry-1'"
         ).fetchone()
-    assert row is None, "失败必须释放去重行，否则重投会被当成重复而永久吞掉"
+        assert row is not None, "失败必须落库登记（D16/C6）"
+        assert row["status"] == "failed"
+        assert row["next_retry_at"] is not None, "失败必须带退避时间，供重投/恢复扫描"
+        # 模拟退避到期（等价于钉钉稍晚重投 / 恢复扫描到点）
+        conn.execute(
+            "UPDATE ekbs_msg_inbox SET next_retry_at = datetime('now', '-1 seconds')"
+            " WHERE msg_id = 'retry-1'"
+        )
+        conn.commit()
 
-    # 重投（钉钉会重发同一条）现在应能被受理
     respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    calls_before = api.call_count
     code2, _ = await handler.process({"data": payload(msg_id="retry-1")})
     assert code2 == ACK_OK
+    assert api.call_count == calls_before + 1, "退避到期后重投必须被重新受理（at-least-once）"
+    with runtime.db.sync_connect() as conn:
+        status = conn.execute(
+            "SELECT status FROM ekbs_msg_inbox WHERE msg_id = 'retry-1'"
+        ).fetchone()["status"]
+    assert status == "done"
+
+
+@respx.mock
+async def test_inbox_recovers_stale_processing(handler, runtime) -> None:
+    """崩溃残留（D16 at-least-once 的核心场景）：processing 超租约的行被恢复重驱动，
+    用户最终收到回答 —— 旧实现里这条消息会被幂等表永久吞掉。"""
+    mock_dingtalk()
+    api = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    # 模拟「上一次处理到一半进程崩溃」：直接写入一条超租约的 processing 行
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "INSERT INTO ekbs_msg_inbox(msg_id, sender_staff_id, conversation_id,"
+            " conversation_type, text, status, retry_count, updated_at)"
+            " VALUES ('crash-1', 'demo_alice', 'cid-1', '1', '年假有多少天',"
+            " 'processing', 0, datetime('now', '-1 hour'))"
+        )
+        conn.commit()
+
+    recovered = await handler.recover_pending()
+    assert recovered == 1, "超租约的 processing 行必须被重驱动"
+    assert api.call_count == 1, "重驱动必须真正调用问答 API 并回复用户"
+    with runtime.db.sync_connect() as conn:
+        status = conn.execute(
+            "SELECT status FROM ekbs_msg_inbox WHERE msg_id = 'crash-1'"
+        ).fetchone()["status"]
+    assert status == "done"
+
+
+@respx.mock
+async def test_inbox_deadletter_after_exhausted_retries(handler, runtime) -> None:
+    """重试耗尽 → 死信表 + inbox 行终态（防「删档后重投被当新消息」）。"""
+    mock_dingtalk()
+    respx.post(API_URL).mock(return_value=httpx.Response(503, json={"detail": "down"}))
+    handler.inbox = MessageInbox(runtime.db, max_retries=1)  # 压低预算加速耗尽
+
+    code, _ = await handler.process({"data": payload(msg_id="dead-1")})
+    assert code == ACK_RETRY  # 首次失败：failed + 退避
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "UPDATE ekbs_msg_inbox SET next_retry_at = datetime('now', '-1 seconds')"
+            " WHERE msg_id = 'dead-1'"
+        )
+        conn.commit()
+    code2, _ = await handler.process({"data": payload(msg_id="dead-1")})
+    assert code2 == ACK_RETRY  # 第二次失败：预算耗尽 → 死信
+    with runtime.db.sync_connect() as conn:
+        dead = conn.execute(
+            "SELECT reason FROM ekbs_msg_deadletter WHERE msg_id = 'dead-1'"
+        ).fetchone()
+        assert dead is not None, "耗尽后必须入死信表（人工处置入口）"
+        row = conn.execute(
+            "SELECT status, next_retry_at FROM ekbs_msg_inbox WHERE msg_id = 'dead-1'"
+        ).fetchone()
+        assert row["status"] == "failed" and row["next_retry_at"] is None
+    code3, _ = await handler.process({"data": payload(msg_id="dead-1")})
+    assert code3 == ACK_OK  # 终态：重投不再受理，也不报错
 
 
 @respx.mock
@@ -313,3 +388,236 @@ async def test_process_never_raises_on_malformed_callback(handler) -> None:
     for weird in ({}, {"data": None}, {"data": {"msgId": None}}, "not-a-dict"):
         code, _ = await handler.process(weird)
         assert code == ACK_OK
+
+
+def test_render_answer_strips_path_shows_heading_dedupes(handler) -> None:
+    """引用不得五条同名；应去路径前缀并展示末级小节。"""
+    text = handler._render_answer(
+        "交班需说明停水停电等事项 [1][2]",
+        [
+            {
+                "cite_index": 1,
+                "doc_id": 65,
+                "doc_title": "doc文档/XJWY-GC-01-01交接班管理制度",
+                "heading_path": "4． 制度 > 4.6 重要事项交接，如：停水停电",
+            },
+            {
+                "cite_index": 2,
+                "doc_id": 65,
+                "doc_title": "doc文档/XJWY-GC-01-01交接班管理制度",
+                "heading_path": "4． 制度 > 4.7 交班人应向接班人详细介绍",
+            },
+            {
+                "cite_index": 3,
+                "doc_id": 65,
+                "doc_title": "doc文档/XJWY-GC-01-01交接班管理制度",
+                "heading_path": "4． 制度 > 4.6 重要事项交接，如：停水停电",
+            },
+        ],
+    )
+    assert "doc文档/" not in text
+    assert "XJWY-GC-01-01交接班管理制度 · 4.6" in text
+    assert "4.7" in text
+    assert text.count("参考资料") == 1
+    assert text.count("\n[") == 2  # 同小节去重后仅两条
+
+
+@respx.mock
+async def test_refused_still_sends_figure_attachments(handler, cards) -> None:
+    """拒答分支也要能发原图（模型说「资料无图」但 figure_attachments 仍在）。"""
+    rel = "parse/68/images/qr.png"
+    abs_path = handler.settings.data_dir / rel
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx"
+        b"\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND"
+        b"\xaeB`\x82"
+    )
+    routes = mock_dingtalk(card_ok=False)
+    respx.post(f"{OAPI_BASE_URL}{MEDIA_UPLOAD_PATH}").mock(
+        return_value=httpx.Response(
+            200, json={"errcode": 0, "errmsg": "ok", "media_id": "media-qr"}
+        )
+    )
+    body = answer_body(refused=True)
+    body["answer"] = "未找到可靠依据。"
+    body["figure_attachments"] = [
+        {"chunk_id": 1, "figure_id": "img-qr", "image_path": rel, "doc_title": "熙物联"}
+    ]
+    respx.post(API_URL).mock(return_value=httpx.Response(200, json=body))
+    code, _ = await handler.process({"data": payload(msg_id="msg-fig-refuse", text="二维码呢")})
+    assert code == ACK_OK
+    image_sends = [
+        json.loads(call.request.content)
+        for call in routes["oto"].calls
+        if json.loads(call.request.content).get("msgKey") == MSG_KEY_IMAGE
+    ]
+    assert len(image_sends) == 1
+
+
+@respx.mock
+async def test_figure_attachments_trigger_image_reply(handler, cards) -> None:
+    """找图意图：文字卡片之后再 media/upload + sampleImageMsg 发原图。"""
+    rel = "parse/68/images/demo.png"
+    abs_path = handler.settings.data_dir / rel
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx"
+        b"\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND"
+        b"\xaeB`\x82"
+    )
+    routes = mock_dingtalk()
+    media = respx.post(f"{OAPI_BASE_URL}{MEDIA_UPLOAD_PATH}").mock(
+        return_value=httpx.Response(
+            200, json={"errcode": 0, "errmsg": "ok", "media_id": "media-abc"}
+        )
+    )
+    body = answer_body()
+    body["figure_attachments"] = [
+        {
+            "chunk_id": 99,
+            "figure_id": "img-demo",
+            "image_path": rel,
+            "doc_title": "熙物联使用教程V4",
+        }
+    ]
+    respx.post(API_URL).mock(return_value=httpx.Response(200, json=body))
+
+    code, _ = await handler.process(
+        {"data": payload(msg_id="msg-fig-1", text="把图片发我")}
+    )
+    assert code == ACK_OK
+    assert media.call_count == 1
+    # 卡片成功后另发一条 sampleImageMsg
+    image_sends = [
+        json.loads(call.request.content)
+        for call in routes["oto"].calls
+        if json.loads(call.request.content).get("msgKey") == MSG_KEY_IMAGE
+    ]
+    assert len(image_sends) == 1
+    assert json.loads(image_sends[0]["msgParam"])["photoURL"] == "@media-abc"
+
+
+@respx.mock
+async def test_single_chat_file_enters_personal_library(handler) -> None:
+    """单聊发文件不进问答，改走私有库登记。"""
+    routes = mock_dingtalk()
+    respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(
+        return_value=httpx.Response(200, json={"downloadUrl": "https://files.example/note.txt"})
+    )
+    respx.get("https://files.example/note.txt").mock(
+        return_value=httpx.Response(200, content="只有本人".encode())
+    )
+    api = respx.post(f"{API_BASE}/api/v1/personal/files").mock(
+        return_value=httpx.Response(200, json={"message": "已放入你的私有库：note。"})
+    )
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    body = payload(msg_id="file-1", text="", msgtype="file")
+    body["content"] = {"downloadCode": "dc-1", "fileName": "note.txt"}
+    code, _ = await handler.process({"data": body})
+    assert code == ACK_OK
+    assert qa.call_count == 0
+    assert api.call_count == 1
+    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
+    assert "私有库" in sent["content"]
+
+
+@respx.mock
+async def test_single_chat_file_over_configured_limit(handler, seeded) -> None:
+    """超限文案用 limits.max_file_size_mb，并接受钉钉 OSS 的 http 下载地址。"""
+    runtime, _ = seeded
+    runtime.settings.limits["max_file_size_mb"] = 1
+    routes = mock_dingtalk()
+    blob = b"x" * (1 * 1024 * 1024 + 1)
+    respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(
+        return_value=httpx.Response(200, json={"downloadUrl": "http://files.example/big.txt"})
+    )
+    respx.get("http://files.example/big.txt").mock(
+        return_value=httpx.Response(200, content=blob)
+    )
+    api = respx.post(f"{API_BASE}/api/v1/personal/files").mock(
+        return_value=httpx.Response(200, json={"message": "不应入库"})
+    )
+    body = payload(msg_id="file-big", text="", msgtype="file")
+    body["content"] = {"downloadCode": "dc-big", "fileName": "big.txt"}
+    code, _ = await handler.process({"data": body})
+    assert code == ACK_OK
+    assert api.call_count == 0
+    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
+    assert sent["content"] == "文件超过 1 MB，私有库暂不接收。"
+
+
+@respx.mock
+async def test_group_file_is_refused(handler) -> None:
+    routes = mock_dingtalk()
+    download = respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(
+        return_value=httpx.Response(200, json={"downloadUrl": "https://files.example/note.txt"})
+    )
+    body = payload(msg_id="file-group", text="", msgtype="file", conversation_type="2")
+    body["content"] = {"downloadCode": "dc-2", "fileName": "note.txt"}
+    code, _ = await handler.process({"data": body})
+    assert code == ACK_OK
+    assert download.call_count == 0
+    sent = json.loads(json.loads(routes["group"].calls[0].request.content)["msgParam"])
+    assert "单聊" in sent["text"]
+
+
+@respx.mock
+async def test_personal_list_command_does_not_enter_qa(handler) -> None:
+    routes = mock_dingtalk()
+    respx.get(f"{API_BASE}/api/v1/personal/files").mock(
+        return_value=httpx.Response(200, json={"message": "你的私有库还是空的。"})
+    )
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    code, _ = await handler.process({"data": payload(msg_id="plist-1", text="我的文件")})
+    assert code == ACK_OK
+    assert qa.call_count == 0
+    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
+    assert "私有库" in sent["content"]
+
+
+@respx.mock
+async def test_accessible_doc_list_uses_catalog_not_qa_or_file(handler) -> None:
+    """「列出我可以查询/查阅的文件清单」回可见文档，不进问答，也不发原文。"""
+    mock_dingtalk()
+    catalog = respx.get(f"{API_BASE}/api/v1/discovery/catalog?doc_limit=80").mock(
+        return_value=httpx.Response(
+            200,
+            json={"help_text": "你当前可见的文档：\n1. 年假管理制度", "documents": [], "suggestions": []},
+        )
+    )
+    file_route = respx.post(f"{API_BASE}/api/v1/discovery/file").mock(
+        return_value=httpx.Response(200, json={"action": "none", "message": "不应发原文"})
+    )
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+
+    for index, text in enumerate(
+        (
+            "列出我可以查询文件的目录清单",
+            "列出我可以查阅文件的清单",
+            "我可以查询哪些文件",
+        )
+    ):
+        result = await handler.handle(payload(msg_id=f"cat-list-{index}", text=text))
+        assert result.reason == "catalog", text
+        assert "年假管理制度" in result.answer
+
+    assert catalog.call_count == 3
+    assert file_route.call_count == 0
+    assert qa.call_count == 0
+
+    sent = await handler.handle(
+        payload(msg_id="cat-send-1", text="把年假管理制度文件发给我")
+    )
+    assert sent.reason == "file"
+    assert file_route.call_count == 1
+    assert catalog.call_count == 3
+    assert qa.call_count == 0
+
+    asked = await handler.handle(payload(msg_id="cat-qa-1", text="年假制度是什么"))
+    assert asked.reason != "catalog"
+    assert qa.call_count == 1
+    assert catalog.call_count == 3
+    assert file_route.call_count == 1

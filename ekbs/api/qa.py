@@ -46,9 +46,9 @@ class QaRequest(BaseModel):
     stream: bool = False
     conversation_id: str | None = None
     use_cache: bool = True
-    #: 作答模式：``prose``（默认，业务问答）| ``numeric``（取数：值/单位/页码 + 抄写校验）。
-    #: 取数模式见 ekbs/retrieval/numeric.py 与 README §四 第 77 条；两种模式各自独立缓存。
-    mode: str = Field(default="prose", pattern="^(prose|numeric)$")
+    #: 作答模式：``auto``（默认，按意图路由）| ``prose`` | ``numeric``。
+    #: 取数见 ekbs/retrieval/numeric.py；``qa.auto_numeric`` 控制 auto 是否进取数。
+    mode: str = Field(default="auto", pattern="^(auto|prose|numeric)$")
 
 
 class RetrieveRequest(BaseModel):
@@ -140,12 +140,15 @@ def _check_question_length(runtime: Any, question: str) -> None:
 
 
 def _citation_payload(citations: list[Any]) -> list[dict[str, Any]]:
+    from ekbs.discovery import display_doc_title
+
     return [
         {
             "cite_index": c.cite_index,
             "chunk_id": c.chunk_id,
             "doc_id": c.doc_id,
             "doc_title": c.doc_title,
+            "display_title": display_doc_title(c.doc_title),
             "doc_version": c.doc_version,
             "heading_path": c.heading_path,
             "page_from": c.page_from,
@@ -220,14 +223,28 @@ async def qa_chat(
         trace_id=trace_id,
     )
 
+    answer_text = answer.answer
+    suggested: list[dict[str, Any]] = []
+    if answer.refused:
+        # D22-P0：拒答时附 2～3 条相关示例问（过 ACL）
+        from ekbs.discovery import format_refusal_hints, suggested_questions
+
+        suggested = suggested_questions(
+            runtime, perm, limit=3, query=safe_question, for_refusal=True
+        )
+        hint = format_refusal_hints(suggested)
+        if hint and "你可以试试问" not in (answer_text or ""):
+            answer_text = (answer_text or "未找到可靠依据。").rstrip() + hint
+
     body = {
-        "answer": answer.answer,
+        "answer": answer_text,
         "question": safe_question,
         "rewritten_query": answer.rewritten_query,
         "history_used": answer.history_used,
         "citations": _citation_payload(answer.citations),
         "refused": answer.refused,
         "refusal_reason": answer.refusal_reason,
+        "suggested_questions": [s["question"] for s in suggested],
         "model": answer.model,
         "session_id": session_id,
         "turn": turn,
@@ -239,6 +256,10 @@ async def qa_chat(
         "degraded": [*answer.retrieval.degraded, *answer.degraded],
         # 取数模式的结构化结果（prose 模式下为 None）
         "numeric": answer.numeric,
+        "mode": payload.mode,
+        "mode_used": answer.mode_used,
+        "intent": answer.intent,
+        "figure_attachments": list(answer.figure_attachments or []),
         "perm_fingerprint": perm.fingerprint,
         "visible_shard_count": len(perm.visible_shard_ids),
         "warnings": list(perm.warnings),

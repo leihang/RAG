@@ -107,12 +107,12 @@ parse:
 # ---------- 权限 ----------
 permission:
   default_level: 2
-  l4_enabled: false
-  l3_ingest_enabled: false
+  l4_enabled: true             # 2026-10-09 用户确认（测试期）：全部闸门打开
+  l3_ingest_enabled: true      # 2026-10-09 用户确认（测试期）：L3 允许入库
   policy_cache_ttl: 300
   # 合规闸（00 §7）：云端嵌入 = 全量语料出网。书面确认前保持 false，仅允许合成语料。
-  corpus_egress_ack: false
-  corpus_egress_ack_ticket: ""
+  corpus_egress_ack: true      # 2026-10-09 用户确认（测试期）
+  corpus_egress_ack_ticket: "2026-10-09 用户确认：测试期全部闸门打开（合规书暂缓）"
   # dept_code → 钉钉部门 ID 列表 的映射。见 docs/spec/10 的 O6-1 / K1：
   # 权威方案未定义该映射存在哪里，本骨架先由配置承载（不新增 Schema）。
   # ⚠️ 必须放在**配置**里而不是进程内存里：入库（worker）、路由（api）是两个进程，
@@ -162,6 +162,9 @@ session:
   context_ttl_seconds: 604800
   group_share_context: false
 
+qa:
+  auto_numeric: true
+
 # ---------- 上传行为（05 §6.5）----------
 upload:
   chunk_size_mb: 8            # 分片大小；界面按它切片
@@ -174,6 +177,7 @@ limits:
   per_conversation_qps: 3
   max_question_chars: 2000
   max_file_size_mb: 500
+  personal_storage_mb: 1024
   file_ext_whitelist: [pdf, docx, doc, pptx, ppt, xlsx, xls, txt, md, html, png, jpg, jpeg]
 
 security:
@@ -188,3 +192,9 @@ security:
     - image/jpeg
   sensitive_words_path: "config/sensitive_words.txt"   # 开发（生产 /opt/ekbs/etc/sensitive_words.txt）
   content_security_enabled: true
+  # ---- 本机账号登录（管理台第二种登录方式；见 ekbs/local_auth.py）----
+  # 日常用钉钉免登；本机账号只在「人就在服务器前 / 钉钉不可用」时兜底。
+  local_login_enabled: true          # 关掉后 /auth/local-login 直接 404
+  local_login_allow_remote: false    # ⚠️ 保持 false：true = 内网任何机器都能试密码（不推荐）
+  local_login_max_failures: 5        # 连续失败次数上限
+  local_login_lock_minutes: 15       # 达到上限后的锁定时长

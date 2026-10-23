@@ -93,19 +93,43 @@ def build_sdk_handler(inner: Any, state: StreamState) -> Any:
     return _EkbsChatbotHandler()
 
 
+async def _recover_loop(inner: Any, *, interval_seconds: int = 60) -> None:
+    """D16 周期恢复扫描（08 §3.1）：崩溃/发布窗口的兜底重驱动；永不抛出。"""
+    import asyncio
+
+    from ekbs.logging import get_logger
+
+    log = get_logger(component="dingtalk.stream")
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            count = await inner.recover_pending()
+            if count:
+                log.warning("msg_inbox_recovered", count=count)
+        except Exception as exc:  # noqa: BLE001 - 本轮失败等下一轮
+            log.error("msg_inbox_recover_failed", error=str(exc))
+
+
 def create_stream_task(app: FastAPI, settings: Settings, secrets: Secrets, state: StreamState) -> Any:
     """拉起真正的 Stream 长连接（凭据齐备时才有意义）。"""
 
     async def _run() -> None:
+        import asyncio
+
         from dingtalk_stream import ChatbotMessage, Credential, DingTalkStreamClient
 
         from ekbs.dingtalk.handler import make_handler
+        from ekbs.dingtalk.org_events import build_org_event_handler
+        from ekbs.dingtalk.sync import build_sync_service
         from ekbs.db import Database
         from ekbs.logging import get_logger
 
         log = get_logger(component="dingtalk.stream")
         database = Database(settings)
         inner = make_handler(database, settings, secrets)
+        # D16：先恢复上一轮可能中断的消息，再接入新流量（启动即一次，之后周期扫描）
+        await inner.recover_pending()
+        recovery_task = asyncio.create_task(_recover_loop(inner))
         credential = Credential(
             secrets.get("DINGTALK_CLIENT_ID"), secrets.get("DINGTALK_CLIENT_SECRET")
         )
@@ -113,14 +137,28 @@ def create_stream_task(app: FastAPI, settings: Settings, secrets: Secrets, state
         client.register_callback_handler(
             ChatbotMessage.TOPIC, build_sdk_handler(inner, state)
         )
+        # 人员变动（入职、离职、改职位、改部门）走事件，不再靠每天凌晨全量拉取。
+        org_sync = build_sync_service(database, settings, secrets)
+        client.register_all_event_handler(
+            build_org_event_handler(org_sync, on_connected=state.mark_connected)
+        )
         state.mark_started()
         log.info("stream_starting", topic=ChatbotMessage.TOPIC)
+        # ⚠️ 不能调 start_forever()：它内部是 asyncio.run(self.start())，
+        # 在 uvicorn 已有事件循环里会直接炸（RuntimeError: cannot be called from a running event loop）。
+        # start() 自身带断线重连；外层再兜一层，避免意外退出后适配器空转。
         try:
-            # start_forever 内部自带重连（官方 SDK 契约），异常才会冒到这里
-            await client.start_forever()
-        except Exception as exc:  # pragma: no cover - 需要真实网络
-            state.mark_disconnected(f"stream 异常退出：{exc}")
-            log.error("stream_exited", error=str(exc))
+            while True:
+                try:
+                    await client.start()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # pragma: no cover - 需要真实网络
+                    state.mark_disconnected(f"stream 异常退出：{exc}")
+                    log.error("stream_exited", error=str(exc))
+                await asyncio.sleep(3)
+        finally:
+            recovery_task.cancel()
 
     return app.state.stream_task_factory(_run)
 
@@ -131,11 +169,17 @@ def create_adapter_app(settings: Settings, secrets: Secrets) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         enabled = bool(settings.dingtalk.get("stream_enabled", True))
+        # RobotCode 常等于 AppKey；未单独配置时允许用 CLIENT_ID 顶上
         missing = [
             key
-            for key in ("DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET", "DINGTALK_ROBOT_CODE")
+            for key in ("DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET")
             if not secrets.is_configured(key)
         ]
+        if (
+            not secrets.is_configured("DINGTALK_ROBOT_CODE")
+            and not secrets.is_configured("DINGTALK_CLIENT_ID")
+        ):
+            missing.append("DINGTALK_ROBOT_CODE")
         if not enabled:
             state.mark_disconnected("stream_enabled=false（01 §7 配置）")
             log.info("stream_disabled")

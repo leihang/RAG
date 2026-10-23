@@ -2,7 +2,7 @@
 
 三层都要测，因为这条路的**全部保证**就靠这三层：
 
-1. 解析层：四种格式陷阱（千分位 / 欧陆小数 / 括号负数 / 千·百万补零）+ 畸形输出一律 N/A；
+1. 解析层：千分位 / 欧陆小数 / 括号负数；万、千不换算。畸形输出一律 N/A；
 2. 校验层：**值必须逐字来自它引用的原文片段** —— 这是比"事后对账"更强的结构验证；
 3. 语义层：拒答必须与业务问答一致（`refused=True` + `citations=[]`），
    且两种模式**互不串答案**（缓存键含 mode）。
@@ -56,8 +56,8 @@ def _chunk(content: str) -> SimpleNamespace:
     [
         ("58,3", "%", 58.3),                 # 欧陆式逗号当小数点
         ("(2,124,837)", "CHF", -2124837.0),  # 括号 = 负数
-        (4970.5, "千美元", 4970500.0),        # 单位是"千" → 补三个零
-        ("1.2", "百万", 1200000.0),          # 单位是"百万" → 补六个零
+        (4970.5, "千美元", 4970.5),
+        ("1.2", "百万", 1.2),
         ("1,234,567", "元", 1234567.0),      # 千分位
         ("5", "天", 5.0),
     ],
@@ -110,13 +110,22 @@ def test_verify_rejects_fabricated_quote() -> None:
     assert verify_copied(parsed, [_chunk("完全无关的另一段文字")]) == (False, None)
 
 
-def test_verify_tolerates_scale_word_in_source() -> None:
-    """原文写「1.2 万」，模型抄成 12000 —— 量级等价，应通过（不是"算"，是同一数的两种写法）。"""
+def test_verify_rejects_scaled_value() -> None:
+    """原文写「1.2 万」，模型折成 12000 —— 这是换算，必须拦下。"""
     parsed = parse_numeric_payload(
         json.dumps({"value": 12000, "unit": "度", "quote": "当月用电量 1.2 万度"})
     )
+    assert verify_copied(parsed, [_chunk("报告：当月用电量 1.2 万度")]) == (False, None)
+
+
+def test_verify_keeps_original_surface() -> None:
+    parsed = parse_numeric_payload(
+        json.dumps({"value": 1.2, "unit": "度", "quote": "当月用电量 1.2 万度", "indicator": "用电量"})
+    )
     ok, index = verify_copied(parsed, [_chunk("报告：当月用电量 1.2 万度")])
     assert ok is True and index == 1
+    assert parsed.surface == "1.2 万"
+    assert render_answer(parsed, 1) == "用电量：1.2 万 度 [1]"
 
 
 def test_render_avoids_scientific_notation() -> None:
@@ -212,15 +221,18 @@ async def test_numeric_mode_unverified_value_refuses(seeded) -> None:
 
 @pytest.mark.asyncio
 async def test_prose_mode_untouched_by_numeric_mode(seeded) -> None:
-    """默认模式仍是业务问答：不带 mode 时答案形态与 faithfulness 面板口径都不变。"""
+    """显式 prose（或测试夹具关闭 auto_numeric）时答案形态与 faithfulness 不变。"""
     runtime, _ = seeded
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
     result = await _with_stub_llm(
         runtime, "年假 5 天 [1]。",
-        lambda: runtime.pipeline.answer("年假有多少天", alice, use_cache=False),
+        lambda: runtime.pipeline.answer(
+            "年假有多少天", alice, mode="prose", use_cache=False
+        ),
     )
     assert result.numeric is None, "业务问答不应带取数结构"
-    assert result.numeric is None and result.faithfulness.get("reason") != "numeric_copy_verified"
+    assert result.mode_used == "prose"
+    assert result.faithfulness.get("reason") != "numeric_copy_verified"
 
 
 # ---------------------------------------------------------------- 格式修复（防线 5）
@@ -453,13 +465,8 @@ async def test_numeric_mode_refuses_fabricated_scope(seeded) -> None:
     assert result.citations == []
 
 
-async def test_numeric_mode_discloses_scope_alternatives(seeded, monkeypatch) -> None:
-    """管线上：同标签存在别的数值 → 答案照给，但**同时**披露「另有 …」（不假装唯一）。
-
-    这里桩掉 `find_scope_alternatives` 而不是往召回结果里塞假分块：后者要让假分块
-    补齐 `page_from`/`chunk_type`/… 一长串字段（引用构建会逐个读），既脆又偏离测试意图。
-    真正的"发现歧义"逻辑由上面的单元用例覆盖。
-    """
+async def test_numeric_mode_refuses_scope_alternatives(seeded, monkeypatch) -> None:
+    """P1：同标签存在别的数值且问题未钉口径 → 拒答并反问（不放出任一数当唯一答案）。"""
     runtime, _ = seeded
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
     value, quote = await _real_quote(runtime, alice, "年假有多少天")
@@ -476,9 +483,40 @@ async def test_numeric_mode_discloses_scope_alternatives(seeded, monkeypatch) ->
         runtime, json.dumps(payload, ensure_ascii=False),
         lambda: runtime.pipeline.answer("年假有多少天", alice, mode="numeric", use_cache=False),
     )
+    assert result.refused is True
+    assert result.refusal_reason == "numeric_scope_ambiguous"
+    assert result.citations == []
+    assert "多个口径" in result.answer
+    assert result.numeric and result.numeric.get("alternatives")
+
+
+def test_resolve_answer_mode_auto_and_explicit() -> None:
+    from ekbs.retrieval.numeric import resolve_answer_mode
+
+    assert resolve_answer_mode("numeric", "factual") == "numeric"
+    assert resolve_answer_mode("prose", "numeric") == "prose"
+    assert resolve_answer_mode("auto", "numeric", auto_numeric=True) == "numeric"
+    assert resolve_answer_mode("auto", "factual", auto_numeric=True) == "prose"
+    assert resolve_answer_mode("auto", "numeric", auto_numeric=False) == "prose"
+
+
+async def test_auto_mode_routes_numeric_intent(seeded, monkeypatch) -> None:
+    """mode=auto + 取数意图 → 实际走 numeric（mode_used）。"""
+    runtime, _ = seeded
+    runtime.settings.qa = {**(runtime.settings.qa or {}), "auto_numeric": True}
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    value, quote = await _real_quote(runtime, alice, "年假有多少天")
+    payload = {"value": value, "unit": "天", "quote": quote, "scope": ""}
+    result = await _with_stub_llm(
+        runtime, json.dumps(payload, ensure_ascii=False),
+        lambda: runtime.pipeline.answer(
+            "年假有多少天", alice, mode="auto", use_cache=False
+        ),
+    )
+    assert result.intent == "numeric"
+    assert result.mode_used == "numeric"
     assert result.refused is False
-    assert result.numeric and result.numeric.get("alternatives"), "歧义必须被披露出来"
-    assert any(d.startswith("numeric_scope_ambiguity") for d in result.degraded)
+    assert "依据：" in result.answer or result.numeric
 
 
 def test_question_pinning_suppresses_ambiguity_noise() -> None:

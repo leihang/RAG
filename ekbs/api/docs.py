@@ -39,12 +39,20 @@ from pydantic import BaseModel, Field
 from ekbs.api.auth import INTERNAL_TOKEN_HEADER, INTERNAL_USER_HEADER
 from ekbs.api.qa import _authenticate
 from ekbs.errors import ConfigError, PermissionDenied, SchemaError
+from ekbs.personal import (
+    PERSONAL_LEVEL,
+    assert_personal_kb_storage,
+    personal_user_id_from_code,
+    scope_ref,
+)
 from ekbs.ingest.dir_import import ImportPathError, assert_path_within_raw
 from ekbs.ingest.parser import SUFFIX_ENGINES, normalize_suffix
 from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
 from ekbs.logging import get_logger
 from ekbs.permission.changes import PermissionChangeService
 from ekbs.permission.router import bump_policy_version
+from ekbs.permission.upload_scope import check_document_scope
+from ekbs.permission.viewers import assert_viewers_assignable, grant_document_viewers
 
 router = APIRouter(tags=["docs"])
 log = get_logger(component="api.docs")
@@ -104,6 +112,8 @@ class DocumentCreate(BaseModel):
     kb_code: str | None = None
     level: int = Field(default=2, ge=1, le=4)
     visible_dept_ids: list[str] = Field(default_factory=list)
+    #: 额外可查看的人（用户编号，可多选）。不改变可见部门。
+    viewer_user_ids: list[int] = Field(default_factory=list)
     source_path: str = ""
     doc_version: str = "v1"
     effective_date: str | None = None
@@ -135,6 +145,16 @@ async def create_document(
     except ConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # 上架范围（部门 × 密级）：登记同样受限 —— 否则可以先登记再让 worker 入库绕过。
+    scope = check_document_scope(
+        runtime.db,
+        user_id=user.user_id,
+        level=int(payload.level),
+        visible_dept_ids=list(payload.visible_dept_ids),
+    )
+    if not scope.allowed:
+        raise HTTPException(status_code=403, detail=f"无权登记该文档：{scope.detail}")
+
     kb_id = payload.kb_id
     if kb_id is None and payload.kb_code:
         with runtime.db.sync_connect() as conn:
@@ -161,18 +181,33 @@ async def create_document(
         raise HTTPException(status_code=422, detail=f"文件不存在：{resolved}")
     source_path = str(resolved)
 
+    size_bytes = resolved.stat().st_size
     with runtime.db.sync_connect() as conn:
+        try:
+            assert_personal_kb_storage(
+                conn, settings, kb_id=int(kb_id), incoming=size_bytes
+            )
+            viewers = assert_viewers_assignable(
+                conn, kb_id=int(kb_id), viewer_user_ids=payload.viewer_user_ids
+            )
+        except ConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         conn.execute(
             "INSERT INTO ekbs_document(kb_id, title, source_path, level, visible_dept_ids, "
-            "status, checksum, doc_version, effective_date, expire_date, created_by) "
-            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
+            "status, checksum, size_bytes, doc_version, effective_date, expire_date, created_by) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
             (
                 kb_id, payload.title, source_path, payload.level,
                 json.dumps(payload.visible_dept_ids, ensure_ascii=False), payload.checksum,
-                payload.doc_version, payload.effective_date, payload.expire_date, user.user_id,
+                size_bytes, payload.doc_version, payload.effective_date, payload.expire_date,
+                user.user_id,
             ),
         )
         doc_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        grant_document_viewers(
+            conn, doc_id=doc_id, viewer_user_ids=viewers,
+            operator_id=user.user_id, reason="document:viewers",
+        )
         conn.commit()
     log.info("document_registered", doc_id=doc_id, operator=user.user_id, level=payload.level)
     return JSONResponse({"doc_id": doc_id, "status": "pending"}, status_code=201)
@@ -954,6 +989,8 @@ class UploadInit(BaseModel):
     kb_code: str | None = None
     level: int = Field(default=2, ge=1, le=4)
     visible_dept_ids: list[str] = Field(default_factory=list)
+    #: 额外可查看的人（用户编号，可多选）。同一批上传的每份文件都写上这些人。
+    viewer_user_ids: list[int] = Field(default_factory=list)
     #: 可选标题。上传文件夹时前端把相对路径（去扩展名）作为标题传上来，
     #: 否则 `Path(filename).stem` 会把目录结构整段丢掉，用户看到的就是"文件夹被分离了"。
     title: str | None = Field(default=None, max_length=512)
@@ -1036,7 +1073,7 @@ async def upload_init(
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
     """上传初始化：校验扩展名与大小闸门，并按 SHA-256 做**秒传**判定（`05` §8.2）。"""
-    _, _p = _principal(
+    user, _p = _principal(
         request, _headers(authorization, x_internal_token, x_internal_user_id),
         "doc:document:create",
     )
@@ -1065,6 +1102,33 @@ async def upload_init(
     if payload.size_bytes > max_mb * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"文件超过 {max_mb:g} MB 上限")
 
+    # 文件只使用直接所在文件夹的权限，不套用上级文件夹。
+    # 个人库不读这份设置。放在分片归属判定之前，避免表单上的另一套把文件夹盖掉。
+    kb_code_for_policy = str(payload.kb_code or "").strip()
+    if not kb_code_for_policy and payload.kb_id is not None:
+        with runtime.db.sync_connect() as conn:
+            kb_row = conn.execute(
+                "SELECT code FROM ekbs_kb WHERE kb_id = ?", (int(payload.kb_id),),
+            ).fetchone()
+        kb_code_for_policy = str(kb_row["code"]) if kb_row else ""
+    from ekbs.ingest.folder_policy import policy_for_upload
+
+    personal_owner = personal_user_id_from_code(kb_code_for_policy)
+    if personal_owner is not None:
+        # 个人库固定投给主人：不读文件夹权限，也不采用表单上的密级和部门。
+        payload.level = PERSONAL_LEVEL
+        payload.visible_dept_ids = [scope_ref(personal_owner)]
+        payload.viewer_user_ids = []
+    else:
+        try:
+            applied_policy = policy_for_upload(settings, kb_code_for_policy, payload.filename)
+        except ConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if applied_policy is not None:
+            payload.level = int(applied_policy["level"])
+            payload.visible_dept_ids = list(applied_policy["visible_dept_ids"])
+            payload.viewer_user_ids = list(applied_policy["viewer_user_ids"])
+
     # **分片归属判定前置**：L2/L3 不给部门、L4 未开，都会在**解析阶段**才被拒
     # （worker 异步失败，界面上只显示"上传成功"）。放在这里就能立刻 422，且复用
     # 入库路径的**同一份**判定函数（不另写规则）。
@@ -1080,12 +1144,46 @@ async def upload_init(
     except ConfigError as exc:
         raise HTTPException(status_code=422, detail=f"密级/部门不满足入库条件：{exc}") from exc
 
+    # 上架范围（部门 × 密级）：只能发布到自己的管理范围、且不超过自己的密级上限
+    # （super_admin 例外）。修复评估发现的「有上传权限点就能传任何部门/任何密级」。
+    scope = check_document_scope(
+        runtime.db,
+        user_id=user.user_id,
+        level=int(payload.level),
+        visible_dept_ids=list(payload.visible_dept_ids),
+    )
+    if not scope.allowed:
+        raise HTTPException(status_code=403, detail=f"无权发布该文档：{scope.detail}")
+
+    with runtime.db.sync_connect() as conn:
+        try:
+            viewers = assert_viewers_assignable(
+                conn,
+                kb_id=payload.kb_id,
+                kb_code=payload.kb_code,
+                viewer_user_ids=payload.viewer_user_ids,
+            )
+        except ConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     if payload.checksum:
         doc_id = _find_instant_doc(runtime, str(payload.checksum).strip().lower())
         if doc_id is not None:
             return JSONResponse(
                 {"instant": True, "doc_id": doc_id, "message": "秒传：内容已存在"}
             )
+
+    with runtime.db.sync_connect() as conn:
+        try:
+            assert_personal_kb_storage(
+                conn,
+                settings,
+                kb_id=payload.kb_id,
+                kb_code=payload.kb_code,
+                incoming=int(payload.size_bytes),
+            )
+        except ConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     upload_id = uuid.uuid4().hex
     await runtime.cache.set(
@@ -1099,6 +1197,7 @@ async def upload_init(
             "kb_code": payload.kb_code,
             "level": payload.level,
             "visible_dept_ids": list(payload.visible_dept_ids),
+            "viewer_user_ids": viewers,
             "parts": [],
         },
         ttl=UPLOAD_TTL_SECONDS,
@@ -1257,6 +1356,24 @@ async def upload_complete(
         with runtime.db.sync_connect() as conn:
             row = conn.execute("SELECT code FROM ekbs_kb WHERE kb_id = ?", (int(kb_id),)).fetchone()
         kb_code = str(row["code"]) if row else "default"
+    with runtime.db.sync_connect() as conn:
+        try:
+            assert_personal_kb_storage(
+                conn,
+                settings,
+                kb_id=int(kb_id),
+                kb_code=str(kb_code) if kb_code else None,
+                incoming=merged_bytes,
+            )
+            viewers = assert_viewers_assignable(
+                conn,
+                kb_id=int(kb_id),
+                kb_code=str(kb_code) if kb_code else None,
+                viewer_user_ids=state.get("viewer_user_ids") or [],
+            )
+        except ConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     rel_name = safe_relative_name(str(state["filename"]))
     final_path = raw_root / safe_relative_name(str(kb_code)) / rel_name
     final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1283,6 +1400,10 @@ async def upload_complete(
             ),
         )
         doc_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        grant_document_viewers(
+            conn, doc_id=doc_id, viewer_user_ids=viewers,
+            operator_id=user.user_id, reason="upload:viewers",
+        )
         conn.commit()
     await runtime.cache.delete(f"{UPLOAD_CACHE_PREFIX}{upload_id}")
     log.info("upload_completed", doc_id=doc_id, bytes=final_path.stat().st_size, checksum=digest[:12])

@@ -46,6 +46,8 @@ export interface Citation {
   /** 图片块才有：图 id 与相对 data_dir 的图片路径（`06` §4.11 的"可回源"） */
   figure_id?: string | null
   image_path?: string | null
+  /** 图片块是否已入多模态旁路索引 */
+  figure_mm_indexed?: boolean
 }
 
 export interface FaithfulnessClaim {
@@ -69,12 +71,25 @@ export interface DebugQueryResp {
   answer?: string | null
   refused?: boolean | null
   refusal_reason?: string | null
+  /** D22：拒答时附带的相关示例问 */
+  suggested_questions?: string[] | null
   model?: string
   citations?: Citation[]
+  /** 找图意图或引用含图时：后端汇总的可回源图片（调试台单独展示原图） */
+  figure_attachments?: {
+    chunk_id: number
+    figure_id?: string
+    image_path?: string
+    doc_title?: string
+  }[] | null
   /** 降级标记（如 `unsupported_claim:9`）：答案已返回，但有一项检查被降级了 */
   degraded?: string[] | null
   /** 作答模式：prose（业务问答，默认）| numeric（取数：值/单位/页码 + 抄写校验） */
   mode?: 'prose' | 'numeric' | null
+  /** 实际生效模式（含 auto→numeric） */
+  mode_used?: string | null
+  /** 查询意图：factual / numeric / figure / procedure */
+  intent?: string | null
   /** 取数模式的结构化结果（prose 模式下为 null） */
   numeric?: NumericAnswer | null
   faithfulness?: FaithfulnessReport | null
@@ -91,8 +106,37 @@ export const debugRetrieve = (body: DebugQueryBody) =>
 export const debugRewrite = (body: { query: string; history?: string[] }) =>
   http.post('/rag/debug/rewrite', body) as Promise<Record<string, unknown>>
 
-export const debugSimulate = (body: { query: string; user_id: number }) =>
-  http.post('/rag/debug/simulate', body) as Promise<Record<string, unknown>>
+export interface SimulatedChunk {
+  chunk_id: number
+  doc_id: number
+  shard_id: string
+  doc_title: string
+  chunk_type: string
+  heading_path: string
+  dense_rank: number | null
+  sparse_rank: number | null
+  rrf_score: number
+  rerank_score: number | null
+}
+
+export interface SimulateResp {
+  operator: number
+  simulated_user: number
+  reason: string
+  simulated_perm: {
+    clearance: number
+    dept_chain: string[]
+    visible_shards: string[]
+    fingerprint: string
+  }
+  query: string
+  refused: boolean
+  refusal_reason: string
+  chunks: SimulatedChunk[]
+}
+
+export const debugSimulate = (body: { query: string; user_id: number; reason: string }) =>
+  http.post('/rag/debug/simulate', body) as Promise<SimulateResp>
 
 export const debugShards = () =>
   http.get('/rag/debug/shards') as Promise<{

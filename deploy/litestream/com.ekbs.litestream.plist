@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.ekbs.litestream.plist —— Litestream 连续归档常驻服务（00 v4.0 D15）
+  安装：cp 本文件 ~/Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ekbs.litestream.plist
+  密钥：LITESTREAM_* 环境变量经 ~/.ekbs/secrets.env 注入（与 ekbs 其他服务同一纪律：plist 不写明文）
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ekbs.litestream</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>set -a; source "$HOME/.ekbs/secrets.env" 2>/dev/null || true; set +a; exec /opt/homebrew/bin/litestream replicate -config /opt/ekbs/etc/litestream.yml</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/opt/ekbs/log/litestream.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/opt/ekbs/log/litestream.err.log</string>
+</dict>
+</plist>

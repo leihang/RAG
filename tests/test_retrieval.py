@@ -67,6 +67,157 @@ async def test_bob_can_reach_finance_document(seeded) -> None:
     assert any(chunk.doc_title == "财务保密制度" for chunk in result.chunks)
 
 
+async def test_d18_denied_chunk_never_sent_to_rerank(seeded) -> None:
+    """**D18 红线**：片内 deny 的 chunk 不得进入云端 rerank 的 payload（00 v4.0 C5 双闸）。
+
+    分片过滤只能保证「片级有权」（C1）——alice 能看 kb_hr_L2 分片，但对片内
+    《年假管理制度》加 doc 级 deny 后，其 chunk 仍会参与片内召回；若缺 D18 粗筛，
+    这些 chunk 会随 payload 明文发往第三方 rerank。本用例录制 rerank 入参做抓包式断言。
+    """
+    runtime, _ = seeded
+    alice_id = user_id_of(runtime.db, "demo_alice")
+    bob_id = user_id_of(runtime.db, "demo_bob")
+    with runtime.db.sync_connect() as conn:
+        hr_doc_id = int(
+            conn.execute(
+                "SELECT doc_id FROM ekbs_document WHERE title = '年假管理制度'"
+            ).fetchone()["doc_id"]
+        )
+        finance_doc_id = int(
+            conn.execute(
+                "SELECT doc_id FROM ekbs_document WHERE title = '财务保密制度'"
+            ).fetchone()["doc_id"]
+        )
+        hr_chunk_ids = {
+            int(r["chunk_id"])
+            for r in conn.execute(
+                "SELECT chunk_id FROM ekbs_chunk WHERE doc_id = ?", (hr_doc_id,)
+            ).fetchall()
+        }
+        finance_chunk_ids = {
+            int(r["chunk_id"])
+            for r in conn.execute(
+                "SELECT chunk_id FROM ekbs_chunk WHERE doc_id = ?", (finance_doc_id,)
+            ).fetchall()
+        }
+
+    # 录制 rerank payload（TC-D18 的「抓包」）
+    original = runtime.pipeline.providers.rerank
+    payloads: list[list[int]] = []
+
+    class _RecordingRerank:
+        ref = original.ref
+
+        async def rerank(self, query, docs, top_n):
+            payloads.append([d.chunk_id for d in docs])
+            return await original.rerank(query, docs, top_n)
+
+    runtime.pipeline.providers.rerank = _RecordingRerank()
+
+    # 正向对照：bob 正常问答 —— 录制器必须真的录到了 payload
+    # （证明下方「没录到 deny 内容」不是因为 rerank 压根没被调用）
+    bob = await runtime.perm_context(bob_id)
+    control = await runtime.pipeline.retrieve("财务专用章由谁保管", bob)
+    assert control.refused is False, control.refusal_reason
+    assert payloads, "对照组未触发 rerank 调用，录制器接线有误"
+    assert any(finance_chunk_ids & set(batch) for batch in payloads)
+
+    # 片内 deny：alice 可见 kb_hr_L2 分片，但对片内该文档有 doc 级 deny
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "INSERT INTO ekbs_acl_entry(object_type, object_id, subject_type, subject_id,"
+            " permission, effect) VALUES ('document', ?, 'user', ?, 'read', 'deny')",
+            (str(hr_doc_id), str(alice_id)),
+        )
+        conn.commit()
+
+    alice = await runtime.perm_context(alice_id)
+    before = len(payloads)
+    result = await runtime.pipeline.retrieve("年假有多少天", alice)
+
+    # ① 粗筛确实拦下了候选（闸门在工作，不是空跑）
+    assert result.c5_pre_dropped >= 1
+    # ② 红线：deny 的 chunk 一次都没进过 rerank payload（无权内容零出域）
+    sent = {cid for batch in payloads[before:] for cid in batch}
+    assert not (sent & hr_chunk_ids), "被 deny 的 chunk 泄漏进 rerank payload"
+    # ③ 纵深：最终结果也不含该文档的任何块
+    assert all(chunk.doc_id != hr_doc_id for chunk in result.chunks)
+
+
+async def test_sparse_lane_honors_shard_acl_allow(seeded) -> None:
+    """**双路径等价**（`03` §5.3）：跨部门 shard 级授权后，稀疏路（BM25）必须与稠密路
+    一样能召回 —— 修复前稀疏 SQL 只做部门交集，bob 经 allow 看到 kb_hr_L2 时
+    BM25 一路被清空，混合检索对他静默退化为单路。
+    """
+    runtime, _ = seeded
+    bob_id = user_id_of(runtime.db, "demo_bob")
+    with runtime.db.sync_connect() as conn:
+        hr_child_ids = {
+            int(r["chunk_id"])
+            for r in conn.execute(
+                "SELECT c.chunk_id FROM ekbs_chunk c "
+                "JOIN ekbs_document d ON d.doc_id = c.doc_id "
+                "WHERE d.title = '年假管理制度' AND c.chunk_type = 'child'"
+            ).fetchall()
+        }
+        conn.execute(
+            "INSERT INTO ekbs_acl_entry(object_type, object_id, subject_type, subject_id,"
+            " permission, effect) VALUES ('shard', 'kb_hr_L2', 'user', ?, 'read', 'allow')",
+            (str(bob_id),),
+        )
+        conn.commit()
+
+    bob = await runtime.perm_context(bob_id)
+    # 路由器已把 allow 并入可见分片（且过了密级闸：bob clearance=3 ≥ shard level=2）
+    assert "kb_hr_L2" in bob.visible_shard_ids
+    assert "kb_hr_L2" in bob.acl_allow_shards
+    # 稀疏路也必须能召回（修复前这里恒为空集）
+    sparse_ids = set(runtime.pipeline._sparse_recall("年假有多少天", bob))
+    assert hr_child_ids & sparse_ids, "跨部门授权后稀疏路仍召回不到，双路径不等价"
+
+
+async def test_fts_doc_level_acl_allow_branch(seeded) -> None:
+    """document 级 allow 的稀疏路放行（与 ``can_read_document`` 规则 4 等价）：
+
+    文档在可见分片内、但 `visible_dept_ids` 与本用户部门不命中时，
+    无 allow 则稀疏路查不到（超取交给闸门兜底），有 allow 则必须命中。
+    白盒直测 ``FtsIndex.search``，避免路由/稠密路的干扰。
+    """
+    runtime, _ = seeded
+    with runtime.db.sync_connect() as conn:
+        doc_id = int(
+            conn.execute(
+                "SELECT doc_id FROM ekbs_document WHERE title = '年假管理制度'"
+            ).fetchone()["doc_id"]
+        )
+        doc_child_ids = {
+            int(r["chunk_id"])
+            for r in conn.execute(
+                "SELECT chunk_id FROM ekbs_chunk WHERE doc_id = ? AND chunk_type = 'child'",
+                (doc_id,),
+            ).fetchall()
+        }
+
+    fts = runtime.pipeline.fts
+    base = dict(shard_ids=["kb_hr_L2"], clearance=3, top_k=10)
+    stranger = [("user", "999")]  # 部门链不含 102 的用户主体
+
+    # 未授权：部门不命中（visible_dept_ids=["102"] ∩ ["1"] = ∅）→ 查不到
+    before = fts.search("年假有多少天", dept_chain=["1"], subjects=stranger, **base)
+    assert not {h.chunk_id for h in before} & doc_child_ids
+
+    # document 级 allow 后：allow 分支命中
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "INSERT INTO ekbs_acl_entry(object_type, object_id, subject_type, subject_id,"
+            " permission, effect) VALUES ('document', ?, 'user', '999', 'read', 'allow')",
+            (str(doc_id),),
+        )
+        conn.commit()
+    after = fts.search("年假有多少天", dept_chain=["1"], subjects=stranger, **base)
+    assert {h.chunk_id for h in after} & doc_child_ids
+
+
 async def test_carol_sees_only_public_shard(seeded) -> None:
     runtime, _ = seeded
     carol = await runtime.perm_context(user_id_of(runtime.db, "demo_carol"))

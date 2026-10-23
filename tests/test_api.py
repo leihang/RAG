@@ -218,13 +218,50 @@ async def test_dev_token_issues_jwt(client: AsyncClient, seeded) -> None:
     assert answered.json()["answer"]
 
 
-async def test_dingtalk_login_without_credentials_is_503(client) -> None:
-    """没配钉钉凭据时免登端点必须明确 503（不是 501 占位，也不是 500）。"""
+async def test_dingtalk_login_is_refused_for_admin(client) -> None:
+    """管理台不发钉钉免登令牌。钉钉同事不能由此进入管理台。"""
     response = await client.post("/api/v1/auth/dingtalk-login", json={"auth_code": "x"})
-    assert response.status_code == 503
-    assert "DINGTALK_CLIENT_ID" in response.json()["detail"]
+    assert response.status_code == 403
+    assert "登录名和口令" in response.json()["detail"]
 
 
 async def test_dingtalk_login_validates_input(client) -> None:
     response = await client.post("/api/v1/auth/dingtalk-login", json={"auth_code": ""})
     assert response.status_code == 422
+
+
+async def test_dingtalk_config_is_public_and_lists_missing_keys(client, seeded) -> None:
+    """前端免登配置端点：**无需鉴权**（登录页在拿到令牌前就要读它），
+    只返回公开标识（corpId / AppKey），并把缺失项列出来供管理员照单补配置。"""
+    response = await client.get("/api/v1/auth/dingtalk-config")
+    assert response.status_code == 200
+    body = response.json()
+    # 测试环境没有钉钉凭据 → 不可用，且三项都缺
+    assert body["enabled"] is False
+    assert set(body["missing"]) == {
+        "DINGTALK_CORP_ID", "DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET",
+    }
+    # 公开标识可以为空，但**绝不能出现任何密钥值**
+    assert "secret" not in str(body).lower().replace("dingtalk_client_secret", "")
+
+
+async def test_dingtalk_config_reports_enabled_when_credentials_present(
+    client, seeded
+) -> None:
+    # 注意：`client` 夹具内部会 create_app(...) 并自建 runtime，
+    # 因此要改**应用实例**的 secrets，而不是 seeded 那个 runtime。
+    app_runtime = client.app.state.runtime
+    app_runtime.secrets._env.update(  # noqa: SLF001 - 测试直接注入凭据视图
+        {
+            "DINGTALK_CORP_ID": "ding-corpid-1",
+            "DINGTALK_CLIENT_ID": "ding-appkey-1",
+            "DINGTALK_CLIENT_SECRET": "ding-appsecret-1",
+        }
+    )
+    body = (await client.get("/api/v1/auth/dingtalk-config")).json()
+    assert body["enabled"] is True
+    assert body["corp_id"] == "ding-corpid-1"
+    assert body["client_id"] == "ding-appkey-1"
+    assert body["missing"] == []
+    # AppSecret 永不外发（`04` §2.6 纪律）
+    assert "ding-appsecret-1" not in str(body)

@@ -27,6 +27,8 @@ export const getParseResult = (taskId: number) =>
     preview?: string
     preview_truncated?: boolean
     note?: string
+    needs_review?: boolean
+    markdown?: string
   }>
 
 export const retryParseTask = (taskId: number) =>
@@ -35,6 +37,95 @@ export const retryParseTask = (taskId: number) =>
 export const cancelParseTask = (taskId: number) =>
   http.post(`/parse/tasks/${taskId}/cancel`) as Promise<unknown>
 
+export interface ParseDraftTable {
+  table_id: string
+  caption?: string
+  page?: number | null
+  body_html: string
+  chars?: number
+}
+
+export interface ParseDraftFigure {
+  figure_id: string
+  caption?: string
+  ocr_text?: string
+  page?: number | null
+  image_path?: string
+  has_image?: boolean
+  /** normal | faint | blank —— 淡色附图多为 faint；印章在清洗时已丢弃 */
+  kind?: string
+  ink_frac?: number | null
+  display_hint?: string
+}
+
+/** 扫描件复核草稿（全文 + 表格 HTML + 图片清单） */
+export const getParseDraft = (taskId: number) =>
+  http.get(`/parse/tasks/${taskId}/draft`) as Promise<{
+    task_id: number
+    status: string
+    markdown: string
+    chars?: number
+    engine?: string
+    parse_ms?: number | null
+    figure_count?: number
+    table_count?: number
+    tables?: ParseDraftTable[]
+    figures?: ParseDraftFigure[]
+    clean_stats?: Record<string, unknown>
+    note?: string
+  }>
+
+/** 复核期取图（默认 enhance=1：淡色附图抬对比；入库后改用 /assets/figure/{chunk_id}） */
+export const fetchParseDraftFigure = (
+  taskId: number,
+  figureId: string,
+  opts: { enhance?: boolean } = {},
+) =>
+  http.get(`/parse/tasks/${taskId}/figures/${figureId}`, {
+    params: { enhance: opts.enhance === false ? 0 : 1 },
+    responseType: 'blob',
+  }) as Promise<Blob>
+
+export interface DraftAssetSave {
+  markdown: string
+  tables?: Array<{
+    table_id: string
+    caption?: string
+    body_html: string
+    page?: number | null
+  }>
+  figures?: Array<{
+    figure_id: string
+    caption?: string
+    ocr_text?: string
+  }>
+}
+
+export const saveParseDraft = (taskId: number, body: string | DraftAssetSave) =>
+  http.put(
+    `/parse/tasks/${taskId}/draft`,
+    typeof body === 'string' ? { markdown: body } : body,
+  ) as Promise<{
+    task_id: number
+    status: string
+    chars: number
+  }>
+
+/** 复核通过 → 分块入库；可顺带提交最终正文（如粘贴 WPS 结果） */
+export const approveParseTask = (taskId: number, markdown?: string) =>
+  http.post(
+    `/parse/tasks/${taskId}/approve`,
+    markdown == null ? {} : { markdown },
+  ) as Promise<{
+    task_id: number
+    status: string
+    parent_count?: number
+    child_count?: number
+  }>
+
+export const rejectParseTask = (taskId: number) =>
+  http.post(`/parse/tasks/${taskId}/reject`) as Promise<unknown>
+
 export const getParseConfig = () =>
   http.get('/parse/config') as Promise<Record<string, unknown>>
 
@@ -42,7 +133,19 @@ export const getChunkTree = (docId: number) =>
   http.get(`/chunks/documents/${docId}/tree`) as Promise<ChunkTree>
 
 export const getChunk = (chunkId: number) =>
-  http.get(`/chunks/${chunkId}`) as Promise<Record<string, unknown>>
+  http.get(`/chunks/${chunkId}`) as Promise<{ chunk: ChunkNode & Record<string, unknown> }>
+
+/** 文档内块检索（不走全库 RAG；空 q 按 seq 浏览） */
+export const searchDocumentChunks = (
+  docId: number,
+  params: { q?: string; limit?: number } = {},
+) =>
+  http.get(`/chunks/documents/${docId}/search`, { params }) as Promise<{
+    document: { doc_id: number; title?: string; status?: string; level?: number }
+    query: string
+    total: number
+    chunks: ChunkNode[]
+  }>
 
 export const updateChunk = (chunkId: number, body: { content: string; reason?: string }) =>
   http.put(`/chunks/${chunkId}`, body) as Promise<unknown>

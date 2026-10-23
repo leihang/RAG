@@ -193,9 +193,19 @@ fi
 if [ "$WITH_DEPS" = "1" ]; then
   echo
   echo "== 6. 依赖项与指纹一致性（01 §14，--with-deps）=="
-  deps="$(http_get "$API/health/deps")"
+  # /health/deps 会真实出网并暴露内部状态：只允许「服务器本机」或「已登录管理员」。
+  # 本脚本在服务器上跑（回环）即可直接调；若从别处指向内网地址，则带上内部令牌。
+  deps_token="${EKBS_INTERNAL_TOKEN:-}"
+  if [ -z "$deps_token" ] && [ -r "$SECRETS" ]; then
+    deps_token="$(grep -E '^EKBS_INTERNAL_TOKEN=' "$SECRETS" | head -1 | cut -d= -f2- || true)"
+  fi
+  if [ -n "$deps_token" ]; then
+    deps="$(curl -s --max-time 10 -H "X-Internal-Token: ${deps_token}" "$API/health/deps" 2>/dev/null || true)"
+  else
+    deps="$(http_get "$API/health/deps")"
+  fi
   if [ -z "$(printf '%s' "$deps" | jpath faiss_shards)" ] && [ -z "$(printf '%s' "$deps" | jpath embed)" ]; then
-    s "api /health/deps 无响应（01 §14 使用该路径；04 §7.3 未给出实现，缺省跳过）"
+    s "api /health/deps 无响应或需要身份（本机直连免凭据；远程需令牌 + sys:health:read）"
   else
     for kv in "faiss_shards:>0" "embed:true" "llm:true" "rerank:true" "dingtalk_stream:true" "fingerprint_match:true"; do
       k="${kv%%:*}"; want="${kv##*:}"; got="$(printf '%s' "$deps" | jpath "$k")"

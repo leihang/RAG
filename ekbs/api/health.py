@@ -22,12 +22,13 @@ import time
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ekbs.index.fts import ensure_userdict as _ensure_userdict
 
 from ekbs.ingest.chunker import active_token_counter
+from ekbs.local_auth import is_loopback
 from ekbs.logging import get_logger
 
 router = APIRouter(tags=["health"])
@@ -35,6 +36,44 @@ log = get_logger(component="health")
 
 #: 依赖探测结果的短缓存（避免反复烧 token）；键为 "all"
 _PROBE_TTL_SECONDS = 60
+
+#: 深探测所需权限点（`05` §3.4 的 sys:health:read；kb_admin / auditor / super_admin 具备）
+_PROBE_PERMISSION = "sys:health:read"
+
+
+def _require_probe_access(request: Request) -> None:
+    """``/health/deps`` 的访问控制：**只认「服务器本机」或「已登录且有权限的管理员」**。
+
+    探针 ``/livez`` ``/healthz`` ``/readyz`` 保持公开 —— 监控必须能无凭据调用，
+    且它们只做本机查询、不出网。本条会**真实出网**并暴露内部状态（模型型号、
+    分片/向量数、磁盘水位、指纹一致性），因此按管理台同一套身份口径收口：
+
+    * 服务器本机直连（回环且无 ``X-Forwarded-For``）→ 放行（smoke.sh / 本机排障）；
+    * 其余来源 → 必须带有效令牌（钉钉免登或本机账号登录签发），且具备
+      ``sys:health:read`` 权限点。
+
+    **刻意不引入第三种凭据**：管理台就只有钉钉免登与本机账号登录两条路。
+    """
+    client_host = request.client.host if request.client else None
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if is_loopback(client_host, forwarded_for):
+        return
+
+    from ekbs.api.qa import _authenticate  # 延迟导入：避免 health 与 qa 的导入环
+
+    runtime = request.app.state.runtime
+    headers = {key.lower(): value for key, value in request.headers.items()}
+    try:
+        user = _authenticate(request, headers)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "深探测需要身份：请在服务器本机访问，"
+                "或用管理台登录名和口令登录后携带令牌"
+            ),
+        ) from exc
+    runtime.authz.require(user.user_id, _PROBE_PERMISSION)
 
 
 @router.get("/livez")
@@ -81,7 +120,11 @@ async def health_deps(request: Request) -> JSONResponse:
     整包一起缓存过（原实现），后果是：软删一份文档后立刻查 `/health/deps`，
     仍然显示删除前的向量数 —— 排查"删除到底摘没摘向量"时被它带偏过一次。
     网络探针才是贵的，本地读几个计数器是免费的，没理由一起缓存。
+
+    **访问控制**：只允许服务器本机，或已登录且有 ``sys:health:read`` 权限的管理员
+    （见 :func:`_require_probe_access`）。
     """
+    _require_probe_access(request)
     runtime = request.app.state.runtime
     cache = request.app.state.probe_cache
     now = time.time()

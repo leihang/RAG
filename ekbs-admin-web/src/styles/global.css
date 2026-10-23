@@ -10,7 +10,15 @@
   --ekbs-border-secondary: #f0f0f0;
 }
 
-html, body, #root { height: 100%; margin: 0; }
+html, body, #root { height: 100%; margin: 0; overflow: hidden; }
+/* Ant Design ``<App>`` 包在 #root 下，不设高度时 ``.ekbs-shell { height:100% }`` 会塌成顶栏高度 */
+#root > .ant-app {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 body {
   font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Source Han Sans SC', sans-serif;
   font-size: 14px;
@@ -36,3 +44,96 @@ body {
 
 /* 解析失败行左侧红色竖条（§5.3 行高亮） */
 .ekbs-row-failed > td:first-child { box-shadow: inset 3px 0 0 var(--ekbs-error); }
+.ekbs-row-review > td:first-child { box-shadow: inset 3px 0 0 #d48806; }
+
+/* 自建壳层：顶栏固定放身份/退出，侧栏只留菜单（绕开 ProLayout actions 错位）。
+ *
+ * 滚动约定（踩坑记录）：
+ * - html/body/#root 禁滚，避免双滚动条；
+ * - **唯一**纵向滚动容器是 ``.ekbs-shell-body``（ProLayout 的 content 用
+ *   ``height:100% + overflow:auto`` 会和内部 flex 抢高度，结果整页卡死不能滑）；
+ * - ``fixSiderbar`` 侧栏是 ``position:fixed``，滚动 body 时侧栏仍钉住；
+ *   但要扣掉自建顶栏 56px，否则会顶到顶栏下面。
+ */
+.ekbs-shell {
+  flex: 1 1 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.ekbs-topbar {
+  height: 56px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 20px;
+  background: #fff;
+  border-bottom: 1px solid var(--ekbs-border-secondary);
+  z-index: 100;
+}
+.ekbs-topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+.ekbs-topbar-brand {
+  font-size: 16px;
+  white-space: nowrap;
+}
+.ekbs-topbar-crumbs {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ekbs-topbar-right {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 8px;
+  flex: none;
+}
+.ekbs-shell-body {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+  position: relative;
+}
+/* 取消 ProLayout 默认 min-height:100vh，否则内容比视口矮时也会撑出空白 */
+.ekbs-shell-body .ant-pro-layout,
+.ekbs-shell-body .ant-pro-layout .ant-layout {
+  min-height: 0 !important;
+}
+/* 固定侧栏避开自建顶栏 */
+.ekbs-shell-body .ant-layout-sider.ant-pro-sider-fixed,
+.ekbs-shell-body .ant-pro-sider.ant-pro-sider-fixed {
+  top: 56px !important;
+  height: calc(100vh - 56px) !important;
+  max-height: calc(100vh - 56px) !important;
+}
+.ekbs-shell-body .ant-layout-sider .ant-layout-sider-children {
+  height: 100%;
+  overflow: auto;
+}
+.ekbs-user-trigger {
+  display: inline-flex;
+  align-items: center;
+  max-width: 180px;
+}
+.ekbs-user-name {
+  margin-left: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ekbs-user-dept {
+  margin-left: 6px;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

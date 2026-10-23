@@ -9,16 +9,23 @@
  * 多轮：页面在 sessionStorage 里持有 `conversation_id`，连续提问走查询改写 + 会话上下文；
  * 「新会话」会换一个 id（不调 clear API，避免误清正式会话）。
  */
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
-  Alert, Button, Card, Descriptions, Form, Input, InputNumber, Radio, Space, Switch, Table, Tag, Typography, message,
+  Alert, Button, Card, Descriptions, Form, Input, InputNumber, Radio, Select, Space, Switch, Table, Tag, Typography, message,
 } from 'antd'
 import Auth from '@/components/Auth'
+import ChunkPeekDrawer from '@/components/ChunkPeekDrawer'
 import ClearanceTag from '@/components/ClearanceTag'
 import StagesPanel from './StagesPanel'
 import FigureThumb from '@/components/FigureThumb'
 import { faithfulnessBanner, parseStages } from './playgroundData'
-import { debugQuery, debugShards, debugSimulate, type DebugQueryResp, type Citation } from '@/api/rag'
+import { listDocuments } from '@/api/doc'
+import { fetchDiscoveryCatalog, type DiscoveryCatalog } from '@/api/discovery'
+import { personalOwnerText } from '@/utils/personalKb'
+import { searchDocumentChunks } from '@/api/parse'
+import type { ChunkNode, DocumentItem } from '@/api/types'
+import { listUsers } from '@/api/iam'
+import { debugQuery, debugShards, debugSimulate, type DebugQueryResp, type Citation, type SimulateResp } from '@/api/rag'
 import { formatMs } from '@/utils/format'
 
 interface ShardInfo {
@@ -61,10 +68,40 @@ function loadOrCreateConversationId(): string {
 export default function Playground() {
   const [form] = Form.useForm()
   const [simForm] = Form.useForm()
+  const [docSearchForm] = Form.useForm()
   const [result, setResult] = useState<DebugQueryResp | null>(null)
   const [shards, setShards] = useState<ShardInfo | null>(null)
   const [loading, setLoading] = useState(false)
   const [conversationId, setConversationId] = useState(loadOrCreateConversationId)
+  const [peekChunkId, setPeekChunkId] = useState<number | null>(null)
+  const [docOptions, setDocOptions] = useState<DocumentItem[]>([])
+  const [docHits, setDocHits] = useState<ChunkNode[]>([])
+  const [docSearchLoading, setDocSearchLoading] = useState(false)
+  const [catalog, setCatalog] = useState<DiscoveryCatalog | null>(null)
+  const [simResult, setSimResult] = useState<SimulateResp | null>(null)
+  const [simUsers, setSimUsers] = useState<{ value: number; label: string }[]>([])
+
+  useEffect(() => {
+    void listDocuments({ limit: 100 })
+      .then((page) => setDocOptions(page.items ?? []))
+      .catch(() => { /* 无权限时文档块检索仍可手填 doc_id */ })
+    void fetchDiscoveryCatalog({ doc_limit: 20, suggestion_limit: 5 })
+      .then((body) => setCatalog(body))
+      .catch(() => { /* 发现层失败不挡主流程 */ })
+    void listUsers({ limit: 2000 })
+      .then((page) => {
+        const options = (page.items ?? [])
+          .filter((user) => user.status !== 'left')
+          .map((user) => ({
+            value: user.user_id,
+            label: `${user.nick || user.username || '未命名'} · #${user.user_id}${user.title ? ` · ${user.title}` : ''}`,
+          }))
+        setSimUsers(options)
+      })
+      .catch(() => { /* 无用户列表权限时仍可手填 ID */ })
+  }, [])
+
+  const openChunk = (chunkId: number) => setPeekChunkId(chunkId)
 
   const resetConversation = () => {
     const id = newConversationId()
@@ -78,12 +115,18 @@ export default function Playground() {
     message.success('已开启新会话（上一轮上下文不再带入）')
   }
 
-  const run = async () => {
-    const v = await form.validateFields()
+  const runQuery = async (query: string) => {
+    const q = query.trim()
+    if (!q) {
+      message.error('请输入问题')
+      return
+    }
+    form.setFieldsValue({ query: q })
+    const v = form.getFieldsValue()
     setLoading(true)
     try {
       setResult(await debugQuery({
-        query: v.query,
+        query: q,
         mode: v.mode ?? 'prose',
         conversation_id: conversationId,
         rerank_enabled: Boolean(v.rerank_enabled),
@@ -95,6 +138,15 @@ export default function Playground() {
     finally { setLoading(false) }
   }
 
+  const run = async () => {
+    const v = await form.validateFields()
+    await runQuery(String(v.query || ''))
+  }
+
+  const runChip = (question: string) => {
+    void runQuery(question)
+  }
+
   const loadShards = async () => {
     try { setShards(await debugShards()) }
     catch (err) { message.error(err instanceof Error ? err.message : String(err)) }
@@ -104,10 +156,31 @@ export default function Playground() {
     const v = await simForm.validateFields()
     setLoading(true)
     try {
-      await debugSimulate({ query: v.query, user_id: Number(v.user_id) })
-      message.success('已按该身份检索（已记入安全事件）')
+      const body = await debugSimulate({
+        query: String(v.query),
+        user_id: Number(v.user_id),
+        reason: String(v.reason),
+      })
+      setSimResult(body)
+      message.success(`已按用户 #${body.simulated_user} 检索，命中 ${body.chunks.length} 块`)
     } catch (err) { message.error(err instanceof Error ? err.message : String(err)) }
     finally { setLoading(false) }
+  }
+
+  const runDocChunkSearch = async () => {
+    const v = await docSearchForm.validateFields()
+    const docId = Number(v.doc_id)
+    if (!Number.isFinite(docId) || docId <= 0) {
+      message.error('请选择或填写文档 ID')
+      return
+    }
+    setDocSearchLoading(true)
+    try {
+      const resp = await searchDocumentChunks(docId, { q: v.q || '', limit: 50 })
+      setDocHits(resp.chunks ?? [])
+      if (!(resp.chunks ?? []).length) message.info('该文档没有匹配的分块')
+    } catch (err) { message.error(err instanceof Error ? err.message : String(err)) }
+    finally { setDocSearchLoading(false) }
   }
 
   /** 忠实度卡片口径（纯函数，见 playgroundData.faithfulnessBanner） */
@@ -127,10 +200,30 @@ export default function Playground() {
           <Form.Item name="query" label="问题" rules={[{ required: true, message: '请输入问题' }]}>
             <Input.TextArea rows={2} placeholder="如：年假有多少天；下一轮可追问「能介绍详细点吗？」" />
           </Form.Item>
+          {/* D22-P0：空态示例问 chips —— 尚无结果时展示，点击即填入并跑 /rag/debug/query */}
+          {!result && (catalog?.suggestions?.length ?? 0) > 0 ? (
+            <div className="ekbs-discovery-chips" style={{ marginBottom: 12 }}>
+              <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
+                试试这些问题（按你当前可见文档过滤）：
+              </Typography.Text>
+              <Space size={[8, 8]} wrap>
+                {catalog!.suggestions.map((s) => (
+                  <Button
+                    key={s.question}
+                    size="small"
+                    disabled={loading}
+                    onClick={() => runChip(s.question)}
+                  >
+                    {s.question}
+                  </Button>
+                ))}
+              </Space>
+            </div>
+          ) : null}
           <Space size={16} wrap align="end">
             {/*
-              作答模式：prose=业务问答（默认，答案是一段话）；numeric=取数
-              （值/单位/页码 + 抄写校验，宁可 N/A 也不计算，见 ekbs/retrieval/numeric.py）。
+              作答模式：管理台手动切换。prose=业务问答；numeric=取数（值/单位/页码 +
+              抄写校验）。钉钉默认 auto（见配置 qa.auto_numeric）。
               两种模式在后端各走一条路径、各自独立缓存，互不串答案。
             */}
             <Form.Item name="mode" label="作答模式" initialValue="prose" style={{ marginBottom: 0 }}>
@@ -162,6 +255,92 @@ export default function Playground() {
         </Form>
       </Card>
 
+      {/* D22-P0：可见已发布文档导览（过 ACL） */}
+      {catalog ? (
+        <Card
+          title={`可见文档（${catalog.document_count ?? catalog.documents?.length ?? 0}）`}
+          size="small"
+        >
+          {(catalog.documents?.length ?? 0) === 0 ? (
+            <Typography.Text type="secondary">当前账号没有可见的已发布文档。</Typography.Text>
+          ) : (
+            <ul className="ekbs-discovery-docs" style={{ margin: 0, paddingLeft: 20 }}>
+              {catalog.documents.map((d) => (
+                <li key={d.doc_id}>
+                  <Typography.Text>{d.title || '未命名'}</Typography.Text>
+                  <Typography.Text type="secondary" className="ekbs-mono" style={{ marginLeft: 8 }}>
+                    #{d.doc_id}
+                    {personalOwnerText(d) ? ` · ${personalOwnerText(d)}` : d.kb_code ? ` · ${d.kb_code}` : ''}
+                  </Typography.Text>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Card>
+      ) : null}
+
+      <Card title="文档块检索">
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          在指定文档内按关键词扫分块（不走全库 RAG）。点 chunk_id 可查看全文，也可跳转分块预览。
+        </Typography.Paragraph>
+        <Form form={docSearchForm} layout="inline" style={{ marginBottom: 12 }}>
+          <Form.Item name="doc_id" rules={[{ required: true, message: '请选择文档' }]} style={{ minWidth: 280 }}>
+            <Select
+              showSearch
+              allowClear
+              placeholder="选择文档"
+              optionFilterProp="label"
+              options={docOptions.map((d) => ({
+                value: d.doc_id,
+                label: `${d.title || '未命名'} (#${d.doc_id})`,
+              }))}
+            />
+          </Form.Item>
+          <Form.Item name="q" style={{ minWidth: 220 }}>
+            <Input placeholder="关键词（可空=浏览前 50 块）" allowClear />
+          </Form.Item>
+          <Button type="primary" loading={docSearchLoading} onClick={() => void runDocChunkSearch()}>
+            检索文档块
+          </Button>
+        </Form>
+        {docHits.length > 0 ? (
+          <Table<ChunkNode>
+            size="small"
+            rowKey="chunk_id"
+            pagination={{ pageSize: 10 }}
+            dataSource={docHits}
+            columns={[
+              {
+                title: 'chunk',
+                dataIndex: 'chunk_id',
+                width: 90,
+                render: (id: number) => (
+                  <Typography.Link onClick={() => openChunk(id)} className="ekbs-mono">{id}</Typography.Link>
+                ),
+              },
+              { title: '类型', dataIndex: 'chunk_type', width: 80 },
+              { title: '标题路径', dataIndex: 'heading_path', ellipsis: true },
+              {
+                title: '摘要',
+                dataIndex: 'content_head',
+                ellipsis: true,
+                render: (_: unknown, row: ChunkNode) => row.content_head || row.content?.slice(0, 120) || '-',
+              },
+              {
+                title: '多模态',
+                width: 110,
+                render: (_: unknown, row: ChunkNode) =>
+                  row.chunk_type === 'figure' ? (
+                    row.figure_mm_indexed ? <Tag color="purple">已索引</Tag> : <Tag color="orange">未索引</Tag>
+                  ) : (
+                    '-'
+                  ),
+              },
+            ]}
+          />
+        ) : null}
+      </Card>
+
       {result ? (
         <>
           <Card title="答案">
@@ -175,6 +354,18 @@ export default function Playground() {
                     拒答原因：{result.refusal_reason || '（后端未给原因）'}
                     <br />
                     拒答时引用必然为空 —— 这是「没有可靠依据就不编」的硬约束。
+                    {(result.suggested_questions?.length ?? 0) > 0 ? (
+                      <div style={{ marginTop: 8 }}>
+                        <div>相关示例问（点击重试）：</div>
+                        <Space size={[8, 8]} wrap style={{ marginTop: 6 }}>
+                          {result.suggested_questions!.map((q) => (
+                            <Button key={q} size="small" onClick={() => runChip(q)}>
+                              {q}
+                            </Button>
+                          ))}
+                        </Space>
+                      </div>
+                    ) : null}
                   </>
                 }
               />
@@ -303,7 +494,14 @@ export default function Playground() {
               columns={[
                 { title: '#', dataIndex: 'cite_index', width: 50 },
                 { title: '文档', dataIndex: 'doc_title', ellipsis: true },
-                { title: 'chunk', dataIndex: 'chunk_id', width: 90 },
+                {
+                  title: 'chunk',
+                  dataIndex: 'chunk_id',
+                  width: 100,
+                  render: (id: number) => (
+                    <Typography.Link onClick={() => openChunk(id)} className="ekbs-mono">{id}</Typography.Link>
+                  ),
+                },
                 { title: '页', dataIndex: 'page_from', width: 70, render: (v) => v ?? '-' },
                 { title: '标题路径', dataIndex: 'heading_path', ellipsis: true },
                 { title: 'ACL', dataIndex: 'acl_result', width: 90,
@@ -312,10 +510,49 @@ export default function Playground() {
                   render: (v) => (v === 'pass' ? <Tag color="green">pass</Tag> : <Tag>{String(v ?? '-')}</Tag>) },
                 // 图片块被召回时把原图显示出来（调试台里"命中了一张图"要能当场看见）
                 { title: '图', dataIndex: 'figure_id', width: 110,
-                  render: (_, r: Citation) => (r.figure_id ? <FigureThumb chunkId={r.chunk_id} title={r.figure_id} size={72} /> : '-') },
+                  render: (_, r: Citation) => (
+                    r.figure_id || r.image_path
+                      ? <FigureThumb chunkId={r.chunk_id} title={r.figure_id || r.image_path || undefined} size={72} />
+                      : '-'
+                  ) },
+                {
+                  title: '多模态',
+                  width: 100,
+                  render: (_: unknown, r: Citation) =>
+                    r.figure_id || r.image_path ? (
+                      r.figure_mm_indexed ? <Tag color="purple">已索引</Tag> : <Tag color="orange">未索引</Tag>
+                    ) : (
+                      '-'
+                    ),
+                },
               ]}
             />
           </Card>
+
+          {(result.figure_attachments?.length ?? 0) > 0 ? (
+            <Card
+              title={`回源图片（${result.figure_attachments!.length}）`}
+              style={{ marginTop: 12 }}
+              extra={result.intent === 'figure' ? <Tag color="blue">找图意图</Tag> : null}
+            >
+              <Space size={16} wrap>
+                {result.figure_attachments!.map((fig) => (
+                  <div key={`${fig.chunk_id}-${fig.image_path || fig.figure_id || ''}`} style={{ textAlign: 'center' }}>
+                    <FigureThumb
+                      chunkId={fig.chunk_id}
+                      title={fig.figure_id || fig.doc_title || undefined}
+                      size={160}
+                    />
+                    <div style={{ marginTop: 6, maxWidth: 160 }}>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        #{fig.chunk_id}{fig.doc_title ? ` · ${fig.doc_title}` : ''}
+                      </Typography.Text>
+                    </div>
+                  </div>
+                ))}
+              </Space>
+            </Card>
+          ) : null}
 
           <Card title="逐环节明细">
             {/* ⚠️ 必须过 `parseStages`：后端给的是 snake_case（`per_shard`），
@@ -323,10 +560,16 @@ export default function Playground() {
                 运行时就炸在 `dense.perShard.reduce`（用户实测：TypeError: undefined
                 is not an object）。这类断言没有正当用途，已由
                 `tests/test_admin_ui_wiring.py` 全局禁掉。 */}
-            <StagesPanel stages={parseStages(result.stages)} />
+            <StagesPanel stages={parseStages(result.stages)} onOpenChunk={openChunk} />
           </Card>
         </>
       ) : null}
+
+      <ChunkPeekDrawer
+        chunkId={peekChunkId}
+        open={peekChunkId != null}
+        onClose={() => setPeekChunkId(null)}
+      />
 
       {shards ? (
         <Card title="权限路由（当前身份）">
@@ -355,18 +598,81 @@ export default function Playground() {
       <Auth code="rag:playground:simulate">
       <Card title="权限模拟检索（高危）">
         <Typography.Paragraph type="warning">
-          以指定用户身份检索，是系统唯一允许越权读取的入口（默认只有超级管理员能用）。
-          每次调用都会落安全事件。
+          用被测用户的部门、密级和点名权限做检索。上方「检索并生成」走的是当前登录身份，看不到别人的部门文件。
+          这里只返回检索块，不生成回答，也不会写入对方的问答记录。每次调用都会落安全事件。
         </Typography.Paragraph>
-        <Form form={simForm} layout="inline">
-          <Form.Item name="query" rules={[{ required: true, message: '请输入问题' }]}>
-            <Input placeholder="问题" style={{ width: 260 }} />
-          </Form.Item>
-          <Form.Item name="user_id" rules={[{ required: true, message: '请输入用户 ID' }]}>
-            <Input placeholder="用户 ID" style={{ width: 120 }} />
-          </Form.Item>
-          <Button danger loading={loading} onClick={() => void runSimulate()}>以该身份检索</Button>
+        <Form form={simForm} layout="vertical">
+          <Space size={16} wrap align="start">
+            <Form.Item name="user_id" label="被测用户" rules={[{ required: true, message: '请选择用户' }]} style={{ minWidth: 280, marginBottom: 0 }}>
+              <Select
+                showSearch
+                placeholder="选择用户"
+                optionFilterProp="label"
+                options={simUsers}
+              />
+            </Form.Item>
+            <Form.Item name="query" label="问题" rules={[{ required: true, message: '请输入问题' }]} style={{ minWidth: 320, marginBottom: 0 }}>
+              <Input placeholder="要评估的问题" />
+            </Form.Item>
+            <Form.Item name="reason" label="原因" rules={[{ required: true, message: '请填写原因' }]} style={{ minWidth: 240, marginBottom: 0 }}>
+              <Input placeholder="如：核对工程部能否搜到本部门文件" maxLength={200} />
+            </Form.Item>
+            <Form.Item label=" " style={{ marginBottom: 0 }}>
+              <Button danger loading={loading} onClick={() => void runSimulate()}>以该身份检索</Button>
+            </Form.Item>
+          </Space>
         </Form>
+        {simResult ? (
+          <div style={{ marginTop: 16 }}>
+            <Descriptions size="small" column={2} bordered>
+              <Descriptions.Item label="操作者">#{simResult.operator}</Descriptions.Item>
+              <Descriptions.Item label="被测用户">#{simResult.simulated_user}</Descriptions.Item>
+              <Descriptions.Item label="密级"><ClearanceTag level={simResult.simulated_perm.clearance} /></Descriptions.Item>
+              <Descriptions.Item label="原因">{simResult.reason}</Descriptions.Item>
+              <Descriptions.Item label="可见分片" span={2}>
+                {simResult.simulated_perm.visible_shards.length
+                  ? simResult.simulated_perm.visible_shards.map((shard) => <Tag key={shard} color="blue">{shard}</Tag>)
+                  : '无'}
+              </Descriptions.Item>
+            </Descriptions>
+            {simResult.refused ? (
+              <Alert
+                style={{ marginTop: 12 }}
+                type="warning"
+                showIcon
+                message="这次检索没有可用结果"
+                description={simResult.refusal_reason || '未返回原因'}
+              />
+            ) : null}
+            <Table
+              style={{ marginTop: 12 }}
+              size="small"
+              rowKey="chunk_id"
+              pagination={{ pageSize: 8 }}
+              dataSource={simResult.chunks}
+              locale={{ emptyText: '没有命中分块' }}
+              columns={[
+                {
+                  title: 'chunk',
+                  dataIndex: 'chunk_id',
+                  width: 90,
+                  render: (id: number) => (
+                    <Typography.Link onClick={() => openChunk(id)} className="ekbs-mono">{id}</Typography.Link>
+                  ),
+                },
+                { title: '文档', dataIndex: 'doc_title', ellipsis: true },
+                { title: '分片', dataIndex: 'shard_id', width: 160 },
+                { title: '标题路径', dataIndex: 'heading_path', ellipsis: true },
+                {
+                  title: '精排',
+                  dataIndex: 'rerank_score',
+                  width: 90,
+                  render: (score: number | null) => (score == null ? '-' : score.toFixed(3)),
+                },
+              ]}
+            />
+          </div>
+        ) : null}
       </Card>
       </Auth>
     </Space>

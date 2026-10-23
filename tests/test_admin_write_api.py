@@ -17,7 +17,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from ekbs.api.app import create_app
-from tests.conftest import TEST_INTERNAL_TOKEN, user_id_of
+from tests.conftest import TEST_INTERNAL_TOKEN, set_clearance, user_id_of
 
 
 def headers_for(user_id: int) -> dict[str, str]:
@@ -38,9 +38,14 @@ async def client(seeded):
 
 @pytest.fixture
 def kb_admin(seeded):
-    """carol 有 kb_admin 角色（seed 已授予），返回她的 headers 与 user_id。"""
+    """carol 有 kb_admin 角色（seed 已授予），返回她的 headers 与 user_id。
+
+    同时把她的密级提到 L4：上架范围校验要求「文档密级 ≤ 上传者密级」，
+    而 seed 里的 carol 是 L1 的行政专员 —— 测试里她是全量知识库管理员。
+    """
     runtime, _ = seeded
     user_id = user_id_of(runtime.db, "demo_carol")
+    set_clearance(runtime, user_id, 4)
     return runtime, user_id, headers_for(user_id)
 
 
@@ -144,6 +149,8 @@ async def test_register_rejects_path_outside_raw(client, kb_admin) -> None:
 
 async def test_register_rejects_l4_when_disabled(client, kb_admin) -> None:
     runtime, _, headers = kb_admin
+    # 显式关闭 L4 闸，不依赖配置文件默认值（2026-10-09 测试期配置已全开）
+    runtime.settings.permission.l4_enabled = False
     with runtime.db.sync_connect() as conn:
         kb_id = int(conn.execute("SELECT kb_id FROM ekbs_kb LIMIT 1").fetchone()["kb_id"])
     raw = runtime.settings.data_paths()["raw"]

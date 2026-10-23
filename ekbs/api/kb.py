@@ -87,7 +87,11 @@ async def list_knowledge_bases(
             f"       {_LIVE_DOC_COUNT} AS document_count "
             "FROM ekbs_kb k WHERE k.status != 0 ORDER BY k.kb_id"
         ).fetchall()
-    return JSONResponse({"items": [_row_to_dict(r) for r in rows], "total": len(rows)})
+        items = [_row_to_dict(r) for r in rows]
+        from ekbs.personal import attach_personal_owners
+
+        attach_personal_owners(conn, items)
+    return JSONResponse({"items": items, "total": len(items)})
 
 
 class KbCreate(BaseModel):

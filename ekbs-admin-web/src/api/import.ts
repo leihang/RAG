@@ -27,6 +27,54 @@ export const getImportMeta = () => http.get('/import/meta') as Promise<ImportMet
 export const listImportDirs = (path = '', recursive = false) =>
   http.get('/import/dirs', { params: { path, recursive } }) as Promise<ImportDirsResp>
 
+/** 组织树里的一个部门。`dingtalk_dept_id` 就是文档上的可见部门 ID。 */
+export interface DeptOption {
+  dept_id: number
+  dingtalk_dept_id: string
+  name: string
+  parent_dept_id: number | null
+  tree_depth: number
+  dept_code: string
+}
+
+/** 上传/导入选可见部门。权限与建目录相同（`doc:document:create`），审核员也能用。 */
+export const listDeptOptions = () =>
+  http.get('/import/depts') as Promise<{ items?: DeptOption[]; note?: string }>
+
+/** 入库时可以额外点名的人。提交值是用户编号，不是部门 ID。 */
+export interface ViewerOption {
+  user_id: number
+  nick: string
+  title: string
+  clearance: number
+  /** 主部门。没有部门时为空，界面归到「未分配部门」。 */
+  dept_id?: number | null
+  dept_name: string
+}
+
+export const listViewerOptions = (q = '') =>
+  http.get('/import/users', { params: q ? { q } : {} }) as Promise<{ items?: ViewerOption[] }>
+
+/** 在 raw 下新建目录。带上密级时，把权限记在这个文件夹上。 */
+export const createImportDir = (body: {
+  path: string
+  level?: number
+  visible_dept_ids?: string[]
+  viewer_user_ids?: number[]
+}) =>
+  http.post('/import/dirs', body) as Promise<{
+    rel_path: string
+    created: boolean
+    folder_policy?: { level: number; visible_dept_ids: string[]; viewer_user_ids: number[] } | null
+  }>
+
+/** 删除空文件夹。磁盘上已经没有这个目录时也算成功。 */
+export const deleteImportDir = (path: string) =>
+  http.delete('/import/dirs', { params: { path }, skipErrorToast: true }) as Promise<{
+    rel_path: string
+    deleted: boolean
+  }>
+
 /** 预览：这个目录会导入哪些文件、哪些重复、有没有闸门挡着。**不写库**。 */
 export const scanImportDir = (body: ImportScanBody) =>
   http.post('/import/scan', body) as Promise<ImportScanResp>

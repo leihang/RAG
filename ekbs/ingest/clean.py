@@ -7,30 +7,20 @@
 方案 `06` §1.7 的"清洗 10 步"只落实了其中零散几条（表格序列化在 `table_serialize`、
 页眉页脚等在解析器里各做各的）。
 
-## 本轮补的第一条：公式/单位残留规整
+## 本轮规则
 
-MinerU 走数学模式时会把 `100%` 输出成 LaTeX，**原样入库就再也搜不到**：
-
-.. code-block:: text
-
-    原件里的人话            库里存的样子                        用户搜「覆盖率100%」
-    ─────────────────────  ──────────────────────────────────  ──────────────────
-    安全培训覆盖率 100%     $1 0 0 \\%$                          ❌ 关键词那一路召不回
-    合格率 100%            $100 \\text{‰}$                       ❌ 连字符都对不上
-
-所以这里把**"其实就是个数字/单位"的行内公式**还原成人话；**真正的公式一律不动**
-（含 `\\frac`、`^`、`_`、`\\sum`、希腊字母等——它们不是"被拆散的数字"）。
+1. **公式/单位残留规整**：MinerU 数学模式把 `100%` 拆成 `$1 0 0 \\%$` → 还原成人话。
+2. **扫描件印章/签字噪声**（`20` §2 步 2「水印与印章不进正文」）：
+   公章 OCR 碎片、统一社会信用代码尾号、视觉模型「盖有红色印章…」描述、
+   签署栏拉丁乱码（``ein高g`` / ``01g80423001``）从正文与图注里剔除。
+3. **中文断字合回**：扫描 OCR 常见 ``项目名 称`` / ``离心 机`` → ``项目名称`` / ``离心机``。
+4. **高发 OCR 错字**：如 ``有限责仕公司`` → ``有限责任公司``（盖章压字后误识）。
 
 ## 规矩
 
-* 只处理行内 `$...$` / `$$...$$`；
-* 剥掉安全宏（`\\text{}` `\\mathrm{}` `\\mathbf{}` `\\%` `\\‰` 与 `\\,` `\\;` `\\!` 等间距宏）；
-* 剥完**还剩反斜杠** → 说明是真公式，**整段原样保留**；
-* 剥完只由「数字/空白/常见标点/中文单位」组成且含数字 → 采用；`％`→`%`、`－`→`-`；
-* 数字之间被 MinerU 塞进的空格要合起来（`1 0 0` → `100`）。
-
-其余清洗步骤（页眉页脚、重复行、PII 之外的规整）继续按需往这里加 ——
-**入库链路上只此一处**，避免"改了写入侧、忘了重建侧"的老问题。
+* 只做**确定性**规则，不调用 LLM、不做语义改写；
+* 真公式一律不动（含 `\\frac`/`^`/字母）；
+* 清洗发生在 checksum **之后**，秒传/去重键仍基于解析原始产物。
 """
 
 from __future__ import annotations
@@ -73,6 +63,82 @@ _DIGIT_GAP = re.compile(r"(?<=[\d.])[ \t\u3000]+(?=[\d.,])")
 #: 数字与单位符号之间的空格也要去掉：`100 %` → `100%`、`25 ℃` → `25℃`
 _UNIT_GAP = re.compile(r"(?<=\d)[ \t\u3000]+(?=[%‰％℃℉°])")
 _MULTI_SPACE = re.compile(r"[ \t\u3000]{2,}")
+
+#: 汉字之间的 OCR 断字空格：`项目名 称` → `项目名称`（扫描合同表头高频）
+_CJK_GAP = re.compile(r"(?<=[\u4e00-\u9fff])[ \t\u3000]+(?=[\u4e00-\u9fff])")
+
+#: 视觉模型 / OCR 对红色公章的描述句（进索引只会污染检索）
+_SEAL_DESC = re.compile(
+    r"[（(]\s*盖有红色印章[^）)\n]{0,120}[）)]"
+    r"|印章内容为[「\"“]?[^」\"”\n]{0,80}[」\"”]?"
+    r"|盖有红色印章[^\n]{0,80}"
+)
+
+#: 签署栏旁的公章编号碎片（**整行纯数字**或紧贴「盖章」；不动账号/税号字段）
+_SEAL_CODE_LINE = re.compile(r"(?m)^[\s\u3000]*\d{8,18}[\s\u3000]*$")
+_SEAL_CODE_INLINE = re.compile(
+    r"（盖章）\s*\d{5,18}"
+    r"|\d{10,18}\s*（盖章）"
+)
+
+#: 签署栏拉丁乱码：`ein高g` / `E動` / `01g80423001` / `01g8042`
+_SIGN_LATIN_JUNK = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:"
+    r"[A-Za-z]{1,4}[\u4e00-\u9fff]{1,2}[A-Za-z]{0,3}"  # ein高g / E動 / E動责任
+    r"|[A-Za-z]*\d{2,}[A-Za-z]+\d{4,}"  # 01g80423001
+    r"|[A-Za-z]\d{6,}"  # g80423001 一类
+    r"|[山a-zA-Z]{1,3}重?\d{8,}"  # 山A重14134197750011
+    r")"
+    r"(?![A-Za-z0-9])"
+)
+
+#: 公章压进**签署行**的信用代码/编号碎片（不扫整篇，避免误伤电话/账号）
+_SEAL_CODE_FRAG = re.compile(
+    r"(?<!\d)"
+    r"(?:"
+    r"5001\d{0,2}\s*0?1080423901"  # 常见重庆信用代码尾
+    r"|50010\d{0,12}"
+    r"|(?<![元￥$])\d{13,18}(?![.\d])"  # 信用代码长度；排除带小数金额
+    r")"
+    r"(?!\d)"
+)
+_SIGN_LINE = re.compile(
+    r"(?m)^.*(甲方|乙方|代表人|授权代表|经办人|签字|签署日期|盖章）).*$"
+)
+
+#: 盖章压字后的残片：`食务有限章）` / `有服务有限限责任`
+_SEAL_GARBLED = re.compile(
+    r"食务有限章[）\)\uff09]?"
+    r"|有服务有限限责任"
+    r"|港有服务"
+    r"|有限限责任"
+    r"|股份有公(?!司)"
+    r"|分公司分公司"
+    r"|[）\)\uff09]\s*授权代表授权代表"
+)
+
+#: 签署栏手写姓名：仅匹配「代表人：张三」这类带冒号字段，避免误伤「签字盖章之日起」。
+#: 姓名至少 2 字。甲/乙/方/单位是栏目标题，不是人名——「代表人：乙方单位」曾被收成「[手写签字]位」。
+_HANDWRITE_NAME = re.compile(
+    r"(?P<label>(?:代表人|授权代表|经办人|签字)[：:]\s*)"
+    r"(?P<name>[\u4e00-\u9fffA-Za-z]{2,4})"
+    r"(?=(?:\s|$|[日年甲方乙方单位]|\d))"
+)
+_NOT_A_PERSON_NAME = re.compile(r"^(?:甲|乙|方|单|位|甲方|乙方|单位|公司|日期|盖章|签字)")
+
+#: 高发 OCR 错字（盖章/扫描压字后）—— 只改**明确错、改了更对**的词
+_OCR_TYPO_MAP: tuple[tuple[str, str], ...] = (
+    ("有限责仕公司", "有限责任公司"),
+    ("责仕公司", "责任公司"),
+    ("联系电处", "联系电话"),
+    ("公司庆两路支行", "公司重庆两路支行"),
+    ("重公司分公司", "重庆分公司"),
+    ("乙万违约", "乙方违约"),
+    ("城市营服务", "城市运营服务"),
+    ("城市运营服务港有服务有限限责任公司", "城市运营服务有限责任公司"),
+    ("E動责任公司", "有限责任公司"),
+)
 
 
 def _unwrap_body(body: str) -> tuple[str, bool]:
@@ -122,6 +188,165 @@ def normalize_math_in_text(text: str) -> tuple[str, int, int]:
     return _MATH_SPAN.sub(_sub, text), used, kept
 
 
+def collapse_cjk_gaps(text: str) -> tuple[str, int]:
+    """合并汉字之间的 OCR 断字空格。返回 (文本, 合并次数)。"""
+    if not text:
+        return text, 0
+    count = 0
+
+    def _sub(_match: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        return ""
+
+    return _CJK_GAP.sub(_sub, text), count
+
+
+def apply_ocr_typos(text: str) -> tuple[str, int]:
+    """高发 OCR 错字替换。返回 (文本, 替换次数)。"""
+    if not text:
+        return text, 0
+    n = 0
+    out = text
+    for bad, good in _OCR_TYPO_MAP:
+        if bad == good:
+            continue
+        if bad in out:
+            hits = out.count(bad)
+            out = out.replace(bad, good)
+            n += hits
+    return out, n
+
+
+def _mask_handwritten_names(text: str) -> tuple[str, int]:
+    """签署栏手写姓名 OCR 不可靠 → 占位，避免错误人名进检索。"""
+    if not text:
+        return text, 0
+    n = 0
+
+    def _sub(match: re.Match[str]) -> str:
+        nonlocal n
+        name = match.group("name")
+        # 空名、占位，或栏目标题（乙方/单位）都不是手写姓名
+        if not name or name in ("手写签字", "[手写签字]") or _NOT_A_PERSON_NAME.match(name):
+            return match.group(0)
+        n += 1
+        return f"{match.group('label')}[手写签字]"
+
+    return _HANDWRITE_NAME.sub(_sub, text), n
+
+
+def strip_seal_and_signature_noise(text: str) -> tuple[str, dict[str, int]]:
+    """去掉扫描件印章/签署栏 OCR 噪声（`20` §2 步 2）。
+
+    保留「经双方盖章之日起生效」这类**条款正文**；只剥印章描述、编号碎片与乱码。
+    """
+    if not text:
+        return text, {}
+    stats = {
+        "seal_desc_removed": 0,
+        "seal_code_removed": 0,
+        "sign_latin_removed": 0,
+        "handwrite_masked": 0,
+    }
+    out = text
+
+    def _count_sub(pattern: re.Pattern[str], key: str, repl: str = "") -> None:
+        nonlocal out
+        found = pattern.findall(out)
+        if found:
+            stats[key] += len(found)
+            out = pattern.sub(repl, out)
+
+    _count_sub(_SEAL_DESC, "seal_desc_removed")
+    _count_sub(_SEAL_CODE_LINE, "seal_code_removed")
+    # 紧贴「盖章」的编号整篇都剥，但账号/开户/银行行上的数字是尾部账户，留下。
+    inline_removed = 0
+    kept_lines: list[str] = []
+    for line in out.splitlines(keepends=True):
+        if re.search(r"账号|开户|银行", line):
+            kept_lines.append(line)
+            continue
+        new_line, n = _SEAL_CODE_INLINE.subn("", line)
+        inline_removed += n
+        kept_lines.append(new_line)
+    if inline_removed:
+        stats["seal_code_removed"] += inline_removed
+        out = "".join(kept_lines)
+    _count_sub(_SIGN_LATIN_JUNK, "sign_latin_removed")
+    _count_sub(_SEAL_GARBLED, "seal_desc_removed")
+
+    # 仅在签署行剥信用代码碎片。带账号/开户/银行的行是尾部账户信息，数字留下。
+    # 条款正文里的电话/账号不走这条（_SIGN_LINE 不含「账号」单独成行）。
+    def _scrub_sign_line(match: re.Match[str]) -> str:
+        line = match.group(0)
+        if re.search(r"账号|开户|银行", line):
+            return line
+        cleaned_line, n = _SEAL_CODE_FRAG.subn("", line)
+        if n:
+            stats["seal_code_removed"] += n
+        return cleaned_line
+
+    out = _SIGN_LINE.sub(_scrub_sign_line, out)
+
+    out, hw_n = _mask_handwritten_names(out)
+    if hw_n:
+        stats["handwrite_masked"] = hw_n
+
+    # 图注整段只剩「盖章」噪声时，换成中性占位，避免 dig 进向量
+    if "盖章" in out and len(out) < 80:
+        compact = re.sub(r"\s+", "", out)
+        if re.fullmatch(r"(?:\[图片\])?[^。]{0,20}（?盖章）?[^。]{0,20}", compact) or (
+            "盖章" in compact and not any(k in compact for k in ("之日起", "后生效", "双方", "合同"))
+            and len(compact) < 40
+        ):
+            stats["seal_desc_removed"] += 1
+            out = "[签署/盖章区]"
+
+    # 压缩清洗后留下的多余空行/空格
+    out = re.sub(r"[ \t\u3000]{2,}", " ", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    # 签署栏「授权代表授权代表」重复；OCR 把「签署日期」撕成「署日期」
+    out = re.sub(r"(授权代表){2,}", "授权代表", out)
+    out = re.sub(r"签字：\s*署日期", "签署日期", out)
+    out = re.sub(r"(?<![签日])署日期", "签署日期", out)
+    out = re.sub(r"授权代表\s*授权代表", "授权代表", out)
+    return out, {k: v for k, v in stats.items() if v}
+
+
+def clean_figure_text(text: str) -> str:
+    """图题注 / OCR 专用清洗（印章页视觉描述不得进检索）。"""
+    if not text:
+        return text
+    result = clean_markdown(text)
+    cleaned = result.text.strip()
+    # 视觉模型常输出「无可读文字 / 盖有红色印章」—— 这类图注不如占位
+    if any(
+        mark in cleaned
+        for mark in ("无可读文字", "盖有红色印章", "纯白背景", "没有任何可识别")
+    ):
+        if "甲方" in cleaned or "乙方" in cleaned or "单位" in cleaned:
+            # 保留甲乙方标签行，去掉印章描述与编号
+            lines = []
+            for line in cleaned.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                if any(m in s for m in ("无可读文字", "盖有红色印章", "纯白背景", "场景描述")):
+                    continue
+                if re.fullmatch(r"\d{8,18}", s):
+                    continue
+                lines.append(s)
+            cleaned = "\n".join(lines).strip() or "[签署/盖章区]"
+        else:
+            cleaned = "[签署/盖章区]"
+    # 签署页图：公司名被印章撕成碎片时整段降级
+    if cleaned and len(cleaned) < 60 and re.search(r"市棉|股份有限\s*$|理工程技术", cleaned):
+        if "甲方" not in cleaned and "乙方" not in cleaned:
+            cleaned = "[签署/盖章区]"
+    return cleaned
+
+
 @dataclass
 class CleanResult:
     """清洗结果 + 可观测统计（进日志与质量报告）。"""
@@ -131,9 +356,26 @@ class CleanResult:
 
 
 def clean_markdown(markdown: str) -> CleanResult:
-    """入库前的清洗（目前只有"公式/单位残留规整"一条；后续步骤往这里加）。"""
-    text, used, kept = normalize_math_in_text(markdown or "")
+    """入库前的清洗（公式规整 + 扫描件印章/签字噪声 + 中文断字）。"""
+    text = markdown or ""
     stats: dict[str, Any] = {}
+
+    text, used, kept = normalize_math_in_text(text)
     if used or kept:
-        stats = {"math_unwrapped": used, "math_preserved": kept}
+        stats["math_unwrapped"] = used
+        stats["math_preserved"] = kept
+
+    # 先合断字，再错字/印章：否则「食 务有限章」匹配不到清洗规则
+    text, cjk_n = collapse_cjk_gaps(text)
+    if cjk_n:
+        stats["cjk_gaps_collapsed"] = cjk_n
+
+    # 错字先于印章剥离：如「E動责任公司」整词替换，避免先剥成「任公司」
+    text, typo_n = apply_ocr_typos(text)
+    if typo_n:
+        stats["ocr_typos_fixed"] = typo_n
+
+    text, seal_stats = strip_seal_and_signature_noise(text)
+    stats.update(seal_stats)
+
     return CleanResult(text=text, stats=stats)

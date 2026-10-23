@@ -43,16 +43,20 @@ from ekbs.retrieval.faithfulness import (
     REFUSE_MISSING_CITATION,
     REFUSE_UNSUPPORTED_CLAIM,
     assess_faithfulness,
+    clause_mismatches,
     mostly_unsupported,
 )
 from ekbs.retrieval.numeric import (
+    MODE_AUTO,
     MODE_NUMERIC,
     MODE_PROSE,
     build_numeric_prompt,
     find_scope_alternatives,
+    format_numeric_user_reply,
+    format_scope_clarify_reply,
     parse_numeric_payload,
     question_pins_scope,
-    render_answer,
+    resolve_answer_mode,
     verify_copied,
     verify_scope,
 )
@@ -120,6 +124,8 @@ class RetrievalResult:
     chunks: list[RetrievedChunk] = field(default_factory=list)
     candidate_count: int = 0
     c5_dropped: int = 0
+    #: D18 粗筛（rerank 之前的 doc 级 ACL）丢弃数；与 c5_dropped（rerank 后复检）分列
+    c5_pre_dropped: int = 0
     top_score: float | None = None
     refused: bool = False
     refusal_reason: str = ""
@@ -171,6 +177,12 @@ class AnswerResult:
     #: **取数模式**的结构化结果（值/单位/页码/原文片段/是否通过抄写校验）。
     #: 业务问答（prose）下为 None —— 两种模式的答案形态不同，前端据此分别渲染。
     numeric: dict[str, Any] | None = None
+    #: 解析后的实际作答模式（``prose`` | ``numeric``）；请求可为 ``auto``
+    mode_used: str = MODE_PROSE
+    #: 查询改写侧意图标签（factual / numeric / figure / procedure）
+    intent: str = "factual"
+    #: 供钉钉/前端直接回源的图片附件（相对 data_dir 的 image_path）
+    figure_attachments: list[dict[str, Any]] = field(default_factory=list)
     ttft_ms: int = 0
     total_ms: int = 0
     prompt_tokens: int = 0
@@ -248,7 +260,7 @@ SYSTEM_PROMPT = (
 
 #: 提示词版本（进答案缓存键）：**改动 SYSTEM_PROMPT 必须同步 +1**，
 #: 否则旧提示词生成的答案会继续从缓存里被服务。
-PROMPT_REVISION = "v3"
+PROMPT_REVISION = "v4"
 
 
 class RetrievalPipeline:
@@ -411,6 +423,10 @@ class RetrievalPipeline:
                 clearance=perm.clearance,
                 dept_chain=perm.dept_chain,
                 top_k=top_k or self.settings.retrieval.sparse_top_k,
+                # 双路径等价（03 §5.3）：稀疏路放行语义须与闸门一致，
+                # 否则跨部门授权用户的 BM25 一路静默为空
+                acl_allow_shards=sorted(perm.acl_allow_shards),
+                subjects=sorted(perm.subjects),
             )
             for hit in hits:
                 # bm25 越小越相关 → 取负后越大越好（供 α 融合）
@@ -684,9 +700,26 @@ class RetrievalPipeline:
         shortlist = [chunk_id for chunk_id, _ in fused[: params["rerank_top_n"]]]
         result.candidate_count = len(shortlist)
         ranked: list[RetrievedChunk] = []
+        #: D18 粗筛丢弃的候选（rerank 路径填充；关闭路径无出网行为，由 C5 复检兜底）
+        pre_dropped_ids: set[int] = set()
 
         if rerank_enabled:
             docs = self.load_chunks(shortlist)
+            # D18 粗筛（00 v4.0 C5 双闸之第一闸）：云端 rerank **之前**先做 doc 级 ACL。
+            # 无权 chunk 不进入 payload、不发出企业边界 —— 分片过滤只能保证「片级有权」，
+            # 片内 deny / ACL 补丁整片加载的无权文档，必须在出网前拦下（rerank 后仍有 C5 复检）。
+            pre_pairs = [(cid, docs[cid].doc_id) for cid in shortlist if cid in docs]
+            _, pre_dropped = await asyncio.to_thread(
+                self.gate.filter_chunks, perm, pre_pairs
+            )
+            pre_dropped_ids = {chunk_id for chunk_id, _ in pre_dropped}
+            result.c5_pre_dropped = len(pre_dropped)
+            if collect_debug:
+                result.stage_debug["c5_pre"] = {
+                    "checked": len(pre_pairs),
+                    "dropped": len(pre_dropped),
+                    "dropped_chunk_ids": [cid for cid, _ in pre_dropped],
+                }
             payload = [
                 RerankDoc(
                     chunk_id=chunk_id,
@@ -698,20 +731,30 @@ class RetrievalPipeline:
                     sparse_rank=sparse_ranks.get(chunk_id),
                 )
                 for chunk_id, score in fused[: params["rerank_top_n"]]
-                if chunk_id in docs
+                if chunk_id in docs and chunk_id not in pre_dropped_ids
             ]
-            try:
-                reranked = await self.providers.rerank.rerank(
-                    query, payload, params["rerank_top_n"]
+            reranked: list = []
+            if payload:
+                try:
+                    reranked = await self.providers.rerank.rerank(
+                        query, payload, params["rerank_top_n"]
+                    )
+                except (RerankUnavailable, ModelUnavailable) as exc:
+                    # 00 §2.3：跳过精排，直接取 RRF Top-5（仍须过 C5）
+                    log.warning("rerank_unavailable_degrade", error=str(exc))
+                    result.degraded.append("rerank_skipped")
+            else:
+                # 候选被 D18 全部丢弃：不向外部发任何请求（顺带省一次 rerank 调用）
+                log.info(
+                    "d18_prefilter_emptied_payload",
+                    user_id=perm.user_id,
+                    dropped=len(pre_dropped),
                 )
-            except (RerankUnavailable, ModelUnavailable) as exc:
-                # 00 §2.3：跳过精排，直接取 RRF Top-5（仍须过 C5）
-                log.warning("rerank_unavailable_degrade", error=str(exc))
-                result.degraded.append("rerank_skipped")
-                reranked = []
             score_map = {item.chunk_id: item.score for item in reranked}
             if score_map:
                 for chunk_id, rrf_score in fused[: params["rerank_top_n"]]:
+                    if chunk_id in pre_dropped_ids:
+                        continue  # D18：被粗筛丢弃者不回流 ranked
                     chunk = docs.get(chunk_id)
                     if chunk is None:
                         continue
@@ -722,8 +765,11 @@ class RetrievalPipeline:
                     ranked.append(chunk)
                 ranked.sort(key=lambda c: (-(c.rerank_score or 0.0), c.chunk_id))
             else:
-                result.degraded.append("rerank_fallback_rrf")
+                if payload:
+                    result.degraded.append("rerank_fallback_rrf")
                 for chunk_id, rrf_score in fused[: params["rerank_keep"]]:
+                    if chunk_id in pre_dropped_ids:
+                        continue  # D18：降级路径同样不放行
                     chunk = docs.get(chunk_id)
                     if chunk is None:
                         continue
@@ -745,7 +791,8 @@ class RetrievalPipeline:
 
         rerank_done = time.perf_counter()
 
-        # ④ C5 闸门（在 rerank 之后、进 Prompt 之前；被丢弃者不得进入任何下游）
+        # ④ C5 复检（00 v4.0 C5 双闸之第二闸：rerank 之后、进 Prompt 之前；
+        #    与 D18 粗筛冗余互补 —— 防「粗筛→复检」之间的权限变更窗口；被丢弃者不得进入任何下游）
         kept, dropped = await asyncio.to_thread(
             self.gate.filter_chunks, perm, [(c.chunk_id, c.doc_id) for c in ranked]
         )
@@ -761,7 +808,10 @@ class RetrievalPipeline:
             )
         if not survivors:
             result.refused = True
-            result.refusal_reason = REFUSE_ALL_DENIED if dropped else REFUSE_NO_CANDIDATE
+            # 粗筛（D18）与复检（C5）任一拦截过候选，都算「全被权限拦掉」而非「无候选」
+            result.refusal_reason = (
+                REFUSE_ALL_DENIED if (dropped or pre_dropped_ids) else REFUSE_NO_CANDIDATE
+            )
             result.timings_ms.update(
                 embed=_ms(started, embed_done),
                 recall=_ms(embed_done, recall_done),
@@ -812,8 +862,12 @@ class RetrievalPipeline:
             }
         if params["parent_expand"]:
             selected = await asyncio.to_thread(self._expand_parents, selected, perm)
+        # 短叶子父块（制度点分条款各成碎片时）把同章兄弟一并带入，补全召回上下文
+        selected = await asyncio.to_thread(self._expand_short_siblings, selected, perm)
         # 正文命中后，把同页的 figure 一并带进上下文（PPT「把照片发出来」依赖这条）
         selected = await asyncio.to_thread(self._expand_page_figures, selected, perm)
+        # docx 等常无页码：同页扩不到时，再按同文档补 figure（熙物联二维码踩过）
+        selected = await asyncio.to_thread(self._expand_doc_figures, selected, perm)
 
         expand_done = time.perf_counter()
         result.chunks = selected
@@ -856,6 +910,92 @@ class RetrievalPipeline:
             else:
                 expanded.append(chunk)
         return expanded
+
+    def _expand_short_siblings(
+        self,
+        chunks: list[RetrievedChunk],
+        perm: PermContext,
+        *,
+        short_chars: int = 160,
+        window: int = 4,
+        max_total: int = 16,
+    ) -> list[RetrievedChunk]:
+        """短叶子父块命中时，拉取同文档、同一级标题下的相邻兄弟进上下文。
+
+        交接班类 Word 常被切成「每条 4.x 一个 20～90 字父块」且无 child；
+        仅靠 keep=5 只能带上几条碎片。兄弟扩展在**不重切库**的前提下补全同章条款。
+        扩展块仍过 C5。
+        """
+        if not chunks:
+            return chunks
+        present = {c.chunk_id for c in chunks}
+        anchors = [
+            c
+            for c in chunks
+            if c.chunk_type == "parent" and len((c.content or "").strip()) < short_chars
+        ]
+        if not anchors:
+            return chunks
+
+        extra_ids: list[int] = []
+        seen_extra: set[int] = set()
+        with self.db.sync_connect() as conn:
+            for anchor in anchors:
+                root = (anchor.heading_path or "").split(" > ", 1)[0].strip()
+                if not root:
+                    continue
+                rows = conn.execute(
+                    "SELECT chunk_id, heading_path, seq FROM ekbs_chunk "
+                    "WHERE doc_id = ? AND chunk_type = 'parent' "
+                    "AND (heading_path = ? OR heading_path LIKE ?) "
+                    "ORDER BY seq",
+                    (int(anchor.doc_id), root, f"{root} > %"),
+                ).fetchall()
+                if not rows:
+                    continue
+                ids = [int(r["chunk_id"]) for r in rows]
+                try:
+                    idx = ids.index(int(anchor.chunk_id))
+                except ValueError:
+                    idx = 0
+                lo = max(0, idx - window)
+                hi = min(len(ids), idx + window + 1)
+                for cid in ids[lo:hi]:
+                    if cid in present or cid in seen_extra:
+                        continue
+                    seen_extra.add(cid)
+                    extra_ids.append(cid)
+                    if len(extra_ids) >= max_total:
+                        break
+                if len(extra_ids) >= max_total:
+                    break
+
+        if not extra_ids:
+            return chunks
+
+        loaded = self.load_chunks(extra_ids)
+        kept, dropped = self.gate.filter_chunks(
+            perm, [(cid, loaded[cid].doc_id) for cid in loaded]
+        )
+        allowed = {chunk_id for chunk_id, _ in kept}
+        if dropped:
+            log.info("c5_denied_sibling", count=len(dropped), user_id=perm.user_id)
+
+        # 按锚点分数赋予扩展块略低的分，保持原命中优先
+        score_by_doc = {
+            c.doc_id: (c.rerank_score, c.rrf_score) for c in anchors
+        }
+        out = list(chunks)
+        for cid in extra_ids:
+            if cid not in allowed or cid not in loaded:
+                continue
+            sib = loaded[cid]
+            base = score_by_doc.get(sib.doc_id, (0.0, 0.0))
+            sib.rerank_score = float(base[0]) * 0.85 if base[0] else 0.0
+            sib.rrf_score = float(base[1]) * 0.85 if base[1] else 0.0
+            out.append(sib)
+            present.add(cid)
+        return out
 
     def _expand_page_figures(
         self,
@@ -961,6 +1101,93 @@ class RetrievalPipeline:
             )
         return out
 
+    def _expand_doc_figures(
+        self,
+        chunks: list[RetrievedChunk],
+        perm: PermContext,
+        *,
+        max_per_doc: int = 4,
+        max_total: int = 8,
+    ) -> list[RetrievedChunk]:
+        """正文命中但无页码（docx 常见）时，把**同文档** figure 并入上下文。
+
+        ``_expand_page_figures`` 要求 page_from 非空；熙物联教程正文与图都无页码时
+        会静默跳过，模型只能看到「请扫二维码」文字却看不到图，进而拒答或乱引其它文档的图。
+        """
+        if not chunks:
+            return chunks
+        present = {c.chunk_id for c in chunks}
+        already_has_fig = {c.doc_id for c in chunks if c.chunk_type == "figure" or c.figure_id}
+        doc_ids = sorted(
+            {
+                int(c.doc_id)
+                for c in chunks
+                if c.chunk_type != "figure" and int(c.doc_id or 0) not in already_has_fig
+            }
+        )
+        if not doc_ids:
+            return chunks
+
+        figure_ids: list[int] = []
+        with self.db.sync_connect() as conn:
+            for doc_id in doc_ids:
+                rows = conn.execute(
+                    "SELECT chunk_id FROM ekbs_chunk "
+                    "WHERE doc_id = ? AND chunk_type = 'figure' "
+                    "ORDER BY seq LIMIT ?",
+                    (doc_id, int(max_per_doc)),
+                ).fetchall()
+                for row in rows:
+                    cid = int(row["chunk_id"])
+                    if cid in present:
+                        continue
+                    figure_ids.append(cid)
+                    if len(figure_ids) >= max_total:
+                        break
+                if len(figure_ids) >= max_total:
+                    break
+        if not figure_ids:
+            return chunks
+
+        figures = self.load_chunks(figure_ids)
+        kept, dropped = self.gate.filter_chunks(
+            perm, [(cid, figures[cid].doc_id) for cid in figures]
+        )
+        allowed = {chunk_id for chunk_id, _ in kept}
+        if dropped:
+            log.info("c5_denied_doc_figure", count=len(dropped), user_id=perm.user_id)
+
+        score_by_doc: dict[int, tuple[float, float]] = {}
+        for c in chunks:
+            if c.chunk_type == "figure":
+                continue
+            prev = score_by_doc.get(int(c.doc_id), (0.0, 0.0))
+            score_by_doc[int(c.doc_id)] = (
+                max(prev[0], float(c.rerank_score or 0.0)),
+                max(prev[1], float(c.rrf_score or 0.0)),
+            )
+
+        out = list(chunks)
+        inserted = 0
+        for cid in figure_ids:
+            if cid not in allowed or cid in present:
+                continue
+            fig = figures[cid]
+            base = score_by_doc.get(int(fig.doc_id), (0.0, 0.0))
+            fig.rerank_score = float(base[0]) * 0.9 if base[0] else 0.0
+            fig.rrf_score = float(base[1]) * 0.9 if base[1] else 0.0
+            out.append(fig)
+            present.add(cid)
+            inserted += 1
+        if inserted:
+            log.info(
+                "doc_figures_expanded",
+                docs=len(doc_ids),
+                figures=inserted,
+                user_id=perm.user_id,
+            )
+        return out
+
     # ------------------------------------------------------------------
     # 生成与引用
     # ------------------------------------------------------------------
@@ -981,6 +1208,8 @@ class RetrievalPipeline:
                 page = f"（第 {chunk.page_from} 页）" if chunk.page_from == chunk.page_to else (
                     f"（第 {chunk.page_from}-{chunk.page_to} 页）"
                 )
+            from ekbs.discovery import display_doc_title
+
             heading = f"{chunk.heading_path} " if chunk.heading_path else ""
             kind = ""
             body = chunk.content
@@ -991,8 +1220,9 @@ class RetrievalPipeline:
                 html = information_block_to_html(chunk.content)
                 if html:
                     body = html
+            title = display_doc_title(chunk.doc_title)
             lines.append(
-                f"[{index}] {kind}{chunk.doc_title}{page} {heading}: {body}".strip()
+                f"[{index}] {kind}{title}{page} {heading}: {body}".strip()
             )
         return "\n".join(lines)
 
@@ -1195,6 +1425,28 @@ class RetrievalPipeline:
                 )
             degraded.append(f"{DEGRADED_UNSUPPORTED}:{len(report.unsupported)}")
 
+        # 答案里的「第X条/章」必须出现在被引用块的标题路径里，写错条号就整答拒掉。
+        mismatched = clause_mismatches(answer_text, chunks)
+        if mismatched:
+            self.gate.record_security_event(
+                "clause_mismatch",
+                user_id=perm.user_id,
+                severity="medium",
+                detail={"clauses": mismatched[:8], "model": llm_result.model},
+            )
+            return AnswerResult(
+                answer=f"{NO_BASIS_MARKER}。",
+                citations=[],
+                retrieval=retrieval,
+                model=llm_result.model,
+                refused=True,
+                refusal_reason="clause_mismatch",
+                hallucinated_citations=hallucinated,
+                faithfulness=report.as_dict(),
+                degraded=degraded,
+                **timing_kw,
+            )
+
         citations = self._post_check_citations(answer_text, chunks, perm)
         return AnswerResult(
             answer=answer_text,
@@ -1294,7 +1546,9 @@ class RetrievalPipeline:
                     numeric = retried
         elapsed_ms = int((time.perf_counter() - started) * 1000)
 
-        def _refuse(reason: str, detail: dict[str, Any]) -> AnswerResult:
+        def _refuse(
+            reason: str, detail: dict[str, Any], *, answer_text: str = "未找到可靠依据。"
+        ) -> AnswerResult:
             """取数失败一律走这里：**答案与引用同时清空**，不留"有答案没出处"的中间态。"""
             self.gate.record_security_event(
                 "numeric_refused",
@@ -1303,7 +1557,7 @@ class RetrievalPipeline:
                 detail={"reason": reason, "model": llm_result.model, **detail},
             )
             return AnswerResult(
-                answer="未找到可靠依据。",
+                answer=answer_text,
                 citations=[],
                 retrieval=retrieval,
                 model=llm_result.model,
@@ -1337,29 +1591,29 @@ class RetrievalPipeline:
 
         numeric.verified = True
         numeric.cite_index = cite_index
-        # 歧义披露：同一行标签在别处还有**不同数值**（如 2024年 vs 2026年）→
-        # 不猜、不拒答，把"另有 …"一起给出去，用户自己能看出抄的是哪一行。
+        # P1：同标签多口径且问题未钉死年份/表名 → 拒答并反问（消掉「同一问两个真数」）
         alternatives = find_scope_alternatives(
             chunks, quote=numeric.quote, value=numeric.value
         )
-        if alternatives and question_pins_scope(question, numeric.scope):
-            # 问题自带了口径（"2026年总用电量…"）且与返回口径相符 → 用户已指明哪一行，
-            # 再挂"另有 2024 年…"是噪声，收声。
-            alternatives = []
-        if alternatives:
+        if alternatives and not question_pins_scope(question, numeric.scope):
             numeric.alternatives = alternatives
-        answer_text, _leaked = self._apply_output_guard(render_answer(numeric, cite_index), perm)
+            clarify = format_scope_clarify_reply(numeric, alternatives)
+            return _refuse(
+                "numeric_scope_ambiguous",
+                {"alternatives": len(alternatives)},
+                answer_text=clarify,
+            )
+
+        answer_text, _leaked = self._apply_output_guard(
+            format_numeric_user_reply(numeric, cite_index), perm
+        )
         # 复用既有引用路径：ACL 二次确认 + 页码区间校验，与业务问答同一套（不另写一份）
         citations = self._post_check_citations(answer_text, chunks, perm)
-        degraded = (
-            [f"numeric_scope_ambiguity:{len(alternatives)}"] if alternatives else []
-        )
         return AnswerResult(
             answer=answer_text,
             citations=citations,
             retrieval=retrieval,
             model=llm_result.model,
-            degraded=degraded,
             numeric=numeric.as_dict(),
             # 取数模式的"忠实度"由抄写校验承担：显式写清口径，
             # 免得调试台按业务问答的面板显示成"未通过"（那是另一套判据）
@@ -1495,7 +1749,7 @@ class RetrievalPipeline:
         allow_generation: bool = True,
         overrides: RetrievalOverrides | None = None,
         collect_debug: bool = False,
-        mode: str = MODE_PROSE,
+        mode: str = MODE_AUTO,
     ) -> AnswerResult:
         """检索 + 生成的一条龙（供 API 与钉钉适配器调用）。
 
@@ -1506,6 +1760,9 @@ class RetrievalPipeline:
         多轮时：先把会话历史取出来（``ekbs_session_ctx``，键含用户维度）→ **查询改写**
         → 用改写后的查询检索 → 带历史生成 → 把本轮写回上下文。
         每轮都重新加载 ``PermContext`` 由调用方负责（`03` §6.1 V5）。
+
+        ``mode``：``auto``（默认，按意图 + ``qa.auto_numeric`` 路由）|
+        ``prose`` / ``numeric``（显式覆盖，管理台用）。
 
         ``overrides`` / ``collect_debug``：检索调试台用；正式问答保持默认即可。
         """
@@ -1518,6 +1775,9 @@ class RetrievalPipeline:
 
         # ② 查询改写（00 §2.1 的第一步）；改写后的查询才是检索输入
         rewrite = await self._rewrite(question, messages)
+        intent = str(getattr(rewrite, "intent", "factual") or "factual")
+        auto_numeric = bool((getattr(self.settings, "qa", None) or {}).get("auto_numeric", True))
+        mode_used = resolve_answer_mode(mode, intent, auto_numeric=auto_numeric)
 
         cached = None
         # 答案缓存键必须含**历史指纹**：同一问题在不同上下文下答案不同，
@@ -1530,8 +1790,8 @@ class RetrievalPipeline:
             perm.fingerprint,
             f"{rewrite.rewritten}|{_history_digest(messages)}|gen={int(allow_generation)}"
             # 模式必须进键：取数模式与业务问答的答案形态完全不同，
-            # 不加这截就会把上一模式的结果（甚至缓存的自由文本）喂给另一个模式。
-            f"|mode={mode}|rc={self.retrieval_cache_revision()}",
+            # 用解析后的 mode_used（auto→prose/numeric），避免同意图重复缓存两套键。
+            f"|mode={mode_used}|rc={self.retrieval_cache_revision()}",
         )
         if use_cache and not collect_debug:
             cached = await self.cache.get(cache_key)
@@ -1551,6 +1811,9 @@ class RetrievalPipeline:
                 refused=bool(cached.get("refused", False)),
                 refusal_reason=str(cached.get("refusal_reason", "")),
                 numeric=cached.get("numeric"),
+                mode_used=str(cached.get("mode_used") or mode_used),
+                intent=str(cached.get("intent") or intent),
+                figure_attachments=list(cached.get("figure_attachments") or []),
                 degraded=["answer_cache_hit"],
             )
             # 命中缓存也要记这一轮上下文：否则多轮追问会丢掉这一轮（实测踩到）
@@ -1560,7 +1823,7 @@ class RetrievalPipeline:
         retrieval = await self.retrieve(
             rewrite.rewritten, perm, overrides=overrides, collect_debug=collect_debug
         )
-        if allow_generation and mode == MODE_NUMERIC:
+        if allow_generation and mode_used == MODE_NUMERIC:
             result = await self._answer_numeric(question, retrieval, perm)
         elif allow_generation:
             result = await self.generate(question, retrieval, perm, history=messages)
@@ -1568,6 +1831,72 @@ class RetrievalPipeline:
             result = self._retrieval_only_answer(question, retrieval, perm)
         result.rewritten_query = rewrite.rewritten
         result.history_used = rewrite.used_history
+        result.mode_used = mode_used
+        result.intent = intent
+        result.figure_attachments = self._collect_figure_attachments(
+            retrieval.chunks,
+            result.citations,
+            intent=intent,
+            query=rewrite.rewritten or question,
+        )
+        # 找图意图：引用里的空白垃圾图（空调合同扫描页等）不得留在答案卡片上
+        if intent == "figure" and result.figure_attachments:
+            keep_ids = {int(a["chunk_id"]) for a in result.figure_attachments}
+            cleaned: list[Citation] = []
+            for cite in result.citations:
+                is_fig = bool(cite.figure_id or cite.image_path)
+                if is_fig and int(cite.chunk_id) not in keep_ids:
+                    continue
+                cleaned.append(cite)
+            if cleaned:
+                for i, cite in enumerate(cleaned, 1):
+                    cite.cite_index = i
+                result.citations = cleaned
+        # 找图意图且已筛出相关原图时：模型常因「资料区没有像素」口头拒答；
+        # 实际发图走 figure_attachments，不应再当成无依据拒答。
+        if (
+            intent == "figure"
+            and result.figure_attachments
+            and result.refused
+            and result.refusal_reason in {REFUSE_NO_BASIS, REFUSE_EMPTY_ANSWER, ""}
+        ):
+            titles = sorted(
+                {
+                    str(a.get("doc_title") or "").strip()
+                    for a in result.figure_attachments
+                    if str(a.get("doc_title") or "").strip()
+                }
+            )
+            doc_hint = f"（来自{'、'.join(titles[:2])}）" if titles else ""
+            result.answer = f"已找到相关图片{doc_hint}，见下方原图。"
+            result.refused = False
+            result.refusal_reason = ""
+            if not result.citations:
+                # 用附件对应块补最小引用，便于调试台/钉钉对齐
+                by_id = {c.chunk_id: c for c in retrieval.chunks}
+                rebuilt: list[Citation] = []
+                for i, att in enumerate(result.figure_attachments, 1):
+                    src = by_id.get(int(att.get("chunk_id") or 0))
+                    if src is None:
+                        continue
+                    rebuilt.append(
+                        Citation(
+                            cite_index=i,
+                            chunk_id=int(src.chunk_id),
+                            doc_id=int(src.doc_id),
+                            doc_title=str(src.doc_title or ""),
+                            doc_version=str(getattr(src, "doc_version", None) or "v1"),
+                            heading_path=str(src.heading_path or ""),
+                            page_from=src.page_from,
+                            page_to=src.page_to,
+                            rerank_score=src.rerank_score,
+                            acl_result="pass",
+                            page_check="pass",
+                            figure_id=src.figure_id,
+                            image_path=src.image_path,
+                        )
+                    )
+                result.citations = rebuilt
 
         # ③ 写回上下文（群聊按用户隔离，见 session.py 的说明）
         await self._remember_turn(conversation_id, perm, question, result)
@@ -1582,16 +1911,162 @@ class RetrievalPipeline:
                     "refusal_reason": result.refusal_reason,
                     "citations": [c.__dict__ for c in result.citations],
                     "numeric": result.numeric,
+                    "mode_used": mode_used,
+                    "intent": intent,
+                    "figure_attachments": result.figure_attachments,
                 },
                 ttl=self.settings.retrieval.cache.answer_ttl,
             )
         return result
 
+    @staticmethod
+    def _figure_is_junk(content: str, heading_path: str = "") -> bool:
+        """多模态旁路常把扫描件空白页当「图」召回；这类不得回源。"""
+        blob = f"{content or ''}\n{heading_path or ''}"
+        return any(
+            mark in blob
+            for mark in ("无可读文字", "纯白背景", "纯白色的背景", "没有任何可识别")
+        )
+
+    @staticmethod
+    def _figure_query_score(
+        *,
+        query: str,
+        doc_title: str,
+        content: str,
+        text_hit_docs: set[int],
+        doc_id: int,
+    ) -> int:
+        """找图回源排序：正文命中文档 > 题注/标题与问句重合 > 垃圾图垫底。"""
+        q = (query or "").strip().lower()
+        title = (doc_title or "").strip().lower()
+        body = (content or "").strip().lower()
+        score = 0
+        if doc_id in text_hit_docs:
+            score += 100
+        for n in (4, 3, 2):
+            for i in range(0, max(0, len(q) - n + 1)):
+                gram = q[i : i + n]
+                if gram in title:
+                    score += 5 * n
+                if gram in body:
+                    score += 3 * n
+        if RetrievalPipeline._figure_is_junk(content):
+            score -= 200
+        return score
+
+    @staticmethod
+    def _collect_figure_attachments(
+        chunks: Sequence[RetrievedChunk],
+        citations: Sequence[Citation],
+        *,
+        intent: str,
+        query: str = "",
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """汇总要回源的图片：找图意图下按问句相关性排序，并丢掉空白垃圾图。"""
+        by_id = {c.chunk_id: c for c in chunks}
+        # 正文/表格命中的文档：二维码问句通常先命中「首次登录」段，再扩同文档图
+        text_hit_docs = {
+            int(c.doc_id)
+            for c in chunks
+            if c.chunk_type not in {"figure"} and not c.figure_id
+        }
+        candidates: list[tuple[int, dict[str, Any], int]] = []
+        seen: set[int] = set()
+
+        def _push(chunk_id: int, figure_id: str, image_path: str, doc_title: str, doc_id: int, content: str) -> None:
+            if not image_path or chunk_id in seen:
+                return
+            seen.add(chunk_id)
+            score = RetrievalPipeline._figure_query_score(
+                query=query,
+                doc_title=doc_title,
+                content=content,
+                text_hit_docs=text_hit_docs,
+                doc_id=int(doc_id or 0),
+            )
+            candidates.append(
+                (
+                    score,
+                    {
+                        "chunk_id": chunk_id,
+                        "figure_id": figure_id or "",
+                        "image_path": image_path,
+                        "doc_title": doc_title or "",
+                    },
+                    int(doc_id or 0),
+                )
+            )
+
+        for cite in citations:
+            path = str(getattr(cite, "image_path", None) or "").strip()
+            fid = str(getattr(cite, "figure_id", None) or "").strip()
+            if not path and not fid:
+                continue
+            src = by_id.get(int(cite.chunk_id))
+            content = str(getattr(src, "content", None) or getattr(cite, "heading_path", None) or "")
+            _push(
+                int(cite.chunk_id),
+                fid or (src.figure_id if src else ""),
+                path or (str(src.image_path or "") if src else ""),
+                str(getattr(cite, "doc_title", None) or (src.doc_title if src else "")),
+                int(getattr(cite, "doc_id", None) or (src.doc_id if src else 0) or 0),
+                content,
+            )
+
+        if (intent or "").strip().lower() == "figure":
+            for chunk in chunks:
+                if chunk.chunk_type != "figure" and not chunk.figure_id:
+                    continue
+                _push(
+                    int(chunk.chunk_id),
+                    str(chunk.figure_id or ""),
+                    str(chunk.image_path or ""),
+                    str(chunk.doc_title or ""),
+                    int(chunk.doc_id or 0),
+                    str(chunk.content or chunk.heading_path or ""),
+                )
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda item: (-item[0], item[1]["chunk_id"]))
+        # 有正相关图时丢掉垃圾图；全是垃圾则不回源（宁可不发，也不发错文档）
+        positive = [c for c in candidates if c[0] > 0]
+        pool = positive if positive else []
+        if not pool:
+            return []
+
+        # 问句能对上某文档标题时，只发这些文档的图（「熙物联」不夹带空调合同）
+        q = (query or "").strip().lower()
+        title_matched_docs = {
+            doc_id
+            for score, att, doc_id in pool
+            if doc_id
+            and any(
+                q[i : i + n] in (att.get("doc_title") or "").lower()
+                for n in (4, 3, 2)
+                for i in range(0, max(0, len(q) - n + 1))
+            )
+        }
+        if title_matched_docs:
+            pool = [c for c in pool if c[2] in title_matched_docs] or pool
+        elif text_hit_docs:
+            anchored = [c for c in pool if c[2] in text_hit_docs]
+            if anchored:
+                pool = anchored
+
+        return [att for _, att, _ in pool[:limit]]
+
     async def _rewrite(self, question: str, messages: Sequence[dict[str, str]]) -> Any:
         if self.rewriter is None:
-            from ekbs.session import RewriteResult
+            from ekbs.session import QueryRewriter, RewriteResult
 
-            return RewriteResult(question, question, "off", used_history=False)
+            # 改写关闭时仍要做意图识别，否则 mode=auto 永远落不到 numeric
+            result = RewriteResult(question, question, "off", used_history=False)
+            result.intent = QueryRewriter.detect_intent(question)
+            return result
         return await self.rewriter.rewrite(question, messages)
 
     async def _remember_turn(
@@ -1630,6 +2105,7 @@ class RetrievalPipeline:
             f"k={cfg.dense_top_k}:{cfg.sparse_top_k}:{cfg.rrf_k}:{int(cfg.parent_expand)}",
             f":mq={cfg.multi_query}:{getattr(cfg, 'dense_multi_query', 1)}",
             f"rw={getattr(cfg.query_rewrite, 'strategy', '')}",
+            f"expand={getattr(getattr(getattr(self.rewriter, 'expand_llm', None), 'ref', None), 'ident', '')}",
             f"prompt={PROMPT_REVISION}",
         ]
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]

@@ -335,8 +335,125 @@ def _parse_text(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
     )
 
 
+#: 页眉「页数：1 / 2」→ 总页数；用于补 ``page_count``（Word 轻量解析无真实分页时）
+_DOCX_HEADER_PAGE_TOTAL = re.compile(
+    r"页\s*数\s*[：:]\s*\d+\s*/\s*(\d+)", re.IGNORECASE
+)
+#: 页眉装饰小图阈值：短边与长边都偏小时视为 logo，不进正文 figure
+_DOCX_DECORATIVE_MAX_EDGE = 120
+
+
+def _collapse_docx_row_cells(cells: Sequence[str]) -> list[str]:
+    """页眉表常合并单元格，相邻重复值压成一条（``文件名称|书名|书名`` → ``文件名称|书名``）。"""
+    out: list[str] = []
+    for raw in cells:
+        text = (raw or "").strip().replace("\n", " ")
+        if not text:
+            continue
+        if out and out[-1] == text:
+            continue
+        out.append(text)
+    return out
+
+
+def _format_docx_header_row(cells: Sequence[str]) -> str | None:
+    """把一行页眉表格式化成可检索的键值串。
+
+    合并单元格后行长常为奇数（``文件名称|书名|文件编号：X…``）：
+    已含冒号的格子当整段键值；其余按「标签 → 值」成对吞掉。
+    """
+    cleaned = _collapse_docx_row_cells(cells)
+    if not cleaned:
+        return None
+    atoms: list[str] = []
+    index = 0
+    while index < len(cleaned):
+        current = cleaned[index]
+        if "：" in current or ":" in current:
+            atoms.append(current)
+            index += 1
+            continue
+        if index + 1 < len(cleaned):
+            atoms.append(f"{current}：{cleaned[index + 1]}")
+            index += 2
+            continue
+        atoms.append(current)
+        index += 1
+    return "；".join(atoms)
+
+
+def _docx_header_meta(document: Any) -> tuple[list[str], int | None]:
+    """抽取页眉/页脚**文字**一次（制度文件的文件名、编号、版本、页数等）。
+
+    方案 ``20`` §2 步 1「页眉页脚剔除」针对的是 **PDF 每页重复出现的装饰行**；
+    Word 里管控信息往往**只住在 header 表**、正文没有 —— 原先只抽页眉图、不抽字，
+    等于把文件编号/生效日期洗掉。这里抽一次挂到文首「文件信息」，不按页重复注入。
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+    page_total: int | None = None
+    parts: list[Any] = []
+    for section in getattr(document, "sections", ()) or ():
+        for attr in (
+            "header",
+            "footer",
+            "first_page_header",
+            "first_page_footer",
+            "even_page_header",
+            "even_page_footer",
+        ):
+            part = getattr(section, attr, None)
+            if part is not None:
+                parts.append(part)
+    for part in parts:
+        for table in getattr(part, "tables", ()) or ():
+            for row in table.rows:
+                try:
+                    cells = [((cell.text or "").strip()) for cell in row.cells]
+                except Exception:  # noqa: BLE001 — 坏表行跳过
+                    continue
+                line = _format_docx_header_row(cells)
+                if not line or line in seen:
+                    continue
+                seen.add(line)
+                lines.append(line)
+                match = _DOCX_HEADER_PAGE_TOTAL.search(line)
+                if match:
+                    page_total = int(match.group(1))
+        for paragraph in getattr(part, "paragraphs", ()) or ():
+            text = (getattr(paragraph, "text", None) or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            lines.append(text)
+            match = _DOCX_HEADER_PAGE_TOTAL.search(text)
+            if match:
+                page_total = int(match.group(1))
+    return lines, page_total
+
+
+def _docx_raster_is_decorative(blob: bytes, *, max_edge: int = _DOCX_DECORATIVE_MAX_EDGE) -> bool:
+    """页眉 logo 一类小图：进 figure 只会污染检索（实测设备编号指导书 89×26）。"""
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+    except Exception:  # pragma: no cover
+        return False
+    try:
+        with Image.open(BytesIO(blob)) as image:
+            width, height = image.size
+    except Exception:  # noqa: BLE001
+        return False
+    return max(int(width), int(height)) < int(max_edge)
+
+
 def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
-    """`.docx` —— 按文档顺序抽段落、表格与**嵌入图片**（与 pptx 同口径进 ``figures``）。"""
+    """`.docx` —— 按文档顺序抽段落、表格与**嵌入图片**（与 pptx 同口径进 ``figures``）。
+
+    页眉/页脚：**文字**抽一次写入文首「文件信息」；**装饰小图**不进 figure，
+    较大的页眉图仍落盘（历史夹具与交接班制度 logo 兜底保留）。
+    """
     try:
         import docx  # python-docx
         from docx.oxml.ns import qn
@@ -346,16 +463,39 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
         raise ParserUnavailable(f"python-docx 不可用：{exc}") from exc
 
     document = docx.Document(str(path))
+    header_meta, header_page_count = _docx_header_meta(document)
     lines: list[str] = []
+    if header_meta:
+        # 用 H2：与一级编号章（level=2）同级，后续 ``1. 目的`` 会弹出本节点，
+        # 避免 ``文件信息 > 4.1 …`` 污染 heading_path。
+        lines.append("## 文件信息")
+        lines.extend(header_meta)
+        lines.append("")
     tables: list[ParsedTable] = []
     figures: list[ParsedFigure] = []
     table_seq = 0
     seen_images: set[str] = set()
     ocr_budget = [_figure_ocr_budget()]
-    textless: list[tuple[int, int]] = []
+    #: (figure_index, blob_size, nearby_text) —— 无字图用上文题注，避免只剩「图1」搜不到「二维码」
+    textless: list[tuple[int, int, str]] = []
+    recent_texts: list[str] = []
 
-    def _ingest_images(element: Any) -> None:
+    def _nearby_caption() -> str:
+        """优先带「二维码/扫描/下载」的近邻段，再退到 APP/图片，最后取最近正文。"""
+        for keys in (
+            ("二维码", "二维碼", "扫码", "扫描", "下载"),
+            ("图片", "图示", "示意图"),
+            ("APP", "App", "app"),
+        ):
+            for text in reversed(recent_texts):
+                if any(k in text for k in keys):
+                    return text
+        return recent_texts[-1] if recent_texts else ""
+
+    def _ingest_images(element: Any, *, skip_decorative: bool = False) -> None:
         for blob, ext, caption in _docx_images_in_element(element, document):
+            if skip_decorative and not (caption or "").strip() and _docx_raster_is_decorative(blob):
+                continue
             added = _register_figure_blob(
                 blob, ext,
                 assets_dir=assets_dir, figures=figures, seen=seen_images,
@@ -363,14 +503,18 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
                 log_file=path.name,
             )
             if added and not figures[-1].caption and not figures[-1].ocr_text:
-                textless.append((len(figures) - 1, len(blob)))
+                textless.append((len(figures) - 1, len(blob), _nearby_caption()))
 
     # 按文档顺序交错段落 / 表格 / 图片，避免「全文段落完再甩表/图」打乱阅读位置
     for child in document.element.body.iterchildren():
         if child.tag == qn("w:p"):
             paragraph = Paragraph(child, document)
-            _ingest_images(child)
             text = (paragraph.text or "").strip()
+            # 先记上文再落图：空段里的二维码才能挂上「扫描二维码下载」
+            if text:
+                recent_texts.append(text)
+                del recent_texts[:-6]
+            _ingest_images(child)
             if not text:
                 continue
             style = (paragraph.style.name or "").lower() if paragraph.style else ""
@@ -398,6 +542,8 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
 
     # 兜底：正文遍历漏掉的关系图（页眉/页脚/文本框等）仍要落盘，否则等于丢图
     for blob, ext, caption in _docx_images_from_rels(document):
+        if not (caption or "").strip() and _docx_raster_is_decorative(blob):
+            continue
         added = _register_figure_blob(
             blob, ext,
             assets_dir=assets_dir, figures=figures, seen=seen_images,
@@ -405,7 +551,7 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
             log_file=path.name,
         )
         if added and not figures[-1].caption and not figures[-1].ocr_text:
-            textless.append((len(figures) - 1, len(blob)))
+            textless.append((len(figures) - 1, len(blob), _nearby_caption()))
 
     # 再兜底：页眉/页脚的图挂在 **header/footer part** 的关系上，不在 document.part.rels；
     # 实测交接班制度等 docx 的 logo 只在 word/header1.xml → word/media/，正文 blip=0。
@@ -424,6 +570,8 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
             if element is None:
                 continue
             for blob, ext, caption in _docx_images_in_element(element, part):
+                if not (caption or "").strip() and _docx_raster_is_decorative(blob):
+                    continue
                 added = _register_figure_blob(
                     blob, ext,
                     assets_dir=assets_dir, figures=figures, seen=seen_images,
@@ -431,10 +579,12 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
                     log_file=path.name,
                 )
                 if added and not figures[-1].caption and not figures[-1].ocr_text:
-                    textless.append((len(figures) - 1, len(blob)))
+                    textless.append((len(figures) - 1, len(blob), _nearby_caption()))
 
     # zip 级兜底：任何 part 漏扫时仍能从 word/media/ 捞到栅格图（与 xlsx 同口径）
     for blob, ext in _ooxml_media_blobs(path, prefix="word/media/"):
+        if _docx_raster_is_decorative(blob):
+            continue
         added = _register_figure_blob(
             blob, ext,
             assets_dir=assets_dir, figures=figures, seen=seen_images,
@@ -442,24 +592,40 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
             log_file=path.name,
         )
         if added and not figures[-1].caption and not figures[-1].ocr_text:
-            textless.append((len(figures) - 1, len(blob)))
+            textless.append((len(figures) - 1, len(blob), _nearby_caption()))
 
     if textless:
         title = path.stem.strip()
-        if title:
-            biggest = max(textless, key=lambda item: item[1])[0]
-            if not figures[biggest].caption and not figures[biggest].ocr_text:
-                figures[biggest].caption = title
+        # 全部无字图都挂题注（旧逻辑只给最大一张 → 其余被 chunker 当「无文本」丢掉）
+        # OCR 默认关闭时教程截图常两张都无字；优先挂「上文」让「二维码/下载」能被检索到。
+        for rank, (idx, _size, nearby) in enumerate(textless, start=1):
+            if figures[idx].caption or figures[idx].ocr_text:
+                continue
+            nearby_bit = " ".join((nearby or "").split())
+            if len(nearby_bit) > 36:
+                nearby_bit = nearby_bit[:36].rstrip() + "…"
+            parts = [p for p in (title, nearby_bit) if p]
+            if len(textless) > 1:
+                parts.append(f"图{rank}")
+            figures[idx].caption = " · ".join(parts) if parts else f"图{rank}"
 
     if figures:
         log.info("docx_figures_extracted", file=path.name, figures=len(figures))
+    if header_meta:
+        log.info(
+            "docx_header_meta_extracted",
+            file=path.name,
+            lines=len(header_meta),
+            page_count=header_page_count,
+        )
 
     return ParsedDocument(
-        markdown="\n".join(lines),
+        markdown="\n".join(lines).rstrip() + ("\n" if lines else ""),
         engine="docx",
         source_path=str(path),
         tables=tables,
         figures=figures,
+        page_count=header_page_count,
     )
 
 
@@ -670,18 +836,30 @@ def _parse_doc(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
 
     figures = list(parsed.figures)
     if not figures and assets_dir is not None:
-        # textutil 常丢图：从原 .doc 二进制里捞还能认的栅格图
+        # textutil 常丢图：从原 .doc 二进制里捞还能认的栅格图。
+        # ⚠️ 必须跳过装饰小图（页眉 logo 常见 89×26）：此前未过滤，维保记录等
+        # .doc 会把 logo 当正文 figure 入库，污染检索（chunk「重庆熙街 SUNNY BLOCK」）。
+        # 也不要用 path.stem 当 caption —— 会挡住「无题注+装饰」的跳过逻辑。
         seen: set[str] = set()
         ocr_budget = [_figure_ocr_budget()]
+        skipped_decorative = 0
         for blob, ext in _scan_embedded_raster_blobs(path.read_bytes()):
+            if _docx_raster_is_decorative(blob):
+                skipped_decorative += 1
+                continue
             _register_figure_blob(
                 blob, ext,
                 assets_dir=assets_dir, figures=figures, seen=seen,
-                caption=path.stem, page=None, ocr_budget=ocr_budget,
+                caption="", page=None, ocr_budget=ocr_budget,
                 log_file=path.name,
             )
-        if figures:
-            log.info("doc_figures_scanned", file=path.name, figures=len(figures))
+        if figures or skipped_decorative:
+            log.info(
+                "doc_figures_scanned",
+                file=path.name,
+                figures=len(figures),
+                skipped_decorative=skipped_decorative,
+            )
 
     # 引擎名保留 doc，便于日志/审计区分"走了旧格式转换"
     return ParsedDocument(
@@ -1002,6 +1180,9 @@ def _mineru_env() -> dict[str, str]:
 
     env = dict(os.environ)
     env.setdefault(MINERU_SOURCE_ENV, "modelscope")
+    # ONNX Runtime 1.30 在进程退出时拆遥测会 SIGABRT（macOS 弹「Python 意外退出」）。
+    # 崩溃栈停在 PosixTelemetry::Shutdown，产物已经写完。子进程起来之前关掉遥测。
+    env.setdefault("ORT_DISABLE_TELEMETRY", "1")
     if not env.get(MODELSCOPE_CACHE_ENV):
         candidate = _repo_mineru_models_dir()
         if candidate.is_dir():
@@ -1116,16 +1297,26 @@ def _parse_mineru(path: Path, *, assets_dir: Path | None = None) -> ParsedDocume
                 raise ParserUnavailable(f"{last_reason}：{path.name}") from exc
 
             tail = _subprocess_tail(completed)
+            # 产物目录：<out>/<stem>/auto（无 auto 时退化为 <out>/<stem>）
+            # ⚠️ 必须先找产物再看退出码：macOS 上 MinerU 常在写完 content_list
+            # 后以 SIGABRT（returncode -6）崩掉；旧逻辑整页重跑，解析时间翻倍。
+            base = Path(out_dir) / path.stem
+            auto = base / "auto" if (base / "auto").is_dir() else (base if base.is_dir() else Path(out_dir))
+            content_list = _find_output(auto, f"{path.stem}_content_list.json")
+            markdown_file = _find_output(auto, f"{path.stem}.md")
+            if content_list is not None or markdown_file is not None:
+                if completed.returncode != 0:
+                    log.warning(
+                        "mineru_nonzero_exit_but_output_ok",
+                        file=path.name,
+                        returncode=completed.returncode,
+                        attempt=attempt,
+                        hint="产物已落盘，采纳结果、不再重试",
+                    )
+                break
             if completed.returncode != 0:
                 last_reason = f"MinerU 解析失败（退出码 {completed.returncode}）：{tail}"
             else:
-                # 产物目录：<out>/<stem>/auto（无 auto 时退化为 <out>/<stem>）
-                base = Path(out_dir) / path.stem
-                auto = base / "auto" if (base / "auto").is_dir() else (base if base.is_dir() else Path(out_dir))
-                content_list = _find_output(auto, f"{path.stem}_content_list.json")
-                markdown_file = _find_output(auto, f"{path.stem}.md")
-                if content_list is not None or markdown_file is not None:
-                    break
                 last_reason = f"MinerU 未产出可识别的结果（既无 content_list.json 也无 .md）：{tail}"
             if attempt < attempts:
                 log.warning("mineru_retry", file=path.name, attempt=attempt, reason=last_reason[:200])
@@ -1741,6 +1932,16 @@ def _find_output(directory: Path, name: str) -> Path | None:
     return None
 
 
+def _emit_seal_account(emit, text: str) -> None:
+    """公章图不进正文，但章下压住的银行账号要留在签署行里。"""
+    raw = (text or "").strip()
+    if not raw or not re.search(r"账号|开户银行", raw):
+        return
+    if not re.search(r"\d{8,}", raw):
+        return
+    emit(raw)
+
+
 def _blocks_to_document(
     blocks: Sequence[dict],
     path: Path,
@@ -1799,14 +2000,28 @@ def _blocks_to_document(
             caption = " ".join(str(c) for c in (block.get("img_caption") or []) if c).strip()
             managed = _persist_figure(img, out_root, assets_dir) if img else None
             if managed is None:
+                from ekbs.ingest.seal_filter import is_seal_image
+
+                if is_seal_image(None, caption=caption):
+                    log.info("seal_figure_dropped", file=path.name, img=img, page=page)
+                    _emit_seal_account(emit, caption)
+                    continue
                 # 没给 assets_dir（或找不到源图）→ 只能留链接，且**明确告警**：这种链接会失效
                 if img and assets_dir is None:
                     log.warning("figure_not_persisted", file=path.name, img=img)
                 emit(f"![{caption or '图片'}]({img})" if img else (caption or "（图片）"))
             else:
+                from ekbs.ingest.seal_filter import is_seal_image
+
+                image_file = assets_dir / managed
+                # 先按画面/题注丢掉公章，避免对印章浪费 OCR，也不写进附图
+                if is_seal_image(image_file, caption=caption):
+                    log.info("seal_figure_dropped", file=path.name, img=managed, page=page)
+                    _emit_seal_account(emit, caption)
+                    continue
                 ocr = ""
                 if ocr_budget > 0:
-                    outcome = _ocr_figure(assets_dir / managed)
+                    outcome = _ocr_figure(image_file)
                     ocr = outcome.text
                     if outcome.attempted:
                         ocr_budget -= 1
@@ -1817,6 +2032,13 @@ def _blocks_to_document(
                             hint="MinerU 不可用，本文件剩余图片不再尝试 OCR（图片本身已落盘）",
                         )
                         ocr_budget = 0
+                if is_seal_image(image_file, caption=caption, ocr=ocr):
+                    log.info(
+                        "seal_figure_dropped", file=path.name, img=managed,
+                        page=page, via="ocr",
+                    )
+                    _emit_seal_account(emit, caption or ocr)
+                    continue
                 figures.append(
                     ParsedFigure(
                         name=managed, caption=caption, page=page,
@@ -1841,6 +2063,12 @@ def _blocks_to_document(
     markdown = "\n".join(lines)
     if not markdown.strip() and markdown_file is not None:
         markdown = markdown_file.read_text(encoding="utf-8", errors="replace")
+    # 跨页续表合并（清洗步 4）：MinerU 常把一表拆成多块
+    from ekbs.ingest.table_merge import merge_continued_tables
+
+    markdown, tables, merge_stats = merge_continued_tables(markdown, tables)
+    if merge_stats:
+        log.info("mineru_tables_merged", file=path.name, **merge_stats)
     return ParsedDocument(
         markdown=markdown,
         engine="mineru",

@@ -105,10 +105,13 @@ class Authenticator:
         user = self._load_user(user_id=int(user_id), dt_userid=None)
         if user is None:
             raise PermissionDenied("用户不存在或已离职")
+        channel = str(payload.get("channel") or "web")
+        if channel == "dingtalk_h5":
+            raise PermissionDenied("管理台不接受钉钉免登，请使用登录名和口令")
         return AuthUser(
             user_id=user[0],
             dingtalk_userid=user[1],
-            channel=str(payload.get("channel") or "web"),
+            channel=channel,
             via="jwt",
         )
 

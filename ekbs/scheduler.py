@@ -4,7 +4,7 @@
 本栈固定 ``workers=1`` 也只是「当前不炸」，不是设计。因此所有定时任务集中在这里，
 单进程单写者，与 `01` §5.6 的归档路径「事务内 DROP 触发器 → 删除 → 重建」相容。
 
-作业清单（8 项，`04` §7.1.4）：
+作业清单（`04` §7.1.4；组织全量只在管理台打开定时更新后按间隔跑）：
 
 | 作业 | 频率 | 现状 |
 |---|---|---|
@@ -15,7 +15,8 @@
 | ``rate_limit_cleanup`` | 10 min | ✅ 已实现（`ekbs_rate_limit` 滑窗回收） |
 | ``msg_dedup_cleanup`` | 1 h | ✅ 已实现（`ekbs_msg_dedup` 7 天） |
 | ``reconcile`` | 每日 01:30 | ◐ 部分实现（SQLite↔FTS5 计数对账；FAISS 侧复用自检） |
-| ``org_sync`` / ``audit_archive`` | 每日 | ⏳ 需钉钉凭据 / 归档实现（见 `04` §6.3） |
+| ``audit_archive`` | 每日 03:00 | ✅ 已实现 |
+| 组织同步 | 管理台开启后按小时间隔 | 与「从钉钉更新」相同：部门 + 人员。未开启时不跑 |
 """
 
 from __future__ import annotations
@@ -35,12 +36,15 @@ from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
 from ekbs.logging import get_logger
 from ekbs.observability.alerts import evaluate_all, record_alerts
 from ekbs.observability.metrics import snapshot
+from ekbs.observability.notify import AlertNotifier
 from ekbs.runtime import Runtime
 
 log = get_logger(component="scheduler")
 
 SESSION_CONTEXT_TTL_DEFAULT = 7200
 MSG_DEDUP_RETAIN_DAYS = 7
+#: D16 inbox 终态行留存：failed 终态（死信对应行）保留 30 天供人工处置
+MSG_INBOX_DEAD_RETAIN_DAYS = 30
 RATE_LIMIT_WINDOW_SECONDS = 600
 
 
@@ -90,6 +94,11 @@ def job_metrics_collect(runtime: Runtime) -> None:
     hits = evaluate_all(runtime.db)
     if hits:
         record_alerts(runtime.db, hits)
+        # 推送到告警通道（08 §5.2：钉钉主通道 + 邮件带外；未配置则只记日志）
+        try:
+            AlertNotifier(runtime.db, runtime.secrets).notify(hits)
+        except Exception as exc:  # noqa: BLE001 - 推送失败绝不影响采集作业
+            log.error("alert_notify_failed", error=str(exc)[:200])
     log.debug("metrics_collected", host=values, in_process=len(in_process), alerts=len(hits))
 
 
@@ -129,9 +138,43 @@ def job_msg_dedup_cleanup(runtime: Runtime) -> None:
             "DELETE FROM ekbs_msg_dedup WHERE created_at < datetime('now', ?)",
             (f"-{MSG_DEDUP_RETAIN_DAYS} days",),
         )
+        # D16：inbox 终态行按留存期清理 —— done 7 天（对齐 dedup）；
+        # failed 终态（重试耗尽）留 30 天供人工处置，死信表本身保留（量小，人工清理）。
+        # 注意不能清「未终态」行：那会破坏 at-least-once 的重驱动。
+        inbox_done = conn.execute(
+            "DELETE FROM ekbs_msg_inbox WHERE status = 'done'"
+            " AND updated_at < datetime('now', ?)",
+            (f"-{MSG_DEDUP_RETAIN_DAYS} days",),
+        )
+        inbox_dead = conn.execute(
+            "DELETE FROM ekbs_msg_inbox WHERE status = 'failed' AND next_retry_at IS NULL"
+            " AND updated_at < datetime('now', ?)",
+            (f"-{MSG_INBOX_DEAD_RETAIN_DAYS} days",),
+        )
         conn.commit()
         if cursor.rowcount:
             log.info("msg_dedup_cleaned", removed=cursor.rowcount)
+        if inbox_done.rowcount or inbox_dead.rowcount:
+            log.info(
+                "msg_inbox_cleaned", done_removed=inbox_done.rowcount,
+                dead_removed=inbox_dead.rowcount,
+            )
+
+
+def job_alert_channel_heartbeat(runtime: Runtime) -> None:
+    """每日 09:00 告警通道心跳（08 §5.2）：未送达即说明告警黑洞，必须人工介入。"""
+    results = AlertNotifier(runtime.db, runtime.secrets).heartbeat()
+    if results and not all(results.values()):
+        log.error("alert_heartbeat_partial", results=results)
+
+
+def job_quality_sentinel(runtime: Runtime) -> None:
+    """每日质量哨兵（00 v4.0 D21）：抽样重估支撑率/拒答率，劣化写指标供告警。"""
+    from ekbs.observability.sentinel import run_sentinel
+
+    report = run_sentinel(runtime.db)
+    if report.degraded:
+        log.warning("quality_sentinel_degraded", **report.as_dict())
 
 
 def job_reconcile(runtime: Runtime) -> None:
@@ -165,30 +208,6 @@ def job_reconcile(runtime: Runtime) -> None:
         )
 
 
-def job_org_sync(runtime: Runtime) -> None:
-    """组织同步（04 §4）：全量 + 离职回看。
-
-    凭据缺失时**只告警不报错** —— 开发环境没有钉钉凭据是正常状态；
-    但一旦有凭据，这里就是保证「权限回收 ≤5 分钟」的那条路径（04 §4.5）。
-    """
-    import asyncio
-
-    from ekbs.dingtalk.sync import build_sync_service
-    from ekbs.errors import ConfigError
-
-    try:
-        service = build_sync_service(runtime.db, runtime.settings, runtime.secrets, cache=runtime.cache)
-    except ConfigError as exc:
-        log.warning("org_sync_skipped_no_credentials", reason=str(exc))
-        return
-    try:
-        report = asyncio.run(service.sync_full())
-        leave = asyncio.run(service.sync_leave_records(days=1))
-        log.info("org_sync_done", **report.as_dict(), leave_deleted=leave.deleted)
-    except Exception as exc:
-        log.error("org_sync_failed", error=f"{type(exc).__name__}: {exc}")
-
-
 def job_audit_archive(runtime: Runtime) -> None:
     """审计归档（00 §3.5 留存期 + 01 §5.6 的触发器摘除例外）。
 
@@ -215,6 +234,34 @@ def job_trash_purge(runtime: Runtime) -> None:
         log.info("trash_purged", **report)
 
 
+async def job_org_sync(runtime: Runtime) -> None:
+    """到点才拉。未开启、未到间隔、或上一轮还在跑，直接返回。"""
+    from ekbs.dingtalk.sync import build_sync_service
+    from ekbs.errors import ConfigError
+    from ekbs.permission.org_schedule import claim_org_sync, finish_org_sync
+
+    if not claim_org_sync(runtime.db):
+        return
+    try:
+        service = build_sync_service(
+            runtime.db, runtime.settings, runtime.secrets, cache=runtime.cache
+        )
+        report = await service.sync_full(mode="schedule")
+        log.info(
+            "org_sync_scheduled",
+            departments=report.departments,
+            users=report.users,
+            created=report.created,
+            updated=report.updated,
+        )
+    except ConfigError as exc:
+        log.warning("org_sync_scheduled_skipped", error=str(exc))
+    except Exception as exc:  # noqa: BLE001 - 定时失败记日志，下一轮再等一个间隔
+        log.error("org_sync_scheduled_failed", error=f"{type(exc).__name__}: {exc}")
+    finally:
+        finish_org_sync(runtime.db)
+
+
 def build_scheduler(runtime: Runtime) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=runtime.settings.app.timezone)
     scheduler.add_job(job_cache_cleanup, IntervalTrigger(minutes=10), args=[runtime],
@@ -231,12 +278,18 @@ def build_scheduler(runtime: Runtime) -> AsyncIOScheduler:
                       id="msg_dedup_cleanup", replace_existing=True)
     scheduler.add_job(job_reconcile, CronTrigger(hour=1, minute=30), args=[runtime],
                       id="reconcile", replace_existing=True)
-    scheduler.add_job(job_org_sync, CronTrigger(hour=2, minute=30), args=[runtime],
-                      id="org_sync", replace_existing=True)
     scheduler.add_job(job_audit_archive, CronTrigger(hour=3, minute=0), args=[runtime],
                       id="audit_archive", replace_existing=True)
+    # 质量哨兵：每日 03:10（08 §5.1；审计归档之后、流量低谷）
+    scheduler.add_job(job_quality_sentinel, CronTrigger(hour=3, minute=10), args=[runtime],
+                      id="quality_sentinel", replace_existing=True)
+    # 告警通道心跳：每日 09:00（08 §5.2；上班即验证带外通道可达）
+    scheduler.add_job(job_alert_channel_heartbeat, CronTrigger(hour=9, minute=0), args=[runtime],
+                      id="alert_channel_heartbeat", replace_existing=True)
     scheduler.add_job(job_trash_purge, CronTrigger(hour=3, minute=30), args=[runtime],
                       id="trash_purge", replace_existing=True)
+    scheduler.add_job(job_org_sync, IntervalTrigger(minutes=5), args=[runtime],
+                      id="org_sync", replace_existing=True)
     return scheduler
 
 
@@ -255,17 +308,22 @@ def main(argv: list[str] | None = None) -> int:
         ("rate_limit_cleanup", job_rate_limit_cleanup),
         ("msg_dedup_cleanup", job_msg_dedup_cleanup),
         ("reconcile", job_reconcile),
-        ("org_sync", job_org_sync),
         ("audit_archive", job_audit_archive),
+        ("quality_sentinel", job_quality_sentinel),
+        ("alert_channel_heartbeat", job_alert_channel_heartbeat),
         ("trash_purge", job_trash_purge),
+        ("org_sync", job_org_sync),
     ]
     try:
         if args.once:
             for name, job in jobs:
                 try:
-                    job(runtime) if name != "cache_cleanup" else asyncio.run(
-                        runtime.cache.cleanup_expired()
-                    )
+                    if name == "cache_cleanup":
+                        asyncio.run(runtime.cache.cleanup_expired())
+                    elif name == "org_sync":
+                        asyncio.run(job_org_sync(runtime))
+                    else:
+                        job(runtime)
                 except Exception as exc:
                     log.error("job_failed", job=name, error=str(exc))
             log.info("scheduler_once_done", jobs=len(jobs))

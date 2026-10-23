@@ -20,6 +20,8 @@ const DocUpload = lazy(() => import('@/pages/docs/DocumentUpload'))
 const DocImport = lazy(() => import('@/pages/import/ImportDirs'))
 const DocDetail = lazy(() => import('@/pages/docs/DocumentDetail'))
 const ParseTasks = lazy(() => import('@/pages/parse/ParseTaskList'))
+const ReviewCompare = lazy(() => import('@/pages/parse/ReviewCompare'))
+const ChunkDocList = lazy(() => import('@/pages/chunks/ChunkDocList'))
 const ChunkExplorer = lazy(() => import('@/pages/chunks/ChunkExplorer'))
 const Playground = lazy(() => import('@/pages/rag/Playground'))
 const UserList = lazy(() => import('@/pages/iam/UserList'))
@@ -42,9 +44,12 @@ export const ROUTES: AppRoute[] = [
   // 具体 :docId 必须放在 trash/upload/list 之后，避免把固定路径当成 id
   { path: 'docs/:docId', Component: DocDetail, perm: 'doc:document:read' },
   { path: 'parse/tasks', Component: ParseTasks, perm: 'parse:task:read' },
+  { path: 'parse/review/:docId', Component: ReviewCompare, perm: 'parse:task:read' },
+  // chunks 列表必须排在 :docId 之前
+  { path: 'chunks', Component: ChunkDocList, perm: 'doc:chunk:read' },
   { path: 'chunks/:docId', Component: ChunkExplorer, perm: 'doc:chunk:read' },
   { path: 'rag/playground', Component: Playground, perm: 'rag:playground:run' },
-  { path: 'iam/users', Component: UserList, perm: 'perm:user:read' },
+  { path: 'iam/accounts', Component: UserList, perm: 'perm:user:read' },
   { path: 'iam/roles', Component: RoleList, perm: 'perm:role:read' },
   { path: 'iam/depts', Component: DeptMapping, perm: 'perm:dept:read' },
   { path: 'iam/acl', Component: AclConsole, perm: 'perm:acl:read' },

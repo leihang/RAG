@@ -67,17 +67,17 @@ def test_observe_emits_p95_and_count() -> None:
 
 
 def test_threshold_table_matches_doc_levels() -> None:
-    """`04` §7.7 的表：17 条有阈值的指标，级别分布 P1×2 / P2×10 / P3×5。"""
+    """`04` §7.7 的表 + `08` §5.1 的质量哨兵两条：19 条，P1×3 / P2×11 / P3×5。"""
     levels = [rule.severity for rule in a.ALERT_RULES]
-    assert len(a.ALERT_RULES) == 17
-    assert levels.count("P1") == 2
-    assert levels.count("P2") == 10
+    assert len(a.ALERT_RULES) == 19
+    assert levels.count("P1") == 3
+    assert levels.count("P2") == 11
     assert levels.count("P3") == 5
 
 
 def test_p1_rules_are_the_security_critical_ones() -> None:
     p1 = {rule.name for rule in a.ALERT_RULES if rule.severity == "P1"}
-    assert p1 == {m.STREAM_CONNECTED, m.PERM_REVOKE_LAG}
+    assert p1 == {m.STREAM_CONNECTED, m.PERM_REVOKE_LAG, m.QUALITY_DEGRADED}
 
 
 def test_sum_window_fires(runtime) -> None:

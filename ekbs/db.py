@@ -27,7 +27,7 @@ from ekbs.config import Settings
 from ekbs.errors import SchemaError
 
 #: `01` §5 的权威表数（含 FTS5 虚拟表 ``ekbs_chunk_fts``，不含 5 张 FTS5 影子表）
-EXPECTED_TABLES = 29
+EXPECTED_TABLES = 32
 
 #: `01` §5.6 的审计触发器数（5 张表 × UPDATE+DELETE + ``ekbs_qa_session`` 的 UPDATE 守卫 = 12）
 EXPECTED_TRIGGERS = 12
@@ -146,6 +146,23 @@ class Database:
                     "ON ekbs_document(deleted_at) WHERE deleted_at IS NOT NULL"
                 )
                 conn.commit()
+            if "parse_ms" not in cols:
+                conn.execute("ALTER TABLE ekbs_document ADD COLUMN parse_ms INTEGER")
+                conn.commit()
+            policy_cols = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(ekbs_policy_version)").fetchall()
+            }
+            additions = (
+                ("org_sync_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("org_sync_interval_hours", "INTEGER NOT NULL DEFAULT 24"),
+                ("org_sync_armed_at", "TEXT"),
+                ("org_sync_running_at", "TEXT"),
+            )
+            for name, ddl in additions:
+                if name not in policy_cols:
+                    conn.execute(f"ALTER TABLE ekbs_policy_version ADD COLUMN {name} {ddl}")
+            conn.commit()
 
     def verify_schema(self) -> SchemaReport:
         """按 `01` §5.7 与 ``deploy/scripts/smoke.sh`` 的同一口径自检。"""

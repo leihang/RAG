@@ -19,12 +19,16 @@ from ekbs.dingtalk.client import (
     CARD_UPDATE_PATH,
     GROUP_SEND_PATH,
     MAX_MSG_PARAM_BYTES,
+    MAX_SAMPLE_FILE_BYTES,
     MAX_STREAM_CHUNK_BYTES,
     MAX_STREAM_TOTAL_BYTES,
+    MEDIA_UPLOAD_BODY_MAX,
     OTO_SEND_PATH,
     CardTarget,
     DingTalkOpenApiClient,
     markdown_msg_param,
+    media_upload_body_size,
+    sample_file_too_big,
     text_msg_param,
 )
 from ekbs.dingtalk.token import TOKEN_PATH
@@ -261,3 +265,26 @@ async def test_update_card_data_puts_options_nested() -> None:
     assert body["cardUpdateOptions"] == {"updateCardDataByKey": True}
     assert "updateCardDataByKey" not in body, "平铺到顶层会被当成无效字段（04 §5.7 的错法）"
     assert body["cardData"]["cardParamMap"] == {"content": "新内容"}
+
+
+def test_sample_file_limit_stays_inside_dingtalk_body() -> None:
+    """请求体 20971520 是实测上限；文件本体要给 255 字符文件名留出封装。"""
+    worst = "\U0001F600" * 255
+    assert MEDIA_UPLOAD_BODY_MAX == 20 * 1024 * 1024
+    assert MAX_SAMPLE_FILE_BYTES < MEDIA_UPLOAD_BODY_MAX
+    assert media_upload_body_size(MAX_SAMPLE_FILE_BYTES, worst) == MEDIA_UPLOAD_BODY_MAX
+    assert media_upload_body_size(MAX_SAMPLE_FILE_BYTES + 1, worst) == MEDIA_UPLOAD_BODY_MAX + 1
+    assert sample_file_too_big(MAX_SAMPLE_FILE_BYTES, worst) is False
+    assert sample_file_too_big(MAX_SAMPLE_FILE_BYTES + 1, "a.txt") is True
+    assert media_upload_body_size(MAX_SAMPLE_FILE_BYTES, "a.txt") < MEDIA_UPLOAD_BODY_MAX
+    # 比预算更长的真实文件名，即使文件本体没超，请求体也会被钉钉 413。
+    assert sample_file_too_big(MAX_SAMPLE_FILE_BYTES, "\U0001F600" * 400) is True
+
+    for name in ("a.txt", "a" * 23, "文" * 255, worst, '"' * 40):
+        payload = b"xyz"
+        request = httpx.Request(
+            "POST",
+            "https://oapi.dingtalk.com/media/upload",
+            files={"media": (name, payload, "application/octet-stream")},
+        )
+        assert len(request.read()) == media_upload_body_size(len(payload), name)

@@ -20,9 +20,11 @@ def test_figure_index_upsert_search_roundtrip(tmp_path: Path) -> None:
     index = FigureIndex(tmp_path / "figures.faiss", dim=8)
     vectors = np.asarray([[1.0, 0, 0, 0, 0, 0, 0, 0], [0, 1.0, 0, 0, 0, 0, 0, 0]], dtype="float32")
     assert index.upsert(vectors, [101, 202]) == 2
+    assert index.contains([101, 202, 999]) == {101, 202}
     hits = index.search([1.0, 0, 0, 0, 0, 0, 0, 0], top_k=1)
     assert hits and hits[0][0] == 101
     assert index.remove([101]) == 1
+    assert index.contains([101, 202]) == {202}
     hits2 = index.search([1.0, 0, 0, 0, 0, 0, 0, 0], top_k=2)
     assert all(cid != 101 for cid, _ in hits2)
 

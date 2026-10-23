@@ -94,8 +94,13 @@ retrieval:
   # 查询改写（00 §2.1 的第一步，多轮对话时启用）；策略：off | heuristic | llm
   # heuristic：含指代 / 追问展开用语（详细、继续…）/ 过短时并入上一轮问题
   # llm：用云端模型按模板改写成自包含查询
+  # expand_*：检索前用快速模型把这一句再写成 2 个角度，关键词和向量共用。
+  # 失败则退回规则变体。不使用回答模型 qwen-max。
   query_rewrite:
     strategy: heuristic
+    expand_model: qwen-turbo
+    expand_timeout_s: 8
+    expand_max_tokens: 64
   cache:
     backend: memory+sqlite
     l1_size: 2000
@@ -148,12 +153,13 @@ models:
     provider: dashscope
     # 图片描述用的视觉模型（`06` §4.11）。**会计费、会把图片发到云端**，
     # 所以默认不启用：这里显式配了 model 才生效（`parse.figure_caption` 再决定要不要跑）。
-    # 实测 2026-09-29：qwen-vl-plus 对图表能读出关键数字与趋势，对现场照片能读出设备型号与读数；
-    # 每张图约 500~760 token、1~2 秒。要更准可换 qwen-vl-max（单价贵几倍）。
-    model: qwen-vl-plus
+    # 2026-10-21 起账号里 qwen-vl-plus 返回 model_not_found，图注全部落空，图片块只剩「图N」。
+    # 当前已开通的是 qwen3-vl-plus（2026-10-22 探活：能读出图表数字）。
+    # max_tokens 要盖住「抄录图中文字」：300 会把一页幻灯片截断，检索只剩开头。
+    model: qwen3-vl-plus
     temperature: 0.1
     top_p: 0.8
-    max_tokens: 300
+    max_tokens: 1024
     timeout_s: 60
     max_retries: 2
 
@@ -173,12 +179,12 @@ parse:
 # ---------- 权限 ----------
 permission:
   default_level: 2
-  l4_enabled: false
-  l3_ingest_enabled: false
+  l4_enabled: true             # 2026-10-09 用户确认（测试期）：全部闸门打开
+  l3_ingest_enabled: true      # 2026-10-09 用户确认（测试期）：L3 允许入库
   policy_cache_ttl: 300
   # 合规闸（00 §7）：云端嵌入 = 全量语料出网。书面确认前保持 false，仅允许合成语料。
   corpus_egress_ack: true      # 部署前功能测试（2026-09-29 用户确认）
-  corpus_egress_ack_ticket: "2026-09-29 用户确认：正式路径功能测试，语料可出网"
+  corpus_egress_ack_ticket: "2026-09-29 用户确认：正式路径功能测试，语料可出网；2026-10-09 用户确认：测试期全部闸门打开（合规书暂缓）"
   # dept_code → 钉钉部门 ID 列表 的映射。见 docs/spec/10 的 O6-1 / K1：
   # 权威方案未定义该映射存在哪里，本骨架先由配置承载（不新增 Schema）。
   # ⚠️ 必须放在**配置**里而不是进程内存里：入库（worker）、路由（api）是两个进程，
@@ -188,16 +194,16 @@ permission:
     hr: ["102"]
     finance: ["103"]
 
-# ---------- 钉钉（开发环境关闭；凭据走 secrets.env）----------
+# ---------- 钉钉（凭据走 ~/.ekbs/secrets.env；robot_code 优先读 DINGTALK_ROBOT_CODE）----------
 dingtalk:
-  stream_enabled: false    # 开发：不连钉钉 Stream，adapter 不启动
+  stream_enabled: true     # 联调：拉起 Stream；缺凭据时 adapter 会记 disconnected，不装死
   per_user_session: true
   rate_limit_per_user_per_min: 20
   max_reply_chars: 3500
   reconnect_backoff_seconds: [3, 5, 10, 20, 30]
   heartbeat_ping_seconds: 60
   ack_timeout_seconds: 10
-  robot_code: "dingdevplaceholder"
+  robot_code: ""           # 留空则用 secrets 的 DINGTALK_ROBOT_CODE / CLIENT_ID
   openapi:
     base_url: "https://api.dingtalk.com"
     legacy_base_url: "https://oapi.dingtalk.com"
@@ -207,9 +213,9 @@ dingtalk:
     token_cache_key: "ekbs:dt:app_token:{app_key}"
     token_refresh_ahead_seconds: 300
   card:
-    ai_template_id: "dingdevplaceholder"
-    citation_template_id: "dingdevplaceholder"
-    streaming_enabled: true
+    ai_template_id: ""              # 先空：走普通文本回复；有模板后再填
+    citation_template_id: ""
+    streaming_enabled: false        # 无模板时关流式卡片
     streaming_chunk_chars: 24
     streaming_min_interval_ms: 300
     streaming_max_duration_seconds: 120
@@ -228,6 +234,11 @@ session:
   context_ttl_seconds: 604800
   group_share_context: false
 
+# ---------- 问答通道（取数自动路由）----------
+qa:
+  # mode=auto 时：意图为 numeric 则走取数（类型锁死+抄写校验）；false=auto 一律 prose
+  auto_numeric: true
+
 # ---------- 上传行为（05 §6.5）----------
 upload:
   chunk_size_mb: 8
@@ -240,6 +251,8 @@ limits:
   per_conversation_qps: 3
   max_question_chars: 2000
   max_file_size_mb: 500
+  # 每个钉钉用户私有库的总容量（已入库且未删除的文件字节相加）
+  personal_storage_mb: 1024
   file_ext_whitelist: [pdf, docx, doc, pptx, ppt, xlsx, xls, txt, md, html, png, jpg, jpeg]
 
 security:
@@ -254,3 +267,9 @@ security:
     - image/jpeg
   sensitive_words_path: "config/sensitive_words.txt"   # 开发（生产 /opt/ekbs/etc/sensitive_words.txt）
   content_security_enabled: true
+  # ---- 本机账号登录（管理台第二种登录方式；见 ekbs/local_auth.py）----
+  # 日常用钉钉免登；本机账号只在「人就在服务器前 / 钉钉不可用」时兜底。
+  local_login_enabled: true          # 关掉后 /auth/local-login 直接 404
+  local_login_allow_remote: false    # ⚠️ 保持 false：true = 内网任何机器都能试密码（不推荐）
+  local_login_max_failures: 5        # 连续失败次数上限
+  local_login_lock_minutes: 15       # 达到上限后的锁定时长

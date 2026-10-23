@@ -25,6 +25,16 @@ export function formatPercent(value?: number | null, digits = 1): string {
   return `${(Number(value) * 100).toFixed(digits)}%`
 }
 
+/** 解析耗时。无记录时用全角破折号，和「还没跑过」区分开。 */
+export function formatDurationMs(ms?: number | null): string {
+  if (ms == null || Number.isNaN(Number(ms)) || Number(ms) < 0) return '—'
+  const sec = Math.max(0, Math.round(Number(ms) / 1000))
+  if (sec < 60) return `${sec} 秒`
+  const minutes = Math.floor(sec / 60)
+  const rest = sec % 60
+  return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分`
+}
+
 export function formatTime(value?: string | null): string {
   if (!value) return '-'
   const d = dayjs(value)

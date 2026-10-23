@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Sequence
 
 import httpx
@@ -47,6 +48,17 @@ CARD_STREAMING_PATH = "/v1.0/card/streaming"
 
 MSG_KEY_TEXT = "sampleText"
 MSG_KEY_MARKDOWN = "sampleMarkdown"
+MSG_KEY_IMAGE = "sampleImageMsg"
+MSG_KEY_FILE = "sampleFile"
+#: 机器人把文件发回聊天窗口只有这一条：``media/upload?type=file`` 拿 ``media_id``，再 ``sampleFile``。
+#: 仓库里没有第二条、更大的发送接口（``docs/spec/50`` 的文件消息也只列了 ``sampleFile``）。
+OAPI_BASE_URL = "https://oapi.dingtalk.com"
+MEDIA_UPLOAD_PATH = "/media/upload"
+#: 实测：整段 multipart 请求体刚好 20971520 字节能拿到 media_id，多 1 字节 HTTP 413。
+#: 这是请求体上限，不是文件本体上限；封装（boundary + 文件名）要占掉一部分。
+MEDIA_UPLOAD_BODY_MAX = 20 * 1024 * 1024
+#: 私有库文件名校验最长 255 个字符，发送时用真实文件名。每个字符按 UTF-8 最多 4 字节估封装。
+_SAMPLE_FILE_NAME_CHARS = 255
 
 #: 单聊批量发送的人数上限（文档 20 与 100 两个口径，**取严取 20**）
 MAX_OTO_USERS = 20
@@ -89,6 +101,54 @@ def text_msg_param(content: str) -> dict[str, str]:
 
 def markdown_msg_param(title: str, text: str) -> dict[str, str]:
     return {"title": title, "text": text}
+
+
+def image_msg_param(photo_url: str) -> dict[str, str]:
+    """``sampleImageMsg``：``photoURL`` 可为公网 URL 或 ``@media_id``。"""
+    return {"photoURL": photo_url}
+
+
+def media_upload_body_size(file_size: int, filename: str) -> int:
+    """``upload_file_media`` 发出的 multipart 请求体长度（不含 URL 与 HTTP 头）。
+
+    与 httpx 的封装一致：boundary 固定 32 个十六进制字符，文件名按表单规则编码。
+    """
+    from httpx._multipart import MultipartStream
+
+    name = filename if isinstance(filename, str) and filename != "" else "file"
+    stream = MultipartStream(
+        data={},
+        files={"media": (name, b"", "application/octet-stream")},
+    )
+    overhead = stream.get_content_length()
+    if overhead is None:
+        raise RuntimeError("无法计算钉钉媒体上传的请求体大小")
+    return int(overhead) + max(int(file_size), 0)
+
+
+def max_sample_file_bytes() -> int:
+    """文件本体上限：255 个 4 字节字符的文件名也不会把请求体顶过 20971520。"""
+    worst = "\U0001F600" * _SAMPLE_FILE_NAME_CHARS
+    return MEDIA_UPLOAD_BODY_MAX - media_upload_body_size(0, worst)
+
+
+#: 发回钉钉窗口的文件本体上限。短文件名其实还能再大几百字节，但长文件名会把请求体撞破。
+MAX_SAMPLE_FILE_BYTES = max_sample_file_bytes()
+
+
+def sample_file_too_big(file_size: int, filename: str) -> bool:
+    """文件本体超过安全上限，或这份真实文件名会让请求体超过 20971520。"""
+    size = max(int(file_size), 0)
+    if size > MAX_SAMPLE_FILE_BYTES:
+        return True
+    return media_upload_body_size(size, filename) > MEDIA_UPLOAD_BODY_MAX
+
+
+def file_msg_param(media_id: str, filename: str) -> dict[str, str]:
+    """``sampleFile``：``mediaId`` 来自 ``media/upload?type=file``。"""
+    photo = media_id if media_id.startswith("@") else f"@{media_id.lstrip('@')}"
+    suffix = Path(filename).suffix.lower().lstrip(".") or "file"
+    return {"mediaId": photo, "fileName": Path(filename).name or "原文", "fileType": suffix}
 
 
 class DingTalkOpenApiClient:
@@ -186,6 +246,95 @@ class DingTalkOpenApiClient:
         )
         inc(CARD_SEND, 1, result="success")
         return result
+
+    async def download_message_file(self, download_code: str) -> bytes:
+        """用机器人收到的 ``downloadCode`` 把用户发来的文件下载下来。"""
+        meta = await self._post(
+            "/v1.0/robot/messageFiles/download",
+            {"downloadCode": download_code, "robotCode": self.robot_code},
+        )
+        url = str(meta.get("downloadUrl") or "")
+        # 钉钉文件落在 OSS 上，返回的是 http 而不是 https（实测 host 为 *.aliyuncs.com）。
+        if not (url.startswith("https://") or url.startswith("http://")):
+            raise ModelUnavailable("钉钉没有返回文件下载地址")
+        client = self._client or httpx.AsyncClient(timeout=self.timeout_s)
+        owned = self._client is None
+        try:
+            response = await client.get(url)
+        finally:
+            if owned:
+                await client.aclose()
+        if response.status_code >= 400:
+            raise ModelUnavailable(f"下载钉钉文件失败：HTTP {response.status_code}")
+        return response.content
+
+    async def upload_image_media(self, image_bytes: bytes, *, filename: str = "image.png") -> str:
+        """上传图片，返回 ``media_id``。"""
+        return await self._upload_media(image_bytes, filename=filename, media_type="image")
+
+    async def upload_file_media(self, file_bytes: bytes, *, filename: str) -> str:
+        """上传原文，返回 ``media_id``（发给 ``sampleFile``）。"""
+        return await self._upload_media(file_bytes, filename=filename, media_type="file")
+
+    async def _upload_media(self, payload_bytes: bytes, *, filename: str, media_type: str) -> str:
+        """上传到钉钉媒体中心。``media_type`` 为 ``image`` 或 ``file``。"""
+        if not payload_bytes:
+            raise ValueError("上传内容不能为空")
+        token = await self.token_client.get_token()
+        url = f"{OAPI_BASE_URL}{MEDIA_UPLOAD_PATH}"
+        client = self._client or httpx.AsyncClient(timeout=max(self.timeout_s, 60.0))
+        owned = self._client is None
+        try:
+            response = await client.post(
+                url,
+                params={"access_token": token, "type": media_type},
+                files={"media": (filename, payload_bytes, "application/octet-stream")},
+            )
+            response.raise_for_status()
+            payload = response.json() or {}
+        except Exception as exc:
+            raise ModelUnavailable(f"钉钉媒体上传失败：{exc}") from exc
+        finally:
+            if owned:
+                await client.aclose()
+        if int(payload.get("errcode") or 0) != 0:
+            raise ModelUnavailable(
+                f"钉钉媒体上传失败：errcode={payload.get('errcode')} errmsg={payload.get('errmsg')}"
+            )
+        media_id = str(payload.get("media_id") or "").strip()
+        if not media_id:
+            raise ModelUnavailable(f"钉钉媒体上传未返回 media_id：{payload}")
+        return media_id
+
+    async def send_image_oto(self, user_ids: Sequence[str], media_id: str) -> dict[str, Any]:
+        """单聊发图片（``sampleImageMsg``）。"""
+        photo = media_id if media_id.startswith("@") else f"@{media_id.lstrip('@')}"
+        return await self.send_oto_message(user_ids, MSG_KEY_IMAGE, image_msg_param(photo))
+
+    async def send_image_group(
+        self, open_conversation_id: str, media_id: str
+    ) -> dict[str, Any]:
+        """群聊发图片（``sampleImageMsg``）。"""
+        photo = media_id if media_id.startswith("@") else f"@{media_id.lstrip('@')}"
+        return await self.send_group_message(
+            open_conversation_id, MSG_KEY_IMAGE, image_msg_param(photo)
+        )
+
+    async def send_file_oto(
+        self, user_ids: Sequence[str], media_id: str, filename: str
+    ) -> dict[str, Any]:
+        """单聊发原文（``sampleFile``）。"""
+        return await self.send_oto_message(
+            user_ids, MSG_KEY_FILE, file_msg_param(media_id, filename)
+        )
+
+    async def send_file_group(
+        self, open_conversation_id: str, media_id: str, filename: str
+    ) -> dict[str, Any]:
+        """群聊发原文（``sampleFile``）。"""
+        return await self.send_group_message(
+            open_conversation_id, MSG_KEY_FILE, file_msg_param(media_id, filename)
+        )
 
     @staticmethod
     def _msg_payload(msg_key: str, msg_param: dict[str, Any]) -> dict[str, str]:

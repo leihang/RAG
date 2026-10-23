@@ -24,8 +24,14 @@ def _env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """所有用例都跑在 mock provider + 临时数据目录上。"""
     monkeypatch.setenv("EKBS_INTERNAL_TOKEN", TEST_INTERNAL_TOKEN)
     monkeypatch.setenv("EKBS_JWT_SECRET", TEST_JWT_SECRET)
-    # 避免继承外部环境造成的不确定（例如误配真实 provider）
-    for key in ("DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY"):
+    # 避免继承外部环境造成的不确定（例如误配真实 provider，或本机钉钉凭据）
+    for key in (
+        "DASHSCOPE_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "DINGTALK_CLIENT_ID",
+        "DINGTALK_CLIENT_SECRET",
+        "DINGTALK_CORP_ID",
+    ):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -33,11 +39,15 @@ def _env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 def settings(tmp_path: Path):
     from ekbs.config import load_settings
 
-    return load_settings(
+    loaded = load_settings(
         DEV_CONFIG,
         data_dir=tmp_path / "var",
         db_path=tmp_path / "var" / "index" / "ekbs.db",
     )
+    # 单测默认关掉 auto 取数路由：大量用例写「年假有多少天」且假定 prose；
+    # 生产/联调 yaml 仍为 auto_numeric: true，需测 auto 时在用例内显式打开。
+    loaded.qa = {**(loaded.qa or {}), "auto_numeric": False}
+    return loaded
 
 
 @pytest.fixture
@@ -75,6 +85,21 @@ def user_id_of(db, dingtalk_userid: str) -> int:
         ).fetchone()
     assert row is not None, f"未找到用户 {dingtalk_userid}"
     return int(row["user_id"])
+
+
+def set_clearance(runtime, user_id: int, level: int) -> None:
+    """调整用户密级上限（并自增策略版本，使指纹缓存失效）。
+
+    用途：上架范围校验（`ekbs.permission.upload_scope`）要求「文档密级 ≤ 上传者密级」，
+    而 seed 里的 carol 只是「行政专员 / L1」——她是测试里的知识库管理员，
+    因此需要显式提权来表达「一个真正的全量知识库管理员」。
+    """
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "UPDATE ekbs_user SET clearance = ? WHERE user_id = ?", (int(level), int(user_id))
+        )
+        conn.execute("UPDATE ekbs_policy_version SET version = version + 1 WHERE id = 1")
+        conn.commit()
 
 
 async def make_client(app):

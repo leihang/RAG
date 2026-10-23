@@ -110,6 +110,28 @@ def to_rel(settings: Settings, path: Path) -> str:
         raise ImportPathError(f"路径不在 raw 目录内：{path}") from exc
 
 
+def ensure_import_dir(settings: Settings, rel: str) -> tuple[str, bool]:
+    """在 raw 下建目录（允许多级，父目录可以还不存在）。
+
+    返回 ``(相对路径, 是否这次新建)``。目标已是目录时幂等，不报错。
+    越界、空路径、``.`` / ``..``、以点开头的段，在 ``mkdir`` 之前拒绝。
+    """
+    cleaned = str(rel or "").strip().replace("\\", "/").strip("/")
+    if not cleaned:
+        raise ImportPathError("请填写文件夹路径")
+    parts = cleaned.split("/")
+    if any(part in {"", ".", ".."} or part.startswith(".") for part in parts):
+        raise ImportPathError("文件夹名不能包含 . 、.. 或以点开头的段")
+    if len(cleaned) > 400 or any(len(part) > 80 for part in parts):
+        raise ImportPathError("文件夹路径过长")
+    target = resolve_within_raw(settings, cleaned)
+    if target.exists() and not target.is_dir():
+        raise ImportPathError(f"同名文件已存在，不能建文件夹：{cleaned}")
+    created = not target.exists()
+    target.mkdir(parents=True, exist_ok=True)
+    return to_rel(settings, target), created
+
+
 @dataclass
 class DirEntry:
     """目录浏览用的一条子目录。"""
@@ -222,7 +244,9 @@ def discover_files(
     files = [
         path
         for path in sorted(directory.glob(pattern))
-        if path.is_file() and path.suffix.lower() in exts
+        if path.is_file()
+        and not path.name.startswith(".")
+        and path.suffix.lower() in exts
     ]
     return files[: int(limit)] if limit else files
 
@@ -232,7 +256,9 @@ def _dir_file_count(directory: Path, extensions: set[str]) -> int:
         return sum(
             1
             for path in directory.rglob("*")
-            if path.is_file() and path.suffix.lower() in extensions
+            if path.is_file()
+            and not path.name.startswith(".")
+            and path.suffix.lower() in extensions
         )
     except OSError:  # pragma: no cover - 权限/坏软链接
         return 0
@@ -411,6 +437,7 @@ def enqueue_files(
     dept_ids: Sequence[str] = (),
     created_by: int | None = None,
     doc_version: str = "v1",
+    viewer_user_ids: Sequence[int] = (),
 ) -> dict[str, Any]:
     """把选中的文件登记成 ``status='pending'`` 文档，交给 worker 解析。
 
@@ -422,9 +449,27 @@ def enqueue_files(
     """
     import json
 
+    from ekbs.personal import PERSONAL_LEVEL, personal_user_id_from_code, scope_ref
+
+    with db.sync_connect() as conn:
+        kb_row = conn.execute(
+            "SELECT code FROM ekbs_kb WHERE kb_id = ?", (int(kb_id),),
+        ).fetchone()
+    personal_owner = personal_user_id_from_code(str(kb_row["code"]) if kb_row else "")
+    if personal_owner is not None:
+        level = PERSONAL_LEVEL
+        dept_ids = [scope_ref(personal_owner)]
+        viewer_user_ids = []
+
     blockers = check_blockers(settings, level=level, dept_ids=dept_ids)
     if blockers:
         raise ConfigError("；".join(blockers))
+    from ekbs.permission.viewers import assert_viewers_assignable, grant_document_viewers
+
+    with db.sync_connect() as conn:
+        viewers = assert_viewers_assignable(
+            conn, kb_id=int(kb_id), viewer_user_ids=viewer_user_ids
+        )
     if len(rel_paths) > ENQUEUE_LIMIT:
         # **明确拒绝而不是静默截断**：导入这种动作一旦少导了一半而不说，
         # 操作者会拿着"已完成"的提示去用缺了一半的知识库。
@@ -465,25 +510,55 @@ def enqueue_files(
             continue
 
         title = path.stem
-        with db.sync_connect() as conn:
-            cursor = conn.execute(
-                "INSERT INTO ekbs_document(kb_id, title, source_path, level, visible_dept_ids, "
-                "status, checksum, size_bytes, doc_version, created_by) "
-                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
-                (
-                    kb_id,
-                    title,
-                    str(path),
-                    level,
-                    json.dumps(list(dept_ids), ensure_ascii=False),
-                    checksum,
-                    path.stat().st_size,
-                    doc_version,
-                    created_by,
-                ),
-            )
-            doc_id = int(cursor.lastrowid or 0)
-            conn.commit()
+        size_bytes = path.stat().st_size
+        file_policy = None
+        refuse = None
+        if personal_owner is None:
+            from ekbs.ingest.folder_policy import permission_for_import_file
+
+            file_policy, refuse = permission_for_import_file(settings, rel)
+        if refuse:
+            failed.append({"rel_path": rel, "error": refuse})
+            continue
+        file_level = int(file_policy["level"]) if file_policy else int(level)
+        file_depts = list(file_policy["visible_dept_ids"]) if file_policy else list(dept_ids)
+        file_viewers = list(file_policy["viewer_user_ids"]) if file_policy else list(viewers)
+        file_blockers = check_blockers(settings, level=file_level, dept_ids=file_depts)
+        if file_blockers:
+            failed.append({"rel_path": rel, "error": "；".join(file_blockers)})
+            continue
+        try:
+            from ekbs.personal import assert_personal_kb_storage
+
+            with db.sync_connect() as conn:
+                assert_personal_kb_storage(
+                    conn, settings, kb_id=int(kb_id), incoming=size_bytes
+                )
+                cursor = conn.execute(
+                    "INSERT INTO ekbs_document(kb_id, title, source_path, level, visible_dept_ids, "
+                    "status, checksum, size_bytes, doc_version, created_by) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                    (
+                        kb_id,
+                        title,
+                        str(path),
+                        file_level,
+                        json.dumps(file_depts, ensure_ascii=False),
+                        checksum,
+                        size_bytes,
+                        doc_version,
+                        created_by,
+                    ),
+                )
+                doc_id = int(cursor.lastrowid or 0)
+                grant_document_viewers(
+                    conn, doc_id=doc_id, viewer_user_ids=file_viewers,
+                    operator_id=created_by, reason="import:viewers",
+                )
+                conn.commit()
+        except ConfigError as exc:
+            failed.append({"rel_path": rel, "error": str(exc)})
+            continue
         enqueued.append({"rel_path": rel, "doc_id": doc_id, "size_bytes": path.stat().st_size})
 
     log.info(

@@ -19,8 +19,12 @@
 2. **``simulate`` 是跨权限操作**（以别人身份检索）：必须 ``rag:playground:simulate``、
    **落安全事件与审计**、并在响应里回显被模拟者与操作者（`05` 称之为"高危"）。
 
-⚠️ Schema 里**没有调试历史表**（29 张表已冻结），因此 ``history`` 用 ``ekbs_cache``
-做环形缓冲（TTL 7 天、最多 50 条）—— 它是**临时排障数据**，不是审计数据。
+⚠️ Schema 里**没有调试历史表**（31 张表已冻结），因此 ``history`` 用 ``ekbs_cache``
+做环形缓冲（TTL 7 天、最多 50 条）—— 它是**临时排障数据**。
+
+``POST /rag/debug/query``（完整作答）会**额外**写入 ``ekbs_qa_*`` 审计表
+（``channel='playground'``），与正式 ``/qa/chat`` 同口径，便于持续改进与分析；
+仅改写/仅检索仍只进环形缓冲，避免刷爆审计。
 参数模板（``/rag/param-presets``）与反馈（``/debug/feedback``）同样缺表，
 本实现**不做**并在 README 的待确认里列出（新增表需先改 `01` §5 与 `00` §9.1）。
 """
@@ -38,9 +42,10 @@ from pydantic import BaseModel, Field
 
 from ekbs.api.auth import INTERNAL_TOKEN_HEADER, INTERNAL_USER_HEADER
 from ekbs.api.qa import _authenticate
+from ekbs.audit import AuditService, TurnRecord
 from ekbs.errors import PermissionDenied
-from ekbs.logging import get_logger
-from ekbs.permission.router import ShardRouter
+from ekbs.logging import get_logger, trace_id_var
+from ekbs.permission.console import is_console_role, widen_for_console
 from ekbs.retrieval.pipeline import RetrievalOverrides
 
 router = APIRouter(tags=["playground"])
@@ -82,6 +87,7 @@ class DebugRequest(BaseModel):
     rerank_min_score: float | None = Field(default=None, ge=0.0, le=1.0)
     parent_expand: bool | None = None
     #: 作答模式：prose（默认）| numeric（取数模式，见 ekbs/retrieval/numeric.py）
+    #: 管理台手动切换：仅 prose / numeric（不用 auto，避免调试时意图路由干扰对照）
     mode: str = Field(default="prose", pattern="^(prose|numeric)$")
 
     def overrides(self) -> RetrievalOverrides:
@@ -112,7 +118,45 @@ def _chunk_view(chunk: Any) -> dict[str, Any]:
         "sparse_rank": chunk.sparse_rank,
         "rrf_score": round(chunk.rrf_score, 8),
         "rerank_score": chunk.rerank_score,
+        "figure_id": getattr(chunk, "figure_id", None),
+        "image_path": getattr(chunk, "image_path", None),
     }
+
+
+def _citation_views(runtime: Any, citations: list[Any]) -> list[dict[str, Any]]:
+    """调试台引用：补 doc_id / 多模态索引标识，便于直达看块。"""
+    figure_ids = [
+        int(c.chunk_id)
+        for c in citations
+        if getattr(c, "figure_id", None) or getattr(c, "image_path", None)
+    ]
+    indexed: set[int] = set()
+    figure_index = getattr(runtime, "figure_index", None)
+    if figure_ids and figure_index is not None:
+        try:
+            indexed = figure_index.contains(figure_ids)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("figure_mm_contains_failed", error=str(exc)[:160])
+    views: list[dict[str, Any]] = []
+    for c in citations:
+        is_figure = bool(getattr(c, "figure_id", None) or getattr(c, "image_path", None))
+        views.append(
+            {
+                "cite_index": c.cite_index,
+                "chunk_id": c.chunk_id,
+                "doc_id": c.doc_id,
+                "doc_title": c.doc_title,
+                "page_from": c.page_from,
+                "heading_path": getattr(c, "heading_path", None),
+                "acl_result": c.acl_result,
+                "page_check": c.page_check,
+                # ⚠️ 图片字段不能省：前端靠 chunk_id 取 `GET /assets/figure/{chunk_id}`
+                "figure_id": c.figure_id,
+                "image_path": c.image_path,
+                "figure_mm_indexed": (int(c.chunk_id) in indexed) if is_figure else False,
+            }
+        )
+    return views
 
 
 async def _record_history(runtime: Any, entry: dict[str, Any]) -> None:
@@ -165,6 +209,8 @@ async def debug_retrieve(
     )
     runtime = request.app.state.runtime
     perm = await runtime.perm_context(user.user_id)
+    if is_console_role(runtime.authz.load(user.user_id).roles):
+        perm = widen_for_console(perm, runtime.db)
     result = await runtime.pipeline.retrieve(
         payload.query, perm, overrides=payload.overrides(), collect_debug=True
     )
@@ -216,6 +262,8 @@ async def debug_query(
     )
     runtime = request.app.state.runtime
     perm = await runtime.perm_context(user.user_id)
+    if is_console_role(runtime.authz.load(user.user_id).roles):
+        perm = widen_for_console(perm, runtime.db)
     # 调试台必须看见 stages：关答案缓存 + collect_debug；调参仍只作用于本次
     answer = await runtime.pipeline.answer(
         payload.query,
@@ -227,6 +275,29 @@ async def debug_query(
         mode=payload.mode,
     )
     result = answer.retrieval
+    # 落正式审计（channel=playground），管理台「问答日志」可筛到；此前只进 cache 环形缓冲会丢
+    audit: AuditService = runtime.audit
+    session_id, turn = audit.resolve_session(
+        perm,
+        channel="playground",
+        conversation_id=payload.conversation_id,
+        ttl_seconds=runtime.sessions.ttl_seconds,
+    )
+    audit.record_turn(
+        TurnRecord(
+            session_id=session_id,
+            user_id=perm.user_id,
+            dt_userid=perm.dingtalk_userid,
+            channel="playground",
+            conversation_id=payload.conversation_id,
+            perm_fingerprint=perm.fingerprint,
+            clearance=perm.clearance,
+            turn=turn,
+        ),
+        question=payload.query,
+        answer=answer,
+        trace_id=trace_id_var.get() or "",
+    )
     await _record_history(
         runtime,
         {
@@ -239,35 +310,42 @@ async def debug_query(
             "conversation_id": payload.conversation_id,
             "chunks": len(result.chunks),
             "refused": answer.refused,
+            "session_id": session_id,
         },
     )
+    answer_text = answer.answer
+    suggested_questions: list[str] = []
+    if answer.refused:
+        from ekbs.discovery import format_refusal_hints, suggested_questions as _suggest
+
+        hints = _suggest(runtime, perm, limit=3, query=payload.query, for_refusal=True)
+        suggested_questions = [s["question"] for s in hints]
+        footer = format_refusal_hints(hints)
+        if footer and "你可以试试问" not in (answer_text or ""):
+            answer_text = (answer_text or "未找到可靠依据。").rstrip() + footer
+
     return JSONResponse(
         {
             "query": payload.query,
             "rewritten_query": answer.rewritten_query,
             "history_used": answer.history_used,
             "conversation_id": payload.conversation_id,
-            "answer": answer.answer,
+            "session_id": session_id,
+            "turn": turn,
+            "answer": answer_text,
             "refused": answer.refused,
             "refusal_reason": answer.refusal_reason,
+            "suggested_questions": suggested_questions,
             "model": answer.model,
             "prompt_tokens": answer.prompt_tokens,
             "completion_tokens": answer.completion_tokens,
             # 取数模式（mode=numeric）的结构化结果：值/单位/页码/原文片段/是否通过抄写校验
             "numeric": answer.numeric,
-            "citations": [
-                {
-                    "cite_index": c.cite_index, "chunk_id": c.chunk_id, "doc_title": c.doc_title,
-                    "page_from": c.page_from, "acl_result": c.acl_result, "page_check": c.page_check,
-                    # ⚠️ 图片字段不能省：图片块被召回时，前端要靠 chunk_id 去
-                    # `GET /assets/figure/{chunk_id}` 取原图显示。原先这里漏了
-                    # `figure_id` / `image_path`，而 `/qa/chat` 是带的 —— 同一个引用
-                    # 两个接口两套字段，调试台上永远看不到图（用户实测反馈）。
-                    "figure_id": c.figure_id,
-                    "image_path": c.image_path,
-                }
-                for c in answer.citations
-            ],
+            "mode": payload.mode,
+            "mode_used": answer.mode_used,
+            "intent": answer.intent,
+            "citations": _citation_views(runtime, answer.citations),
+            "figure_attachments": list(answer.figure_attachments or []),
             "faithfulness": answer.faithfulness,
             "stages": result.stage_debug,
             "timings_ms": {**result.timings_ms, "generate_ms": answer.ttft_ms},

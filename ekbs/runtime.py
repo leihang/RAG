@@ -26,7 +26,7 @@ from ekbs.logging import configure_logging, get_logger
 from ekbs.permission.acl import DocumentGate
 from ekbs.permission.context import PermContext
 from ekbs.permission.router import ShardRouter
-from ekbs.provider.registry import Providers, build_providers
+from ekbs.provider.registry import Providers, build_providers, build_query_expand_llm
 from ekbs.ratelimit import RateLimiter
 from ekbs.retrieval.pipeline import RetrievalPipeline
 from ekbs.security import ContentGuard
@@ -130,7 +130,10 @@ class Runtime:
             log.info("shards_loaded", count=len(active), dim=shards.dim)
 
         sessions = SessionStore(db, settings)
-        rewriter = QueryRewriter(settings=settings, llm=providers.llm)
+        expand_llm = build_query_expand_llm(settings, secrets)
+        rewriter = QueryRewriter(
+            settings=settings, llm=providers.llm, expand_llm=expand_llm,
+        )
         authz = AuthzService(db)
         content_guard = ContentGuard(
             sensitive_words_path=settings.security.get("sensitive_words_path", "config/sensitive_words.txt"),
@@ -156,6 +159,9 @@ class Runtime:
             ),
             rerank=providers.rerank.ref.ident if providers.rerank else "disabled",
             llm=providers.llm.ref.ident,
+            query_expand=(
+                expand_llm.ref.ident if expand_llm is not None else "rules"
+            ),
             corpus_egress_ack=settings.permission.corpus_egress_ack,
             l3_ingest_enabled=settings.permission.l3_ingest_enabled,
         )

@@ -86,6 +86,26 @@ def build_llm(settings: Settings, secrets: Secrets) -> LLMProvider:
     return _build_compatible_llm(settings.models.llm, secrets, what="LLM")
 
 
+def build_query_expand_llm(settings: Settings, secrets: Secrets) -> LLMProvider | None:
+    """快速模型，只把一条问法扩成两个检索角度。未配置则仍用规则变体。"""
+    raw = (settings.retrieval.model_extra or {}).get("query_rewrite") or {}
+    if not isinstance(raw, dict):
+        return None
+    model = str(raw.get("expand_model") or "").strip()
+    if not model:
+        return None
+    parent = settings.models.llm
+    cfg = parent.model_copy(update={
+        "model": model,
+        "max_tokens": int(raw.get("expand_max_tokens") or 64),
+        "timeout_s": int(raw.get("expand_timeout_s") or 8),
+        "max_retries": 0,
+        "temperature": 0.3,
+        "fallback": parent.fallback.model_copy(update={"provider": "", "model": ""}),
+    })
+    return _build_compatible_llm(cfg, secrets, what="查询扩写")
+
+
 def _build_compatible_llm(cfg, secrets: Secrets, *, what: str) -> LLMProvider:
     """按 `LLMCfg` 构造一个 OpenAI 兼容的对话模型（文本 LLM 与视觉模型共用）。
 

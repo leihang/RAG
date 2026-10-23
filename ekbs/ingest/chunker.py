@@ -14,6 +14,9 @@
 切分优先级（`20` §3.2）：Markdown ``#`` 标题 → 中文条款
 （``第X章/节/条``）→ ``X.X`` 编号 → 句子聚合 → 长度兜底。
 
+**条款各自成块**：``第X条``、``4.1`` 这种已经切开的条款不再按长度并进同一块。
+一条写得很长时，仍只在这一条内部按 1024～1536 / 256～384 切开。
+
 ``heading_path`` **不得为空**：缺标题时用 ``doc_title`` / ``文档`` 作根。
 """
 
@@ -42,13 +45,17 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _CLAUSE_HEADING_RE = re.compile(
     r"^第([一二三四五六七八九十百千零〇两\d]+)([章节条款项])\s*(.*)$"
 )
-_DOTTED_HEADING_RE = re.compile(r"^(\d+(?:\.\d+)+)\s+(\S.*)$")
+#: 点分/一级编号标题：``4.1 设备`` / ``4．1 设备`` / ``1. 目的`` / ``2．范围``
+#: （一级编号必须带点号，避免把 ``123 某某`` 误当成标题）
+_DOTTED_HEADING_RE = re.compile(
+    r"^(\d+(?:[.．]\d+)+|\d+[.．])\s*(\S.*)$"
+)
 _CLAUSE_LEVEL = {"章": 2, "节": 3, "条": 3, "款": 4, "项": 4}
 _SENTENCE_END = "。！？；.!?;\n"
 
 #: 条款/编号行 —— 这类行**本身就是内容**，最容易被"当标题"吞掉
 _CLAUSE_LIKE_RE = re.compile(
-    r"^\s*(第[一二三四五六七八九十百千零〇两\d]+[章节条款项]|\d+(?:\.\d+)+\s|\d+[．.、])"
+    r"^\s*(第[一二三四五六七八九十百千零〇两\d]+[章节条款项]|\d+(?:[.．]\d+)+\s|\d+[．.、])"
 )
 #: 「标题行同时也是正文」的判据：短标题（如 `第一条 年假天数`）只当标题，
 #: 而"整条就是内容"的行（带句读/很长）必须**同时**进正文，否则整行文字会消失。
@@ -335,6 +342,53 @@ class Section:
     page_to: int | None = None
 
 
+#: 嵌套点分小节：末级形如 ``4.1 …`` / ``4.1.2 …``（至少两段数字），可并入所属大节。
+_NESTED_DOTTED_LEAF_RE = re.compile(r"^(\d+(?:[.．]\d+)+)\s*(\S.*)?$")
+
+
+def _heading_parts(heading_path: str) -> list[str]:
+    return [p.strip() for p in (heading_path or "").split(" > ") if p.strip()]
+
+
+def _is_nested_dotted_leaf(title: str) -> bool:
+    return bool(_NESTED_DOTTED_LEAF_RE.match((title or "").strip()))
+
+
+def major_heading_path(heading_path: str) -> str:
+    """把嵌套点分小节收拢到所属大节路径。
+
+    * ``4． 制度 > 4.1 接班…`` → ``4． 制度``
+    * ``交接班 > 4． 制度 > 4.6 …`` → ``交接班 > 4． 制度``
+    * ``1． 目的`` / ``## 第一条 年假`` → 原样（本身就是大节，不跨节合并）
+    * 无大节壳的孤儿 ``4.1`` / ``4.2`` → 合成键 ``4．``（只用于识别所属章，不再并块）
+    """
+    parts = _heading_parts(heading_path)
+    if not parts:
+        return ""
+    while len(parts) >= 2 and _is_nested_dotted_leaf(parts[-1]):
+        parts.pop()
+    if len(parts) == 1 and _is_nested_dotted_leaf(parts[0]):
+        num = _NESTED_DOTTED_LEAF_RE.match(parts[0])
+        assert num is not None
+        head = re.split(r"[.．]", num.group(1))[0]
+        return f"{head}．"
+    return " > ".join(parts)
+
+
+def pack_major_sections(sections: Sequence[Section]) -> list[Section]:
+    """每条条款保持独立，不再把 ``4.1`` / ``4.2`` 拼进同一个父块。
+
+    以前按大节把嵌套点分小节收成一段再按 token 装箱，一条检索块里会同时出现
+    好几条。现在切分边界就是条款边界；单条过长仍由后面的 ``_pack`` 在条内切开。
+    """
+    return list(sections)
+
+
+def merge_short_sections(sections: Sequence[Section], **_kwargs: object) -> list[Section]:
+    """兼容旧名。条款不再按大节并块。"""
+    return pack_major_sections(sections)
+
+
 @dataclass
 class FigureInput:
     """文档里抽出的图片（**已落盘**），供分块器生成可检索的 figure 块。
@@ -390,7 +444,7 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
     标题来源（按优先级命中即切）：
     1. Markdown ``#`` … ``######``
     2. 中文条款行 ``第X章/节/条/款/项``（制度 PDF 最常见，MinerU 常不标 text_level）
-    3. 点分编号 ``3.2 标题``
+    3. 点分/一级编号 ``3.2 标题`` / ``1. 目的`` / ``2．范围``（半角/全角点）
 
     ``page_map``：``[(char_offset, page_from, page_to), …]``；缺省则页码为 None。
     """
@@ -444,6 +498,11 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
         else:
             current_start = offset + line_len + 1
 
+    def _dotted_level(num: str) -> int:
+        """``1.`` → 2；``4.1`` → 3；``4.1.2`` → 4（与章/节层级对齐，便于同级弹出）。"""
+        parts = [p for p in re.split(r"[.．]", num.rstrip(".．")) if p]
+        return min(1 + max(len(parts), 1), 6)
+
     for line in markdown.splitlines():
         stripped = line.strip()
         match = _HEADING_RE.match(stripped)
@@ -462,8 +521,9 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
                 title = f"{title} {rest}"
             push_heading(level, title, len(line), source_line=line)
         elif dotted:
-            title = f"{dotted.group(1)} {dotted.group(2).strip()}"
-            push_heading(3, title, len(line), source_line=line)
+            num = dotted.group(1).strip()
+            title = f"{num} {dotted.group(2).strip()}"
+            push_heading(_dotted_level(num), title, len(line), source_line=line)
         else:
             buffer.append(line)
         offset += len(line) + 1
@@ -557,7 +617,8 @@ def chunk_markdown(
     result = ChunkingResult()
     seq = 0
     root = ensure_heading_path("", doc_title=doc_title)
-    for section in split_sections(markdown, page_map=page_map):
+    sections = pack_major_sections(split_sections(markdown, page_map=page_map))
+    for section in sections:
         heading = ensure_heading_path(section.heading_path, doc_title=doc_title)
         # 小节完全无标题路径时，用文档根；已有条款路径则保留
         if not section.heading_path.strip():
@@ -597,13 +658,15 @@ def chunk_markdown(
                     )
                 )
 
-    for figure in figures:
-        content = _figure_search_text(figure)
+    for fig_index, figure in enumerate(figures, start=1):
+        content = _figure_search_text(
+            figure, doc_title=doc_title, figure_index=fig_index
+        )
         if not content:
             log.debug("figure_skipped_no_text", image_path=figure.image_path)
             continue
         seq += 1
-        fig_heading = ensure_heading_path(figure.caption, doc_title=doc_title)
+        fig_heading = ensure_heading_path(figure.caption or doc_title, doc_title=doc_title)
         result.nodes.append(
             ChunkNode(
                 chunk_type="figure",
@@ -646,8 +709,17 @@ def chunk_markdown(
     return result
 
 
-def _figure_search_text(figure: FigureInput) -> str:
-    """图片的可检索文本 = 题注 + 图中文字（OCR）；两者都空则返回空串（不建索引块）。"""
+def _figure_search_text(
+    figure: FigureInput,
+    *,
+    doc_title: str = "",
+    figure_index: int = 0,
+) -> str:
+    """图片的可检索文本 = 题注 + 图中文字（OCR）。
+
+    两者都空时：若有 ``doc_title`` 则用 ``[图片] 文档名 · 图N`` 兜底（OCR 默认关闭时
+    教程截图常见无字，仍须建块以便多模态检索与钉钉回源）；连文档名也没有才跳过。
+    """
     parts: list[str] = []
     if figure.caption.strip():
         parts.append(f"[图片] {figure.caption.strip()}")
@@ -655,7 +727,14 @@ def _figure_search_text(figure: FigureInput) -> str:
         if not parts:
             parts.append("[图片]")
         parts.append(figure.ocr_text.strip())
-    return "\n".join(parts).strip()
+    if parts:
+        return "\n".join(parts).strip()
+    title = (doc_title or "").strip()
+    if not title:
+        return ""
+    if figure_index > 0:
+        return f"[图片] {title} · 图{figure_index}"
+    return f"[图片] {title}"
 
 
 def _pack(text: str, min_tokens: int, max_tokens: int, *, overlap: int = 0) -> list[str]:

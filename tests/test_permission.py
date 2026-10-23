@@ -5,6 +5,31 @@ from __future__ import annotations
 from tests.conftest import user_id_of
 
 
+async def test_console_widen_opens_other_dept_within_clearance(seeded) -> None:
+    """后台检索补部门，不提高密级，也不改钉钉问答用的原始路由。"""
+    from ekbs.permission.acl import DocumentFacts, DocumentGate
+    from ekbs.permission.console import widen_for_console
+
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    wide = widen_for_console(alice, runtime.db)
+    gate = DocumentGate(runtime.db, runtime.settings)
+    kb_id = int(alice.visible_kb_ids[0])
+    other = DocumentFacts(
+        doc_id=9001, kb_id=kb_id, title="财务", level=2, status="published",
+        visible_dept_ids=("103",), effective_date=None, expire_date=None,
+    )
+    secret = DocumentFacts(
+        doc_id=9002, kb_id=kb_id, title="财务机密", level=3, status="published",
+        visible_dept_ids=("103",), effective_date=None, expire_date=None,
+    )
+    assert gate.can_read_document(alice, other, []).allowed is False
+    assert gate.can_read_document(wide, other, []).allowed is True
+    assert gate.can_read_document(wide, secret, []).reason == "level"
+    assert alice.visible_shard_ids == ("kb_all_L1", "kb_hr_L2")
+    assert "kb_finance_L3" not in wide.visible_shard_ids
+
+
 async def test_visible_shards_by_clearance_and_dept(seeded) -> None:
     """路由结果必须是「密级 ≤ clearance 且部门命中」，且顺序稳定（升序）。"""
     runtime, _summary = seeded

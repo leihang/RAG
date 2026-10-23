@@ -149,6 +149,37 @@ async def test_dev_users_shape(client, seeded) -> None:
         assert {"user_id", "dingtalk_userid", "clearance", "roles"} <= set(item)
     # 登录页要靠这些字段渲染下拉；nick 允许为空但角色要是数组
     assert all(isinstance(i["roles"], list) for i in items)
+    assert all(str(i["dingtalk_userid"]).startswith("demo_") for i in items)
+
+
+async def test_dev_users_skip_dingtalk_directory(seeded) -> None:
+    """钉钉同步进来的在职同事不进管理台快捷登录，也不能拿 dev-token 冒充。"""
+    from httpx import ASGITransport, AsyncClient
+    from ekbs.api.app import create_app
+
+    runtime, _ = seeded
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "INSERT INTO ekbs_user(dingtalk_userid, nick, clearance, status) "
+            "VALUES ('16190000000000001', '同事甲', 2, 'active')"
+        )
+        conn.commit()
+        outsider = int(
+            conn.execute(
+                "SELECT user_id FROM ekbs_user WHERE dingtalk_userid = '16190000000000001'"
+            ).fetchone()["user_id"]
+        )
+    app = create_app(runtime.settings)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
+            listed = await c.get("/api/v1/auth/dev-users")
+            denied = await c.post("/api/v1/auth/dev-token", json={"user_id": outsider})
+    assert listed.status_code == 200
+    ids = [item["dingtalk_userid"] for item in listed.json()["items"]]
+    assert ids, "种子身份仍应可登录"
+    assert all(str(item).startswith("demo_") for item in ids)
+    assert "16190000000000001" not in ids
+    assert denied.status_code == 403
 
 
 def test_dev_users_is_404_in_production(seeded) -> None:
@@ -199,10 +230,12 @@ async def test_upload_init_accepts_awkward_xlsx_names(seeded) -> None:
     """经 HTTP 验一遍：这些文件名都必须被接受（否则用户根本传不上来）。"""
     from httpx import ASGITransport, AsyncClient
     from ekbs.api.app import create_app
-    from tests.conftest import TEST_INTERNAL_TOKEN, user_id_of
+    from tests.conftest import TEST_INTERNAL_TOKEN, set_clearance, user_id_of
 
     runtime, _ = seeded
     uid = user_id_of(runtime.db, "demo_carol")
+    # 上架范围校验要求上传者密级 ≥ 文档密级（carol 在 seed 里是 L1，此处表达全量管理员）
+    set_clearance(runtime, uid, 4)
     headers = {"X-Internal-Token": TEST_INTERNAL_TOKEN, "X-Internal-User-Id": str(uid)}
     app = create_app(runtime.settings)
     async with app.router.lifespan_context(app):
@@ -308,10 +341,13 @@ async def test_frontend_facing_response_shapes(seeded) -> None:
 async def _upload_client(seeded):
     from httpx import ASGITransport, AsyncClient
     from ekbs.api.app import create_app
-    from tests.conftest import TEST_INTERNAL_TOKEN, user_id_of
+    from tests.conftest import TEST_INTERNAL_TOKEN, set_clearance, user_id_of
 
     runtime, _ = seeded
     uid = user_id_of(runtime.db, "demo_carol")
+    # 上架范围校验要求「文档密级 ≤ 上传者密级」；carol 在 seed 里是 L1 行政专员，
+    # 但她是本文件里的知识库管理员 —— 显式提权，表达"真正的全量知识库管理员"。
+    set_clearance(runtime, uid, 4)
     app = create_app(runtime.settings)
     client = AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver")
     return runtime, app, client, {"X-Internal-Token": TEST_INTERNAL_TOKEN, "X-Internal-User-Id": str(uid)}
@@ -498,6 +534,8 @@ async def test_upload_rejects_l2_without_dept_up_front(seeded) -> None:
     from ekbs.api.app import create_app
 
     runtime, app, client, headers = await _upload_client(seeded)
+    # 显式关闭 L4 闸，不依赖配置文件默认值（2026-10-09 测试期配置已全开）
+    runtime.settings.permission.l4_enabled = False
     async with app.router.lifespan_context(app):
         async with client as c:
             # L2 无部门 → 立刻 422，且原因可操作

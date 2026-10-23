@@ -43,13 +43,38 @@ def _no_ocr(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EKBS_FIGURE_OCR", "0")
 
 
+def _png_bytes(width: int, height: int, rgb: bytes = b"\xaa\xbb\xcc") -> bytes:
+    """任意尺寸实心 PNG（页眉装饰小图 vs 可保留图的对照用）。"""
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    row = b"\x00" + (rgb * width)
+    raw = row * height
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
 def test_docx_extracts_header_media_via_zip_fallback(tmp_path: Path) -> None:
-    """页眉图不在 document.part.rels —— 必须靠 word/media zip 兜底（实测交接班制度）。"""
+    """页眉**较大**图不在 document.part.rels —— 必须靠 word/media / header part 兜底。
+
+    装饰小 logo（短边 <120）现改为跳过进 figure，避免污染检索；本夹具用 160×160。
+    """
     import zipfile
 
     docx = pytest.importorskip("docx")
     png = tmp_path / "logo.png"
-    png.write_bytes(_tiny_png(b"\xaa\xbb\xcc"))
+    png.write_bytes(_png_bytes(160, 160, b"\xaa\xbb\xcc"))
 
     document = docx.Document()
     document.add_paragraph("正文无图")
@@ -68,6 +93,85 @@ def test_docx_extracts_header_media_via_zip_fallback(tmp_path: Path) -> None:
     assert len(parsed.figures) >= 1
     assert (assets / parsed.figures[0].name).is_file()
     assert "正文无图" in parsed.markdown
+
+
+def test_docx_preserves_header_control_fields(tmp_path: Path) -> None:
+    """制度 Word 页眉管控表（文件名/编号/页数）必须进文首「文件信息」，不能只抽 logo。"""
+    docx = pytest.importorskip("docx")
+
+    document = docx.Document()
+    document.add_paragraph("1. 目的")
+    document.add_paragraph("满足公共设备管理需要。")
+    table = document.sections[0].header.add_table(rows=2, cols=4, width=docx.shared.Cm(16))
+    cells = [
+        ["文件名称", "设备编号作业指导书", "文件编号：XJWY-GC-02", "文件编号：XJWY-GC-02"],
+        ["生效日期", "2024年4月1日", "页    数： 1 / 2", "页    数： 1 / 2"],
+    ]
+    for ri, row in enumerate(cells):
+        for ci, text in enumerate(row):
+            table.rows[ri].cells[ci].text = text
+    # 装饰小 logo：不应进 figures
+    tiny = tmp_path / "tiny.png"
+    tiny.write_bytes(_png_bytes(40, 20))
+    document.sections[0].header.paragraphs[0].add_run().add_picture(str(tiny))
+
+    path = tmp_path / "control.docx"
+    document.save(str(path))
+    assets = tmp_path / "parse" / "ctrl"
+    parsed = parse_file(path, assets_dir=assets)
+
+    assert "## 文件信息" in parsed.markdown
+    assert "设备编号作业指导书" in parsed.markdown
+    assert "XJWY-GC-02" in parsed.markdown
+    assert "2024年4月1日" in parsed.markdown
+    assert parsed.page_count == 2
+    assert parsed.figures == [], "页眉装饰小图不应进 figure"
+    assert "1. 目的" in parsed.markdown
+
+
+def test_doc_binary_scan_skips_decorative_logo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``.doc`` textutil 丢图后的二进制扫描也必须跳过页眉 logo（89×26）。"""
+    import shutil
+    import subprocess
+
+    from ekbs.ingest import parser as parser_mod
+    from ekbs.ingest.parser import ParsedDocument, _docx_raster_is_decorative
+
+    logo = _png_bytes(89, 26)
+    keep = _png_bytes(400, 300)
+    assert _docx_raster_is_decorative(logo) is True
+    assert _docx_raster_is_decorative(keep) is False
+
+    fake = tmp_path / "record.doc"
+    fake.write_bytes(b"OLE-FAKE")
+    empty = ParsedDocument(markdown="设施设备维保记录\n", engine="docx", source_path=str(fake))
+
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/textutil")
+
+    def _run(cmd: list[str], **_kwargs: object) -> object:
+        out = Path(cmd[cmd.index("-output") + 1])
+        out.write_bytes(b"PK")
+        return type("R", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr(parser_mod, "_parse_docx", lambda _path, *, assets_dir=None: empty)
+    monkeypatch.setattr(
+        parser_mod,
+        "_scan_embedded_raster_blobs",
+        lambda _data: [(logo, "png"), (keep, "png")],
+    )
+
+    assets = tmp_path / "parse" / "doc58"
+    parsed = parser_mod._parse_doc(fake, assets_dir=assets)
+    assert parsed.engine == "doc"
+    assert len(parsed.figures) == 1, [f.name for f in parsed.figures]
+    # name 形如 images/img-xxxxxxxx.png（相对 assets_dir）
+    disk = assets / parsed.figures[0].name
+    assert disk.is_file(), disk
+    from PIL import Image
+
+    with Image.open(disk) as im:
+        assert im.size == (400, 300)
 
 
 def test_docx_extracts_embedded_pictures(tmp_path: Path) -> None:

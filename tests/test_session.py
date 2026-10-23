@@ -76,11 +76,38 @@ def test_clear_removes_only_that_user(runtime, sessions: SessionStore) -> None:
 def test_anaphora_detection() -> None:
     assert _needs_context("那它需要提前几天申请")
     assert _needs_context("这个怎么算")
-    assert _needs_context("年假")  # 过短，脱离上下文无法检索
+    assert _needs_context("他们需要提前申请")
+    assert _needs_context("年假")  # 过短，又不是人名或编号
     assert _needs_context("能介绍详细点吗？")  # 追问展开，无指代也要改写
     assert _needs_context("再说详细一点")
     assert not _needs_context("员工年假天数如何计算")
     assert not _needs_context("财务专用章由谁保管")
+    # 整词：「其他」不是「他」，「应该」不是「该」
+    assert not _needs_context("其他城市不超过400元")
+    assert not _needs_context("应该提前几天")
+    assert not _needs_context("其它部门怎么办")
+    # 人名、编号本身完整，不因过短去补上一轮
+    assert not _needs_context("雷航")
+    assert not _needs_context("何刚")
+    assert not _needs_context("雷航是谁")
+    assert not _needs_context("118")
+    assert not _needs_context("V4")
+    assert not _needs_context("GB/T 50300")
+    assert not _needs_context("制度〔2024〕15号")
+
+
+async def test_rewriter_keeps_name_and_does_not_merge_false_anaphora(runtime) -> None:
+    rewriter = QueryRewriter(settings=runtime.settings)
+    history = [
+        {"role": "user", "content": "熙物联使用教程V4"},
+        {"role": "assistant", "content": "见教程第 1 页 [1]"},
+    ]
+    name = await rewriter.rewrite("雷航", history)
+    assert name.rewritten == "雷航"
+    assert name.used_history is False
+    plain = await rewriter.rewrite("其他城市不超过400元", history)
+    assert plain.rewritten == "其他城市不超过400元"
+    assert plain.used_history is False
 
 
 async def test_rewriter_without_history_is_noop(runtime) -> None:
@@ -160,6 +187,81 @@ async def test_rewriter_llm_strategy_uses_real_provider(runtime) -> None:
     result = await rewriter.rewrite("那它需要提前几天申请", history)
     assert result.strategy == "llm"
     assert result.rewritten == "年假申请需要提前几天"
+
+
+class _AngleRef:
+    provider = "dashscope"
+    model = "qwen-turbo"
+
+
+class _AngleLLM:
+    def __init__(self, text: str = "", boom: bool = False) -> None:
+        self.text = text
+        self.boom = boom
+        self.prompts: list[str] = []
+        self.ref = _AngleRef()
+
+    async def generate(self, messages, **kwargs):
+        from ekbs.provider.base import LLMResult
+
+        self.prompts.append(str(messages[-1]["content"]))
+        if self.boom:
+            raise RuntimeError("timeout")
+        return LLMResult(text=self.text, model="qwen-turbo")
+
+
+async def test_fast_model_angles_are_shared_and_keep_original(runtime) -> None:
+    """快速模型写的角度同时给关键词和向量；第 1 条必须是改写后的原问。"""
+    runtime.settings.retrieval.multi_query = 3
+    runtime.settings.retrieval.dense_multi_query = 3
+    llm = _AngleLLM(
+        "1. 员工年假一共有几天\n"
+        "请问年假有多少天\n"
+        "\n"
+        "2、年假天数是如何规定的\n"
+        "这是一段用来解释为什么要这样问的很长很长很长很长很长很长很长很长很长很长的说明文字不应该进入检索"
+    )
+    rewriter = QueryRewriter(settings=runtime.settings, expand_llm=llm)
+    result = await rewriter.rewrite("请问年假有多少天", [])
+    assert result.rewritten == "请问年假有多少天"
+    assert result.sparse_variants == [
+        "请问年假有多少天",
+        "员工年假一共有几天",
+        "年假天数是如何规定的",
+    ]
+    assert result.dense_variants == result.sparse_variants
+    assert "对话历史" not in llm.prompts[0]
+    assert rewriter.expand_variants("请问年假有多少天") == result.sparse_variants
+    assert rewriter.expand_dense_variants("请问年假有多少天") == result.dense_variants
+
+
+async def test_model_angles_expand_the_context_query_not_the_history(runtime) -> None:
+    runtime.settings.retrieval.multi_query = 3
+    llm = _AngleLLM("年假申请的提前天数是多少\n请假需要提前多久")
+    rewriter = QueryRewriter(settings=runtime.settings, expand_llm=llm)
+    history = [
+        {"role": "user", "content": "年假有多少天"},
+        {"role": "assistant", "content": "5 天 [1]"},
+    ]
+    result = await rewriter.rewrite("那它需要提前几天申请", history)
+    assert result.rewritten.startswith("年假有多少天")
+    assert result.sparse_variants[0] == result.rewritten
+    assert "5 天" not in llm.prompts[0]
+    assert "assistant" not in llm.prompts[0]
+    assert result.rewritten in llm.prompts[0]
+
+
+async def test_model_angle_failure_keeps_rule_variants(runtime) -> None:
+    runtime.settings.retrieval.multi_query = 3
+    runtime.settings.retrieval.dense_multi_query = 3
+    rewriter = QueryRewriter(
+        settings=runtime.settings, expand_llm=_AngleLLM(boom=True),
+    )
+    result = await rewriter.rewrite("请问年假有多少天", [])
+    plain = QueryRewriter(settings=runtime.settings)
+    assert result.sparse_variants == plain.expand_variants("请问年假有多少天")
+    assert result.dense_variants == plain.expand_dense_variants("请问年假有多少天")
+    assert "员工年假一共有几天" not in result.sparse_variants
 
 
 # ---------------------------------------------------------------------------

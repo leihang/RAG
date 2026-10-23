@@ -50,10 +50,56 @@ export function useAuth() {
 
   const logout = useCallback(() => clear(), [clear])
 
+  /** 钉钉免登：authCode 在此换一次 JWT（authCode 一次性，服务端防重放）。 */
+  const loginWithDingTalk = useCallback(
+    async (authCode: string) => {
+      const data = (await http.post('/auth/dingtalk-login', { auth_code: authCode })) as {
+        token: string
+        user_id: number
+        nick?: string
+      }
+      const snapshot = { user_id: data.user_id, nick: data.nick }
+      useAuthStore.getState().setSession(data.token, snapshot)
+      setSession(data.token, snapshot)
+      return refresh()
+    },
+    [refresh, setSession],
+  )
+
+  /** 本机账号登录（仅服务器本机可用；远程会被后端 403，错误原因原样抛出）。 */
+  const loginWithPassword = useCallback(
+    async (username: string, password: string) => {
+      const data = (await http.post('/auth/local-login', {
+        username,
+        password,
+      })) as {
+        token: string
+        user_id: number
+        nick?: string
+        must_change?: boolean
+      }
+      const snapshot = { user_id: data.user_id, nick: data.nick }
+      useAuthStore.getState().setSession(data.token, snapshot)
+      setSession(data.token, snapshot)
+      await refresh()
+      return { mustChange: Boolean(data.must_change), nick: data.nick, user_id: data.user_id }
+    },
+    [refresh, setSession],
+  )
+
   useEffect(() => {
     // 有 token 但没快照（刷新页面后）→ 补拉一次
     if (token && !me) void refresh().catch(() => clear())
   }, [token, me, refresh, clear])
-
-  return { me, token, clearance, refresh, loginAsDev, logout, isAuthed: Boolean(token) }
+  return {
+    me,
+    token,
+    clearance,
+    refresh,
+    loginAsDev,
+    loginWithDingTalk,
+    loginWithPassword,
+    logout,
+    isAuthed: Boolean(token),
+  }
 }

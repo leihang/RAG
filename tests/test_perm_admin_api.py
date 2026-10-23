@@ -296,6 +296,11 @@ async def test_dept_views_and_mapping_is_not_implemented(client, root) -> None:
     depts = (await client.get("/api/v1/perm/depts", headers=headers)).json()
     assert depts["items"] and depts["closure_rows"] >= len(depts["items"])
     assert "O6-1" in depts["note"]
+    hr = next(item for item in depts["items"] if str(item["dingtalk_dept_id"]) == "102")
+    assert any(member["nick"] == "Alice" and member["is_primary"] == 1 for member in hr["members"])
+    hq = next(item for item in depts["items"] if str(item["dingtalk_dept_id"]) == "1")
+    assert hq["tree_depth"] < hr["tree_depth"]
+    assert any(member["nick"] == "Alice" for member in hq["members"])
     mapping = await client.put("/api/v1/perm/depts/1/mapping", headers=headers, json={})
     assert mapping.status_code == 501
     assert "O6-1" in mapping.json()["detail"]
@@ -312,3 +317,124 @@ async def test_permission_audit_lists_changes(client, root) -> None:
     assert body["total"] >= 1
     assert body["items"][0]["change_type"] == "clearance"
     assert body["retention_days"] == 365
+
+
+async def test_manual_org_sync_is_permissioned(client, root, seeded) -> None:
+    """手动同步：普通用户不能拉；管理员拉到的是服务返回的登记结果。"""
+    from ekbs.dingtalk.sync import SyncReport
+
+    runtime, root_id = root
+    end_user = headers_for(user_id_of(runtime.db, "demo_alice"))
+    forbidden = await client.post("/api/v1/perm/org/sync", headers=end_user)
+    assert forbidden.status_code == 403
+
+    class _FakeSync:
+        async def sync_full(self, **_kwargs):
+            return SyncReport(
+                mode="full", users=1, created=0, updated=1, departments=0,
+                detail={"source": "auth_scopes", "authed_departments": 0, "authed_users": 1},
+            )
+
+    import ekbs.dingtalk.sync as sync_mod
+
+    original = sync_mod.build_sync_service
+    sync_mod.build_sync_service = lambda *args, **kwargs: _FakeSync()  # type: ignore[assignment]
+    try:
+        headers = headers_for(root_id)
+        status = await client.get("/api/v1/perm/org/sync", headers=headers)
+        assert status.status_code == 200
+        assert "事件" in status.json()["note"]
+        pulled = await client.post("/api/v1/perm/org/sync", headers=headers)
+    finally:
+        sync_mod.build_sync_service = original
+    assert pulled.status_code == 200, pulled.text
+    body = pulled.json()
+    assert body["users"] == 1
+    assert body["detail"]["source"] == "auth_scopes"
+
+
+async def test_org_sync_schedule_saves_interval(client, root) -> None:
+    """定时更新的小时数可改。普通用户不能改。保存后不会立刻再拉。"""
+    runtime, root_id = root
+    headers = headers_for(root_id)
+    end_user = headers_for(user_id_of(runtime.db, "demo_alice"))
+    denied = await client.put(
+        "/api/v1/perm/org/sync/schedule",
+        headers=end_user,
+        json={"enabled": True, "interval_hours": 6},
+    )
+    assert denied.status_code == 403
+    saved = await client.put(
+        "/api/v1/perm/org/sync/schedule",
+        headers=headers,
+        json={"enabled": True, "interval_hours": 6},
+    )
+    assert saved.status_code == 200, saved.text
+    body = saved.json()
+    assert body["enabled"] is True
+    assert body["interval_hours"] == 6
+    assert body["next_run_at"]
+    status = await client.get("/api/v1/perm/org/sync", headers=headers)
+    assert status.json()["schedule"]["interval_hours"] == 6
+    listed = await client.get("/api/v1/perm/users", headers=headers, params={"auth_source": "local"})
+    assert listed.status_code == 200
+    assert all(item["auth_source"] == "local" for item in listed.json()["items"])
+
+
+async def test_permission_catalog_is_chinese(client, root) -> None:
+    _, root_id = root
+    resp = await client.get("/api/v1/perm/permissions", headers=headers_for(root_id))
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["items"]
+    read = next(item for item in items if item["code"] == "doc:document:read")
+    assert read["name"] == "查看文档"
+    assert all(item["name"] and item["code"] for item in items)
+
+
+async def test_create_local_user_and_hide_demo(client, root) -> None:
+    """管理台用户列表不出现种子身份；新建的是能用口令登录的本机账号。"""
+    _, root_id = root
+    headers = headers_for(root_id)
+    listed = await client.get("/api/v1/perm/users", headers=headers)
+    assert listed.status_code == 200
+    assert all(
+        not str(item["dingtalk_userid"]).startswith("demo_")
+        for item in listed.json()["items"]
+    )
+
+    created = await client.post(
+        "/api/v1/perm/users",
+        headers=headers,
+        json={
+            "username": "ops_admin",
+            "password": "correct-horse-12",
+            "nick": "运维",
+            "clearance": 2,
+            "role_code": "kb_admin",
+        },
+    )
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["username"] == "ops_admin"
+    assert "password" not in body
+
+    again = await client.get("/api/v1/perm/users", headers=headers)
+    row = next(item for item in again.json()["items"] if item["username"] == "ops_admin")
+    assert row["nick"] == "运维"
+    assert row["clearance"] == 2
+    assert "kb_admin" in row["roles"]
+    assert row["auth_source"] == "local"
+
+    duplicate = await client.post(
+        "/api/v1/perm/users",
+        headers=headers,
+        json={"username": "ops_admin", "password": "correct-horse-12", "nick": "重复"},
+    )
+    assert duplicate.status_code == 409
+
+    short = await client.post(
+        "/api/v1/perm/users",
+        headers=headers,
+        json={"username": "shortpw", "password": "abc", "nick": "短"},
+    )
+    assert short.status_code == 422

@@ -32,6 +32,7 @@ import { ProDescriptions, ProTable } from '@ant-design/pro-components'
 import type { ProColumns } from '@ant-design/pro-components'
 import { getHealth, getOverview, listAlertRules, listShards } from '@/api/system'
 import type { ShardInfo } from '@/api/types'
+import { personalOwnerText } from '@/utils/personalKb'
 import EmptyState from '@/components/EmptyState'
 import { formatNumber, formatPercent, formatTime } from '@/utils/format'
 import MetricsChart from './MetricsChart'
@@ -298,7 +299,13 @@ const ALERT_RULE_COLUMNS: ProColumns<AlertRuleRow>[] = [
 
 const SHARD_COLUMNS: ProColumns<ShardInfo>[] = [
   { title: '分片 ID', dataIndex: 'shard_id', width: 180, copyable: true },
-  { title: '部门', dataIndex: 'dept_code', width: 140, render: (_, row) => row.dept_code ?? '-' },
+  {
+    title: '部门 / 归属',
+    dataIndex: 'dept_code',
+    width: 280,
+    ellipsis: true,
+    render: (_, row) => personalOwnerText(row) || row.dept_code || '-',
+  },
   {
     title: '密级',
     dataIndex: 'level',

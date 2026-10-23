@@ -11,7 +11,12 @@
 | ``GET /perm/roles`` | ``perm:role:read``（SA/KA/AU） |
 | ``POST/PUT/DELETE /perm/roles…`` | ``perm:role:create/update/delete``（**仅 SA**） |
 | ``POST /perm/roles/{id}/assign`` | ``perm:role:assign``（仅 SA） |
-| ``GET /perm/users`` | ``perm:user:read``（SA/KA/AU） |
+| ``GET /perm/permissions`` | ``perm:role:read`` —— 权限点中文目录 |
+| ``GET /perm/users`` | ``perm:user:read``（SA/KA/AU）；不含 ``demo_`` 种子身份 |
+| ``POST /perm/users`` | ``perm:user:create``（仅 SA）—— 新建本机登录账号 |
+| ``GET /perm/org/sync`` | ``perm:user:read`` —— 最近一次通讯录同步 |
+| ``POST /perm/org/sync`` | ``perm:user:update``（SA/KA）—— 按授权范围手动拉一次部门和人员 |
+| ``PUT /perm/org/sync/schedule`` | ``perm:user:update`` —— 定时更新的开关和间隔小时数 |
 | ``PUT /perm/users/{id}`` | ``perm:user:update``（SA/KA）—— 只允许改 ``status`` |
 | ``PUT /perm/users/{id}/clearance`` | ``perm:user:set_clearance``（**仅 SA**） |
 | ``GET /perm/depts`` | ``perm:dept:read``（SA/KA/AU） |
@@ -41,6 +46,11 @@ from ekbs.api.auth import INTERNAL_TOKEN_HEADER, INTERNAL_USER_HEADER
 from ekbs.api.qa import _authenticate
 from ekbs.errors import ConfigError, PermissionDenied
 from ekbs.logging import get_logger
+from ekbs.permission.org_schedule import (
+    read_org_schedule,
+    save_org_schedule,
+    touch_org_sync_clock,
+)
 from ekbs.permission.changes import PermissionChangeService
 from ekbs.permission.router import bump_policy_version
 
@@ -111,6 +121,28 @@ async def list_roles(
         role["permissions"] = by_role.get(int(role["role_id"]), [])
         role["user_count"] = counts.get(int(role["role_id"]), 0)
     return JSONResponse({"items": roles, "builtin_codes": list(BUILTIN_ROLE_CODES)})
+
+
+@router.get("/perm/permissions")
+async def list_permissions(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """权限点目录：code 仍是接口契约，name 是给管理台看的中文。"""
+    _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "perm:role:read")
+    runtime = request.app.state.runtime
+    with runtime.db.sync_connect() as conn:
+        rows = conn.execute(
+            "SELECT code, name, module FROM ekbs_permission ORDER BY module, code"
+        ).fetchall()
+    return JSONResponse({
+        "items": [
+            {"code": str(r["code"]), "name": str(r["name"]), "module": str(r["module"])}
+            for r in rows
+        ]
+    })
 
 
 class RoleCreate(BaseModel):
@@ -323,16 +355,20 @@ async def list_users(
     request: Request,
     q: str | None = Query(default=None, description="昵称/钉钉 ID 模糊匹配"),
     status: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=200),
+    auth_source: str | None = Query(default=None, description="local 只看管理台登记的账号"),
+    limit: int = Query(default=50, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
     authorization: str | None = Header(default=None),
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """用户列表（含角色、密级、部门链与钉钉同步时间）。"""
+    """用户列表（含角色、密级、部门链与本机登录名）。
+
+    ``demo_`` 种子身份不出现在管理台：管理端登录走本机账号，不走演示身份。
+    """
     _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "perm:user:read")
     runtime = request.app.state.runtime
-    where = ["u.deleted_at IS NULL"]
+    where = ["u.deleted_at IS NULL", "u.dingtalk_userid NOT LIKE 'demo_%'"]
     params: list[Any] = []
     if q:
         where.append("(u.nick LIKE ? OR u.dingtalk_userid LIKE ?)")
@@ -340,9 +376,18 @@ async def list_users(
     if status:
         where.append("u.status = ?")
         params.append(status)
+    if auth_source:
+        where.append("u.auth_source = ?")
+        params.append(auth_source)
     sql = (
-        "SELECT u.user_id, u.dingtalk_userid, u.nick, u.clearance, u.status, u.dept_chain, "
-        "u.perm_version, u.synced_at, "
+        "SELECT u.user_id, u.dingtalk_userid, u.nick, u.title, u.clearance, u.status, "
+        "u.auth_source, u.dept_chain, u.perm_version, u.synced_at, "
+        "(SELECT ud.dept_id FROM ekbs_user_dept ud "
+        " JOIN ekbs_dept d ON d.dept_id = ud.dept_id AND d.deleted_at IS NULL "
+        " WHERE ud.user_id = u.user_id "
+        " ORDER BY ud.is_primary DESC, ud.dept_id LIMIT 1) AS dept_id, "
+        "(SELECT a.username FROM ekbs_local_account a WHERE a.user_id = u.user_id "
+        " ORDER BY a.username LIMIT 1) AS username, "
         "(SELECT GROUP_CONCAT(r.code) FROM ekbs_user_role ur JOIN ekbs_role r "
         " ON r.role_id = ur.role_id WHERE ur.user_id = u.user_id) AS roles "
         f"FROM ekbs_user u WHERE {' AND '.join(where)} ORDER BY u.user_id LIMIT ? OFFSET ?"
@@ -356,6 +401,7 @@ async def list_users(
             except ValueError:
                 item["dept_chain"] = []
             item["roles"] = (item.get("roles") or "").split(",") if item.get("roles") else []
+            item["dept_id"] = int(item["dept_id"]) if item.get("dept_id") is not None else None
             rows.append(item)
         total = int(
             conn.execute(
@@ -363,6 +409,133 @@ async def list_users(
             ).fetchone()["c"]
         )
     return JSONResponse({"items": rows, "total": total, "limit": limit, "offset": offset})
+
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=2, max_length=32)
+    password: str = Field(min_length=6, max_length=128)
+    nick: str = Field(min_length=1, max_length=64)
+    clearance: int = Field(default=2, ge=1, le=4)
+    role_code: str | None = None
+    title: str = ""
+
+
+@router.post("/perm/users")
+async def create_local_user(
+    payload: UserCreate,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """新建一个用登录名和口令进入管理台的账号。
+
+    钉钉通讯录仍由同步维护。这里建的人 ``auth_source=local``，钉钉同步不会覆盖口令。
+    """
+    from ekbs.local_auth import MIN_PASSWORD_LENGTH, hash_password
+
+    principal = _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "perm:user:create"
+    )
+    username = payload.username.strip()
+    nick = payload.nick.strip()
+    if not username or any(ch.isspace() for ch in username) or ":" in username:
+        raise HTTPException(status_code=422, detail="登录名不能有空格或冒号")
+    if username.lower().startswith("demo"):
+        raise HTTPException(status_code=422, detail="登录名不能使用 demo 前缀")
+    if len(payload.password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(status_code=422, detail=f"口令至少 {MIN_PASSWORD_LENGTH} 位")
+    try:
+        password_hash = hash_password(payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    runtime = request.app.state.runtime
+    dingtalk_userid = f"local:{username}"
+    with runtime.db.sync_connect() as conn:
+        taken = conn.execute(
+            "SELECT 1 FROM ekbs_local_account WHERE username = ? "
+            "UNION ALL SELECT 1 FROM ekbs_user WHERE dingtalk_userid = ?",
+            (username, dingtalk_userid),
+        ).fetchone()
+        if taken is not None:
+            raise HTTPException(status_code=409, detail=f"登录名已存在：{username}")
+        role_id = None
+        if payload.role_code:
+            role = conn.execute(
+                "SELECT role_id FROM ekbs_role WHERE code = ? AND status = 1",
+                (payload.role_code,),
+            ).fetchone()
+            if role is None:
+                raise HTTPException(status_code=422, detail=f"角色不存在：{payload.role_code}")
+            role_id = int(role["role_id"])
+        conn.execute(
+            "INSERT INTO ekbs_user(dingtalk_userid, nick, title, clearance, status, "
+            "auth_source, dept_chain) VALUES (?, ?, ?, ?, 'active', 'local', '[]')",
+            (dingtalk_userid, nick, payload.title.strip(), int(payload.clearance)),
+        )
+        user_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        conn.execute(
+            "INSERT INTO ekbs_local_account(username, user_id, password_hash, must_change) "
+            "VALUES (?, ?, ?, 0)",
+            (username, user_id, password_hash),
+        )
+        if role_id is not None:
+            conn.execute(
+                "INSERT INTO ekbs_user_role(user_id, role_id, scope_type, scope_id, granted_at) "
+                "VALUES (?, ?, 'global', 0, datetime('now'))",
+                (user_id, role_id),
+            )
+        version = bump_policy_version(conn, reason=f"user_create:{user_id}")
+        conn.commit()
+    log.info(
+        "local_user_created", user_id=user_id, username=username,
+        role=payload.role_code, operator=principal.user_id,
+    )
+    return JSONResponse(
+        {
+            "user_id": user_id,
+            "username": username,
+            "nick": nick,
+            "clearance": int(payload.clearance),
+            "role_code": payload.role_code,
+            "policy_version": version,
+        },
+        status_code=201,
+    )
+
+
+class PasswordReset(BaseModel):
+    password: str = Field(min_length=6, max_length=128)
+
+
+@router.put("/perm/users/{user_id}/password")
+async def reset_user_password(
+    user_id: int,
+    payload: PasswordReset,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """管理员重置某个本机账号的口令。钉钉同事没有管理台口令，不能在这里设。"""
+    from ekbs.local_auth import MIN_PASSWORD_LENGTH, LocalAccountService
+
+    principal = _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "perm:user:update"
+    )
+    if len(payload.password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(status_code=422, detail=f"口令至少 {MIN_PASSWORD_LENGTH} 位")
+    runtime = request.app.state.runtime
+    service = LocalAccountService(runtime.db, runtime.settings)
+    try:
+        changed = service.set_password_for_user(user_id, payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not changed:
+        raise HTTPException(status_code=404, detail="该用户没有管理台登录名，不能重置口令")
+    log.info("local_password_reset", user_id=user_id, operator=principal.user_id)
+    return JSONResponse({"user_id": user_id, "ok": True})
 
 
 class UserUpdate(BaseModel):
@@ -448,6 +621,103 @@ async def set_clearance(
 
 
 # ---------------------------------------------------------------------------
+# 通讯录同步（手动全量；人员变动由钉钉事件推送，见 ekbs.dingtalk.org_events）
+# ---------------------------------------------------------------------------
+
+
+@router.get("/perm/org/sync")
+async def org_sync_status(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """最近一次通讯录同步的结果。"""
+    _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "perm:user:read")
+    runtime = request.app.state.runtime
+    with runtime.db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT log_id, mode, started_at, ended_at, created, updated, deleted, failed, "
+            "error, detail FROM ekbs_sync_log ORDER BY log_id DESC LIMIT 1"
+        ).fetchone()
+    latest = dict(row) if row is not None else None
+    if latest is not None:
+        try:
+            latest["detail"] = json.loads(latest.get("detail") or "{}")
+        except ValueError:
+            latest["detail"] = {}
+    return JSONResponse(
+        {
+            "latest": latest,
+            "schedule": read_org_schedule(runtime.db),
+            "note": (
+                "按钉钉应用当前的通讯录授权范围，同时更新部门和人员。"
+                "定时更新按这里保存的小时间隔重复做这一次。"
+                "平时的入职、离职、调岗仍可由钉钉事件推送。"
+            ),
+        }
+    )
+
+
+@router.post("/perm/org/sync")
+async def org_sync_now(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """按当前授权范围拉一次通讯录并登记。"""
+    principal = _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "perm:user:update"
+    )
+    runtime = request.app.state.runtime
+    from ekbs.dingtalk.sync import build_sync_service
+
+    try:
+        service = build_sync_service(
+            runtime.db, runtime.settings, runtime.secrets, cache=runtime.cache
+        )
+    except ConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    try:
+        report = await service.sync_full(operator_id=principal.user_id)
+    except Exception as exc:  # noqa: BLE001 - 钉钉侧失败要原样回到页面
+        log.error("org_sync_manual_failed", operator_id=principal.user_id, error=str(exc))
+        raise HTTPException(status_code=502, detail=f"通讯录同步失败：{exc}") from exc
+    log.info("org_sync_manual", operator_id=principal.user_id, users=report.users,
+             created=report.created, updated=report.updated)
+    touch_org_sync_clock(runtime.db)
+    return JSONResponse(report.as_dict())
+
+
+class OrgSyncScheduleUpdate(BaseModel):
+    enabled: bool
+    interval_hours: int = Field(ge=1, le=720)
+
+
+@router.put("/perm/org/sync/schedule")
+async def org_sync_schedule(
+    payload: OrgSyncScheduleUpdate,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """保存定时更新。间隔从保存这一刻起算，到点由调度进程拉部门和人员。"""
+    _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "perm:user:update"
+    )
+    runtime = request.app.state.runtime
+    try:
+        saved = save_org_schedule(
+            runtime.db, enabled=payload.enabled, interval_hours=payload.interval_hours
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(saved)
+
+
+# ---------------------------------------------------------------------------
 # 部门与映射
 # ---------------------------------------------------------------------------
 
@@ -462,15 +732,43 @@ async def list_depts(
     """部门树 + 闭包 + 当前生效的 dept_code 映射。"""
     _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "perm:dept:read")
     runtime = request.app.state.runtime
+    from ekbs.permission.dept_tree import attach_dept_codes
+
     with runtime.db.sync_connect() as conn:
         depts = [
             dict(r)
             for r in conn.execute(
                 "SELECT dept_id, dingtalk_dept_id, name, parent_dept_id, dept_path, depth, status "
-                "FROM ekbs_dept WHERE deleted_at IS NULL ORDER BY dept_path"
+                "FROM ekbs_dept WHERE deleted_at IS NULL"
             ).fetchall()
         ]
         closure = int(conn.execute("SELECT COUNT(*) FROM ekbs_dept_closure").fetchone()[0])
+        members_by_dept: dict[int, list[dict[str, Any]]] = {}
+        for record in conn.execute(
+            "SELECT ud.dept_id, ud.is_primary, u.user_id, u.dingtalk_userid, u.nick, "
+            "u.title, u.clearance, u.status, "
+            "(SELECT GROUP_CONCAT(r.code) FROM ekbs_user_role ur "
+            " JOIN ekbs_role r ON r.role_id = ur.role_id WHERE ur.user_id = u.user_id) AS roles "
+            "FROM ekbs_user_dept ud "
+            "JOIN ekbs_user u ON u.user_id = ud.user_id "
+            "WHERE u.deleted_at IS NULL AND IFNULL(u.auth_source, '') != 'local' "
+            "ORDER BY u.nick"
+        ):
+            members_by_dept.setdefault(int(record["dept_id"]), []).append(
+                {
+                    "user_id": int(record["user_id"]),
+                    "dingtalk_userid": record["dingtalk_userid"],
+                    "nick": record["nick"],
+                    "title": record["title"],
+                    "clearance": int(record["clearance"] or 1),
+                    "status": record["status"],
+                    "is_primary": int(record["is_primary"] or 0),
+                    "roles": (record["roles"] or "").split(",") if record["roles"] else [],
+                }
+            )
+    depts = attach_dept_codes(depts, runtime.settings.permission.dept_code_map or {})
+    for dept in depts:
+        dept["members"] = members_by_dept.get(int(dept["dept_id"]), [])
     return JSONResponse(
         {
             "items": depts,

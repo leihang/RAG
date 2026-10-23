@@ -30,7 +30,9 @@ from ekbs.index.shard import parse_shard_id, resolve_shard_for_document
 from ekbs.ingest.code_chunker import chunk_code, display_source_path, is_code_source
 from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE, retrievable_chunk_ids
 from ekbs.ingest import token_calib
-from ekbs.ingest.clean import clean_markdown
+from ekbs.ingest.clean import clean_figure_text, clean_markdown
+from ekbs.ingest.seal_filter import partition_seal_figures, strip_figure_anchors
+from ekbs.ingest.table_merge import merge_continued_tables
 from ekbs.ingest.chunker import (
     active_token_counter,
     content_coverage,
@@ -153,16 +155,53 @@ class IngestPipeline:
             dept_code=dept_code,
             fingerprint=self.providers.embed.ref.fingerprint,
         )
+        from ekbs.personal import grant_personal_shard, sole_personal_owner
+
+        owner = sole_personal_owner(list(visible_dept_ids))
+        if owner is not None:
+            with self.db.sync_connect() as conn:
+                grant_personal_shard(conn, user_id=owner, shard_id=shard_id)
+                conn.commit()
 
         checksum = checksum or hashlib.sha256(markdown.encode("utf-8")).hexdigest()
         # 清洗（`06` §1.7）——**显式一步**，放在 checksum 之后、分块之前：
         #   * checksum 仍基于解析原始产物 → 「秒传/去重」的语义不变；
         #   * 进分块、进 FTS、进向量的都是清洗后的文本（此前"清洗"没有独立实现，
         #     解析器吐出的 `$1 0 0 \%$` 这类 LaTeX 原样入库 → 关键词那一路搜不到）。
-        cleaned = clean_markdown(markdown)
-        if cleaned.stats:
-            log.info("markdown_cleaned", title=title, **cleaned.stats)
-        markdown = cleaned.text
+        # 代码不走这步：扫描件清洗会把连续空格压成一个，Python 缩进一丢，
+        # AST 就切不出类里的方法。
+        if not is_code_source(source_path):
+            cleaned = clean_markdown(markdown)
+            if cleaned.stats:
+                log.info("markdown_cleaned", title=title, **cleaned.stats)
+            markdown = cleaned.text
+        # 跨页续表合并（清洗步 4）；过长则保持拆开，由 table_serialize 按行批拆
+        markdown, tables_list, merge_stats = merge_continued_tables(markdown, list(tables))
+        tables = tables_list
+        if merge_stats:
+            log.info("tables_merged_for_ingest", title=title, **merge_stats)
+        if figures:
+            kept_figures, dropped_seals = partition_seal_figures(
+                list(figures), self.settings.data_dir
+            )
+            if dropped_seals:
+                markdown = strip_figure_anchors(
+                    markdown, {str(fig.figure_id or "") for fig in dropped_seals}
+                )
+                log.info("seal_figures_dropped", title=title, count=len(dropped_seals))
+            figures = kept_figures
+        # 图题注/OCR 同步过印章清洗（扫描合同签署页视觉描述不得进检索）
+        if figures:
+            figures = [
+                FigureInput(
+                    image_path=fig.image_path,
+                    caption=clean_figure_text(fig.caption or ""),
+                    ocr_text=clean_figure_text(fig.ocr_text or ""),
+                    page=fig.page,
+                    figure_id=fig.figure_id,
+                )
+                for fig in figures
+            ]
         if existing_doc_id is not None:
             self._replace_existing(existing_doc_id, shard_id=shard_id)
             doc_id = int(existing_doc_id)

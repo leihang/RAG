@@ -30,6 +30,14 @@ export const getDocumentDetail = (docId: number) =>
 export const getDocument = async (docId: number): Promise<DocumentItem> =>
   (await getDocumentDetail(docId)).document
 
+/** 原件回源（鉴权 blob；PDF / 图片左栏用）。 */
+export const fetchDocumentSource = (docId: number) =>
+  http.get(`/docs/documents/${docId}/source`, { responseType: 'blob' }) as Promise<Blob>
+
+/** Word / Excel / PPT / 文本原件转成的 HTML，嵌进对照左栏。 */
+export const fetchDocumentSourcePreview = (docId: number) =>
+  http.get(`/docs/documents/${docId}/source-preview`, { responseType: 'text' }) as Promise<string>
+
 export const updateDocument = (docId: number, body: Record<string, unknown>) =>
   http.put(`/docs/documents/${docId}`, body) as Promise<unknown>
 
@@ -102,6 +110,8 @@ export interface UploadInitBody {
   kb_code?: string | null
   level?: number
   visible_dept_ids?: string[]
+  /** 额外可查看的人，用户编号，可多选 */
+  viewer_user_ids?: number[]
 }
 
 export type UploadInitResp =
@@ -162,6 +172,9 @@ export interface KnowledgeBaseItem {
   default_level: number
   status?: number
   document_count?: number
+  owner_user_id?: number | null
+  owner_nick?: string | null
+  owner_dingtalk_userid?: string | null
 }
 
 export const listKnowledgeBases = () =>

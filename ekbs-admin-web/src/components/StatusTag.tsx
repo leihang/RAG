@@ -2,7 +2,7 @@
 import { Badge } from 'antd'
 
 type StatusKey =
-  | 'published' | 'parsing' | 'indexing' | 'pending' | 'failed' | 'offline'
+  | 'published' | 'parsing' | 'indexing' | 'pending' | 'review' | 'failed' | 'offline'
   | 'queued' | 'cancelled' | 'success' | 'denied' | 'deleted'
 
 const META: Record<StatusKey, { text: string; status: 'success' | 'processing' | 'warning' | 'error' | 'default' }> = {
@@ -10,6 +10,7 @@ const META: Record<StatusKey, { text: string; status: 'success' | 'processing' |
   parsing: { text: '解析中', status: 'processing' },
   indexing: { text: '索引中', status: 'processing' },
   pending: { text: '待解析', status: 'processing' },
+  review: { text: '待复核', status: 'warning' },
   queued: { text: '排队中', status: 'processing' },
   failed: { text: '失败', status: 'error' },
   cancelled: { text: '已取消', status: 'default' },

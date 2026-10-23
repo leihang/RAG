@@ -1,14 +1,14 @@
 # =============================================================================
-# EKBS 运行时依赖（**与 `方案/deploy/requirements.txt` 保持同一版本口径**）
+# EKBS 运行时依赖（**与 `deploy/requirements.txt` 保持同一版本口径**）
 # -----------------------------------------------------------------------------
-# 权威来源：`方案/deploy/requirements.txt`（本文件是它在开发仓库根目录的镜像，
+# 权威来源：`deploy/requirements.txt`（本文件是它在开发仓库根目录的镜像，
 #           只做了一处裁剪：MinerU 系重量级解析依赖默认不装，见文末说明）。
 # 安装：.venv/bin/pip install -r requirements.txt
 #       （本机 pypi.org 不可达，venv 内已配置清华镜像 .venv/pip.conf）
 #
 # 【Python 版本】⚠️ 文档内部矛盾（已在交付说明中标注，落地前需定）：
 #   · `01-实施步骤与本地部署.md` §3 正文：`brew install python@3.11`，称 MinerU 对 3.11 兼容性最好
-#   · `方案/deploy/requirements.txt` 头部：Python ≥ 3.12
+#   · `deploy/requirements.txt` 头部：Python ≥ 3.12
 #   本仓库按 **01 §3（权威配置来源）** 用 python3.11 建 venv；两者不可混用同一份 site-packages。
 #
 # 【Apple Silicon】只装 faiss-cpu（走 Accelerate）；**不要装 faiss-gpu**，不要混用 conda。

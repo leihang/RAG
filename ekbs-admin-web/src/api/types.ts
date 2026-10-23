@@ -36,12 +36,20 @@ export interface KnowledgeBase {
   description?: string
   default_level?: number
   status?: number
+  document_count?: number
+  owner_user_id?: number | null
+  owner_nick?: string | null
+  owner_dingtalk_userid?: string | null
 }
 
 export interface DocumentItem {
   doc_id: number
   kb_id: number
   kb_code?: string
+  kb_name?: string | null
+  owner_user_id?: number | null
+  owner_nick?: string | null
+  owner_dingtalk_userid?: string | null
   title: string
   level: number
   status: string
@@ -56,6 +64,8 @@ export interface DocumentItem {
   shard_id?: string
   chunk_count?: number
   size_bytes?: number | null
+  /** 本次解析耗时（毫秒）；旧文档为空 */
+  parse_ms?: number | null
   source_path?: string
 }
 
@@ -81,6 +91,7 @@ export interface ChunkNode {
   chunk_type: string
   seq: number
   content: string
+  content_head?: string
   token_count?: number | null
   heading_path?: string | null
   page_from?: number | null
@@ -89,6 +100,8 @@ export interface ChunkNode {
   image_path?: string | null
   shard_id?: string
   faiss_row?: number | null
+  /** figure 块是否已写入 figures.faiss 多模态旁路索引 */
+  figure_mm_indexed?: boolean
 }
 
 /**
@@ -112,6 +125,9 @@ export interface ChunkTree {
 export interface ShardInfo {
   shard_id: string
   dept_code?: string
+  owner_user_id?: number | null
+  owner_nick?: string | null
+  owner_dingtalk_userid?: string | null
   level?: number
   dim?: number
   vector_count?: number
@@ -134,11 +150,22 @@ export interface Overview {
 export interface UserItem {
   user_id: number
   dingtalk_userid: string
+  username?: string | null
+  auth_source?: string
   nick?: string
+  title?: string
   clearance: number
   status?: string
   dept_ids?: string
+  /** 主部门。没有部门时归到「未分配部门」。 */
+  dept_id?: number | null
   roles?: string[]
+}
+
+export interface PermissionItem {
+  code: string
+  name: string
+  module: string
 }
 
 export interface RoleItem {
@@ -212,6 +239,9 @@ export interface ImportKbItem {
   code: string
   name: string
   document_count?: number
+  owner_user_id?: number | null
+  owner_nick?: string | null
+  owner_dingtalk_userid?: string | null
   /** 实测该端点**当前不返回**这个字段；页面按「有就优先用」处理（见 `ImportMeta` 说明） */
   default_level?: number
 }
@@ -231,11 +261,25 @@ export interface ImportMeta {
 }
 
 /** `GET /import/dirs` 的一层子目录。**注意**没有 `rel_under`（那个只出现在 `recursive=true` 的扁平列表里）。 */
+/** 文件夹上记下的入库权限。`level == null` 表示这个目录还没写过。 */
+export interface FolderPolicy {
+  level: number | null
+  visible_dept_ids: string[]
+  viewer_user_ids: number[]
+  /** 权限写在哪一层。和当前目录不同时，表示沿用上级文件夹。 */
+  policy_from: string | null
+}
+
 export interface ImportDirEntry {
   name: string
   rel_path: string
+  rel_under?: string
   has_children?: boolean
   importable_files?: number
+  level?: number | null
+  visible_dept_ids?: string[]
+  viewer_user_ids?: number[]
+  policy_from?: string | null
 }
 
 export interface ImportDirsResp {
@@ -245,6 +289,7 @@ export interface ImportDirsResp {
   dirs: ImportDirEntry[]
   root?: string
   recursive?: boolean
+  folder_policy?: FolderPolicy | null
 }
 
 /** 扫描预览里一行的动作（`ekbs/ingest/dir_import.py` 的 ACTION_*）。 */
@@ -285,6 +330,8 @@ export interface ImportScanBody {
 export interface ImportRunBody extends ImportScanBody {
   kb_id?: number | null
   kb_code?: string | null
+  /** 额外可查看的人（用户编号，可多选） */
+  viewer_user_ids?: number[]
   /** 勾选导入的相对路径；**空数组 = 按目录全量**（后端会自己重扫） */
   files: string[]
 }

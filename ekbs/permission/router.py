@@ -159,10 +159,26 @@ class ShardRouter:
         本实现的取舍：**kb 级 ACL 只做「显式 deny 收敛 + 显式 allow 补齐」**，
         没有任何 kb 级条目时全部 active kb 可见（从而不破坏 L1 全员可见）。
         """
+        import json
+
         rows = conn.execute(
-            "SELECT kb_id, status FROM ekbs_kb"
+            "SELECT kb_id, status, retrieval_config FROM ekbs_kb"
         ).fetchall()
-        active = {int(r["kb_id"]) for r in rows if int(r["status"]) == 1}
+        active: set[int] = set()
+        for record in rows:
+            if int(record["status"]) != 1:
+                continue
+            try:
+                config = json.loads(record["retrieval_config"] or "{}")
+            except ValueError:
+                config = {}
+            owner = config.get("owner_user_id") if isinstance(config, dict) and config.get("personal") else None
+            if owner:
+                # 私有库不在「默认全员可见」里，只对主人开放。
+                if ("user", str(owner)) in subjects:
+                    active.add(int(record["kb_id"]))
+                continue
+            active.add(int(record["kb_id"]))
         acl_rows = conn.execute(
             "SELECT object_id, subject_type, subject_id, effect FROM ekbs_acl_entry "
             "WHERE object_type = 'kb' AND permission IN ('read', 'manage') "
@@ -180,6 +196,40 @@ class ShardRouter:
                 continue
             (allow if row["effect"] == "allow" else deny).add(kb_id)
         return tuple(sorted((active | allow) - deny))
+
+    @staticmethod
+    def _viewer_shards(
+        conn: Any,
+        user_id: int,
+        clearance: int,
+        now: str,
+        level_of: dict[str, int],
+    ) -> set[str]:
+        """这个人被点名可看的文档落在哪些仍有效的分片上。
+
+        个人库排除在外。密级高于本人的分片不加入。分片不在 ``level_of``
+        （未建好或已退役）时同样跳过。
+        """
+        rows = conn.execute(
+            "SELECT DISTINCT c.shard_id AS shard_id "
+            "FROM ekbs_acl_entry a "
+            "JOIN ekbs_document d ON d.doc_id = CAST(a.object_id AS INTEGER) "
+            "JOIN ekbs_chunk c ON c.doc_id = d.doc_id "
+            "JOIN ekbs_kb k ON k.kb_id = d.kb_id "
+            "WHERE a.object_type = 'document' AND a.subject_type = 'user' "
+            "AND a.subject_id = ? AND a.effect = 'allow' "
+            "AND a.permission IN ('read', 'manage') "
+            "AND (a.expire_at IS NULL OR a.expire_at > ?) "
+            "AND d.deleted_at IS NULL AND d.status != 'deleted' "
+            "AND k.code NOT LIKE 'personal-%'",
+            (str(int(user_id)), now),
+        ).fetchall()
+        found: set[str] = set()
+        for row in rows:
+            shard_id = str(row["shard_id"])
+            if level_of.get(shard_id, 9) <= int(clearance):
+                found.add(shard_id)
+        return found
 
     def route(self, user_id: int) -> RoutingResult:
         """计算该用户的可见分片集合（`docs/spec/10` §4 的四步）。"""
@@ -204,7 +254,8 @@ class ShardRouter:
             now = str(conn.execute("SELECT datetime('now')").fetchone()[0])
 
             subjects, dept_subjects = self._expand_subjects(conn, user_id, dept_chain)
-            dept_codes = self.resolve_dept_codes(dept_subjects)
+            map_codes = set(self.resolve_dept_codes(dept_subjects))
+            dept_codes = set(map_codes)
             acl_allow, acl_deny = self._shard_acl(conn, subjects, now)
 
             shard_rows = conn.execute(
@@ -212,18 +263,30 @@ class ShardRouter:
             ).fetchall()
             level_of = {str(r["shard_id"]): int(r["level"]) for r in shard_rows}
             visible: set[str] = set()
+            # 分片部门码已经是钉钉部门 ID 时，直接和本人部门链比较。
+            # 对照表仍负责 hr/finance 这种短名。密级不够的分片不打开。
             for row in shard_rows:
+                dept_code = str(row["dept_code"])
+                by_id = (
+                    dept_code in dept_subjects
+                    and dept_code != "all"
+                    and dept_code not in map_codes
+                )
                 if int(row["level"]) > clearance:
                     continue
-                dept_code = str(row["dept_code"])
-                if dept_code == "all" or dept_code in dept_codes:
+                if dept_code == "all" or dept_code in dept_codes or dept_code in dept_subjects:
                     visible.add(str(row["shard_id"]))
+                    if by_id:
+                        dept_codes.add(dept_code)
             # ACL allow **也必须过密级闸**：ACL 是跨部门的横向补丁，不能突破 clearance 这条纵向上限
             # （00 §3.2 规则 1：访问需满足 doc.level <= user.clearance）。
             granted_allow = frozenset(
                 shard for shard in acl_allow if level_of.get(shard, 9) <= clearance
             )
-            visible = (visible | set(granted_allow)) - set(acl_deny)
+            # 入库时点名的个人只打开「这些文件所在的分片」，不写进 acl_allow_shards。
+            # 整片允许会在 L4 白名单之前放行，同片里没被点名的文件也会被看光。
+            viewer_shards = self._viewer_shards(conn, user_id, clearance, now, level_of)
+            visible = (visible | set(granted_allow) | viewer_shards) - set(acl_deny)
 
             warnings: list[str] = []
             if not dept_code_map_configured(self.settings) and not acl_allow:
@@ -245,7 +308,7 @@ class ShardRouter:
                 policy_version=policy_version,
                 acl_allow_shards=granted_allow,
                 acl_deny_shards=acl_deny,
-                matched_dept_codes=dept_codes,
+                matched_dept_codes=frozenset(dept_codes),
                 subjects=subjects,
                 dept_subjects=dept_subjects,
                 warnings=tuple(warnings),

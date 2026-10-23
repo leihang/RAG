@@ -219,8 +219,8 @@ async def test_figure_becomes_searchable_chunk(seeded) -> None:
     assert image_abs.exists(), "图片文件应当仍留在磁盘上（否则引用打不开）"
 
 
-async def test_figure_without_any_text_is_dropped(seeded) -> None:
-    """既无题注又无 OCR 的图，不该产生垃圾块。"""
+async def test_figure_without_any_text_uses_doc_title_fallback(seeded) -> None:
+    """无题注/OCR 时用文档名兜底建块（OCR 默认关，教程截图常见无字）。"""
     runtime, summary = seeded
     image_rel = "parse/testfig/images/blank.png"
     image_abs = runtime.settings.data_dir / image_rel
@@ -237,12 +237,26 @@ async def test_figure_without_any_text_is_dropped(seeded) -> None:
         figures=(FigureInput(image_path=image_rel),),
     )
     with runtime.db.sync_connect() as conn:
-        n = conn.execute(
-            "SELECT COUNT(*) AS n FROM ekbs_chunk "
+        figs = conn.execute(
+            "SELECT content, image_path FROM ekbs_chunk "
             "WHERE doc_id = ? AND chunk_type = 'figure'",
             (result.doc_id,),
-        ).fetchone()["n"]
-    assert n == 0, "无文字图片不应落块"
+        ).fetchall()
+    assert len(figs) == 1, "有文档名时应兜底建 figure 块"
+    assert "空图文档" in (figs[0]["content"] or "")
+    assert figs[0]["image_path"] == image_rel
+
+
+async def test_figure_without_text_or_title_is_dropped() -> None:
+    """连文档名都没有时，无字图仍不建块。"""
+    from ekbs.ingest.chunker import chunk_markdown
+
+    result = chunk_markdown(
+        "# 正文\n\n有图。\n",
+        figures=(FigureInput(image_path="parse/x.png"),),
+        doc_title="",
+    )
+    assert result.figures == []
 
 
 @pytest.mark.parametrize("suffix", [".py", ".ts", ".go", ".java", ".sql"])

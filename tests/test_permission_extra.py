@@ -161,6 +161,8 @@ def test_shard_placement_rules(settings) -> None:
 
     with pytest.raises(ConfigError):
         resolve_shard_for_document(level=2, visible_dept_ids=[], settings=settings)
+    # L4 闸：用例显式关闭，不依赖配置文件默认值（2026-10-09 测试期配置已全开）
+    settings.permission.l4_enabled = False
     with pytest.raises(ConfigError):
         resolve_shard_for_document(level=4, visible_dept_ids=["102"], settings=settings)
     with pytest.raises(ConfigError):
@@ -177,6 +179,8 @@ async def test_ingest_rejects_l3_when_gate_closed(seeded) -> None:
         db=runtime.db, settings=runtime.settings, providers=runtime.providers,
         shards=runtime.shards, fts=runtime.fts,
     )
+    # 显式关闭闸门，不依赖配置文件默认值（2026-10-09 测试期配置已全开）
+    runtime.settings.permission.l3_ingest_enabled = False
     assert runtime.settings.permission.l3_ingest_enabled is False
     with pytest.raises(ConfigError):
         await pipeline.ingest_markdown(

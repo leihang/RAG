@@ -95,26 +95,22 @@ class OrgSyncService:
     # 全量同步
     # ------------------------------------------------------------------
 
-    async def sync_full(self, *, mark_absent: bool = False, operator_id: int | None = None) -> SyncReport:
+    async def sync_full(
+        self, *, mark_absent: bool = False, operator_id: int | None = None, mode: str = "full"
+    ) -> SyncReport:
         started = time.perf_counter()
-        report = SyncReport(mode="full")
+        report = SyncReport(mode=mode or "full")
         try:
-            departments = await self.directory.fetch_department_tree()
+            departments, scoped_users, scope_detail = await self._load_people()
             report.departments = len(departments)
             created_d, updated_d = self._upsert_departments(departments)
 
             users: dict[str, DirectoryUser] = {}
-            memberships = 0
             for dept in departments:
                 for user in await self.directory.list_department_users(dept.dept_id):
-                    if not user.userid:
-                        continue
-                    existing = users.get(user.userid)
-                    if existing is None:
-                        users[user.userid] = user
-                    else:
-                        merged = set(existing.dept_ids) | set(user.dept_ids) | {dept.dept_id}
-                        existing.dept_ids = sorted(merged)
+                    self._merge_user(users, user, extra_dept=dept.dept_id)
+            for user in scoped_users:
+                self._merge_user(users, user)
             report.users = len(users)
             created_u, updated_u, memberships = self._upsert_users(users.values())
 
@@ -128,13 +124,13 @@ class OrgSyncService:
                     operator_id=operator_id,
                 )
 
-            with self.db.sync_connect() as conn:
-                closures = rebuild_dept_closure(conn)
-                refreshed = refresh_user_dept_chain(conn)
-                report.policy_version = bump_policy_version(conn, reason="org_sync:full")
-                conn.commit()
-            report.detail = {"closure_rows": closures, "users_refreshed": refreshed}
-            self._invalidate_perm_caches()
+            closures, refreshed, version = self._finalize("org_sync:full")
+            report.policy_version = version
+            report.detail = {
+                "closure_rows": closures,
+                "users_refreshed": refreshed,
+                **scope_detail,
+            }
             return report
         except Exception as exc:
             report.failed = 1
@@ -145,6 +141,162 @@ class OrgSyncService:
             report.duration_seconds = time.perf_counter() - started
             observe(ORG_SYNC_DURATION, report.duration_seconds)
             self._write_sync_log(report)
+
+    async def apply_personnel_event(self, event_type: str, user_ids: list[str]) -> SyncReport:
+        """按一条人员变动更新本地用户。
+
+        ``user_add_org`` / ``user_active_org``：入职或激活，拉详情后登记。
+        ``user_modify_org``：职位、部门等资料变化，拉详情后覆盖。
+        ``user_leave_org``：离职，置 ``left``，不再参与问答。
+        """
+        started = time.perf_counter()
+        kind = (event_type or "").strip()
+        report = SyncReport(mode=f"event:{kind}")
+        report.detail = {"user_ids": list(user_ids)}
+        try:
+            if kind == "user_leave_org":
+                for userid in user_ids:
+                    if self._mark_left(userid, reason=kind, operator_id=None):
+                        report.deleted += 1
+            elif kind in {"user_add_org", "user_modify_org", "user_active_org"}:
+                fetched: list[DirectoryUser] = []
+                departments: list[Any] = []
+                for userid in user_ids:
+                    user = await self.directory.get_user(userid)
+                    if user is None or not user.userid:
+                        log.info("org_event_user_missing", event_type=kind, userid=userid)
+                        continue
+                    fetched.append(user)
+                    departments.extend(await self._departments_for(user))
+                if departments:
+                    created_d, updated_d = self._upsert_departments(departments)
+                    report.created += created_d
+                    report.updated += updated_d
+                    report.departments = len(departments)
+                if fetched:
+                    created_u, updated_u, memberships = self._upsert_users(fetched)
+                    report.created += created_u
+                    report.updated += updated_u
+                    report.users = len(fetched)
+                    report.memberships = memberships
+            else:
+                report.detail["ignored"] = True
+                return report
+
+            if report.created or report.updated or report.deleted or report.users:
+                closures, refreshed, version = self._finalize(f"org_sync:{kind}")
+                report.policy_version = version
+                report.detail["closure_rows"] = closures
+                report.detail["users_refreshed"] = refreshed
+            log.info(
+                "org_event_applied",
+                event_type=kind,
+                users=report.users,
+                created=report.created,
+                updated=report.updated,
+                deleted=report.deleted,
+            )
+            return report
+        except Exception as exc:
+            report.failed = 1
+            inc(ORG_SYNC_FAILED, 1, scope="event")
+            log.error("org_sync_failed", mode=report.mode, error=f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            report.duration_seconds = time.perf_counter() - started
+            if not report.detail.get("ignored"):
+                observe(ORG_SYNC_DURATION, report.duration_seconds)
+                self._write_sync_log(report)
+
+    async def _load_people(self) -> tuple[list[Any], list[DirectoryUser], dict[str, Any]]:
+        """按授权范围拉人。
+
+        应用只授权了部分人或部门时，不要从根部门起拉（会 50004）。
+        没有这份范围信息的目录实现（测试夹具）仍走原来的整树。
+        """
+        fetch_scopes = getattr(self.directory, "fetch_auth_scopes", None)
+        if fetch_scopes is not None:
+            scopes = await fetch_scopes()
+            if getattr(scopes, "limited", False):
+                departments: list[Any] = []
+                seen: set[int] = set()
+                for dept_id in list(scopes.authed_dept_ids):
+                    for dept in await self.directory.fetch_department_tree(dept_id):
+                        if dept.dept_id in seen:
+                            continue
+                        seen.add(dept.dept_id)
+                        departments.append(dept)
+                extras: list[DirectoryUser] = []
+                seen_users: set[str] = set()
+                get_user = getattr(self.directory, "get_user", None)
+                if get_user is not None:
+                    for userid in list(scopes.authed_user_ids):
+                        if userid in seen_users:
+                            continue
+                        user = await get_user(userid)
+                        if user is None or not user.userid:
+                            continue
+                        seen_users.add(user.userid)
+                        extras.append(user)
+                        for dept in await self._departments_for(user):
+                            if dept.dept_id in seen:
+                                continue
+                            seen.add(dept.dept_id)
+                            departments.append(dept)
+                return departments, extras, {
+                    "source": "auth_scopes",
+                    "authed_departments": len(scopes.authed_dept_ids),
+                    "authed_users": len(scopes.authed_user_ids),
+                }
+        departments = await self.directory.fetch_department_tree()
+        return departments, [], {"source": "department_tree"}
+
+    async def _departments_for(self, user: DirectoryUser) -> list[Any]:
+        get_dept = getattr(self.directory, "get_department", None)
+        if get_dept is None:
+            return []
+        found = []
+        for dept_id in user.dept_ids:
+            dept = await get_dept(int(dept_id))
+            if dept is None:
+                log.warning(
+                    "org_sync_dept_unresolved",
+                    userid=user.userid,
+                    dept_id=dept_id,
+                )
+                continue
+            found.append(dept)
+        return found
+
+    @staticmethod
+    def _merge_user(
+        users: dict[str, DirectoryUser], user: DirectoryUser, *, extra_dept: int | None = None
+    ) -> None:
+        if not user.userid:
+            return
+        existing = users.get(user.userid)
+        if existing is None:
+            if extra_dept is not None and extra_dept not in user.dept_ids:
+                user.dept_ids = sorted(set(user.dept_ids) | {extra_dept})
+            users[user.userid] = user
+            return
+        merged = set(existing.dept_ids) | set(user.dept_ids)
+        if extra_dept is not None:
+            merged.add(extra_dept)
+        existing.dept_ids = sorted(merged)
+        if user.title and not existing.title:
+            existing.title = user.title
+        if user.name and (not existing.name or existing.name == existing.userid):
+            existing.name = user.name
+
+    def _finalize(self, reason: str) -> tuple[int, int, int]:
+        with self.db.sync_connect() as conn:
+            closures = rebuild_dept_closure(conn)
+            refreshed = refresh_user_dept_chain(conn)
+            version = bump_policy_version(conn, reason=reason)
+            conn.commit()
+        self._invalidate_perm_caches()
+        return closures, refreshed, version
 
     # ------------------------------------------------------------------
     # 离职同步
@@ -287,7 +439,14 @@ class OrgSyncService:
                     "SELECT user_id FROM ekbs_user WHERE dingtalk_userid = ?", (user.userid,)
                 ).fetchone()
                 user_id = int(row["user_id"])
+                if existing is None:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO ekbs_user_role(user_id, role_id, scope_type, scope_id) "
+                        "SELECT ?, role_id, 'global', 0 FROM ekbs_role WHERE code = 'end_user'",
+                        (user_id,),
+                    )
                 primary = user.dept_ids[0] if user.dept_ids else None
+                resolved: list[tuple[int, int]] = []
                 for dept_ref in user.dept_ids:
                     dept_row = conn.execute(
                         "SELECT dept_id FROM ekbs_dept WHERE dingtalk_dept_id = ?",
@@ -295,13 +454,21 @@ class OrgSyncService:
                     ).fetchone()
                     if dept_row is None:
                         continue
-                    conn.execute(
-                        "INSERT INTO ekbs_user_dept(user_id, dept_id, is_primary) VALUES (?, ?, ?) "
-                        "ON CONFLICT(user_id, dept_id) DO UPDATE SET is_primary = excluded.is_primary",
-                        (user_id, int(dept_row["dept_id"]), 1 if dept_ref == primary else 0),
-                    )
-                    memberships += 1
-                if primary is not None:
+                    resolved.append((int(dept_row["dept_id"]), 1 if dept_ref == primary else 0))
+                # 部门变动要换掉旧隶属。一个部门都对不上时保留原关系，避免授权范围
+                # 看不到部门时把已有部门链抹掉。
+                if resolved:
+                    conn.execute("DELETE FROM ekbs_user_dept WHERE user_id = ?", (user_id,))
+                    for dept_id, is_primary in resolved:
+                        conn.execute(
+                            "INSERT INTO ekbs_user_dept(user_id, dept_id, is_primary) "
+                            "VALUES (?, ?, ?) "
+                            "ON CONFLICT(user_id, dept_id) DO UPDATE SET "
+                            "is_primary = excluded.is_primary",
+                            (user_id, dept_id, is_primary),
+                        )
+                        memberships += 1
+                if resolved and primary is not None:
                     conn.execute(
                         "UPDATE ekbs_user SET primary_dept_id = (SELECT dept_id FROM ekbs_dept "
                         "WHERE dingtalk_dept_id = ?) WHERE user_id = ?",

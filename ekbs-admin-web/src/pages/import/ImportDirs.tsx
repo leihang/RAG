@@ -20,6 +20,7 @@ import {
   Input,
   Select,
   Space,
+  TreeSelect,
   Statistic,
   Switch,
   Table,
@@ -32,7 +33,9 @@ import { ProTable, type ProColumns } from '@ant-design/pro-components'
 import { Link, useNavigate } from 'react-router-dom'
 import Auth from '@/components/Auth'
 import EmptyState from '@/components/EmptyState'
-import { getImportMeta, getImportQueue, listImportDirs, runImport, scanImportDir } from '@/api/import'
+import { createImportDir, deleteImportDir, getImportMeta, getImportQueue, listImportDirs, runImport, scanImportDir } from '@/api/import'
+import DeptPicker from '@/components/DeptPicker'
+import ViewerPicker from '@/components/ViewerPicker'
 import { listKnowledgeBases } from '@/api/doc'
 import type {
   ImportDirEntry,
@@ -42,8 +45,9 @@ import type {
   ImportRunResp,
   ImportScanResp,
 } from '@/api/types'
-import { parseDeptIds } from '@/pages/docs/docUtils'
 import { formatBytes } from '@/utils/format'
+import { buildKbTargetTree, isPersonalCode, parseKbTarget, personalOwnerId } from '@/components/kbTargetTree'
+import { personalOwnerText } from '@/utils/personalKb'
 import {
   actionMeta,
   defaultSelectedPaths,
@@ -83,7 +87,10 @@ export default function ImportDirs() {
 
   const [kbId, setKbId] = useState<number | undefined>(undefined)
   const [level, setLevel] = useState(1)
-  const [deptText, setDeptText] = useState('')
+  const [deptIds, setDeptIds] = useState<string[]>([])
+  const [viewerUserIds, setViewerUserIds] = useState<number[]>([])
+  const [folderName, setFolderName] = useState('')
+  const [creatingFolder, setCreatingFolder] = useState(false)
   const [recursive, setRecursive] = useState(true)
 
   const [cwd, setCwd] = useState('')
@@ -91,6 +98,7 @@ export default function ImportDirs() {
   const [dirs, setDirs] = useState<ImportDirEntry[]>([])
   const [dirsLoading, setDirsLoading] = useState(false)
   const [dirsError, setDirsError] = useState<string | null>(null)
+  const [folderLevel, setFolderLevel] = useState<number | null>(null)
 
   const [scan, setScan] = useState<ImportScanResp | null>(null)
   const [scanning, setScanning] = useState(false)
@@ -102,8 +110,6 @@ export default function ImportDirs() {
   const [runError, setRunError] = useState<string | null>(null)
   const [queueCounts, setQueueCounts] = useState<Record<string, number> | null>(null)
 
-  const deptIds = useMemo(() => parseDeptIds(deptText), [deptText])
-
   /** 逐层进入 raw 下的某个相对目录；失败**保持当前目录**，只把原因摆出来（404 多半是输错或该库目录还没建）。 */
   const enterDir = useCallback(async (rel: string) => {
     setDirsLoading(true)
@@ -113,12 +119,68 @@ export default function ImportDirs() {
       setCwd(String(res?.rel_path ?? rel ?? ''))
       setParentRel(res?.parent ?? null)
       setDirs(res?.dirs ?? [])
+      const policy = res?.folder_policy
+      if (policy?.level != null) {
+        setFolderLevel(policy.level)
+        setLevel(policy.level)
+        setDeptIds(policy.visible_dept_ids ?? [])
+        setViewerUserIds(policy.viewer_user_ids ?? [])
+      } else {
+        setFolderLevel(null)
+      }
     } catch (err) {
+      setDirs([])
+      setFolderLevel(null)
       setDirsError(describeImportError(err))
     } finally {
       setDirsLoading(false)
     }
   }, [])
+
+  const removeFolder = async (rel: string) => {
+    if (!window.confirm(`删除文件夹「${rel}」？里面有文件时会拒绝。`)) return
+    try {
+      await deleteImportDir(rel)
+      message.success('已删除文件夹')
+      await enterDir(cwd)
+    } catch (err) {
+      message.error(describeImportError(err))
+    }
+  }
+
+  const createFolder = async () => {
+    const name = folderName.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+    if (!name) {
+      message.warning('请填写文件夹名')
+      return
+    }
+    const rel = [cwd, name].filter(Boolean).join('/')
+    setCreatingFolder(true)
+    try {
+      const targetKb = kbs.find((item) => item.kb_id === kbId)
+      const copyPolicy = !isPersonalCode(targetKb?.code)
+        && folderLevel == null
+        && !(level >= 2 && deptIds.length === 0)
+      const res = await createImportDir({
+        path: rel,
+        ...(copyPolicy
+          ? { level, visible_dept_ids: deptIds, viewer_user_ids: viewerUserIds }
+          : {}),
+      })
+      message.success(res.created ? `已建立文件夹 ${res.rel_path}` : `文件夹已存在：${res.rel_path}`)
+      setFolderName('')
+      await enterDir(cwd)
+      if (folderLevel != null) {
+        message.info('新文件夹没有带上当前文件夹的部门。进入后单独设置，工程部和客服部不会因此互相可见。')
+      } else if (level >= 2 && deptIds.length === 0) {
+        message.info('文件夹已建好。密级 L2/L3 还没选部门，这份权限还没记到文件夹上。')
+      }
+    } catch (err) {
+      message.error(describeImportError(err))
+    } finally {
+      setCreatingFolder(false)
+    }
+  }
 
   useEffect(() => {
     void enterDir('')
@@ -142,10 +204,17 @@ export default function ImportDirs() {
         setKbLevels(levels)
         const list = m.knowledge_bases ?? []
         setKbs(list)
-        const first = list[0]?.kb_id
+        const first = list[0]
         if (first != null) {
-          setKbId(first)
-          setLevel(pickLevel(list[0]?.default_level, levels[first]))
+          setKbId(first.kb_id)
+          const owner = personalOwnerId(first)
+          if (owner) {
+            setLevel(2)
+            setDeptIds([`user:${owner}`])
+            setViewerUserIds([])
+          } else {
+            setLevel(pickLevel(first.default_level, levels[first.kb_id]))
+          }
         }
       })
       .catch((err) => {
@@ -200,7 +269,12 @@ export default function ImportDirs() {
     setRunError(null)
     setRunResp(null)
     try {
-      const res = await runImport({ path: cwd, kb_id: kbId, level, dept_ids: deptIds, recursive, files })
+      const target = kbs.find((k) => k.kb_id === kbId)
+      const viewers = target?.code?.startsWith('personal-') ? [] : viewerUserIds
+      const res = await runImport({
+        path: cwd, kb_id: kbId, level, dept_ids: deptIds, recursive, files,
+        viewer_user_ids: viewers,
+      })
       setRunResp(res)
       message.success(`已登记 ${res.queued} 份待解析文档，进度见「解析任务中心」`)
       // 队列计数只是补充信息（让操作者立刻看到 pending 有没有涨），拿不到就算了
@@ -332,56 +406,90 @@ export default function ImportDirs() {
         <Space size={24} wrap align="start">
           <div>
             <div style={LABEL_STYLE}>目标知识库</div>
-            <Select
+            <TreeSelect
               style={{ width: 280 }}
-              value={kbId}
+              value={kbId == null ? undefined : `kb:${kbId}`}
               loading={metaLoading}
-              placeholder={metaLoading ? '正在加载知识库…' : kbs.length ? '请选择知识库' : '还没有知识库，先去上传页新建'}
-              options={kbs.map((k) => ({
-                value: k.kb_id,
-                label: `${k.name}${k.document_count ? `（${k.document_count} 篇）` : ''}`,
-                title: `code=${k.code}`,
-              }))}
-              onChange={(id: number) => {
+              treeData={buildKbTargetTree(kbs, {}, personalOwnerText)}
+              treeDefaultExpandAll={false}
+              treeNodeFilterProp="title"
+              showSearch
+              styles={{ popup: { root: { maxHeight: 360, overflow: 'auto' } } }}
+              placeholder={metaLoading ? '正在加载知识库…' : kbs.length ? '展开后选择知识库' : '还没有知识库，先去上传页新建'}
+              onChange={(raw) => {
+                const parsed = parseKbTarget(raw == null ? undefined : String(raw))
+                const id = parsed?.kbId
                 setKbId(id)
-                // 换库就把密级初值跟到该库的默认密级（与上传页同一口径）
-                setLevel(pickLevel(kbs.find((k) => k.kb_id === id)?.default_level, kbLevels[id]))
+                const next = kbs.find((item) => item.kb_id === id)
+                const owner = personalOwnerId(next)
+                if (owner) {
+                  setLevel(2)
+                  setDeptIds([`user:${owner}`])
+                  setViewerUserIds([])
+                } else if (id != null) {
+                  setLevel(pickLevel(next?.default_level, kbLevels[id]))
+                  setDeptIds([])
+                  setViewerUserIds([])
+                }
                 setRunResp(null)
               }}
             />
           </div>
 
-          <div>
-            <div style={LABEL_STYLE}>密级</div>
-            <Select
-              style={{ width: 240 }}
-              value={level}
-              onChange={(v: number) => setLevel(v)}
-              options={LEVEL_OPTIONS}
+          {kbs.some((k) => k.kb_id === kbId && isPersonalCode(k.code)) ? (
+            <Alert
+              type="info"
+              showIcon
+              message={`投喂到${personalOwnerText(kbs.find((k) => k.kb_id === kbId) ?? {}) || '这个人'}的私有库`}
+              description="只有本人能检索。不用再选密级、部门和额外可查看的人。"
             />
-          </div>
-
-          <div>
-            <div style={LABEL_STYLE}>可见部门 ID（可留空）</div>
-            <Input
-              style={{ width: 220 }}
-              value={deptText}
-              placeholder="102,103"
-              onChange={(e) => setDeptText(e.target.value)}
+          ) : folderLevel != null ? (
+            <Alert
+              type="success"
+              showIcon
+              message={`当前文件夹已设置权限：L${level}，可见部门 ${deptIds.length} 个，额外可查看 ${viewerUserIds.length} 人`}
+              description="导入这个文件夹时沿用这里的密级、部门和可查看的人，不用再选一遍。"
             />
-          </div>
+          ) : (
+            <>
+              <div>
+                <div style={LABEL_STYLE}>密级</div>
+                <Select
+                  style={{ width: 240 }}
+                  value={level}
+                  onChange={(v: number) => setLevel(v)}
+                  options={LEVEL_OPTIONS}
+                />
+              </div>
 
-          <div>
-            <div style={LABEL_STYLE}>子目录</div>
-            <Space size={8}>
-              <Switch checked={recursive} onChange={setRecursive} />
-              <span>递归包含子目录</span>
-            </Space>
-          </div>
+              <div style={{ minWidth: 280, flex: 1 }}>
+                <div style={LABEL_STYLE}>可见部门（可留空）</div>
+                <DeptPicker value={deptIds} onChange={setDeptIds} />
+              </div>
+
+              <div style={{ minWidth: 320, flex: 1 }}>
+                <div style={LABEL_STYLE}>额外可查看的人（可多选）</div>
+                <ViewerPicker value={viewerUserIds} onChange={setViewerUserIds} />
+              </div>
+            </>
+          )}
+
+          {kbs.some((k) => k.kb_id === kbId && isPersonalCode(k.code)) ? null : (
+            <div>
+              <div style={LABEL_STYLE}>子目录</div>
+              <Space size={8}>
+                <Switch checked={recursive} onChange={setRecursive} />
+                <span>递归包含子目录</span>
+              </Space>
+            </div>
+          )}
         </Space>
         <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0, fontSize: 12 }}>
-          密级 L2/L3 必须填可见部门，L3/L4 还要求服务端已开入库闸；这些条件不满足时，
-          「扫描预览」会把原因列在阻断项里，导入按钮随即禁用（后端也会 409，界面先拦能少一次白跑）。
+          {kbs.some((k) => k.kb_id === kbId && isPersonalCode(k.code))
+            ? '文件记到这个人的私有库，不沿用当前文件夹上的部门。'
+            : folderLevel != null
+              ? '要改这份权限，在上传页选中同一个文件夹后点「修改」。'
+              : '密级 L2/L3 必须选择可见部门。子文件夹不会自动带上上级文件夹的部门。'}
         </Typography.Paragraph>
       </Card>
 
@@ -399,6 +507,20 @@ export default function ImportDirs() {
             </Button>
             <Button size="small" icon={<ReloadOutlined />} loading={dirsLoading} onClick={() => void enterDir(cwd)}>
               刷新
+            </Button>
+            <Input
+              size="small"
+              style={{ width: 180 }}
+              value={folderName}
+              placeholder="新文件夹名"
+              onChange={(e) => setFolderName(e.target.value)}
+              onPressEnter={(e) => {
+                e.preventDefault()
+                void createFolder()
+              }}
+            />
+            <Button size="small" loading={creatingFolder} onClick={() => void createFolder()}>
+              新建文件夹
             </Button>
             <Button
               size="small"
@@ -453,11 +575,16 @@ export default function ImportDirs() {
             },
             {
               title: '操作',
-              width: 100,
+              width: 120,
               render: (_, r) => (
-                <Button type="link" size="small" style={{ padding: 0 }} onClick={() => void enterDir(String(r.rel_path))}>
-                  进入
-                </Button>
+                <Space size={8}>
+                  <Button type="link" size="small" style={{ padding: 0 }} onClick={() => void enterDir(String(r.rel_path))}>
+                    进入
+                  </Button>
+                  <Button type="link" size="small" style={{ padding: 0 }} onClick={() => void removeFolder(String(r.rel_path))}>
+                    删除
+                  </Button>
+                </Space>
               ),
             },
           ]}
@@ -622,7 +749,7 @@ export default function ImportDirs() {
               ) : null}
               <Typography.Paragraph type="secondary" style={{ marginBottom: 8, fontSize: 12 }}>
                 {runResp.hint ??
-                  '解析由 ekbs-worker 异步进行；进度见「解析任务中心」（status: pending → parsing → published）。'}
+                  '解析由 ekbs-worker 异步进行；进度见「解析任务中心」。普通文档：pending → parsing → published；扫描件（路径/标题含「扫描」）：pending → parsing → review（人工复核）→ published。'}
                 {queueCounts
                   ? ` 当前队列：${Object.entries(queueCounts)
                       .map(([k, v]) => `${k} ${v}`)
@@ -631,7 +758,7 @@ export default function ImportDirs() {
                 已导入的内容再扫一次会显示为「重复」，可点「扫描预览」刷新。
               </Typography.Paragraph>
               <Button size="small" type="primary" onClick={() => navigate('/parse/tasks')}>
-                去解析任务中心
+                去清洗解析
               </Button>
             </>
           }

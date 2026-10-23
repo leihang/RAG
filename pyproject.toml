@@ -7,7 +7,7 @@ name = "ekbs"
 version = "0.1.0"
 description = "EKBS 企业知识中枢 —— 部门级 RAG 试点（Python venv + launchd，无 Docker）"
 requires-python = ">=3.11"
-# 依赖版本口径的唯一权威是 requirements.txt（镜像 方案/deploy/requirements.txt），
+# 依赖版本口径的唯一权威是 requirements.txt（镜像 deploy/requirements.txt），
 # 这里不重复声明，避免两处漂移。
 dependencies = []
 

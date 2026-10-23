@@ -11,6 +11,13 @@
  *    指纹由服务端算，前端 store 里的那份只用于展示与排错。
  */
 import axios, { AxiosError, type AxiosInstance, type InternalAxiosRequestConfig } from 'axios'
+
+declare module 'axios' {
+  interface AxiosRequestConfig {
+    /** 调用方自己展示错误时关掉全局 toast。例如新库还没有目录，404 是空列表而不是失败。 */
+    skipErrorToast?: boolean
+  }
+}
 import { message } from 'antd'
 import { useAuthStore } from '@/stores/authStore'
 import { errorTextOf } from '@/utils/errorCode'
@@ -114,7 +121,10 @@ http.interceptors.response.use(
       useAuthStore.getState().clear()
     }
     // 403 不做全局 toast：页面内已有 /403 与按钮级提示，避免重复打扰
-    if (status !== 403 && status !== 401) message.error(text)
+    // 423 同理：只可能来自本机登录的「账号已锁定」，登录表单内联展示原因
+    if (!error.config?.skipErrorToast && status !== 403 && status !== 401 && status !== 423) {
+      message.error(text)
+    }
 
     return Promise.reject(new ApiError(text, { status, code, traceId: body?.trace_id }))
   },

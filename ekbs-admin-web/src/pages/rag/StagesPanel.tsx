@@ -121,7 +121,29 @@ function ShardHits({ shard, expanded }: { shard: DensePerShard; expanded: boolea
   )
 }
 
-function SparseCard({ sparse }: { sparse: NonNullable<DebugStages['sparse']> }) {
+function ChunkLink({
+  value,
+  onOpen,
+}: {
+  value: number | null
+  onOpen?: (chunkId: number) => void
+}) {
+  if (value == null) return <>-</>
+  if (!onOpen) return <>{String(value)}</>
+  return (
+    <Typography.Link onClick={() => onOpen(value)} className="ekbs-mono">
+      {value}
+    </Typography.Link>
+  )
+}
+
+function SparseCard({
+  sparse,
+  onOpenChunk,
+}: {
+  sparse: NonNullable<DebugStages['sparse']>
+  onOpenChunk?: (chunkId: number) => void
+}) {
   const [expanded, setExpanded] = useState(false)
   const columns: ColumnsType<NonNullable<DebugStages['sparse']>['hits'][number]> = [
     { title: '#', width: 48, render: (_v, _row, index) => index + 1 },
@@ -129,7 +151,7 @@ function SparseCard({ sparse }: { sparse: NonNullable<DebugStages['sparse']> }) 
       title: 'chunk_id',
       dataIndex: 'chunk_id',
       width: 120,
-      render: (value: number | null) => (value == null ? '-' : String(value)),
+      render: (value: number | null) => <ChunkLink value={value} onOpen={onOpenChunk} />,
     },
     {
       title: 'BM25 分数',
@@ -167,7 +189,13 @@ function SparseCard({ sparse }: { sparse: NonNullable<DebugStages['sparse']> }) 
   )
 }
 
-function RrfCard({ rrf }: { rrf: NonNullable<DebugStages['rrf']> }) {
+function RrfCard({
+  rrf,
+  onOpenChunk,
+}: {
+  rrf: NonNullable<DebugStages['rrf']>
+  onOpenChunk?: (chunkId: number) => void
+}) {
   const [expanded, setExpanded] = useState(false)
   const columns: ColumnsType<NonNullable<DebugStages['rrf']>['fused'][number]> = [
     { title: '排名', width: 64, render: (_v, _row, index) => index + 1 },
@@ -175,7 +203,7 @@ function RrfCard({ rrf }: { rrf: NonNullable<DebugStages['rrf']> }) {
       title: 'chunk_id',
       dataIndex: 'chunk_id',
       width: 120,
-      render: (value: number | null) => (value == null ? '-' : String(value)),
+      render: (value: number | null) => <ChunkLink value={value} onOpen={onOpenChunk} />,
     },
     {
       title: '融合分',
@@ -207,7 +235,13 @@ function RrfCard({ rrf }: { rrf: NonNullable<DebugStages['rrf']> }) {
   )
 }
 
-function RerankCard({ rerank }: { rerank: NonNullable<DebugStages['rerank']> }) {
+function RerankCard({
+  rerank,
+  onOpenChunk,
+}: {
+  rerank: NonNullable<DebugStages['rerank']>
+  onOpenChunk?: (chunkId: number) => void
+}) {
   const [expanded, setExpanded] = useState(false)
   const { minScore, keep } = rerank
   const columns: ColumnsType<NonNullable<DebugStages['rerank']>['scores'][number] & { decision: string }> = [
@@ -216,7 +250,7 @@ function RerankCard({ rerank }: { rerank: NonNullable<DebugStages['rerank']> }) 
       title: 'chunk_id',
       dataIndex: 'chunk_id',
       width: 120,
-      render: (value: number | null) => (value == null ? '-' : String(value)),
+      render: (value: number | null) => <ChunkLink value={value} onOpen={onOpenChunk} />,
     },
     {
       title: 'rerank 分数',
@@ -272,7 +306,26 @@ function RerankCard({ rerank }: { rerank: NonNullable<DebugStages['rerank']> }) 
   )
 }
 
-function C5Card({ c5 }: { c5: NonNullable<DebugStages['c5']> }) {
+function C5Card({
+  c5,
+  onOpenChunk,
+}: {
+  c5: NonNullable<DebugStages['c5']>
+  onOpenChunk?: (chunkId: number) => void
+}) {
+  const renderIds = (ids: number[]) => {
+    if (!ids.length) return '—'
+    if (!onOpenChunk) return ids.join(', ')
+    return (
+      <Space size={[4, 4]} wrap>
+        {ids.map((id) => (
+          <Typography.Link key={id} onClick={() => onOpenChunk(id)} className="ekbs-mono">
+            {id}
+          </Typography.Link>
+        ))}
+      </Space>
+    )
+  }
   return (
     <Card
       size="small"
@@ -292,12 +345,12 @@ function C5Card({ c5 }: { c5: NonNullable<DebugStages['c5']> }) {
       <Row gutter={[16, 8]}>
         <Col xs={24} md={12}>
           <Typography.Text type="secondary">kept（进入上下文）</Typography.Text>
-          <div className="ekbs-mono">{c5.kept.length ? c5.kept.join(', ') : '—'}</div>
+          <div className="ekbs-mono">{renderIds(c5.kept)}</div>
         </Col>
         <Col xs={24} md={12}>
           <Typography.Text type="secondary">dropped（被 C5 拦截）</Typography.Text>
           <div className="ekbs-mono" style={{ color: c5.dropped.length ? '#ff4d4f' : undefined }}>
-            {c5.dropped.length ? c5.dropped.join(', ') : '—'}
+            {renderIds(c5.dropped)}
           </div>
         </Col>
       </Row>
@@ -305,7 +358,13 @@ function C5Card({ c5 }: { c5: NonNullable<DebugStages['c5']> }) {
   )
 }
 
-export default function StagesPanel({ stages }: { stages: DebugStages }) {
+export default function StagesPanel({
+  stages,
+  onOpenChunk,
+}: {
+  stages: DebugStages
+  onOpenChunk?: (chunkId: number) => void
+}) {
   const keys = stageSectionKeys(stages)
   if (keys.length === 0) {
     return (
@@ -321,12 +380,13 @@ export default function StagesPanel({ stages }: { stages: DebugStages }) {
     <Space direction="vertical" size={12} style={{ width: '100%' }}>
       {stages.params ? <ParamsCard params={stages.params} /> : null}
       {stages.dense ? <DenseCard dense={stages.dense} /> : null}
-      {stages.sparse ? <SparseCard sparse={stages.sparse} /> : null}
-      {stages.rrf ? <RrfCard rrf={stages.rrf} /> : null}
-      {stages.rerank ? <RerankCard rerank={stages.rerank} /> : null}
-      {stages.c5 ? <C5Card c5={stages.c5} /> : null}
+      {stages.sparse ? <SparseCard sparse={stages.sparse} onOpenChunk={onOpenChunk} /> : null}
+      {stages.rrf ? <RrfCard rrf={stages.rrf} onOpenChunk={onOpenChunk} /> : null}
+      {stages.rerank ? <RerankCard rerank={stages.rerank} onOpenChunk={onOpenChunk} /> : null}
+      {stages.c5 ? <C5Card c5={stages.c5} onOpenChunk={onOpenChunk} /> : null}
       <Typography.Text type="secondary" style={{ fontSize: 12 }}>
         共 {keys.length} 段明细（{keys.join(' / ')}）；未出现的段落代表后端本次没有写入，不是 0。
+        {onOpenChunk ? ' 点击 chunk_id 可查看块内容。' : ''}
       </Typography.Text>
       {formatNumber(keys.length) ? null : null}
     </Space>

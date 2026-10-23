@@ -29,6 +29,29 @@ vi.mock('@/api/import', () => ({
   scanImportDir: api.scanImportDir,
   runImport: api.runImport,
   getImportQueue: api.getImportQueue,
+  createImportDir: vi.fn(),
+  listDeptOptions: vi.fn(),
+}))
+
+vi.mock('@/components/ViewerPicker', () => ({
+  default: () => null,
+}))
+
+vi.mock('@/components/DeptPicker', () => ({
+  default: ({
+    value,
+    onChange,
+  }: {
+    value?: string[]
+    onChange?: (ids: string[]) => void
+  }) => (
+    <input
+      aria-label="可见部门"
+      placeholder="102,103"
+      value={(value ?? []).join(',')}
+      onChange={(e) => onChange?.(e.target.value.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean))}
+    />
+  ),
 }))
 
 // 页面用 `/kb/knowledge-bases` 补「该库默认密级」（`/import/meta` 的 knowledge_bases 不含它）
@@ -164,6 +187,7 @@ describe('目录导入页', () => {
       dept_ids: ['102'],
       recursive: true,
       files: ['policy/a.pdf'],
+      viewer_user_ids: [],
     })
     // 结果面板与 toast 都会说这句话，取第一个即可
     expect((await screen.findAllByText(/已登记 1 份待解析文档/)).length).toBeGreaterThan(0)

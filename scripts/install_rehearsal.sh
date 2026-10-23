@@ -157,7 +157,7 @@ done
 DB="$RL_DATA/index/ekbs.db"
 if [ -f "$DB" ]; then
   tables="$(sqlite3 "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view') AND name LIKE 'ekbs%' AND name NOT LIKE 'ekbs_chunk_fts_%';")"
-  [ "$tables" = "29" ] && p "库内 ekbs 实体表 29 张（01 §5）" || f "库内实体表 $tables 张，应为 29"
+  [ "$tables" = "32" ] && p "库内 ekbs 实体表 32 张（01 §5）" || f "库内实体表 $tables 张，应为 32"
   mode="$(sqlite3 "$DB" 'PRAGMA journal_mode;')"
   [ "$mode" = "wal" ] && p "journal_mode=WAL" || f "journal_mode=${mode}（应为 wal）"
   integ="$(sqlite3 "$DB" 'PRAGMA integrity_check;')"

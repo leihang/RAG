@@ -101,6 +101,12 @@ def resolve_shard_for_document(
             "如需入库须走独立分片 + 白名单）"
         )
     depts = [str(d) for d in visible_dept_ids if str(d).strip()]
+    from ekbs.personal import sole_personal_owner
+
+    owner = sole_personal_owner(depts)
+    if owner is not None:
+        # 私有库不进部门分片。p<用户ID> 只靠 shard ACL 授给本人。
+        return ShardPlacement(primary_shard_id=make_shard_id(f"p{owner}", level))
     if not depts:
         if level == 1:
             return ShardPlacement(primary_shard_id=make_shard_id(PUBLIC_DEPT_CODE, 1))

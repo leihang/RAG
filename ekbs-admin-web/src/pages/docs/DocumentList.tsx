@@ -15,6 +15,7 @@ import ImpactConfirmModal from './ImpactConfirmModal'
 import { normalizeBatchResult } from './docUtils'
 import { batchDocuments, listDocuments, offlineDocument, publishDocument, type DocListQuery } from '@/api/doc'
 import type { DocumentItem } from '@/api/types'
+import { personalOwnerText } from '@/utils/personalKb'
 import { formatTime } from '@/utils/format'
 
 const BATCH_LIMIT = 500
@@ -66,18 +67,24 @@ export default function DocumentList() {
       valueEnum: { 1: { text: 'L1' }, 2: { text: 'L2' }, 3: { text: 'L3' }, 4: { text: 'L4' } },
       render: (_, row) => <ClearanceTag level={row.level} /> },
     { title: '状态', dataIndex: 'status', width: 110, valueType: 'select',
-      valueEnum: { pending: { text: '待解析' }, parsing: { text: '解析中' }, published: { text: '已发布' }, failed: { text: '失败' }, offline: { text: '已下线' } },
+      valueEnum: { pending: { text: '待解析' }, parsing: { text: '解析中' }, review: { text: '待复核' }, published: { text: '已发布' }, failed: { text: '失败' }, offline: { text: '已下线' } },
       render: (_, row) => <StatusTag status={row.status} /> },
     { title: '页数', dataIndex: 'page_count', width: 80, search: false, render: (_, r) => (r.page_count == null ? '-' : String(r.page_count)) },
     { title: '分块', dataIndex: 'chunk_count', width: 80, search: false,
       render: (_, row) => <Link to={`/chunks/${row.doc_id}`}>{row.chunk_count ?? 0}</Link> },
     { title: '版本', dataIndex: 'doc_version', width: 70, search: false },
-    { title: '知识库', dataIndex: 'kb_code', width: 100, search: false },
+    { title: '知识库', dataIndex: 'kb_code', width: 280, search: false, ellipsis: true,
+      render: (_, row) => personalOwnerText(row) || row.kb_name || row.kb_code || '—' },
     { title: '更新时间', dataIndex: 'updated_at', width: 170, search: false, render: (_, r) => formatTime(r.updated_at) },
-    { title: '操作', valueType: 'option', width: 200, fixed: 'right', render: (_, row) => [
-      <Auth key="pub" code="doc:document:publish">{row.status === 'published' ? null : <a onClick={() => void single(row.doc_id, 'publish')}>发布</a>}</Auth>,
+    { title: '操作', valueType: 'option', width: 260, fixed: 'right', render: (_, row) => [
+      row.status === 'review' ? (
+        <a key="draft" onClick={() => navigate(`/parse/review/${row.doc_id}`)}>查看清洗稿</a>
+      ) : row.status === 'published' ? (
+        <a key="compare" onClick={() => navigate(`/parse/review/${row.doc_id}`)}>原件对照</a>
+      ) : null,
+      <Auth key="pub" code="doc:document:publish">{row.status === 'published' || row.status === 'review' ? null : <a onClick={() => void single(row.doc_id, 'publish')}>发布</a>}</Auth>,
       <Auth key="off" code="doc:document:offline">{row.status === 'offline' ? null : <a onClick={() => void single(row.doc_id, 'offline')}>下线</a>}</Auth>,
-      <a key="tree" onClick={() => navigate(`/chunks/${row.doc_id}`)}>分块</a>,
+      row.status === 'review' ? null : <a key="tree" onClick={() => navigate(`/chunks/${row.doc_id}`)}>分块</a>,
       <a key="detail" onClick={() => navigate(`/docs/${row.doc_id}`)}>详情</a>,
       // 删除进回收站（§5.5 L-C）：原件保留 30 天，永久清除在回收站页
       <Auth key="del" code="doc:document:delete">
@@ -101,7 +108,7 @@ export default function DocumentList() {
         rowKey="doc_id"
         actionRef={actionRef}
         columns={columns}
-        scroll={{ x: 1180 }}
+        scroll={{ x: 1240 }}
         options={{ density: true, fullScreen: true, setting: true, reload: true }}
         pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100] }}
         toolBarRender={() => [

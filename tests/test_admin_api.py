@@ -191,13 +191,26 @@ async def test_qa_session_log_exposes_audit_without_snippet_text(client, seeded)
 
 async def test_system_health_and_shards_expose_gates(client, seeded) -> None:
     runtime, _ = seeded
+    # 显式设定三个闸门并断言接口如实透出 —— 不依赖配置文件默认值
+    # （2026-10-09 测试期配置已全开；配置无关的断言才不会被配置变更打破）
+    runtime.settings.permission.corpus_egress_ack = False
+    runtime.settings.permission.l3_ingest_enabled = False
+    runtime.settings.permission.l4_enabled = False
     admin_id = grant_role(runtime, "demo_carol", "kb_admin")
     headers = headers_for(admin_id)
     health = (await client.get("/api/v1/system/health", headers=headers)).json()
-    assert health["schema"]["ok"] is True and health["schema"]["tables"] == 29
+    assert health["schema"]["ok"] is True and health["schema"]["tables"] == 32
     assert health["embedding"]["fingerprint_match"] is True
     assert health["gates"] == {
         "corpus_egress_ack": False, "l3_ingest_enabled": False, "l4_enabled": False,
+    }
+    # 打开后同样如实透出（闸门是配置驱动，不是硬编码）
+    runtime.settings.permission.corpus_egress_ack = True
+    runtime.settings.permission.l3_ingest_enabled = True
+    runtime.settings.permission.l4_enabled = True
+    health_open = (await client.get("/api/v1/system/health", headers=headers)).json()
+    assert health_open["gates"] == {
+        "corpus_egress_ack": True, "l3_ingest_enabled": True, "l4_enabled": True,
     }
     shards = (await client.get("/api/v1/system/shards", headers=headers)).json()
     assert shards["count"] == 3

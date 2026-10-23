@@ -1,9 +1,9 @@
 # EKBS 应用仓库（开发机骨架）
 
 > **当前状态：一期骨架可运行 + 云端代码路径已就绪**
-> 入库 → 分片 → 混合检索 → RRF → 精排 → C5 闸门 → 生成 → 引用校验 整条链已跑通；
+> 入库 → 分片 → 混合检索 → alpha 融合 → 精排 → C5 闸门 → 生成 → 引用校验 整条链已跑通；
 > 离线（mock 模型）与**云端代码路径**（respx 按真实契约模拟百炼三端点）都有端到端用例；
-> `402` 个 pytest 用例全绿。**云端三模型已选定并用真实 key 跑通全链路**（`qwen3.7-text-embedding-flash@1024` + `qwen3.7-text-rerank` + `qwen-max`），见 §三。
+> `983` 个 pytest 用例全绿（981 passed / 2 skipped）。**云端三模型已选定并用真实 key 跑通全链路**（`qwen3.7-text-embedding-flash@1024` + `qwen3.7-text-rerank` + `qwen-max`），见 §三。
 >
 > 权威设计文档在 [`方案/`](方案/)（8 份）。本文件只讲**代码怎么跑、已做到哪、还差什么**；
 > 与 `方案/` 冲突时以 `方案/` 为准，并请把本文件与代码一起改掉。
@@ -47,7 +47,7 @@ curl -s -X POST localhost:8000/api/v1/qa/chat -H 'Content-Type: application/json
 跑测试：
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 402 passed；不出网、不花钱
+.venv/bin/python -m pytest tests/ -q          # 983 collected（981 passed, 2 skipped）；不出网、不花钱
 ```
 
 跑**开发机冒烟**（与 `deploy/scripts/smoke.sh` 同口径，但适配开发布局）：
@@ -167,7 +167,7 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
 | 引用后置校验：编号存在 + ACL 二次确认 + 页码区间 + figure 字段 | `tests/test_retrieval.py` |
 | 缓存按指纹分区（答案/检索键必含指纹） | `tests/test_retrieval.py` |
 | 健康端点四个 + 无凭证 401 + `/v1` 别名 | `tests/test_api.py` + 真实服务 curl |
-| 入库编排：四层分块、分片归属、批量嵌入、FTS 写入、多部门 shard ACL 授权 | `seed_demo` + `worker --once` |
+| 入库编排：四层分块、分片归属、批量嵌入、FTS 写入、多部门 shard ACL 授权 | `seed_demo` 后等常驻 worker 轮询至 `published`（**勿**与常驻并存再跑 `worker --once`，会双开 MinerU 耗尽内存；抢不到 `data_dir/worker.lock` 会 exit(1)。强制联调：先 `bash scripts/dev_services.sh stop worker` 再 `--once`，跑完再启） |
 | 定时作业 9 项（缓存清理/指标/对账/会话清理…） | `scheduler --once`，三方对账 `diff_ratio=0.0` |
 | 图片回源 ACL 复检 + 路径穿越防护 | `tests/test_api.py` |
 | **百炼云端 provider**：嵌入（兼容模式、≤10 条、按 index 还原、维度断言）、重排（原生 HTTP）、生成（fallback + SSE） | `tests/test_dashscope_provider.py`（17 用例，respx 离线） |
@@ -362,6 +362,7 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
 | 90 | **改写要分两类、"变体"要分两侧；稠密侧原来只有单查询**。① 现状核实（代码）：`rewrite.rewritten`（上下文消解后的自包含查询）**稠密与稀疏都用**，但 MultiQuery 变体**只喂了稀疏**（`variants` 只传 `_sparse_recall_scored`），稠密永远只有 1 路。② 两侧需要的变体**不是同一种东西**：BM25 要词面变体（`_keyword_focus`／去语气词），稠密要**语义变体** —— 把关键词碎片喂嵌入会把语义拉偏（此前实测过）。③ 顺带发现一个真 bug：`expand_variants` 内部又按**进程级配置**截断一次，于是检索调试台的 `RetrievalOverrides` **被静默吞掉**（台面调 3、实际出 1） | 稠密召回无法从"换个说法"中受益；调试台调参不生效 → 排查时表现为"改了没用"，极易误判为"这个开关没用" | ① `RewriteResult` 扩展：`intent`（factual/numeric/figure/procedure，**保守**启发式）+ `sparse_variants` + `dense_variants`，旧字段 `variants` 保留并与之同步；② 新增 `QueryRewriter.expand_dense_variants()`（只做自然语言改写：主查询/原始措辞/去口语外壳/补问句）；③ 新增 `retrieval.dense_multi_query`（1=关，默认 1）：每个语义变体各嵌一次、各召回一路，**再用 RRF 融合——不平均向量**（变体越多平均向量越糊）；④ 显式 `limit` 优先于进程配置（修掉 override 被吞）；⑤ 缓存版本加入 `dense_multi_query`（漏了会让旧答案继续被服务、A/B 被污染）；⑥ 16 条用例钉住；⑦ A/B 工具 `var/reports/dense_multi_query_ab.py`（**完整链路**：嵌入→召回→融合→精排）：当前 10 题题集**饱和**（两种设置都 Hit@1 100% / MRR 1.0）⇒ **区分不出**，成本实测**每问多 8~11 token**（查询嵌入，命中 24h 缓存则不花钱）；本机开（cloud=3）、生产模板关（deploy=1），等 16 篇语料回来再判 |
 | 91 | **`.html` 没有解析分支 + MinerU 偶发失败被错误信息掩盖（我为此误判两次）**。① `.html` 在白名单里却没有解析器 → 落到 `text` 引擎，**整行标签原样入库**（实测 `content` 就是 `<html><body><h1>交接班制度</h1>…`）。② PDF 解析失败时报的是 `MinerU 未产出可识别的结果（既无 content_list.json 也无 .md）`，真实原因（`PermissionError: … '/Users/…/.cache/modelscope'`、模型缺失、内存不足）**全被吞掉**；我据此先后误判为「mineru 没装」「模型不在」，实际 **MinerU 在 `var/mineru-venv`（2.0 G）、模型在 `var/mineru-models/models/PDF-Extract-Kit-1.0`（1.9 G，9-29 就在）**，代码本来就会自动发现并指向工作区缓存（`_mineru_env()`） | ①html 标签污染检索词项、白占 token；②PDF 的偶发失败（同批 16 份里出现过 2 次，重跑即好）**一次抖动就判整篇入库失败**，且报错信息把人引向错误方向（本次浪费了两次排查） | ① 新增 `_parse_html`（标准库 `HTMLParser`，零新依赖）：保留标题层级/列表/表格，`<head>` 整段丢弃，实体解码并把 NBSP 归一化成普通空格，表格进独立通道；`.html/.htm` 一起注册（能力清单 63→65、上传口径 11→12，四处钉死的用例同步）；② MinerU 加**重试**（`EKBS_MINERU_ATTEMPTS`，默认 2）并新增 `_subprocess_tail()`：**每次失败都把子进程输出尾部带进异常**，消息里还附「已尝试 N 次 / 模型缓存路径」；③ 修回被我误删的「只有 markdown 时回落」守卫；④ 新增 7 条用例（html 结构与表格、NBSP、`<head>` 丢弃、重试一次成功、失败信息含真实原因、退出码失败保留 stderr）；⑤ 清理我多复制的一层模型目录（`var/mineru-models/modelscope`），`var/mineru-models/models/` 为唯一权威位置 |
 | 92 | **本地计数口径改用官方 SDK 自带词表，并把「计数口径」纳入校准绑定**。起因：被问"为什么不用 token-meter" —— 查证后它不是计数口径库（PyPI `smalldreamcollective-tokenmeter` 是**花销记账/预算**库：核心零依赖，"准确计数"要装 `[openai]`=**tiktoken**，支持模型只有 Anthropic/OpenAI，**要求 Python ≥3.12** 而本机是 3.11；用它等于退回实测偏差 −35% 的同源错配）。**顺带发现**：官方 `dashscope` SDK **随包自带** `resources/qwen.tiktoken`（2.5 MB，离线、零下载、与 SDK 同版本），`get_tokenizer()` 即可用 | ① 我们的计数口径本身没问题，但依赖一个部署物（`var/models/qwen-tokenizer.json`，11 MB）+ 一个依赖（`tokenizers`）+ 一次下载步骤，属于不必要的活动部件；② 更严重的是**校准只绑了嵌入指纹、没绑计数口径** —— 换词表（SDK/HF/tiktoken 回退）会改变 `local_tokens`，而旧系数会被**静默沿用**（不同口径实测差 1.69 倍），校准名不副实 | ① `count_tokens` 首选改为官方 SDK 自带词表（`EKBS_TOKENIZER_PATH` 仍是最高优先级；SDK 缺失时退 HF json → tiktoken 告警 → CJK 启发式），口径标识形如 `qwen:sdk:<path>`/`qwen:file:<path>`/`qwen:env:<path>`；② 实测两词表**计数逐条相同**（语料/英文/代码/表格/编号/emoji 共 7 组样本，462=462）而 `cl100k` 高 69% → 换口径无精度风险；③ `token_calib` 的 `record/summarize/load/calibrated_tokens` 全部增加 `counter`，**无口径字段的旧记录/旧系数在要求口径时一律失效**（与 `summarize` 同规则，宁严勿混），三处调用点（入库记录 / `/health/deps` / 校准工具）同步；④ 工具在"记录被排除"时打印可执行提示（"入库 ≥3 篇后重跑本工具即可重建系数"）；⑤ `requirements.txt` 与 `ekbs/tools/fetch_tokenizer` 标注为**可选路径**（想固定到 HF 词表时才用）；⑥ 新增 5 条用例（官方词表为默认 / env 仍最高优先 / 两词表一致 / 口径不符使校准失效 / 旧记录兼容语义）。**影响**：`/health/deps.token_calibration` 现为 `None` —— 这是**正确失效**（4 条旧记录既非当前嵌入变体、也无口径字段），入库 ≥3 篇后重跑工具即可恢复 |
+| 93 | **待办：制度与数字的评估集还没建**（2026-10-22）。代码侧已收紧三处：条款不再按长度并进同一块；回答里的「第X条/章/节」必须出现在所引用块的标题路径里，对不上就拒答；取数禁止把「万/千/亿」换算成基本单位，展示原文那一串。库里当时已发布只有 3 份（115 新世纪表处理时间节点、117 2026年8月工作汇报、118 危险作业禁止行为），而且仍是旧切分；`docs/eval/golden_corpus16*.json` 对不上这批文件 | 没有对得上的题集，就不能给条款引用和数字原样卡门禁。拿旧的 16 份金标跑出来的 Hit@5 不能代表现在的库 | **待办，先不跑、不卡 0.92**。① 这 3 份按新规则重新解析后再抽题；② 三类各约 20 题：能答的、跨相邻条款的、原文里没有答案的；③ 检索仍用「标题 + 原文片段」看前 5 条，及格线维持现有的 0.8；④ 「条号对得上标题路径」和「数字与原文逐字一致」只记通过/不通过，不用模型打分 |
 
 另有 9 条（路径/事件名/字段口径不实：`contact/v3/departments/lists` 未核实到、
 事件名应为 `org_dept_create/modify/remove`、`isInAtList==false` 也能收群消息无依据、

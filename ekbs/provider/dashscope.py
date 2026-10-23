@@ -77,6 +77,23 @@ def _auth_headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
+def _message_text(content: Any) -> str:
+    """视觉模型有时把 content 分成多段（文本块列表），不能直接 str() 成 Python 列表。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(str(item.get("text") or ""))
+        return "".join(parts)
+    return str(content)
+
+
 class DashScopeEmbeddingProvider(EmbeddingProvider):
     def __init__(
         self,
@@ -451,7 +468,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         choices = payload.get("choices") or []
         text = ""
         if choices:
-            text = str((choices[0].get("message") or {}).get("content") or "")
+            text = _message_text((choices[0].get("message") or {}).get("content"))
         usage = payload.get("usage") or {}
         return LLMResult(
             text=text,

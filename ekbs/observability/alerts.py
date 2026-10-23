@@ -147,6 +147,17 @@ ALERT_RULES: tuple[AlertRule, ...] = (
         m.PERM_REVOKE_LAG, "gauge", 300, 60, "P1",
         "权限回收滞后 > 300s（安全）",
     ),
+    # ---- 质量哨兵（00 v4.0 D21）：窗口 25h，覆盖每日一次的产生节奏 ----
+    AlertRule(
+        m.QUALITY_DEGRADED, "gauge", 1, 90000, "P1",
+        "质量哨兵劣化：支撑率相对 7 日基线降 >0.03 或拒答率 >15%",
+        comparison=">=",
+    ),
+    AlertRule(
+        m.QUALITY_REFUSAL_RATE, "gauge", 0.15, 90000, "P2",
+        "质量哨兵：拒答率 >15%（知识覆盖度预警）",
+        comparison=">",
+    ),
 )
 
 

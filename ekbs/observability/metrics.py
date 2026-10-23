@@ -131,3 +131,9 @@ PERM_REVOKE_LAG: Final = "ekbs_dingtalk_perm_revoke_lag_seconds"
 QA_TOTAL: Final = "ekbs_qa_total"
 RETRIEVAL_LATENCY: Final = "ekbs_retrieval_latency_seconds"
 C5_DENIED: Final = "ekbs_c5_denied_total"
+
+#: 质量哨兵（00 v4.0 D21）：每日抽样评测产物 —— 由 observability/sentinel.py 直写
+QUALITY_SUPPORT_RATE: Final = "ekbs_quality_support_rate"
+QUALITY_REFUSAL_RATE: Final = "ekbs_quality_refusal_rate"
+QUALITY_DEGRADED: Final = "ekbs_quality_degraded"
+QUALITY_SENTINEL_SAMPLES: Final = "ekbs_quality_sentinel_samples"

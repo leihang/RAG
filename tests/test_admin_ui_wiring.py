@@ -56,6 +56,8 @@ def test_playground_normalizes_stages_before_rendering() -> None:
     """`StagesPanel` 只接受归一化后的 `DebugStages`；接线必须过 `parseStages`。"""
     source = (WEB_SRC / "pages" / "rag" / "Playground.tsx").read_text(encoding="utf-8")
     assert "parseStages" in source, "Playground 没有引入 parseStages"
+    assert "fetchDiscoveryCatalog" in source, "D22：Playground 应接入发现层 catalog"
+    assert "ekbs-discovery-chips" in source, "D22：Playground 应有空态 chips 容器"
     assert "stages={parseStages(" in source.replace(" ", ""), (
         "StagesPanel 拿到的不是归一化结果 —— 面板读 perShard，后端给 per_shard，"
         "直接传原始报文会在 dense.perShard.reduce 抛 TypeError"
@@ -72,3 +74,53 @@ def test_stages_panel_has_no_other_callers() -> None:
     assert callers == {"ekbs-admin-web/src/pages/rag/Playground.tsx"}, (
         f"StagesPanel 的调用方变了：{sorted(callers)}；新调用方同样必须传 parseStages(...)"
     )
+
+
+# ---------------------------------------------------------------------------
+# 钉钉免登接线（04 §3.4）：登录页必须真的走 authCode → /auth/dingtalk-login
+# ---------------------------------------------------------------------------
+
+
+def test_login_page_does_not_auto_dingtalk_sso() -> None:
+    """管理台登录页不走钉钉免登。钉钉同事不能从这里进入。"""
+    source = (WEB_SRC / "pages" / "login" / "index.tsx").read_text(encoding="utf-8")
+    assert "requestAuthCode(" not in source
+    assert "loginWithDingTalk(" not in source
+    assert "钉钉同事不能" in source
+
+
+def test_auth_api_posts_authcode_to_backend() -> None:
+    """authCode 必须交给**服务端**换身份：前端不得自己拼身份或信任本地声明。"""
+    source = (WEB_SRC / "api" / "auth.ts").read_text(encoding="utf-8")
+    assert "'/auth/dingtalk-login'" in source or '"/auth/dingtalk-login"' in source
+    assert "auth_code" in source, "请求体字段名必须是 auth_code（后端契约）"
+
+
+def test_no_corp_id_hardcoded_in_frontend() -> None:
+    """corpId 等服务端配置不得硬编码进前端产物（换企业/换应用不该要求重新构建）。"""
+    offenders = []
+    for path in _frontend_sources():
+        text = path.read_text(encoding="utf-8")
+        if "ding" in text.lower() and "corpId:" in text and "corpId: string" not in text:
+            offenders.append(path.relative_to(REPO_ROOT).as_posix())
+    assert not offenders, f"疑似硬编码 corpId：{offenders}"
+
+
+def test_login_page_wires_local_password_login() -> None:
+    """管理台第二种登录方式：本机账号密码（仅服务器本机可用）。
+
+    必须真的有表单 + 真的调后端；失败原因（密码错/被锁/仅限本机）要显示出来。
+    """
+    source = (WEB_SRC / "pages" / "login" / "index.tsx").read_text(encoding="utf-8")
+    assert "loginWithPassword(" in source, "登录页没有接本机账号登录"
+    assert "Input.Password" in source, "登录页缺少口令输入框"
+    assert "localError" in source, "本机登录失败必须把原因显示出来"
+    assert "管理台账号" in source, "登录页要说明账号在管理台账号里新建"
+    assert "新建用户" in source, "缺少「没有账号时去管理台账号新建」的说明"
+
+
+def test_local_login_api_targets_backend_endpoint() -> None:
+    source = (WEB_SRC / "api" / "auth.ts").read_text(encoding="utf-8")
+    assert "'/auth/local-login'" in source or '"/auth/local-login"' in source
+    hook = (WEB_SRC / "hooks" / "useAuth.ts").read_text(encoding="utf-8")
+    assert "loginWithPassword" in hook, "useAuth 未暴露本机登录"

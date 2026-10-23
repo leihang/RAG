@@ -9,9 +9,10 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Button, Card, Descriptions, Empty, Input, List, Space, Spin, Tag, Tooltip, Typography, message } from 'antd'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import Auth from '@/components/Auth'
 import ClearanceTag from '@/components/ClearanceTag'
+import FigureThumb from '@/components/FigureThumb'
 import StatusTag from '@/components/StatusTag'
 import ImpactConfirmModal from '@/pages/docs/ImpactConfirmModal'
 import { getChunkTree, mergeChunk, reembedChunk, splitChunk, updateChunk } from '@/api/parse'
@@ -26,14 +27,31 @@ function isLeafParent(node: ChunkTreeNode | null | undefined): boolean {
 }
 
 function typeLabel(node: ChunkNode, leafParent: boolean): string {
+  if (node.chunk_type === 'figure') return '图片'
+  if (node.chunk_type === 'table') return '表格'
   if (leafParent) return '叶子块（短节）'
   return TYPE_TEXT[node.chunk_type] ?? node.chunk_type
+}
+
+function MmBadge({ node }: { node: ChunkNode }) {
+  if (node.chunk_type !== 'figure') return null
+  return node.figure_mm_indexed ? (
+    <Tooltip title="已写入 figures.faiss，可走多模态召回">
+      <Tag color="purple">多模态已索引</Tag>
+    </Tooltip>
+  ) : (
+    <Tooltip title="图片块尚未写入多模态旁路索引（可重解析或检查 multimodal 配置）">
+      <Tag color="orange">多模态未索引</Tag>
+    </Tooltip>
+  )
 }
 
 export default function ChunkExplorer() {
   const { docId } = useParams<{ docId: string }>()
   const id = Number(docId)
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const focusChunkId = Number(searchParams.get('chunk') || '')
   const [tree, setTree] = useState<ChunkTree | null>(null)
   const [loading, setLoading] = useState(true)
   const [activeParentId, setActiveParentId] = useState<number | null>(null)
@@ -48,13 +66,35 @@ export default function ChunkExplorer() {
     try {
       const data = await getChunkTree(id)
       setTree(data)
+      const focus = Number.isFinite(focusChunkId) && focusChunkId > 0 ? focusChunkId : null
+      if (focus != null) {
+        for (const parent of data.tree ?? []) {
+          if (parent.chunk_id === focus) {
+            setActiveParentId(parent.chunk_id)
+            setActiveChunk(parent)
+            return
+          }
+          const child = (parent.children ?? []).find((c) => c.chunk_id === focus)
+          if (child) {
+            setActiveParentId(parent.chunk_id)
+            setActiveChunk(child)
+            return
+          }
+        }
+        const orphan = (data.orphan_children ?? []).find((c) => c.chunk_id === focus)
+        if (orphan) {
+          setActiveParentId(null)
+          setActiveChunk(orphan)
+          return
+        }
+      }
       const first = data.tree?.[0]
       setActiveParentId(first?.chunk_id ?? null)
       setActiveChunk(first ?? null)
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err))
     } finally { setLoading(false) }
-  }, [id])
+  }, [id, focusChunkId])
 
   useEffect(() => { void load() }, [load])
 
@@ -131,11 +171,20 @@ export default function ChunkExplorer() {
                     title={<Typography.Text ellipsis style={{ maxWidth: 320 }}>{p.heading_path || '(无标题路径)'}</Typography.Text>}
                     description={
                       <Space size={6} wrap>
-                        <Tag color={leaf ? 'blue' : undefined}>{leaf ? '叶子块' : '父容器'}</Tag>
+                        <Tag color={p.chunk_type === 'figure' ? 'purple' : leaf ? 'blue' : undefined}>
+                          {p.chunk_type === 'figure' ? '图片' : leaf ? '叶子块' : '父容器'}
+                        </Tag>
                         <span>{p.token_count ?? 0} tok</span>
                         {!leaf ? <span>子块 {p.children?.length ?? 0}</span> : null}
+                        <MmBadge node={p} />
                         {/* 有子块的父 = 上下文容器，不进向量；无子块的父 = 叶子，必须进向量 */}
-                        {!leaf ? (
+                        {p.chunk_type === 'figure' || p.chunk_type === 'table' ? (
+                          p.faiss_row == null ? (
+                            <Tag color="orange">未入文本向量</Tag>
+                          ) : (
+                            <Tag color="success">已入文本向量</Tag>
+                          )
+                        ) : !leaf ? (
                           <Tooltip title="父块是上下文容器：检索命中叶子块后用它扩展上下文。按设计不进向量。">
                             <Tag>上下文块</Tag>
                           </Tooltip>
@@ -187,7 +236,7 @@ export default function ChunkExplorer() {
               )
             }
           >
-            {isLeafParent(activeParent) ? (
+            {isLeafParent(activeParent) && activeParent?.chunk_type === 'parent' ? (
               <Empty
                 description={
                   <span>
@@ -197,6 +246,10 @@ export default function ChunkExplorer() {
                   </span>
                 }
               />
+            ) : isLeafParent(activeParent) && (activeParent?.chunk_type === 'figure' || activeParent?.chunk_type === 'table') ? (
+              <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+                {activeParent.chunk_type === 'figure' ? '图片块为独立检索单元（见下方详情与多模态标识）。' : '表格块为独立检索单元。'}
+              </Typography.Paragraph>
             ) : (
             <List
               size="small"
@@ -208,7 +261,12 @@ export default function ChunkExplorer() {
                   style={{ cursor: 'pointer', background: activeChunk?.chunk_id === c.chunk_id ? '#f5f7fa' : undefined }}
                 >
                   <List.Item.Meta
-                    title={<Typography.Text ellipsis style={{ maxWidth: 520 }}>{c.heading_path || `#${c.seq}`}</Typography.Text>}
+                    title={
+                      <Space size={6} wrap>
+                        <Typography.Text ellipsis style={{ maxWidth: 420 }}>{c.heading_path || `#${c.seq}`}</Typography.Text>
+                        <MmBadge node={c} />
+                      </Space>
+                    }
                     description={<Typography.Paragraph className="ekbs-ellipsis-2" style={{ marginBottom: 0 }}>{c.content}</Typography.Paragraph>}
                   />
                 </List.Item>
@@ -220,7 +278,12 @@ export default function ChunkExplorer() {
               <Card size="small" style={{ marginTop: 12 }} title="分块详情">
                 <Descriptions size="small" column={2} bordered>
                   <Descriptions.Item label="chunk_id">{activeChunk.chunk_id}</Descriptions.Item>
-                  <Descriptions.Item label="类型">{typeLabel(activeChunk, isLeafParent(activeParent) && activeChunk.chunk_id === activeParent?.chunk_id)}</Descriptions.Item>
+                  <Descriptions.Item label="类型">
+                    <Space size={6} wrap>
+                      {typeLabel(activeChunk, isLeafParent(activeParent) && activeChunk.chunk_id === activeParent?.chunk_id)}
+                      <MmBadge node={activeChunk} />
+                    </Space>
+                  </Descriptions.Item>
                   <Descriptions.Item label="seq">{activeChunk.seq}</Descriptions.Item>
                   <Descriptions.Item label="token">{activeChunk.token_count ?? '-'}</Descriptions.Item>
                   <Descriptions.Item label="分片">{activeChunk.shard_id ?? '-'}</Descriptions.Item>
@@ -236,6 +299,11 @@ export default function ChunkExplorer() {
                       : '无（代码/文本类正常）'}
                   </Descriptions.Item>
                   <Descriptions.Item label="标题路径" span={2}>{activeChunk.heading_path || '-'}</Descriptions.Item>
+                  {activeChunk.chunk_type === 'figure' ? (
+                    <Descriptions.Item label="图" span={2}>
+                      <FigureThumb chunkId={activeChunk.chunk_id} title={activeChunk.figure_id ?? undefined} size={160} />
+                    </Descriptions.Item>
+                  ) : null}
                 </Descriptions>
                 {editing ? (
                   <Space direction="vertical" style={{ width: '100%', marginTop: 12 }}>

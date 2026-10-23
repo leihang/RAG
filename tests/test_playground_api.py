@@ -180,6 +180,7 @@ async def test_debug_query_returns_answer_and_stages(client, playground_headers)
     assert set(body["stages"]) >= {"dense", "sparse", "rrf", "rerank", "c5"}
     assert body.get("history_used") is False
     assert body.get("rewritten_query") == "年假有多少天"
+    assert body.get("session_id"), "完整作答应落审计并回传 session_id"
 
 
 async def test_debug_query_multi_turn_rewrites_followup(client, playground_headers) -> None:

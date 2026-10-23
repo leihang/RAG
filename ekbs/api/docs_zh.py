@@ -34,6 +34,8 @@ ZH_TAGS: dict[str, str] = {
     "chunks": "分块编辑",
     "parse": "解析任务",
     "import": "导入",
+    "discovery": "文档发现",
+    "personal": "个人私有库",
     "perm": "权限管理",
     "admin": "管理台",
     "auth": "认证与权限",
@@ -44,7 +46,7 @@ ZH_TAGS: dict[str, str] = {
 #: 分组的展示顺序（Swagger 按 schema 里的 tags 顺序渲染）
 TAG_ORDER = [
     "health", "auth", "qa", "playground", "docs", "assets",
-    "chunks", "parse", "import", "kb", "perm", "admin", "__default__",
+    "chunks", "parse", "import", "discovery", "personal", "kb", "perm", "admin", "__default__",
 ]
 
 TAG_DESCRIPTIONS: dict[str, str] = {
@@ -58,6 +60,8 @@ TAG_DESCRIPTIONS: dict[str, str] = {
     "chunks": "分块查看与编辑（改子块会追加向量并重写 FTS）",
     "parse": "解析任务中心：状态、重跑、取消、成功率对照",
     "import": "导入：服务器目录导入（扫描 → 登记待解析，解析交给 worker）与上传准入说明",
+    "discovery": "按当前用户权限列出可见文档、示例问，以及点名发送原文",
+    "personal": "钉钉单聊建立的个人私有库：上传、列出、按标题删除，仅本人可见",
     "perm": "角色、部门可见性、密级与权限变更（变更会触发分片迁移与缓存失效）",
     "admin": "管理台只读接口：会话、安全事件、访问日志、概览、告警阈值",
     "__default__": "未分组接口",

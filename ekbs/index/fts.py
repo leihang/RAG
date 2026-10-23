@@ -195,8 +195,16 @@ class FtsIndex:
         clearance: int,
         dept_chain: Sequence[str],
         top_k: int,
+        acl_allow_shards: Sequence[str] = (),
+        subjects: Sequence[tuple[str, str]] = (),
     ) -> list[FtsHit]:
-        """BM25 召回；权限条件全部下推到 SQL（`03` §5.3）。"""
+        """BM25 召回；权限条件全部下推到 SQL（`03` §5.3）。
+
+        可见性 OR 组与 ``DocumentGate.can_read_document`` 的**放行规则**逐条对齐
+        （公开 / 内部公开 / 部门命中 / K6 shard 级 allow / document 级 allow）——
+        否则跨部门授权用户的稀疏路会被部门交集条件清空，混合检索静默退化为单路。
+        **deny 不下推**：召回允许超取，最终授权由 D18/C5 双闸兜底。
+        """
         match_query = to_match_query(query)
         if not match_query or not shard_ids:
             return []
@@ -215,9 +223,21 @@ class FtsIndex:
                AND d.status = 'published'
                AND (d.effective_date IS NULL OR d.effective_date <= date('now'))
                AND (d.expire_date    IS NULL OR d.expire_date    >  date('now'))
-               AND (json_array_length(d.visible_dept_ids) = 0
+               AND (d.level = 1
+                    OR json_array_length(d.visible_dept_ids) = 0
                     OR EXISTS (SELECT 1 FROM json_each(d.visible_dept_ids) v
-                                WHERE v.value IN (SELECT value FROM json_each(:dept_chain))))
+                                WHERE v.value IN (SELECT value FROM json_each(:dept_chain)))
+                    OR c.shard_id IN (SELECT value FROM json_each(:acl_allow_shards))
+                    OR EXISTS (SELECT 1 FROM ekbs_acl_entry a
+                                WHERE a.object_type = 'document'
+                                  AND a.object_id = CAST(d.doc_id AS TEXT)
+                                  AND a.effect = 'allow'
+                                  AND a.permission IN ('read', 'manage')
+                                  AND (a.expire_at IS NULL OR a.expire_at > datetime('now'))
+                                  AND (a.subject_type, a.subject_id) IN (
+                                       SELECT json_extract(value, '$[0]'),
+                                              json_extract(value, '$[1]')
+                                         FROM json_each(:subjects))))
              ORDER BY score ASC
              LIMIT :fetch_limit
         """
@@ -226,6 +246,10 @@ class FtsIndex:
             "shard_ids": json.dumps(list(shard_ids), ensure_ascii=False),
             "clearance": int(clearance),
             "dept_chain": json.dumps([str(d) for d in dept_chain], ensure_ascii=False),
+            "acl_allow_shards": json.dumps([str(s) for s in acl_allow_shards], ensure_ascii=False),
+            "subjects": json.dumps(
+                [[str(t), str(i)] for t, i in subjects], ensure_ascii=False
+            ),
             # 多取几倍再在 Python 里去重：同一 chunk 可能有多行（doc2query 生成的问题），
             # 去重会减少有效候选数，多取可避免召回被挤掉。
             "fetch_limit": max(int(top_k) * 4, int(top_k) + 20),

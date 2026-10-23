@@ -64,12 +64,15 @@
 --          22  ekbs_doc_access_log   文档访问日志
 --          23  ekbs_perm_change_log  权限与密级变更日志
 --          24  ekbs_security_event   安全事件
---         §5.5 缓存与运维（5，替代 Redis）
+--         §5.5 缓存与运维（7，替代 Redis）
 --          25  ekbs_cache            通用缓存（键必须含 perm_fingerprint）
 --          26  ekbs_msg_dedup        钉钉消息幂等
 --          27  ekbs_rate_limit       限流计数
 --          28  ekbs_session_ctx      钉钉多轮会话上下文（键含用户维度）
 --          29  ekbs_metric           运行指标（每 60s 写入）
+--          30  ekbs_msg_inbox        D16 消息落库（at-least-once 状态机）
+--          31  ekbs_msg_deadletter   D16 死信（重试耗尽，人工处置）
+--          32  ekbs_local_account    本机账号密码登录（仅回环可用；绑定已有 ekbs_user）
 --
 -- 【自检】本文件末尾的 `PRAGMA user_version = 1;` 供应用层判断是否已初始化。
 --         正确表数统计（排除 FTS5 的 5 张影子表，见下方说明）：
@@ -188,12 +191,13 @@ CREATE TABLE IF NOT EXISTS ekbs_document (
     mime            TEXT,
     size_bytes      INTEGER,
     page_count      INTEGER,
+    parse_ms        INTEGER,                             -- 本次解析耗时（毫秒）；旧行可空
     doc_version     TEXT    NOT NULL DEFAULT 'v1',
     level           INTEGER NOT NULL DEFAULT 2 CHECK (level BETWEEN 1 AND 4),
     visible_dept_ids TEXT   NOT NULL DEFAULT '[]',       -- JSON 数组，空表示不限部门
     effective_date  TEXT,
     expire_date     TEXT,
-    status          TEXT    NOT NULL DEFAULT 'pending',  -- pending|parsing|indexing|published|failed|offline|deleted
+    status          TEXT    NOT NULL DEFAULT 'pending',  -- pending|parsing|review|indexing|published|failed|offline|deleted
     checksum        TEXT,                                -- SHA-256，用于秒传与去重
     created_by      INTEGER,
     created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
@@ -333,7 +337,12 @@ CREATE INDEX IF NOT EXISTS idx_acl_lookup ON ekbs_acl_entry(object_type, object_
 CREATE TABLE IF NOT EXISTS ekbs_policy_version (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     version    INTEGER NOT NULL DEFAULT 1,
-    updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    -- 管理台「定时更新」：按小时间隔从钉钉重拉部门和人员。存量库由 apply_schema_patches 补列。
+    org_sync_enabled        INTEGER NOT NULL DEFAULT 0,
+    org_sync_interval_hours INTEGER NOT NULL DEFAULT 24,
+    org_sync_armed_at       TEXT,
+    org_sync_running_at     TEXT
 );
 INSERT OR IGNORE INTO ekbs_policy_version(id, version) VALUES (1, 1);
 
@@ -465,6 +474,55 @@ CREATE TABLE IF NOT EXISTS ekbs_msg_dedup (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_msg_dedup_time ON ekbs_msg_dedup(created_at);
+
+-- D16/C6 消息落库：先落库后处理，把 at-most-once 升级为 at-least-once（00 v4.0 D16、08 §3）
+-- 状态机：received → processing → done | failed（failed 按 next_retry_at 退避重投，
+-- 重试耗尽量化入 ekbs_msg_deadletter，行保留防「删档后重投被当新消息」）。
+CREATE TABLE IF NOT EXISTS ekbs_msg_inbox (
+    msg_id            TEXT PRIMARY KEY,                -- 钉钉消息 ID（幂等键）
+    channel           TEXT NOT NULL DEFAULT 'dingtalk_robot',
+    sender_staff_id   TEXT NOT NULL DEFAULT '',
+    conversation_id   TEXT NOT NULL DEFAULT '',
+    conversation_type TEXT NOT NULL DEFAULT '1',
+    text              TEXT NOT NULL DEFAULT '',        -- 消息正文（恢复重驱动的输入）
+    status            TEXT NOT NULL DEFAULT 'received'
+                      CHECK (status IN ('received','processing','done','failed')),
+    retry_count       INTEGER NOT NULL DEFAULT 0,
+    next_retry_at     TEXT,                            -- NULL = 不自动重投（已完成或已耗尽）
+    last_error        TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_msg_inbox_status ON ekbs_msg_inbox(status, next_retry_at);
+
+CREATE TABLE IF NOT EXISTS ekbs_msg_deadletter (
+    msg_id      TEXT PRIMARY KEY,
+    channel     TEXT NOT NULL DEFAULT 'dingtalk_robot',
+    payload     TEXT NOT NULL DEFAULT '',              -- 关键字段 JSON（脱敏口径同审计）
+    reason      TEXT NOT NULL DEFAULT '',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 本机账号密码登录（管理台第二种登录方式：服务器本机运维/应急用）
+-- 设计取舍：
+--   * **不**给 ekbs_user 加密码列：用户表由钉钉同步维护，混入密码会让同步语义变脏；
+--     本表只做「账号 → ekbs_user」的绑定，权限/密级/审计全部复用既有链路；
+--   * 密码只存 scrypt 编码串（标准库，无第三方依赖），永不存明文、永不入日志；
+--   * 失败计数与锁定放在行内：暴力破解在**账号维度**被锁死，不依赖外部限流。
+CREATE TABLE IF NOT EXISTS ekbs_local_account (
+    username        TEXT PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES ekbs_user(user_id) ON DELETE CASCADE,
+    password_hash   TEXT NOT NULL,                     -- scrypt$N$r$p$salt_b64$hash_b64
+    status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
+    must_change     INTEGER NOT NULL DEFAULT 0,        -- 1 = 首次登录须改密（工具置位）
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until    TEXT,                              -- 非空且未到期 → 拒绝登录
+    last_login_at   TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_local_account_user ON ekbs_local_account(user_id);
 
 -- 限流计数（替代 Redis 滑动窗口）；bucket 形如 global:- / user:10231 / conv:cidXXXX
 CREATE TABLE IF NOT EXISTS ekbs_rate_limit (

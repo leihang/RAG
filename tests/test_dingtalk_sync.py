@@ -14,11 +14,13 @@ import pytest
 import respx
 
 from ekbs.dingtalk.directory import (
+    AuthScopes,
     Department,
     DingTalkDirectoryClient,
     DirectoryUser,
     LeaveRecord,
 )
+from ekbs.dingtalk.org_events import PERSONNEL_EVENTS, event_type_of, user_ids_of
 from ekbs.dingtalk.sync import OrgSyncService, build_sync_service
 from ekbs.errors import ConfigError, ModelUnavailable
 from ekbs.observability import metrics as m
@@ -450,6 +452,156 @@ async def test_sync_failure_increments_metric_and_reraises(seeded) -> None:
             "SELECT failed, mode FROM ekbs_sync_log ORDER BY log_id DESC LIMIT 1"
         ).fetchone()
     assert int(row["failed"]) == 1 and row["mode"] == "full"
+
+
+def test_user_ids_come_from_either_event_shape() -> None:
+    assert user_ids_of({"userId": ["a", " b"]}) == ["a", "b"]
+    assert user_ids_of({"userid": "c"}) == ["c"]
+    assert event_type_of("", {"eventType": "user_modify_org"}) == "user_modify_org"
+    assert {"user_add_org", "user_modify_org", "user_leave_org"} <= PERSONNEL_EVENTS
+
+
+@respx.mock
+async def test_fetch_auth_scopes_reads_authorized_people() -> None:
+    respx.get(url__regex=rf"{LEGACY}/auth/scopes.*").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "errcode": 0,
+                "errmsg": "ok",
+                "auth_user_field": ["name", "position"],
+                "auth_org_scopes": {"authed_dept": [], "authed_user": ["u1"]},
+            },
+        )
+    )
+    scopes = await make_client().fetch_auth_scopes()
+    assert scopes.authed_dept_ids == []
+    assert scopes.authed_user_ids == ["u1"]
+    assert scopes.limited is True
+
+
+class ScopedDirectory(FakeDirectory):
+    """授权范围里只有一个人，禁止再去拉根部门。"""
+
+    async def fetch_auth_scopes(self) -> AuthScopes:
+        return AuthScopes(authed_user_ids=["u_only"])
+
+    async def fetch_department_tree(self, root_id: int = 1) -> list[Department]:
+        raise AssertionError("授权范围不含部门时不应从根部门起拉")
+
+    async def get_user(self, userid: str) -> DirectoryUser | None:
+        if userid != "u_only":
+            return None
+        return DirectoryUser(userid=userid, name="仅授权", title="测试岗", dept_ids=[])
+
+    async def get_department(self, dept_id: int) -> Department | None:
+        return None
+
+
+async def test_full_sync_registers_scoped_users_without_root(seeded) -> None:
+    runtime, _ = seeded
+    report = await service(runtime, ScopedDirectory()).sync_full()
+    assert report.detail["source"] == "auth_scopes"
+    assert report.detail["authed_departments"] == 0
+    assert report.detail["authed_users"] == 1
+    assert report.users == 1 and report.failed == 0
+    with runtime.db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT nick, title, status FROM ekbs_user WHERE dingtalk_userid = 'u_only'"
+        ).fetchone()
+        role = conn.execute(
+            "SELECT r.code FROM ekbs_user_role ur JOIN ekbs_role r ON r.role_id = ur.role_id "
+            "JOIN ekbs_user u ON u.user_id = ur.user_id WHERE u.dingtalk_userid = 'u_only'"
+        ).fetchone()
+    assert row["nick"] == "仅授权" and row["title"] == "测试岗" and row["status"] == "active"
+    assert role["code"] == "end_user"
+
+
+async def test_department_change_replaces_old_membership(seeded) -> None:
+    runtime, _ = seeded
+    directory = FakeDirectory()
+    await service(runtime, directory).sync_full()
+    directory.users = {
+        1: [
+            DirectoryUser(userid="u_boss", name="老板", dept_ids=[1]),
+            DirectoryUser(userid="u_alice", name="Alice", dept_ids=[1], title="顾问"),
+        ],
+        100: [DirectoryUser(userid="u_carol", name="Carol", dept_ids=[100])],
+        101: [],
+    }
+    await service(runtime, directory).sync_full()
+    with runtime.db.sync_connect() as conn:
+        chain = json.loads(conn.execute(
+            "SELECT dept_chain FROM ekbs_user WHERE dingtalk_userid = 'u_alice'"
+        ).fetchone()["dept_chain"])
+        title = conn.execute(
+            "SELECT title FROM ekbs_user WHERE dingtalk_userid = 'u_alice'"
+        ).fetchone()["title"]
+    assert chain == ["1"]
+    assert title == "顾问"
+
+
+class PersonnelDirectory:
+    def __init__(self) -> None:
+        self.user = DirectoryUser(userid="u_new", name="新人", dept_ids=[101], title="专员")
+
+    async def get_user(self, userid: str) -> DirectoryUser | None:
+        return self.user if userid == self.user.userid else None
+
+    async def get_department(self, dept_id: int) -> Department | None:
+        if int(dept_id) == 101:
+            return Department(dept_id=101, name="人力资源部", parent_id=1)
+        if int(dept_id) == 1:
+            return Department(dept_id=1, name="根部门", parent_id=None)
+        return None
+
+
+async def test_personnel_events_cover_hire_move_and_leave(seeded) -> None:
+    runtime, _ = seeded
+    directory = PersonnelDirectory()
+    svc = service(runtime, directory)
+    hired = await svc.apply_personnel_event("user_add_org", ["u_new"])
+    assert hired.users == 1 and hired.created >= 1
+    with runtime.db.sync_connect() as conn:
+        title = conn.execute(
+            "SELECT title, status FROM ekbs_user WHERE dingtalk_userid = 'u_new'"
+        ).fetchone()
+    assert title["title"] == "专员" and title["status"] == "active"
+
+    directory.user = DirectoryUser(userid="u_new", name="新人", dept_ids=[1], title="主管")
+    moved = await svc.apply_personnel_event("user_modify_org", ["u_new"])
+    assert moved.updated >= 1
+    with runtime.db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT title, dept_chain FROM ekbs_user WHERE dingtalk_userid = 'u_new'"
+        ).fetchone()
+    assert row["title"] == "主管"
+    assert json.loads(row["dept_chain"]) == ["1"]
+
+    left = await svc.apply_personnel_event("user_leave_org", ["u_new"])
+    assert left.deleted == 1
+    with runtime.db.sync_connect() as conn:
+        status = conn.execute(
+            "SELECT status FROM ekbs_user WHERE dingtalk_userid = 'u_new'"
+        ).fetchone()["status"]
+    assert status == "left"
+
+
+def test_scheduler_does_not_pull_org_on_a_cron(runtime) -> None:
+    """组织全量不能被固定 cron 无条件拉取。
+
+    管理台保存的「定时更新」是开关 + 小时间隔（`permission/org_schedule.py`），
+    调度器只挂 5 分钟一次的「到点检查」，未开启/未到间隔时 `claim_org_sync` 直接返回。
+    """
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    from ekbs.scheduler import build_scheduler
+
+    jobs = {job.id: job for job in build_scheduler(runtime).get_jobs()}
+    job = jobs.get("org_sync")
+    assert job is not None, "调度器需要到点执行管理台保存的定时更新"
+    assert isinstance(job.trigger, IntervalTrigger), "组织同步只能是到点检查，不能是固定 cron"
+    assert job.trigger.interval.total_seconds() == 300
 
 
 def test_build_sync_service_requires_credentials(runtime) -> None:

@@ -54,7 +54,8 @@ CAPTION_PROMPT = (
     "5. 只输出检索文本本身，不要客套话，不要用 Markdown。"
 )
 
-#: 单张图的图片体积上限（超过就不送）：避免把超大图整张塞进请求。
+#: 单张图送视觉模型的体积上限。超过先缩小再送，缩小后仍超限才跳过。
+#: 原图文件不动（回源仍用落盘的那张）。
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
 
@@ -101,15 +102,49 @@ def write_cached_caption(data_dir: Path, image_name: str, caption: str, *, model
     )
 
 
+def _shrink_for_caption(image: Path) -> bytes | None:
+    """把超限原图缩成 JPEG 再送模型。失败或仍超限返回 None。"""
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        with Image.open(image) as im:
+            frame = im.convert("RGB")
+    except Exception:
+        return None
+    for edge, quality in ((2048, 85), (1600, 75), (1280, 70), (1024, 60)):
+        copy = frame.copy()
+        copy.thumbnail((edge, edge))
+        buf = BytesIO()
+        copy.save(buf, format="JPEG", quality=quality, optimize=True)
+        raw = buf.getvalue()
+        if len(raw) <= MAX_IMAGE_BYTES:
+            log.info(
+                "figure_caption_shrunk",
+                image=image.name,
+                bytes=len(raw),
+                edge=edge,
+            )
+            return raw
+    return None
+
+
 def _image_data_url(image: Path) -> str | None:
     try:
-        if image.stat().st_size > MAX_IMAGE_BYTES:
-            return None
+        size = image.stat().st_size
         raw = image.read_bytes()
     except OSError:
         return None
     suffix = image.suffix.lstrip(".").lower() or "png"
     mime = "image/jpeg" if suffix in {"jpg", "jpeg"} else f"image/{suffix}"
+    if size > MAX_IMAGE_BYTES:
+        raw = _shrink_for_caption(image)
+        if not raw:
+            return None
+        mime = "image/jpeg"
     return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
 
 

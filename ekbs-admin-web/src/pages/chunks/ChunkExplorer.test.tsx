@@ -79,4 +79,24 @@ describe('分块预览的向量标签', () => {
     await waitFor(() => expect(screen.getByText('未入向量')).toBeInTheDocument())
     expect(screen.queryByText('上下文块')).toBeNull()
   })
+
+  it('figure 块展示「多模态已索引」标识', async () => {
+    api.getChunkTree.mockResolvedValue({
+      document: { doc_id: 1, title: '图册', status: 'published', level: 1 },
+      parents: 1,
+      children: 0,
+      tree: [
+        {
+          chunk_id: 88, doc_id: 1, chunk_type: 'figure', seq: 1,
+          content: '图注：电表更换', heading_path: '电表更换', token_count: 6,
+          page_from: 1, page_to: 1, faiss_row: 3, figure_id: '图-1',
+          figure_mm_indexed: true, children: [],
+        },
+      ],
+      orphan_children: [],
+    })
+
+    mount()
+    await waitFor(() => expect(screen.getAllByText('多模态已索引').length).toBeGreaterThan(0))
+  })
 })

@@ -49,7 +49,7 @@ def test_backup_creates_archive_with_manifest(seeded, tmp_path: Path) -> None:
         assert not any(name.endswith("secrets.env") for name in names)
         manifest = json.loads(tar.extractfile("ekbs/manifest.json").read().decode("utf-8"))
 
-    assert manifest["schema"]["tables"] == 29
+    assert manifest["schema"]["tables"] == 32
     assert manifest["schema"]["triggers"] == 12
     assert len(manifest["shards"]) == 3
     assert set(manifest["files"]) >= {"index/ekbs.db", "config/application.dev.yaml"}
@@ -83,7 +83,7 @@ def test_restore_drill_verifies_everything(seeded, tmp_path: Path) -> None:
 
     assert report.ok, report.problems
     assert report.checks["integrity"] == "ok"
-    assert report.checks["tables"] == 29
+    assert report.checks["tables"] == 32
     assert report.checks["triggers"] == 12
     assert report.checks["policy_version"] == expected_policy
     assert report.checks["audit_messages"] >= 1

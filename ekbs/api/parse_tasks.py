@@ -4,45 +4,105 @@
 失败可查、可重试。没有这组接口，运维只能 `sqlite3` 直连看 ``ekbs_document.status``。
 
 任务与文档的关系：本栈**一个文档就是一个解析任务**（没有独立的 ``parse_task`` 表，
-29 张表里也没有），``task_id`` 即 ``doc_id`` —— 这一点在响应里显式说明，避免调用方误解。
+31 张表里也没有），``task_id`` 即 ``doc_id`` —— 这一点在响应里显式说明，避免调用方误解。
 
 | 端点 | 权限点（`05` §8.2） |
 |---|---|
 | ``GET /api/v1/parse/tasks`` | ``parse:task:read`` |
 | ``GET /api/v1/parse/tasks/{task_id}`` | ``parse:task:read`` |
 | ``GET /api/v1/parse/tasks/{task_id}/result`` | ``parse:task:read`` |
+| ``GET /api/v1/parse/tasks/{task_id}/draft`` | ``parse:task:read``（待复核可改；已入库只读对照） |
+| ``GET /api/v1/parse/tasks/{task_id}/figures/{figure_id}`` | ``parse:task:read``（复核期看图） |
+| ``PUT /api/v1/parse/tasks/{task_id}/draft`` | ``parse:task:manage`` |
+| ``POST /api/v1/parse/tasks/{task_id}/approve`` | ``parse:task:manage`` |
+| ``POST /api/v1/parse/tasks/{task_id}/reject`` | ``parse:task:manage`` |
 | ``GET /api/v1/parse/config`` | ``parse:task:read`` |
 | ``POST /api/v1/parse/tasks/{task_id}/retry`` | ``doc:document:reparse`` |
 | ``POST /api/v1/parse/tasks/{task_id}/cancel`` | ``parse:task:manage`` |
 
 ⚠️ **两处诚实交代**（都源自 Schema/文档的缺口，不是实现偷懒）：
 
-1. ``ebks_document`` **没有 error 列**（`docs/spec/20` 的 T13 已记录），
+1. ``ekbs_document`` **没有 error 列**（`docs/spec/20` 的 T13 已记录），
    因此失败原因只能指向 worker 日志，接口不编造一个"错误信息"字段；
-2. Schema 的状态机只有 ``pending|parsing|indexing|published|failed|offline``，
-   **没有 cancelled** —— 「取消」对 ``pending`` 任务只能落到 ``failed``，响应里会说明。
+2. 扫描件软状态 ``review``（无 SQL CHECK）：解析清洗后等人审，通过后再分块；
+   「取消」对 ``pending`` 仍落到 ``failed``（Schema 无 cancelled）。
 """
 
 from __future__ import annotations
 
 import json
+import mimetypes
+import re
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, Field
 
 from ekbs.api.auth import INTERNAL_TOKEN_HEADER, INTERNAL_USER_HEADER
 from ekbs.api.qa import _authenticate
 from ekbs.errors import PermissionDenied
+from ekbs.ingest.pipeline import IngestPipeline
 from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
+from ekbs.ingest.figure_enhance import classify_figure, enhance_figure_file
+from ekbs.ingest.scan_review import (
+    STATUS_REVIEW,
+    figures_from_sidecar,
+    load_review_markdown,
+    load_review_sidecar,
+    page_map_from_sidecar,
+    tables_from_sidecar,
+    upgrade_review_draft_seals,
+    upgrade_review_draft_tables,
+    upgrade_review_draft_tail,
+    save_review_asset_edits,
+    write_review_markdown,
+)
 from ekbs.logging import get_logger
 from ekbs.permission.router import bump_policy_version
 
 router = APIRouter(tags=["parse"])
 log = get_logger(component="api.parse")
 
-VALID_STATUSES = ("pending", "parsing", "indexing", "published", "failed", "offline")
+VALID_STATUSES = (
+    "pending",
+    "parsing",
+    "review",
+    "indexing",
+    "published",
+    "failed",
+    "offline",
+)
 MAX_PAGE_SIZE = 200
+MAX_DRAFT_CHARS = 2_000_000
+
+
+class DraftTableEdit(BaseModel):
+    table_id: str = ""
+    caption: str = ""
+    body_html: str = ""
+    page: int | None = None
+
+
+class DraftFigureEdit(BaseModel):
+    figure_id: str = ""
+    caption: str = ""
+    ocr_text: str | None = None
+
+
+class DraftBody(BaseModel):
+    markdown: str = Field(..., description="复核后的全文 Markdown")
+    tables: list[DraftTableEdit] | None = Field(
+        default=None, description="传入则覆盖表格清单；不传保持原表"
+    )
+    figures: list[DraftFigureEdit] | None = Field(
+        default=None, description="传入则按 figure_id 保留并改题注；不传保持原图"
+    )
+
+
+class ApproveBody(BaseModel):
+    markdown: str | None = Field(default=None, description="可选：通过前覆盖草稿")
 
 
 def _principal(request: Request, headers: dict[str, str | None], code: str) -> Any:
@@ -67,7 +127,7 @@ def _task_row(runtime: Any, doc_id: int) -> Any:
         row = conn.execute(
             "SELECT d.doc_id, d.kb_id, k.code AS kb_code, d.title, d.status, d.level, "
             "d.visible_dept_ids, d.source_path, d.parse_path, d.page_count, d.size_bytes, "
-            "d.checksum, d.doc_version, d.created_at, d.updated_at, "
+            "d.checksum, d.doc_version, d.created_at, d.updated_at, d.parse_ms, "
             "(SELECT COUNT(*) FROM ekbs_chunk c WHERE c.doc_id = d.doc_id) AS chunk_count, "
             "(SELECT COUNT(*) FROM ekbs_chunk c WHERE c.doc_id = d.doc_id AND c.chunk_type='child') "
             "  AS child_count, "
@@ -87,7 +147,10 @@ def _task_row(runtime: Any, doc_id: int) -> Any:
 @router.get("/parse/tasks")
 async def list_parse_tasks(
     request: Request,
-    status: str | None = Query(default=None, description="pending|parsing|indexing|published|failed|offline"),
+    status: str | None = Query(
+        default=None,
+        description="pending|parsing|review|indexing|published|failed|offline",
+    ),
     kb_id: int | None = Query(default=None),
     limit: int = Query(default=50),
     offset: int = Query(default=0),
@@ -112,7 +175,7 @@ async def list_parse_tasks(
         params.append(int(kb_id))
     sql = (
         "SELECT d.doc_id AS task_id, d.kb_id, d.title, d.status, d.level, d.page_count, "
-        "d.created_at, d.updated_at, "
+        "d.created_at, d.updated_at, d.parse_ms, "
         "(SELECT COUNT(*) FROM ekbs_chunk c WHERE c.doc_id = d.doc_id) AS chunk_count "
         "FROM ekbs_document d "
         f"WHERE {' AND '.join(where)} ORDER BY d.updated_at DESC, d.doc_id DESC LIMIT ? OFFSET ?"
@@ -128,9 +191,11 @@ async def list_parse_tasks(
                 "SELECT status, COUNT(*) AS c FROM ekbs_document GROUP BY status"
             ).fetchall()
         }
-    attempted = total  # 本页过滤范围内的总数
+    # 成功率只看终态（published/failed/offline），排除 pending/parsing/review/indexing，
+    # 否则「待复核」堆积会把成功率虚低，误触 98% 验收线。
     published = by_status.get("published", 0)
-    all_total = sum(by_status.values()) or 1
+    terminal = published + by_status.get("failed", 0) + by_status.get("offline", 0)
+    success_rate = round(published / terminal, 4) if terminal else 0.0
     return JSONResponse(
         {
             "items": rows,
@@ -138,9 +203,10 @@ async def list_parse_tasks(
             "limit": limit,
             "offset": offset,
             "by_status": by_status,
-            "success_rate": round(published / all_total, 4),
+            "success_rate": success_rate,
             "success_rate_target": 0.98,
-            "note": "task_id 即 doc_id（本栈一个文档就是一个解析任务）",
+            "note": "task_id 即 doc_id；success_rate = published / (published+failed+offline)，"
+            "不含进行中/待复核",
         }
     )
 
@@ -182,10 +248,32 @@ async def get_parse_result(
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """解析结果视图：父子块结构与 Markdown 预览（由已落库的分块拼回）。"""
+    """解析结果视图：待复核时读草稿；已分块后由分块拼回预览。"""
     _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "parse:task:read")
     runtime = request.app.state.runtime
-    _task_row(runtime, task_id)
+    row = _task_row(runtime, task_id)
+    status = str(row["status"])
+    if status == STATUS_REVIEW:
+        try:
+            draft = load_review_markdown(runtime.settings.data_dir, task_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        sidecar = load_review_sidecar(runtime.settings.data_dir, task_id)
+        return JSONResponse(
+            {
+                "task_id": task_id,
+                "status": status,
+                "structure": [],
+                "chunk_count": 0,
+                # 只给短预览：全文走 /draft 与双栏页，避免旧前端 alert/Drawer 再倾倒整篇
+                "preview": draft[: min(preview_chars, 500)],
+                "preview_truncated": True,
+                "engine": sidecar.engine,
+                "needs_review": True,
+                "note": "扫描件待人工复核：请打开 /admin/parse/review/{task_id} 双栏对照；"
+                "全文仅通过 GET /draft 提供，不再由本接口回传。",
+            }
+        )
     with runtime.db.sync_connect() as conn:
         rows = conn.execute(
             "SELECT chunk_id, parent_id, chunk_type, seq, heading_path, page_from, page_to, "
@@ -203,11 +291,417 @@ async def get_parse_result(
     return JSONResponse(
         {
             "task_id": task_id,
+            "status": status,
             "structure": structure,
             "chunk_count": len(structure),
             "preview": markdown[:preview_chars],
             "preview_truncated": len(markdown) > preview_chars,
-            "note": "parse_path 为解析产物落盘位置（MinerU 接入后填充；docs/spec/20 §T8 待定稿）",
+            "needs_review": False,
+            "note": "已分块预览由 ekbs_chunk 拼回；扫描件复核草稿在 status=review 时可读",
+        }
+    )
+
+
+@router.get("/parse/tasks/{task_id}/draft")
+async def get_parse_draft(
+    task_id: int,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """读取扫描件复核草稿（全文）。"""
+    _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "parse:task:read")
+    runtime = request.app.state.runtime
+    row = _task_row(runtime, task_id)
+    status = str(row["status"])
+    if status not in (STATUS_REVIEW, "published"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"仅待复核或已入库文档可看对照（当前 {status}）",
+        )
+    # 旧草稿只在待复核时升级。已入库的稿子不能再改磁盘。
+    if status == STATUS_REVIEW:
+        seal_stats = upgrade_review_draft_seals(runtime.settings.data_dir, task_id)
+        if seal_stats.get("seal_figures_dropped"):
+            log.info("review_draft_seals_upgraded", task_id=task_id, **seal_stats)
+        upgrade_stats = upgrade_review_draft_tables(runtime.settings.data_dir, task_id)
+        if upgrade_stats.get("tables_merged_pairs") or upgrade_stats.get("tables_repaired"):
+            log.info("review_draft_tables_upgraded", task_id=task_id, **upgrade_stats)
+        tail_stats = upgrade_review_draft_tail(
+            runtime.settings.data_dir,
+            task_id,
+            str(row["source_path"] or ""),
+        )
+        if tail_stats:
+            log.info("review_draft_tail_upgraded", task_id=task_id, **tail_stats)
+    try:
+        markdown = load_review_markdown(runtime.settings.data_dir, task_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    sidecar = load_review_sidecar(runtime.settings.data_dir, task_id)
+    tables = []
+    for item in sidecar.tables:
+        body_html = str(item.get("body") or "")
+        tables.append(
+            {
+                "table_id": str(item.get("table_id") or ""),
+                "caption": str(item.get("caption") or ""),
+                "page": item.get("page"),
+                "body_html": body_html,
+                "chars": len(body_html),
+            }
+        )
+    figures = []
+    parse_root = Path(runtime.settings.data_paths()["parse"]).resolve()
+    for item in sidecar.figures:
+        fid = str(item.get("figure_id") or "")
+        rel = str(item.get("image_path") or "").strip()
+        kind = "handwriting" if fid.startswith("handwrite") else "normal"
+        ink_frac = None
+        if fid or rel:
+            candidates = []
+            if rel:
+                candidates.append((runtime.settings.data_dir / rel).resolve())
+            if fid:
+                candidates.extend(
+                    [
+                        parse_root / str(task_id) / "images" / fid,
+                        parse_root / str(task_id) / "images" / f"{fid}.jpg",
+                        parse_root / str(task_id) / "images" / f"{fid}.png",
+                    ]
+                )
+            for cand in candidates:
+                try:
+                    cand.relative_to(parse_root)
+                except Exception:
+                    continue
+                if cand.is_file():
+                    if kind != "handwriting":
+                        try:
+                            meta = classify_figure(cand)
+                            kind = meta.kind
+                            ink_frac = round(meta.ink_frac, 4)
+                        except Exception:
+                            pass
+                    break
+        figures.append(
+            {
+                "figure_id": fid,
+                "caption": str(item.get("caption") or ""),
+                "ocr_text": str(item.get("ocr_text") or ""),
+                "page": item.get("page"),
+                "image_path": rel,
+                "has_image": bool(fid),
+                "kind": kind,
+                "ink_frac": ink_frac,
+                "display_hint": (
+                    "淡色附图，预览已自动增强对比"
+                    if kind in ("faint", "blank")
+                    else ""
+                ),
+            }
+        )
+    return JSONResponse(
+        {
+            "task_id": task_id,
+            "status": status,
+            "read_only": status != STATUS_REVIEW,
+            "markdown": markdown,
+            "chars": len(markdown),
+            "engine": sidecar.engine,
+            "parse_ms": row["parse_ms"],
+            "figure_count": len(figures),
+            "table_count": len(tables),
+            "tables": tables,
+            "figures": figures,
+            "clean_stats": sidecar.clean_stats,
+            "note": "正文里的 [表格 N] 是占位；完整表格见 tables[].body_html。"
+            "图片在 figures[]，用 /parse/tasks/{id}/figures/{figure_id} 取图。",
+        }
+    )
+
+
+_FIGURE_ID_SAFE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+@router.get("/parse/tasks/{task_id}/figures/{figure_id}", response_model=None)
+async def get_parse_draft_figure(
+    task_id: int,
+    figure_id: str,
+    request: Request,
+    enhance: int = Query(default=1, ge=0, le=1, description="1=淡色附图增强预览（默认开）"),
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+):
+    """复核期回源解析产物图（落在 ``parse/<doc_id>/images/``）。越权/越界一律 404。
+
+    默认 ``enhance=1``：淡色附图自动抬升墨迹并衬深色底。印章图在清洗时已丢弃，不会出现在这里。
+    """
+    _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "parse:task:read")
+    if not _FIGURE_ID_SAFE.match(figure_id or ""):
+        raise HTTPException(status_code=404, detail="not_found")
+    runtime = request.app.state.runtime
+    row = _task_row(runtime, task_id)
+    if str(row["status"]) not in (STATUS_REVIEW, "published"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"仅待复核或已入库文档可看解析期图片（当前 {row['status']}）",
+        )
+    sidecar = load_review_sidecar(runtime.settings.data_dir, task_id)
+    match = next(
+        (
+            item
+            for item in sidecar.figures
+            if str(item.get("figure_id") or "") == figure_id
+        ),
+        None,
+    )
+    if match is None:
+        raise HTTPException(status_code=404, detail="not_found")
+
+    parse_root = Path(runtime.settings.data_paths()["parse"]).resolve()
+    rel = str(match.get("image_path") or "").strip()
+    if not rel:
+        candidates = [
+            parse_root / str(task_id) / "images" / figure_id,
+            parse_root / str(task_id) / "images" / f"{figure_id}.jpg",
+            parse_root / str(task_id) / "images" / f"{figure_id}.png",
+        ]
+    else:
+        candidates = [(runtime.settings.data_dir / rel).resolve()]
+
+    candidate: Path | None = None
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(parse_root)
+        except Exception:
+            continue
+        if resolved.is_file():
+            candidate = resolved
+            break
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="not_found")
+
+    if enhance:
+        try:
+            data, media_type, meta = enhance_figure_file(candidate, slate_bg=True)
+            return Response(
+                content=data,
+                media_type=media_type,
+                headers={
+                    "Content-Disposition": f'inline; filename="{candidate.stem}-enhanced.jpg"',
+                    "X-EKBS-Figure-Kind": meta.kind,
+                    "Cache-Control": "private, max-age=60",
+                },
+            )
+        except Exception as exc:
+            log.warning("figure_enhance_failed", path=str(candidate), error=str(exc))
+
+    media_type, _ = mimetypes.guess_type(candidate.name)
+    return FileResponse(
+        candidate,
+        media_type=media_type or "application/octet-stream",
+        filename=candidate.name,
+        content_disposition_type="inline",
+    )
+
+
+@router.put("/parse/tasks/{task_id}/draft")
+async def put_parse_draft(
+    task_id: int,
+    body: DraftBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """保存人工修订后的草稿（尚不分块）。"""
+    principal = _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "parse:task:manage"
+    )
+    runtime = request.app.state.runtime
+    row = _task_row(runtime, task_id)
+    if str(row["status"]) != STATUS_REVIEW:
+        raise HTTPException(
+            status_code=409,
+            detail=f"仅 review 状态可改草稿（当前 {row['status']}）",
+        )
+    text = body.markdown or ""
+    if len(text) > MAX_DRAFT_CHARS:
+        raise HTTPException(status_code=422, detail=f"草稿过长（>{MAX_DRAFT_CHARS} 字符）")
+    try:
+        save_review_asset_edits(
+            runtime.settings.data_dir,
+            task_id,
+            text,
+            tables=None if body.tables is None else [item.model_dump() for item in body.tables],
+            figures=None if body.figures is None else [item.model_dump() for item in body.figures],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "UPDATE ekbs_document SET updated_at = datetime('now') WHERE doc_id = ?",
+            (task_id,),
+        )
+        conn.execute(
+            "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
+            "field, old_value, new_value, reason) "
+            "VALUES (?, 'document', ?, 'review_edit', 'draft', NULL, ?, 'api:draft')",
+            (principal.user_id, str(task_id), f"chars={len(text)}"),
+        )
+        conn.commit()
+    return JSONResponse({"task_id": task_id, "status": STATUS_REVIEW, "chars": len(text)})
+
+
+@router.post("/parse/tasks/{task_id}/approve")
+async def approve_parse_task(
+    task_id: int,
+    request: Request,
+    body: ApproveBody | None = None,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """人工确认复核通过 → 分块 / 嵌入 / published。
+
+    可选 body.markdown：通过前最后一次覆盖草稿（便于粘贴 WPS 识别结果）。
+    """
+    principal = _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "parse:task:manage"
+    )
+    runtime = request.app.state.runtime
+    row = _task_row(runtime, task_id)
+    if str(row["status"]) != STATUS_REVIEW:
+        raise HTTPException(
+            status_code=409,
+            detail=f"仅 review 状态可确认通过（当前 {row['status']}）",
+        )
+    if body is not None and body.markdown is not None:
+        text = body.markdown
+        if len(text) > MAX_DRAFT_CHARS:
+            raise HTTPException(status_code=422, detail=f"草稿过长（>{MAX_DRAFT_CHARS} 字符）")
+        write_review_markdown(runtime.settings.data_dir, task_id, text)
+    try:
+        markdown = load_review_markdown(runtime.settings.data_dir, task_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not markdown.strip():
+        raise HTTPException(status_code=422, detail="草稿为空，无法分块入库")
+
+    sidecar = load_review_sidecar(runtime.settings.data_dir, task_id)
+    try:
+        visible = json.loads(row["visible_dept_ids"] or "[]")
+    except ValueError:
+        visible = []
+
+    ingest = IngestPipeline(
+        db=runtime.db,
+        settings=runtime.settings,
+        providers=runtime.providers,
+        shards=runtime.shards,
+        fts=runtime.fts,
+        figure_index=runtime.figure_index,
+    )
+    try:
+        result = await ingest.ingest_markdown(
+            title=str(row["title"]),
+            markdown=markdown,
+            kb_id=int(row["kb_id"]),
+            level=int(row["level"]),
+            visible_dept_ids=list(visible),
+            source_path=str(row["source_path"] or ""),
+            doc_version=str(row["doc_version"] or "1"),
+            page_map=page_map_from_sidecar(sidecar),
+            figures=[
+                fig for fig in figures_from_sidecar(sidecar)
+                if not str(fig.figure_id or "").startswith("handwrite")
+            ],
+            tables=tables_from_sidecar(sidecar),
+            existing_doc_id=task_id,
+            checksum=(str(row["checksum"]) if row["checksum"] else None),
+        )
+    except Exception as exc:
+        log.error("review_approve_failed", task_id=task_id, error=str(exc)[:240])
+        with runtime.db.sync_connect() as conn:
+            conn.execute(
+                "UPDATE ekbs_document SET status = 'failed', updated_at = datetime('now') "
+                "WHERE doc_id = ?",
+                (task_id,),
+            )
+            conn.commit()
+        raise HTTPException(status_code=500, detail=f"分块入库失败：{exc}") from exc
+
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
+            "field, old_value, new_value, reason) "
+            "VALUES (?, 'document', ?, 'review_approve', 'status', 'review', 'published', "
+            "'api:approve')",
+            (principal.user_id, str(task_id)),
+        )
+        conn.commit()
+    log.info(
+        "review_approved",
+        task_id=task_id,
+        operator=principal.user_id,
+        doc_id=getattr(result, "doc_id", task_id),
+    )
+    return JSONResponse(
+        {
+            "task_id": task_id,
+            "status": "published",
+            "previous_status": STATUS_REVIEW,
+            "parent_count": result.parent_count,
+            "child_count": result.child_count,
+            "vector_count": result.vector_count,
+        }
+    )
+
+
+@router.post("/parse/tasks/{task_id}/reject")
+async def reject_parse_task(
+    task_id: int,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """驳回复核（review → failed）；可再 retry 重新解析。"""
+    principal = _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "parse:task:manage"
+    )
+    runtime = request.app.state.runtime
+    row = _task_row(runtime, task_id)
+    if str(row["status"]) != STATUS_REVIEW:
+        raise HTTPException(
+            status_code=409,
+            detail=f"仅 review 状态可驳回（当前 {row['status']}）",
+        )
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "UPDATE ekbs_document SET status = 'failed', updated_at = datetime('now') "
+            "WHERE doc_id = ?",
+            (task_id,),
+        )
+        conn.execute(
+            "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
+            "field, old_value, new_value, reason) "
+            "VALUES (?, 'document', ?, 'review_reject', 'status', 'review', 'failed', "
+            "'api:reject')",
+            (principal.user_id, str(task_id)),
+        )
+        version = bump_policy_version(conn, reason=f"api:reject:doc={task_id}")
+        conn.commit()
+    return JSONResponse(
+        {
+            "task_id": task_id,
+            "status": "failed",
+            "previous_status": STATUS_REVIEW,
+            "policy_version": version,
         }
     )
 
@@ -262,6 +756,7 @@ async def retry_parse_task(
         )
     if current == "published":
         raise HTTPException(status_code=409, detail="已发布的文档无需重排；如需更新请先下线")
+    # review / failed / offline / pending → pending（扫描件可放弃草稿重跑 OCR）
     with runtime.db.sync_connect() as conn:
         conn.execute(
             "UPDATE ekbs_document SET status = 'pending', updated_at = datetime('now') "

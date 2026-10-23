@@ -32,6 +32,7 @@ export const router = createBrowserRouter(
       ),
       children: [
         { index: true, element: <Navigate to="/dashboard" replace /> },
+        { path: 'iam/users', element: <Navigate to="/iam/accounts" replace /> },
         ...ROUTES.map(({ path, Component, perm }) => ({
           path,
           element: (

@@ -287,3 +287,43 @@ async def test_h5_login_surfaces_dingtalk_error(seeded) -> None:
     with pytest.raises(PermissionDenied) as excinfo:
         await service.resolve_user("authcode-3")
     assert "40078" in str(excinfo.value)
+
+
+@respx.mock
+async def test_replay_protection_survives_cache_flush(seeded) -> None:
+    """**安全事实不落可清空缓存**（v4.0 评估 P1）：清空 ``ekbs_cache`` 后，
+    已用 authCode 的防重放必须依然有效 —— 旧实现里清缓存 = 解除防重放。"""
+    from ekbs.cache.store import CacheStore
+    from ekbs.dingtalk.auth import DingTalkAuthService
+    from ekbs.errors import PermissionDenied
+
+    runtime, _summary = seeded
+    respx.post(URL).mock(
+        return_value=httpx.Response(200, json={"accessToken": "tok-flush", "expireIn": 7200})
+    )
+    respx.post(url__regex=r"https://oapi\.dingtalk\.com/topapi/v2/user/getuserinfo.*").mock(
+        return_value=httpx.Response(
+            200,
+            json={"errcode": 0, "errmsg": "ok", "result": {"userid": "demo_alice", "name": "Alice"}},
+        )
+    )
+    service = DingTalkAuthService(
+        db=runtime.db, settings=runtime.settings,
+        token_client=client(CacheStore(runtime.db, runtime.settings)),
+        cache=CacheStore(runtime.db, runtime.settings),
+    )
+    await service.resolve_user("authcode-flush-1")
+
+    # 模拟运维清空缓存（03 §9.2 的应急预案动作）——不得影响防重放
+    with runtime.db.sync_connect() as conn:
+        conn.execute("DELETE FROM ekbs_cache")
+        conn.commit()
+
+    with pytest.raises(PermissionDenied, match="已被使用过"):
+        await service.resolve_user("authcode-flush-1")
+    # 且消费记录持久化在 ekbs_msg_dedup，不在 ekbs_cache
+    with runtime.db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM ekbs_msg_dedup WHERE msg_id LIKE 'dt_authcode:%'"
+        ).fetchone()
+    assert row is not None

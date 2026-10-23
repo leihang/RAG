@@ -17,7 +17,8 @@
 
 1. **不许算**：上下文没直接给出就 N/A，即使能由其它指标算出来也 N/A；
 2. **不许猜**：指标等价性有任何疑问就 N/A（防"数字是真的但答非所问"）；
-3. **抄完要验**：模型给的数必须能在它引用的原文片段里**逐字找到**（见 :func:`verify_copied`）。
+3. **抄完要验**：模型给的数必须是原文里的那个数字，不把「万 / 千 / 亿」换算成基本单位
+   （见 :func:`verify_copied`）。展示用原文写法。
 
 第 3 条是我们比课程**更强**的地方：课程的保证来自类型锁死，我们额外要求
 "这个数确实是从这段原文抄的" —— 因此数值模式**不需要**再跑自由文本的忠实度校验
@@ -53,9 +54,9 @@ NUMERIC_SYSTEM_PROMPT = (
     "1. **禁止计算与推导**：资料未直接给出该指标时，即使能由其它数字算出，也返回 \"N/A\"。\n"
     "2. **禁止猜测指标**：上下文里所有可能指标都要看实际衡量内容；含义与问题**不完全一致**\n"
     "   （范围不同、只是相关概念、需要聚合）一律返回 \"N/A\"。有疑问也返回 \"N/A\"。\n"
-    "3. 数字格式：千分位逗号要去掉（1,234,567 → 1234567）；欧陆式逗号当小数点（58,3 → 58.3）；\n"
-    "   括号表示负数（(2,124,837) → -2124837）；单位为千/百万/万/亿时**补零到基本单位**\n"
-    "   （4970.5 千美元 → 4970500；1.2 万度 → 12000），并在 unit 里写明换算后的单位。\n"
+    "3. 数字按资料原文抄，**禁止换算**。不要把「万」「千」「亿」折成基本单位\n"
+    "   （原文是「1.2 万度」时 value 写 1.2，不要写成 12000；「万」留在原文里）。\n"
+    "   千分位逗号写入 value 前可以去掉；括号负数的 value 用负号。quote 必须是逐字原文。\n"
     "4. 币种/口径与问题不符 → \"N/A\"。\n"
     "5. quote 必须是从资料里**逐字复制**的一段，且里面真的含有这个数字（原样形式）。\n"
     "6. **scope 是必填口径**：同一个指标往往有多行（2024年/2025年/2026年、不同表），\n"
@@ -87,13 +88,31 @@ def build_numeric_prompt(context: str) -> str:
 #: 取数模式下的用户名（进答案缓存键，避免与业务问答互相命中）
 MODE_NUMERIC = "numeric"
 MODE_PROSE = "prose"
+MODE_AUTO = "auto"
 
-#: 量级词 → 倍数（按课程"千/百万补零"的规则；顺序敏感：先长后短）
-_SCALES: tuple[tuple[str, float], ...] = (
-    ("万亿", 1e12), ("十亿", 1e9), ("百万", 1e6), ("千万", 1e7),
-    ("千亿", 1e11), ("亿", 1e8), ("万", 1e4), ("千", 1e3),
+
+def resolve_answer_mode(
+    requested: str | None,
+    intent: str,
+    *,
+    auto_numeric: bool = True,
+) -> str:
+    """把请求 mode + 意图解析成实际作答模式（``prose`` | ``numeric``）。
+
+    * 显式 ``prose`` / ``numeric`` → 原样（管理台手动切换）；
+    * ``auto``（默认）：``auto_numeric`` 开启且意图为 numeric → 取数，否则业务问答。
+    """
+    req = (requested or MODE_AUTO).strip().lower()
+    if req in {MODE_PROSE, MODE_NUMERIC}:
+        return req
+    if auto_numeric and (intent or "").strip().lower() == MODE_NUMERIC:
+        return MODE_NUMERIC
+    return MODE_PROSE
+
+_SURFACE_RE = re.compile(
+    r"\(?-?\d[\d,]*(?:\.\d+)?\)?(?:\s*(?:万亿|十亿|千万|百万|千亿|亿|万|千))?"
 )
-
+_SURFACE_NUMBER = re.compile(r"\(?-?\d[\d,]*(?:\.\d+)?\)?")
 _NUMBER_TOKEN = re.compile(r"\(?-?\d[\d,\s]*(?:\.\d+)?\)?")
 
 
@@ -114,6 +133,8 @@ class NumericAnswer:
     alternatives: list[dict[str, Any]] = field(default_factory=list)
     reason: str = ""
     raw: str = ""
+    #: 展示用的原文数字（如 ``439200.00``、``1.2 万``）。取数成功后由抄写校验填上。
+    surface: str = ""
     #: 抄写校验命中的引用序号（1-based，对应进上下文的分块顺序）
     cite_index: int | None = None
     verified: bool = False
@@ -137,14 +158,15 @@ class NumericAnswer:
             "reason": self.reason,
             "verified": self.verified,
             "cite_index": self.cite_index,
+            "surface": self.surface,
         }
 
 
 def normalize_number(text: Any, unit: str = "") -> float | None:
     """把"资料/模型给出的数字字符串"归一成基本单位下的 float（不做任何内容推导）。
 
-    覆盖课程列的四种格式陷阱：千分位逗号、欧陆式逗号当小数点、括号负数、千/百万补零。
-    解析不出来返回 ``None``（调用方据此判 N/A）。
+    覆盖千分位逗号、欧陆式逗号当小数点、括号负数。
+    **不**按「万 / 千 / 亿」换算：单位里的量级词不改变数值。
     """
     if text is None:
         return None
@@ -171,13 +193,7 @@ def normalize_number(text: Any, unit: str = "") -> float | None:
             return None
         if negative:
             value = -value
-    # 量级词：模型可能把"千美元"原样写进 unit（课程规则是补零到基本单位）
-    scale = 1.0
-    for word, mult in _SCALES:
-        if word in (unit or ""):
-            scale = mult
-            break
-    return value * scale
+    return value
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -234,19 +250,19 @@ def parse_numeric_payload(text: str) -> NumericAnswer:
     )
 
 
-def _numbers_in(text: str, unit_hint: str = "") -> list[float]:
-    """抽出一段原文里的全部数字（含量级候选），用于"抄写校验"。"""
-    out: list[float] = []
-    for token in _NUMBER_TOKEN.findall(text or ""):
-        base = normalize_number(token)
-        if base is None:
+def _literal_surfaces(text: str) -> list[tuple[str, float]]:
+    """原文中的数字写法。``1.2 万`` 的数值是 1.2，不乘一万。"""
+    found: list[tuple[str, float]] = []
+    for match in _SURFACE_RE.finditer(text or ""):
+        surface = match.group(0).strip()
+        number = _SURFACE_NUMBER.match(surface)
+        if number is None:
             continue
-        out.append(base)
-        # 原文可能写"1.2 万"，量级在文字里而不在数字里 —— 把常见量级都列为候选，
-        # 这样"抄的数字"与"原文形式"之间只差一个量级也能验上（不是计算，是等价形式）。
-        for _word, mult in _SCALES:
-            out.append(base * mult)
-    return out
+        value = normalize_number(number.group(0))
+        if value is None:
+            continue
+        found.append((surface, value))
+    return found
 
 
 def verify_copied(
@@ -255,29 +271,26 @@ def verify_copied(
     *,
     rel_tol: float = 1e-6,
 ) -> tuple[bool, int | None]:
-    """**抄写校验**：模型给的数必须是它引用的原文片段里"逐字存在"的数。
+    """抄写校验：模型给的数必须是引用片段里原样出现的数字，不做万/千换算。
 
-    判定两件事：
-
-    1. ``quote`` 真的出现在某个入选分块的正文里（不是拼出来的）；
-    2. ``value`` 与该片段里的某个数字**在同一量级下相等**（容差只为容忍
-       ``57795.6`` vs ``57795.60`` 这类格式差，不是为了容忍四舍五入 —— 四舍五入
-       在取数模式下应当由模型原样抄，而不是由我们放行）。
-
-    返回 ``(是否通过, 命中的 1-based 引用序号)``。
+    1. ``quote`` 去掉空白后必须出现在某个入选分块里；
+    2. ``value`` 等于该片段里某个数字的字面值（``1.2 万`` 只等于 1.2，不等于 12000）。
+    命中后把原文写法写进 ``answer.surface``，供展示，不再另做千分位或补零。
     """
     if answer.is_na:
         return False, None
-    quote = re.sub(r"\s+", "", answer.quote or "")
-    if not quote:
+    quote_key = re.sub(r"\s+", "", answer.quote or "")
+    if not quote_key:
         return False, None
     value = float(answer.value)
+    surfaces = _literal_surfaces(answer.quote)
     for index, chunk in enumerate(chunks, start=1):
         content = re.sub(r"\s+", "", str(getattr(chunk, "content", "") or ""))
-        if not content or quote not in content:
+        if not content or quote_key not in content:
             continue
-        for candidate in _numbers_in(answer.quote, answer.unit):
-            if abs(candidate - value) <= max(rel_tol * max(abs(value), 1.0), 1e-9):
+        for surface, literal in surfaces:
+            if abs(literal - value) <= max(rel_tol * max(abs(value), 1.0), 1e-9):
+                answer.surface = surface
                 return True, index
     return False, None
 
@@ -398,7 +411,7 @@ def render_answer(answer: NumericAnswer, cite_index: int | None) -> str:
     value = answer.value
     if value is None:
         return "未找到可靠依据。"
-    text = _format_value(float(value))
+    text = answer.surface.strip() if answer.surface else _format_value(float(value))
     if answer.unit:
         text += f" {answer.unit}"
     subject = " ".join(x for x in (answer.scope, answer.indicator) if x)
@@ -406,6 +419,54 @@ def render_answer(answer: NumericAnswer, cite_index: int | None) -> str:
     tail = f"（第 {answer.page} 页）" if answer.page else ""
     marker = f" [{cite_index}]" if cite_index else ""
     return f"{head}{text}{tail}{marker}"
+
+
+def format_numeric_user_reply(answer: NumericAnswer, cite_index: int | None) -> str:
+    """取数成功时的用户可见文案（含依据片段，供钉钉/API 直接展示）。"""
+    lines = [render_answer(answer, cite_index)]
+    if answer.quote:
+        lines.append(f"依据：{answer.quote}")
+    return "\n".join(lines)
+
+
+def format_scope_clarify_reply(
+    answer: NumericAnswer,
+    alternatives: Sequence[dict[str, Any]],
+) -> str:
+    """多口径歧义时的反问文案（拒答，不放出任一数值当唯一答案）。"""
+    lines = [
+        "资料中同一指标存在多个口径，无法唯一确定。请补充年份、月份或表名后再问。",
+        "",
+        "例如：「2026年总用电是多少度」",
+        "",
+        "资料中可见的不同取值：",
+    ]
+    shown: list[str] = []
+    if answer.value is not None:
+        scope = (answer.scope or "").strip() or "未标注口径"
+        unit = f" {answer.unit}" if answer.unit else ""
+        shown.append(
+            f"· {scope}："
+            f"{answer.surface.strip() if answer.surface else _format_value(float(answer.value))}"
+            f"{unit}"
+        )
+    for alt in alternatives:
+        scope = str(alt.get("scope") or alt.get("label") or "未标注口径").strip()
+        raw = alt.get("raw")
+        val = alt.get("value")
+        if raw is not None:
+            num_text = str(raw)
+        elif isinstance(val, (int, float)):
+            num_text = _format_value(float(val))
+        else:
+            continue
+        page = alt.get("page")
+        page_s = f"（第 {page} 页）" if page else ""
+        title = str(alt.get("doc_title") or "").strip()
+        title_s = f" · {title}" if title else ""
+        shown.append(f"· {scope}：{num_text}{page_s}{title_s}")
+    lines.extend(shown[:6] if shown else ["· （未能列出候选行，请改用带年份的问法）"])
+    return "\n".join(lines)
 
 
 @dataclass

@@ -119,6 +119,18 @@ async def test_tree_and_detail(client, admin) -> None:
     assert detail["chunk_type"] == "child" and detail["shard_id"]
     assert detail["token_count"] > 0
     assert detail["retrieval_text"].startswith(detail["heading_path"].split(" > ")[0])
+    assert detail.get("figure_mm_indexed") is False
+
+    search = (
+        await client.get(
+            f"/api/v1/chunks/documents/{doc_id}/search",
+            headers=headers,
+            params={"q": detail["content"][:8], "limit": 10},
+        )
+    ).json()
+    assert search["document"]["doc_id"] == doc_id
+    assert search["total"] >= 1
+    assert any(c["chunk_id"] == chunk_id for c in search["chunks"])
 
 
 async def test_edit_child_swaps_vector_and_rewrites_fts(client, admin) -> None:

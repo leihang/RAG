@@ -6,8 +6,9 @@
 拼好了 `figures` 列表、还把它写进了日志，却**忘了传给 `ingest_markdown`**。
 于是图片全被静默丢掉：磁盘上有、界面里看不见、`/assets/figure/{chunk_id}` 无块可指。
 
-这个用例从"造一份真 pptx → 放进 raw → 入队 → worker 解析 → 查库"整条走一遍，
-只认最终结果：库里必须出现 `chunk_type='figure'` 且 `image_path` 指向落盘文件。
+解析后先停在复核，图片必须进草稿 sidecar（确认通过时分块器只认这份清单）。
+这个用例从"造一份真 pptx → 放进 raw → 入队 → worker 解析"整条走一遍，
+只认结果：状态是 review，sidecar 里有 figure，且 image_path 指向落盘文件。
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import pytest
 
 from ekbs.ingest.dir_import import enqueue_files, raw_root
 from ekbs.ingest.pipeline import IngestPipeline
+from ekbs.ingest.scan_review import load_review_sidecar
 from ekbs.worker import process_once
 from tests.test_import_api import open_compliance
 
@@ -91,17 +93,16 @@ async def test_pptx_with_picture_yields_figure_chunk(runtime, seeded, tmp_path: 
                 "SELECT status FROM ekbs_document WHERE doc_id = ?", (doc_id,)
             ).fetchone()["status"]
         )
-        figures = conn.execute(
-            "SELECT chunk_id, content, image_path, page_from FROM ekbs_chunk "
-            "WHERE doc_id = ? AND chunk_type = 'figure'",
-            (doc_id,),
-        ).fetchall()
-    assert status == "published", f"解析应成功，实际 {status}"
+        chunks = conn.execute(
+            "SELECT COUNT(*) FROM ekbs_chunk WHERE doc_id = ?", (doc_id,)
+        ).fetchone()[0]
+    assert status == "review", f"确认前不应发布，实际 {status}"
+    assert chunks == 0
 
-    # 核心断言：图片块 + image_path 真的进库了
-    assert figures, "PPTX 里的图片没有生成 figure 块（worker 是否忘了传 figures= ？）"
-    row = figures[0]
-    assert "8 月能耗现场照片" in str(row["content"])
-    image_path = str(row["image_path"] or "")
+    side = load_review_sidecar(runtime.settings.data_dir, doc_id)
+    assert side.figures, "PPTX 里的图片没有写进复核草稿"
+    row = side.figures[0]
+    assert "8 月能耗现场照片" in str(row.get("caption") or "")
+    image_path = str(row.get("image_path") or "")
     assert image_path.startswith("parse/"), image_path
     assert (runtime.settings.data_dir / image_path).is_file(), image_path

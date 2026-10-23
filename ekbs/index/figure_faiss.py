@@ -111,6 +111,22 @@ class FigureIndex:
             self.save()
         return removed
 
+    def contains(self, chunk_ids: Sequence[int]) -> set[int]:
+        """返回 ``chunk_ids`` 里**确实在多模态索引中**的子集（管理台「已索引」标识用）。"""
+        self._reload_if_changed()
+        wanted = {int(i) for i in chunk_ids}
+        if not wanted or self.index.ntotal == 0:
+            return set()
+        faiss = _import_faiss()
+        try:
+            ids = faiss.vector_to_array(self.index.id_map)
+        except Exception:  # noqa: BLE001 — 极端旧索引形态兜底
+            size = int(self.index.id_map.size())
+            ids = np.asarray(
+                [int(self.index.id_map.at(i)) for i in range(size)], dtype="int64"
+            )
+        return wanted.intersection(int(x) for x in ids)
+
     def search(self, vector: Sequence[float], top_k: int) -> list[tuple[int, float]]:
         self._reload_if_changed()
         if self.index.ntotal == 0 or top_k <= 0:

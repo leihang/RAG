@@ -26,6 +26,7 @@ class _TableHTMLParser(HTMLParser):
         self._row: list[str] | None = None
         self._cell: list[str] | None = None
         self._in_cell = False
+        self._colspan = 1
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         name = tag.lower()
@@ -34,13 +35,21 @@ class _TableHTMLParser(HTMLParser):
         elif name in {"td", "th"} and self._row is not None:
             self._cell = []
             self._in_cell = True
+            self._colspan = 1
+            for key, value in attrs:
+                if key.lower() == "colspan" and value and value.strip().isdigit():
+                    self._colspan = max(1, min(int(value.strip()), 32))
 
     def handle_endtag(self, tag: str) -> None:
         name = tag.lower()
         if name in {"td", "th"} and self._row is not None and self._cell is not None:
-            self._row.append("".join(self._cell).strip())
+            text = "".join(self._cell).strip()
+            self._row.append(text)
+            for _ in range(self._colspan - 1):
+                self._row.append("")
             self._cell = None
             self._in_cell = False
+            self._colspan = 1
         elif name == "tr" and self._row is not None:
             if self._row:
                 self.rows.append(self._row)

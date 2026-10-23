@@ -40,7 +40,7 @@ _SECRET_KEY_RE = re.compile(
     r")(?:$|[._-])"
 )
 
-#: ``secrets.env`` 的键名清单（`01` §0.2 + `04` §2.6）。
+#: ``secrets.env`` 的键名清单（`01` §0.2 + `04` §2.6 + `08` §5.2）。
 SECRET_KEYS = (
     "DASHSCOPE_API_KEY",
     "DEEPSEEK_API_KEY",
@@ -50,6 +50,15 @@ SECRET_KEYS = (
     "DINGTALK_CORP_ID",
     "JWT_SECRET",
     "EKBS_INTERNAL_TOKEN",
+    # 告警通道（08 §5.2）：主通道钉钉机器人 + 带外邮件 SMTP
+    "EKBS_ALERT_DINGTALK_WEBHOOK",
+    "EKBS_ALERT_DINGTALK_SECRET",
+    "EKBS_ALERT_SMTP_HOST",
+    "EKBS_ALERT_SMTP_PORT",
+    "EKBS_ALERT_SMTP_USER",
+    "EKBS_ALERT_SMTP_PASSWORD",
+    "EKBS_ALERT_SMTP_FROM",
+    "EKBS_ALERT_SMTP_TO",
 )
 
 #: 同一密钥在文档里出现过两个写法时，按顺序都接受。
@@ -297,6 +306,8 @@ class Settings(BaseSettings):
     dingtalk: dict[str, Any] = Field(default_factory=dict)
     adapter: AdapterCfg = Field(default_factory=AdapterCfg)
     session: dict[str, Any] = Field(default_factory=dict)
+    #: 问答通道：``auto_numeric`` 控制 ``mode=auto`` 是否按意图进取数（见 ekbs/retrieval/numeric.py）
+    qa: dict[str, Any] = Field(default_factory=dict)
     limits: dict[str, Any] = Field(default_factory=dict)
     security: dict[str, Any] = Field(default_factory=dict)
 

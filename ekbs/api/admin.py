@@ -13,6 +13,8 @@
 | ``GET /api/v1/system/health`` | ``sys:health:read`` |
 | ``GET /api/v1/system/shards`` | ``sys:health:read`` |
 | ``GET /api/v1/docs/documents`` | ``doc:document:read`` |
+| ``GET /api/v1/docs/documents/{doc_id}/source`` | ``doc:document:read``（原件回源，复核对照） |
+| ``GET /api/v1/docs/documents/{doc_id}/source-preview`` | ``doc:document:read``（Word 等转 HTML，嵌左栏） |
 
 **两条安全约束**（都在实现里）：
 
@@ -24,16 +26,20 @@
 
 from __future__ import annotations
 
+import mimetypes
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from ekbs.api.auth import INTERNAL_TOKEN_HEADER, INTERNAL_USER_HEADER
 from ekbs.api.qa import _authenticate
 from ekbs.authz import SUPER_ADMIN
 from ekbs.errors import PermissionDenied
+from ekbs.ingest.office_preview import OfficePreviewError, render_office_preview
 from ekbs.logging import get_logger
+from ekbs.permission.console import is_console_role, widen_for_console
 from ekbs.observability.alerts import ALERT_RULES, evaluate_all
 
 router = APIRouter(tags=["admin"])
@@ -424,6 +430,10 @@ async def system_shards(
                 "self_check_detail": check.detail if check else "",
             }
         )
+    from ekbs.personal import attach_personal_owners
+
+    with runtime.db.sync_connect() as conn:
+        attach_personal_owners(conn, items)
     return JSONResponse({"items": items, "count": len(items)})
 
 
@@ -459,6 +469,8 @@ async def list_documents(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     perm = await runtime.perm_context(user.user_id)
     admin_bypass = SUPER_ADMIN in principal.roles
+    if is_console_role(principal.roles) and not admin_bypass:
+        perm = widen_for_console(perm, runtime.db)
     limit, offset = _page(limit, offset)
     allow_deleted = str(status or "") == "deleted"
     where = ["1=1"]
@@ -490,7 +502,7 @@ async def list_documents(
     # 试点规模：先取足够候选再精滤分页（避免 total 与可见行不一致）
     fetch_cap = min(max(offset + limit * 5, 200), 2000)
     sql = (
-        "SELECT d.doc_id, d.kb_id, k.code AS kb_code, d.title, d.level, d.status, "
+        "SELECT d.doc_id, d.kb_id, k.code AS kb_code, k.name AS kb_name, d.title, d.level, d.status, "
         "d.visible_dept_ids, d.page_count, d.doc_version, d.effective_date, d.expire_date, "
         "d.updated_at, d.deleted_at, "
         "(SELECT c.shard_id FROM ekbs_chunk c WHERE c.doc_id = d.doc_id LIMIT 1) AS shard_id, "
@@ -524,6 +536,9 @@ async def list_documents(
             if decision.allowed:
                 visible.append(record)
         total = len(visible)
+        from ekbs.personal import attach_personal_owners
+
+        attach_personal_owners(conn, visible)
         # 若触顶仍可能漏计：再做一次全量精滤计数（试点文档量可接受）
         if len(raw_rows) >= fetch_cap:
             count_sql = (
@@ -570,9 +585,11 @@ async def get_document(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     perm = await runtime.perm_context(user.user_id)
     admin_bypass = SUPER_ADMIN in principal.roles
+    if is_console_role(principal.roles) and not admin_bypass:
+        perm = widen_for_console(perm, runtime.db)
     with runtime.db.sync_connect() as conn:
         row = conn.execute(
-            "SELECT d.*, k.code AS kb_code, "
+            "SELECT d.*, k.code AS kb_code, k.name AS kb_name, "
             "(SELECT c.shard_id FROM ekbs_chunk c WHERE c.doc_id = d.doc_id "
             " ORDER BY c.chunk_id LIMIT 1) AS shard_id "
             "FROM ekbs_document d "
@@ -616,9 +633,138 @@ async def get_document(
         item["visible_dept_ids"] = _json.loads(item.get("visible_dept_ids") or "[]")
     except ValueError:
         pass
+    from ekbs.personal import attach_personal_owners
+
+    with runtime.db.sync_connect() as conn:
+        attach_personal_owners(conn, [item])
     return JSONResponse(
         {"document": item, "chunks": chunks, "shards": shards, "citation_count": citations}
     )
+
+
+def _source_under_allowed(runtime: Any, source: str) -> Path | None:
+    """原件必须落在 ``raw`` / ``trash`` 内；越界返回 None（调用方统一 404）。"""
+    if not source or source.startswith("demo://"):
+        return None
+    try:
+        resolved = Path(source).resolve()
+    except Exception:
+        return None
+    paths = runtime.settings.data_paths()
+    for name in ("raw", "trash"):
+        root = Path(paths[name]).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+async def _open_document_source(
+    request: Request,
+    doc_id: int,
+    headers: dict[str, str | None],
+) -> Path:
+    """鉴权后返回原件路径，并记一条 view 审计。"""
+    runtime = request.app.state.runtime
+    user = _authenticate(request, headers)
+    try:
+        principal = runtime.authz.require(user.user_id, "doc:document:read")
+    except PermissionDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    perm = await runtime.perm_context(user.user_id)
+    admin_bypass = SUPER_ADMIN in principal.roles
+    if is_console_role(principal.roles) and not admin_bypass:
+        perm = widen_for_console(perm, runtime.db)
+    with runtime.db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM ekbs_document WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="not_found")
+
+    from ekbs.permission.acl import DocumentFacts
+
+    facts = DocumentFacts.from_row(row)
+    entries = runtime.gate.load_document_acl([doc_id]).get(doc_id, [])
+    if not runtime.gate.can_see_document(
+        perm, facts, entries, for_retrieval=False, allow_deleted=True,
+        admin_bypass=admin_bypass,
+    ):
+        runtime.audit.record_access(
+            user_id=user.user_id, doc_id=doc_id, action="view",
+            channel="admin_source", result="denied",
+        )
+        raise HTTPException(status_code=404, detail="not_found")
+
+    candidate = _source_under_allowed(runtime, str(row["source_path"] or ""))
+    if candidate is None:
+        runtime.audit.record_access(
+            user_id=user.user_id, doc_id=doc_id, action="view",
+            channel="admin_source", result="denied",
+        )
+        raise HTTPException(status_code=404, detail="not_found")
+
+    runtime.audit.record_access(
+        user_id=user.user_id, doc_id=doc_id, action="view",
+        channel="admin_source", result="ok",
+    )
+    return candidate
+
+
+def _source_headers(
+    authorization: str | None,
+    x_internal_token: str | None,
+    x_internal_user_id: str | None,
+) -> dict[str, str | None]:
+    return {
+        "authorization": authorization,
+        INTERNAL_TOKEN_HEADER.lower(): x_internal_token,
+        INTERNAL_USER_HEADER.lower(): x_internal_user_id,
+    }
+
+
+@router.get("/docs/documents/{doc_id}/source")
+async def get_document_source(
+    doc_id: int,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> FileResponse:
+    """文档原件回源（复核左栏的 PDF / 图片）。越权 / 无文件 / 路径越界一律 404。"""
+    candidate = await _open_document_source(
+        request, doc_id, _source_headers(authorization, x_internal_token, x_internal_user_id),
+    )
+    media_type, _ = mimetypes.guess_type(candidate.name)
+    # inline：嵌入复核左栏，禁止 attachment 触发「另存为/新标签打开」弹层
+    return FileResponse(
+        candidate,
+        media_type=media_type or "application/octet-stream",
+        filename=candidate.name,
+        content_disposition_type="inline",
+    )
+
+
+@router.get("/docs/documents/{doc_id}/source-preview")
+async def get_document_source_preview(
+    doc_id: int,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> HTMLResponse:
+    """Word / Excel / PPT / 文本原件转成 HTML，嵌进复核左栏。PDF 请走 /source。"""
+    candidate = await _open_document_source(
+        request, doc_id, _source_headers(authorization, x_internal_token, x_internal_user_id),
+    )
+    try:
+        page = render_office_preview(candidate)
+    except OfficePreviewError as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
+    return HTMLResponse(page)
 
 
 # ---------------------------------------------------------------------------

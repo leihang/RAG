@@ -336,7 +336,7 @@ def test_enqueue_path_escape_is_recorded_as_failure(seeded) -> None:
 
 async def test_enqueued_document_is_picked_up_by_worker(seeded) -> None:
     runtime, _ = seeded
-    """**端到端**：登记 → worker 解析 → published（目录导入的整条闭环）。"""
+    """**端到端**：登记 → worker 解析 → review（确认前不分块、不发布）。"""
     open_compliance(runtime)
     make_raw_files(runtime, {"制度/差旅.md": "# 差旅费管理办法\n\n## 住宿标准\n\n一线城市每晚 600 元。"})
     kb_id = _first_kb_id(runtime)
@@ -360,10 +360,9 @@ async def test_enqueued_document_is_picked_up_by_worker(seeded) -> None:
         chunks = conn.execute(
             "SELECT COUNT(*) FROM ekbs_chunk WHERE doc_id = ?", (doc_id,)
         ).fetchone()[0]
-    assert row["status"] == "published"
-    assert chunks > 0, "worker 解析后应有分块"
-    # **checksum 必须仍是「文件内容哈希」，不能被 markdown 内容哈希覆盖**
-    # （worker 不传 checksum 时 pipeline 会用 markdown 哈希回写，秒传/去重口径当场失真）
+    assert row["status"] == "review"
+    assert chunks == 0, "确认通过前不应分块"
+    # checksum 在解析停复核时也不能被改写，秒传/去重仍按文件内容哈希。
     import hashlib
 
     expected = hashlib.sha256(
@@ -473,3 +472,191 @@ async def test_import_run_end_to_end_via_http(client, seeded) -> None:
 def _first_kb_id(runtime) -> int:
     with runtime.db.sync_connect() as conn:
         return int(conn.execute("SELECT kb_id FROM ekbs_kb ORDER BY kb_id LIMIT 1").fetchone()["kb_id"])
+
+
+def test_dept_tree_follows_parent_and_inverts_code_map() -> None:
+    from ekbs.permission.dept_tree import attach_dept_codes
+
+    rows = [
+        {"dept_id": 33, "parent_dept_id": 24, "name": "工程部", "dingtalk_dept_id": "97486022"},
+        {"dept_id": 1, "parent_dept_id": None, "name": "总部", "dingtalk_dept_id": "1"},
+        {"dept_id": 24, "parent_dept_id": 1, "name": "物业中心", "dingtalk_dept_id": "24"},
+        {"dept_id": 2, "parent_dept_id": 1, "name": "人力资源部", "dingtalk_dept_id": "102"},
+    ]
+    ordered = attach_dept_codes(rows, {"hr": ["102"], "finance": ["103"]})
+    names = [row["name"] for row in ordered]
+    assert names.index("总部") < names.index("物业中心") < names.index("工程部")
+    by_name = {row["name"]: row for row in ordered}
+    assert by_name["工程部"]["tree_depth"] == 2
+    assert by_name["人力资源部"]["dept_code"] == "hr"
+    assert by_name["工程部"]["dept_code"] == ""
+
+
+async def test_create_import_dir_without_uploading_a_file(client, seeded) -> None:
+    runtime, _ = seeded
+    admin = grant_role(runtime, "demo_alice", "doc_reviewer")
+    created = await client.post(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        json={"path": "kbdemo/工程部/图纸"},
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["created"] is True
+    assert body["rel_path"] == "kbdemo/工程部/图纸"
+
+    again = await client.post(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        json={"path": "kbdemo/工程部/图纸"},
+    )
+    assert again.status_code == 200
+    assert again.json()["created"] is False
+
+    listed = await client.get(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        params={"path": "kbdemo", "recursive": "true"},
+    )
+    assert listed.status_code == 200, listed.text
+    assert {d["rel_under"] for d in listed.json()["dirs"]} >= {"工程部", "工程部/图纸"}
+
+    escaped = await client.post(
+        "/api/v1/import/dirs", headers=headers_for(admin), json={"path": "../outside"}
+    )
+    assert escaped.status_code == 403
+
+
+async def test_import_dept_options_for_uploader(client, seeded) -> None:
+    """审核员没有 perm:dept:read，但上传时仍要能看到钉钉部门 ID 和分片码。"""
+    runtime, _ = seeded
+    reviewer = grant_role(runtime, "demo_alice", "doc_reviewer")
+    denied = await client.get("/api/v1/perm/depts", headers=headers_for(reviewer))
+    assert denied.status_code == 403
+
+    resp = await client.get("/api/v1/import/depts", headers=headers_for(reviewer))
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["items"]
+    hr = next(item for item in items if str(item["dingtalk_dept_id"]) == "102")
+    assert hr["name"] == "人力资源部"
+    assert hr["dept_code"] == "hr"
+    assert hr["tree_depth"] >= 1
+    by_id = {item["dept_id"]: item for item in items}
+    parent = by_id[hr["parent_dept_id"]]
+    assert items.index(hr) > items.index(parent)
+    assert hr["tree_depth"] == parent["tree_depth"] + 1
+
+
+async def test_folder_policy_is_listed_and_disappears_when_the_dir_is_gone(client, seeded) -> None:
+    """文件夹记下密级和部门；删掉空文件夹后列表里不再出现。"""
+    runtime, _ = seeded
+    admin = grant_role(runtime, "demo_alice", "doc_reviewer")
+    alice = user_id_of(runtime.db, "demo_alice")
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "INSERT INTO ekbs_kb(code, name, default_level, status) VALUES ('wuye-folder', '物业', 2, 1)"
+        )
+        conn.commit()
+
+    created = await client.post(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        json={
+            "path": "wuye-folder/工程部",
+            "level": 2,
+            "visible_dept_ids": ["102"],
+            "viewer_user_ids": [alice],
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["folder_policy"]["level"] == 2
+    assert created.json()["folder_policy"]["viewer_user_ids"] == [alice]
+
+    listed = await client.get(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        params={"path": "wuye-folder", "recursive": "true"},
+    )
+    assert listed.status_code == 200, listed.text
+    row = next(item for item in listed.json()["dirs"] if item["rel_under"] == "工程部")
+    assert row["level"] == 2
+    assert row["visible_dept_ids"] == ["102"]
+
+    removed = await client.delete(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        params={"path": "wuye-folder/工程部"},
+    )
+    assert removed.status_code == 200, removed.text
+    again = await client.get(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        params={"path": "wuye-folder", "recursive": "true"},
+    )
+    assert again.status_code == 200
+    assert all(item["rel_under"] != "工程部" for item in again.json()["dirs"])
+
+    # 磁盘上已经没有的路径再删一次，仍然成功，界面可以清掉残留名字。
+    gone = await client.delete(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        params={"path": "wuye-folder/工程部"},
+    )
+    assert gone.status_code == 200
+
+    kept = await client.post(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        json={"path": "wuye-folder/工程部"},
+    )
+    assert kept.status_code == 200
+    make_raw_files(runtime, {"wuye-folder/工程部/制度.md": "正文"})
+    blocked = await client.delete(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        params={"path": "wuye-folder/工程部"},
+    )
+    assert blocked.status_code == 409
+
+
+def test_child_folder_does_not_take_the_parent_department(runtime) -> None:
+    """物业中心下面的工程部、客服部各自用自己的部门，不套用上级。"""
+    import json
+
+    from ekbs.errors import ConfigError
+    from ekbs.ingest.folder_policy import policy_for_upload
+
+    root = raw_root(runtime.settings)
+    parent = root / "wuye" / "物业中心"
+    engineering = parent / "工程部"
+    service = parent / "客服部"
+    engineering.mkdir(parents=True)
+    service.mkdir()
+    (parent / ".ekbs-folder.json").write_text(json.dumps({
+        "level": 2, "visible_dept_ids": ["97478025"], "viewer_user_ids": [],
+    }), encoding="utf-8")
+    (engineering / ".ekbs-folder.json").write_text(json.dumps({
+        "level": 2, "visible_dept_ids": ["97486022"], "viewer_user_ids": [],
+    }), encoding="utf-8")
+    (service / ".ekbs-folder.json").write_text(json.dumps({
+        "level": 2, "visible_dept_ids": ["97346041"], "viewer_user_ids": [],
+    }), encoding="utf-8")
+
+    eng = policy_for_upload(runtime.settings, "wuye", "物业中心/工程部/制度.docx")
+    srv = policy_for_upload(runtime.settings, "wuye", "物业中心/客服部/制度.docx")
+    center = policy_for_upload(runtime.settings, "wuye", "物业中心/中心通知.docx")
+    assert eng is not None and eng["visible_dept_ids"] == ["97486022"] and eng["level"] == 2
+    assert srv is not None and srv["visible_dept_ids"] == ["97346041"]
+    assert center is not None and center["visible_dept_ids"] == ["97478025"]
+
+    (parent / ".ekbs-folder.json").write_text(json.dumps({
+        "level": 3, "visible_dept_ids": ["97478025"], "viewer_user_ids": [],
+    }), encoding="utf-8")
+    raised = policy_for_upload(runtime.settings, "wuye", "物业中心/工程部/制度.docx")
+    assert raised is not None
+    assert raised["level"] == 3
+    assert raised["visible_dept_ids"] == ["97486022"]
+
+    (engineering / ".ekbs-folder.json").unlink()
+    with pytest.raises(ConfigError, match="单独选择可见部门"):
+        policy_for_upload(runtime.settings, "wuye", "物业中心/工程部/制度.docx")

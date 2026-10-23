@@ -54,6 +54,7 @@ _CLAIM_RE = re.compile(
 
 REFUSE_MISSING_CITATION = "missing_citation"
 REFUSE_UNSUPPORTED_CLAIM = "unsupported_claim"
+REFUSE_CLAUSE_MISMATCH = "clause_mismatch"
 
 #: 软降级的标记前缀（写进 ``AnswerResult.degraded``，供界面提示与审计分组）
 DEGRADED_UNSUPPORTED = "unsupported_claim"
@@ -242,3 +243,70 @@ def assess_faithfulness(answer: str, chunks: Sequence[object]) -> FaithfulnessRe
     return FaithfulnessReport(
         ok=True, cited_indices=indices, claims=checks, unsupported=[]
     )
+
+
+_CLAUSE_RE = re.compile(
+    r"第\s*([0-9]+|[一二三四五六七八九十百千零〇两]+)\s*([章节条款项])"
+)
+_CN_DIGIT = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+
+
+def _cn_to_int(text: str) -> int | None:
+    """条款序号：阿拉伯数字或常见中文数字（到千）。"""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return int(raw)
+    total = 0
+    pending = 0
+    seen = False
+    for ch in raw:
+        if ch in _CN_DIGIT:
+            pending = _CN_DIGIT[ch]
+            seen = True
+            continue
+        unit = {"十": 10, "百": 100, "千": 1000}.get(ch)
+        if unit is None:
+            return None
+        total += (pending or 1) * unit
+        pending = 0
+        seen = True
+    if not seen:
+        return None
+    return total + pending
+
+
+def _clause_keys(text: str) -> set[tuple[str, int]]:
+    keys: set[tuple[str, int]] = set()
+    for match in _CLAUSE_RE.finditer(text or ""):
+        number = _cn_to_int(match.group(1))
+        if number is None:
+            continue
+        keys.add((match.group(2), number))
+    return keys
+
+
+def clause_mismatches(answer: str, chunks: Sequence[object]) -> list[str]:
+    """答案里写出的「第X章/节/条/款/项」若不在所引用块的标题路径里，列出来。
+
+    没写条款号则通过。写了就必须能在被 ``[n]`` 点到的 ``heading_path`` 里找到
+    同一个序号（``第五条`` 与 ``第5条`` 视为同一条）。
+    """
+    mentions = _clause_keys(strip_citations(answer))
+    if not mentions:
+        return []
+    indices = cited_indices(answer)
+    headings: list[str] = []
+    for index in indices:
+        if not 1 <= index <= len(chunks):
+            continue
+        headings.append(str(getattr(chunks[index - 1], "heading_path", "") or ""))
+    allowed: set[tuple[str, int]] = set()
+    for heading in headings:
+        allowed |= _clause_keys(heading)
+    bad = sorted(mentions - allowed)
+    return [f"第{number}{kind}" for kind, number in bad]

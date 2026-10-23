@@ -1,17 +1,30 @@
 /** ACL 配置（方案 05 §4.8）。deny 优先，必须红色强提示（§1.4）。 */
 import { useRef, useState } from 'react'
 import { ProTable, type ActionType, type ProColumns } from '@ant-design/pro-components'
-import { Button, Checkbox, Form, Input, Modal, Select, Space, Tabs, Tag, Typography, message } from 'antd'
+import { Alert, Button, Checkbox, Form, Input, Modal, Select, Space, Tabs, Tag, Typography, message } from 'antd'
 import Auth from '@/components/Auth'
 import EmptyState from '@/components/EmptyState'
 import { createAcl, deleteAcl, listAcl, simulateAcl } from '@/api/iam'
 import type { AclItem } from '@/api/types'
 
-const ACTIONS = ['read', 'write', 'manage', 'audit']
-const SUBJECT_TABS = [
-  { key: 'user', label: '用户' }, { key: 'dept', label: '部门' },
-  { key: 'role', label: '角色' }, { key: 'group', label: '用户组' },
-]
+const ACTION_ZH: Record<string, string> = {
+  read: '阅读',
+  write: '修改',
+  manage: '管理',
+  audit: '审计',
+}
+const EFFECT_ZH: Record<string, string> = {
+  allow: '允许',
+  deny: '拒绝',
+}
+const SUBJECT_ZH: Record<string, string> = {
+  user: '用户',
+  dept: '部门',
+  role: '角色',
+  group: '用户组',
+}
+const ACTIONS = Object.keys(ACTION_ZH)
+const SUBJECT_TABS = Object.entries(SUBJECT_ZH).map(([key, label]) => ({ key, label }))
 
 export default function AclConsole() {
   const actionRef = useRef<ActionType>()
@@ -25,15 +38,17 @@ export default function AclConsole() {
 
   const columns: ProColumns<AclItem>[] = [
     { title: 'ID', dataIndex: 'acl_id', width: 70, search: false },
-    { title: '主体类型', dataIndex: 'subject_type', width: 110 },
+    { title: '主体类型', dataIndex: 'subject_type', width: 110,
+      render: (_, r) => SUBJECT_ZH[r.subject_type] || r.subject_type },
     { title: '主体', dataIndex: 'subject_id', width: 160 },
     { title: '作用对象', width: 180, search: false,
       render: (_, r) => (r.doc_id ? `文档 #${r.doc_id}` : r.kb_id ? `知识库 #${r.kb_id}` : '全局') },
-    { title: '动作', dataIndex: 'action', width: 100 },
-    { title: '效果', dataIndex: 'effect', width: 100,
+    { title: '动作', dataIndex: 'action', width: 100,
+      render: (_, r) => ACTION_ZH[r.action] || r.action },
+    { title: '效果', dataIndex: 'effect', width: 120,
       render: (_, r) => (r.effect === 'deny'
-        ? <Tag color="red">deny（优先）</Tag>
-        : <Tag color="green">allow</Tag>) },
+        ? <Tag color="red">拒绝（优先）</Tag>
+        : <Tag color="green">允许</Tag>) },
     { title: '创建时间', dataIndex: 'created_at', width: 170, search: false },
     { title: '操作', valueType: 'option', width: 90, fixed: 'right', render: (_, r) => [
       <Auth key="d" code="perm:acl:delete">
@@ -43,7 +58,10 @@ export default function AclConsole() {
   ]
 
   const remove = async (r: AclItem) => {
-    if (!window.confirm(`确认撤销该条 ACL（${r.subject_type}:${r.subject_id} ${r.action}/${r.effect}）？`)) return
+    const who = SUBJECT_ZH[r.subject_type] || r.subject_type
+    const act = ACTION_ZH[r.action] || r.action
+    const effect = EFFECT_ZH[r.effect] || r.effect
+    if (!window.confirm(`确认撤销这条规则（${who} ${r.subject_id}：${act} / ${effect}）？`)) return
     try { await deleteAcl(r.acl_id); message.success('已撤销'); actionRef.current?.reload() }
     catch (err) { message.error(err instanceof Error ? err.message : String(err)) }
   }
@@ -71,6 +89,19 @@ export default function AclConsole() {
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Alert
+        type="info"
+        showIcon
+        message="ACL 是给单份文档或单个知识库开的例外门"
+        description={
+          <span>
+            角色决定能进哪些管理页面，部门和密级决定平时能看到哪些文件。ACL 只处理例外：
+            某个人、部门、角色或用户组，对某一份文档或某一个知识库，额外允许或额外拒绝。
+            「拒绝」优先于「允许」。允许也不能抬高密级：密级不够的人，即使加了允许，仍然看不到更高密级的文件。
+            日常权限用角色和密级，不要把每个人都做成一条 ACL。
+          </span>
+        }
+      />
       <ProTable<AclItem>
         headerTitle="ACL 配置"
         rowKey="acl_id"
@@ -110,14 +141,14 @@ export default function AclConsole() {
             <Input />
           </Form.Item>
           <Form.Item name="action" label="动作" rules={[{ required: true }]}>
-            <Select options={ACTIONS.map((a) => ({ value: a, label: a }))} />
+            <Select options={ACTIONS.map((a) => ({ value: a, label: ACTION_ZH[a] }))} />
           </Form.Item>
           <Form.Item name="effect" label="效果" rules={[{ required: true }]}
-            extra="deny 优先于 allow：命中 deny 时无论其它规则如何都不放行">
-            <Select options={[{ value: 'allow', label: 'allow' }, { value: 'deny', label: 'deny（优先）' }]} />
+            extra="拒绝优先于允许：命中拒绝时，其它允许规则也不放行">
+            <Select options={[{ value: 'allow', label: '允许' }, { value: 'deny', label: '拒绝（优先）' }]} />
           </Form.Item>
           <Checkbox onChange={(e) => { if (!e.target.checked) form.setFieldValue('effect', 'allow') }}>
-            我已知晓 deny 会立即阻断该主体对该对象的访问
+            我已知晓「拒绝」会立刻拦住这个主体访问该对象
           </Checkbox>
         </Form>
       </Modal>

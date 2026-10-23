@@ -10,6 +10,7 @@
 与原方案的关系
 --------------
 * 这是**功能原型 + 日常运维界面**，不是 `05` 的像素级实现（无设计稿、无组件库、无 E2E）；
+* 钉钉远程打开 `/admin`（SPA 或本页回落）均可做扫描件人工复核（与 React 管理台同一 API）；
 * 菜单按**权限点**过滤：登录后读 `/auth/me` 的 `permissions[]`，没有的点位直接不显示；
 * 接口返回 403 时页面显示「无权限」而不是崩掉（如 `kb_admin` 看不到安全事件与访问日志）。
 
@@ -71,7 +72,10 @@ PAGE = """<!DOCTYPE html>
   button{cursor:pointer;background:var(--accent);border-color:var(--accent);color:#fff;
        font-weight:400;box-shadow:0 2px 0 rgba(5,145,255,.1)}
   button.ghost{background:transparent;color:var(--fg);border-color:var(--line);font-weight:400}
-  button.mini{padding:2px 8px;font-size:12px;font-weight:400}
+  button.mini,a.mini{padding:2px 8px;font-size:12px;font-weight:400;display:inline-block;
+       text-decoration:none;line-height:1.4;height:auto}
+  a.mini{background:var(--accent);border:1px solid var(--accent);color:#fff;border-radius:6px}
+  a.mini.ghost{background:transparent;color:var(--fg);border-color:var(--line)}
   button:disabled{opacity:.5;cursor:not-allowed}
   table{width:100%;border-collapse:collapse;font-size:13px}
   th,td{text-align:left;padding:12px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
@@ -215,7 +219,7 @@ function levelTag(level, clearance) {
 const STATUS_META = {
   published: ["success", "已发布"], parsing: ["processing", "解析中"],
   indexing: ["processing", "索引中"], pending: ["processing", "待解析"],
-  failed: ["error", "失败"], offline: ["default", "已下线"],
+  review: ["warning", "待复核"], failed: ["error", "失败"], offline: ["default", "已下线"],
 };
 function statusTag(status) {
   const meta = STATUS_META[String(status)] || ["default", String(status)];
@@ -319,20 +323,39 @@ VIEWS.chunks = async (sub) => {
 };
 
 VIEWS.parse = async () => {
+  /* 钉钉远程打开 /admin（免构建页或 SPA 未构建时）也必须能做扫描件人工复核 */
   const d = await api("/parse/tasks?limit=100");
+  const reviewN = (d.by_status && d.by_status.review) || 0;
   const actions = (r) => {
     const id = r.task_id ?? r.id;
-    return `<button class="mini ghost" data-act="retry" data-id="${id}">重跑</button>
+    // 列表展示会把 status 换成徽标 HTML，动作判断用原始字段 _rawStatus
+    const st = String(r._rawStatus || "");
+    const reviewBtn = st === "review"
+      ? `<a class="mini" href="/admin/parse/review/${id}">查看清洗稿</a>
+         <button class="mini ghost" data-act="reject" data-id="${id}">驳回</button>`
+      : `<a class="mini ghost" href="/admin/chunks/${id}">打开分块</a>`;
+    return `${reviewBtn}
+            <button class="mini ghost" data-act="retry" data-id="${id}">重跑</button>
             <button class="mini ghost" data-act="cancel" data-id="${id}">取消</button>`;
   };
+  const rows = (d.items || []).map(r => Object.assign({}, r, {
+    _rawStatus: r.status,
+    status: statusTag(r.status),
+  }));
   const byStatus = d.by_status ? Object.entries(d.by_status).map(([k,v]) => ({状态:k, 数量:v})) : [];
+  const reviewBanner = reviewN
+    ? `<div class="warn" style="margin:8px 0">有 <b>${reviewN}</b> 份扫描件待人工复核：点「查看清洗稿」进入 SPA 双栏对照（原件↔清洗稿），确认通过后才会分块入库。</div>`
+    : "";
   return `<h2>解析任务</h2>
     <div class="card"><div class="row">
       <span class="tag">总数 ${d.total ?? 0}</span>
+      <span class="tag">待复核 ${reviewN}</span>
       <span class="tag">成功率 ${d.success_rate != null ? (d.success_rate*100).toFixed(1)+"%" : "-"}</span>
       <span class="tag">目标 ${d.success_rate_target != null ? (d.success_rate_target*100).toFixed(0)+"%" : "-"}</span>
-    </div>${table(byStatus, {cols:["状态","数量"]})}<pre>${esc(d.note || "")}</pre></div>
-    <div class="card">${table(d.items || [], {actions})}</div>`;
+    </div>${reviewBanner}${table(byStatus, {cols:["状态","数量"]})}
+    <pre>${esc(d.note || "")}</pre>
+    <div class="muted">扫描件复核已迁至管理台 SPA：<code>/admin/parse/review/&lt;doc_id&gt;</code>。本页不再弹全文预览。</div></div>
+    <div class="card">${table(rows, {actions})}</div>`;
 };
 
 VIEWS.debug = async () => {
@@ -760,6 +783,19 @@ document.addEventListener("click", async (ev) => {
       await api(`/parse/tasks/${t.dataset.id}/${act}`, {method:"POST"});
       return render();
     }
+    if (act === "reject") {
+      if (!confirm(`确认驳回复核任务 ${t.dataset.id}？将标记为失败，可再重跑。`)) return;
+      await api(`/parse/tasks/${t.dataset.id}/reject`, {method:"POST"});
+      return render();
+    }
+    if (act === "viewResult" || act === "review") {
+      /* 全文预览 / 复核抽屉已废除：一律进 SPA */
+      const id = t.dataset.id;
+      location.href = act === "review"
+        ? `/admin/parse/review/${id}`
+        : `/admin/chunks/${id}`;
+      return;
+    }
     if (act === "clearance") {
       const next = prompt(`用户 ${t.dataset.id} 当前密级 L${t.dataset.cur}，改为（1-4）：`, t.dataset.cur);
       if (!next) return;
@@ -792,7 +828,8 @@ document.addEventListener("click", async (ev) => {
       return;
     }
   } catch (e) {
-    alert("操作失败：" + e.message + (e.status ? `（HTTP ${e.status}）` : ""));
+    const msg = String(e.message || e).slice(0, 240);
+    alert("操作失败：" + msg + (e.status ? `（HTTP ${e.status}）` : ""));
   }
 });
 

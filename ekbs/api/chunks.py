@@ -87,6 +87,27 @@ def _chunk_view(row: Any) -> dict[str, Any]:
     return item
 
 
+def _annotate_figure_mm(runtime: Any, items: list[dict[str, Any]]) -> None:
+    """给 figure 块打上 ``figure_mm_indexed``（是否已写入 figures.faiss）。"""
+    figure_ids = [
+        int(item["chunk_id"])
+        for item in items
+        if str(item.get("chunk_type") or "") == "figure"
+    ]
+    indexed: set[int] = set()
+    figure_index = getattr(runtime, "figure_index", None)
+    if figure_ids and figure_index is not None:
+        try:
+            indexed = figure_index.contains(figure_ids)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("figure_mm_contains_failed", error=str(exc)[:160])
+    for item in items:
+        if str(item.get("chunk_type") or "") == "figure":
+            item["figure_mm_indexed"] = int(item["chunk_id"]) in indexed
+        else:
+            item["figure_mm_indexed"] = False
+
+
 async def _reembed_async(
     runtime: Any, chunk_id: int, *, content: str, heading_path: str | None
 ) -> dict[str, Any]:
@@ -159,13 +180,16 @@ async def chunk_tree(
         if doc is None:
             raise HTTPException(status_code=404, detail="document_not_found")
         rows = conn.execute(
-            "SELECT chunk_id, parent_id, chunk_type, seq, heading_path, page_from, page_to, "
-            "token_count, shard_id, faiss_row, substr(content, 1, 200) AS content_head, content "
+            "SELECT chunk_id, doc_id, parent_id, chunk_type, seq, heading_path, page_from, page_to, "
+            "token_count, shard_id, faiss_row, figure_id, image_path, "
+            "substr(content, 1, 200) AS content_head, content "
             "FROM ekbs_chunk WHERE doc_id = ? ORDER BY seq",
             (doc_id,),
         ).fetchall()
     parents = [dict(r) for r in rows if str(r["chunk_type"]) != "child"]
     children = [dict(r) for r in rows if str(r["chunk_type"]) == "child"]
+    flat = parents + children
+    _annotate_figure_mm(runtime, flat)
     tree: list[dict[str, Any]] = []
     for parent in parents:
         node = dict(parent)
@@ -200,7 +224,64 @@ async def chunk_detail(
     """分块详情（含分片归属与页码、嵌入指纹）。"""
     _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "doc:chunk:read")
     runtime = request.app.state.runtime
-    return JSONResponse({"chunk": _chunk_view(_chunk_row(runtime, chunk_id))})
+    view = _chunk_view(_chunk_row(runtime, chunk_id))
+    _annotate_figure_mm(runtime, [view])
+    return JSONResponse({"chunk": view})
+
+
+@router.get("/chunks/documents/{doc_id}/search")
+async def search_document_chunks(
+    doc_id: int,
+    request: Request,
+    q: str = Query(default="", max_length=200),
+    limit: int = Query(default=30, ge=1, le=100),
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """文档内块检索（管理台 / 检索控制台：按关键词扫该文档的分块）。
+
+    空 ``q`` 时按 ``seq`` 返回前 ``limit`` 条，便于浏览；有关键词时对
+    ``content`` / ``heading_path`` 做不区分大小写的子串匹配（不走全库 RAG）。
+    """
+    _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "doc:chunk:read")
+    runtime = request.app.state.runtime
+    needle = (q or "").strip()
+    with runtime.db.sync_connect() as conn:
+        doc = conn.execute(
+            "SELECT doc_id, title, status, level FROM ekbs_document WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+        if doc is None:
+            raise HTTPException(status_code=404, detail="document_not_found")
+        if needle:
+            like = f"%{needle}%"
+            rows = conn.execute(
+                "SELECT chunk_id, doc_id, parent_id, chunk_type, seq, heading_path, "
+                "page_from, page_to, token_count, shard_id, faiss_row, figure_id, image_path, "
+                "substr(content, 1, 400) AS content_head, content "
+                "FROM ekbs_chunk WHERE doc_id = ? AND ("
+                "content LIKE ? COLLATE NOCASE OR IFNULL(heading_path, '') LIKE ? COLLATE NOCASE"
+                ") ORDER BY seq LIMIT ?",
+                (doc_id, like, like, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT chunk_id, doc_id, parent_id, chunk_type, seq, heading_path, "
+                "page_from, page_to, token_count, shard_id, faiss_row, figure_id, image_path, "
+                "substr(content, 1, 400) AS content_head, content "
+                "FROM ekbs_chunk WHERE doc_id = ? ORDER BY seq LIMIT ?",
+                (doc_id, limit),
+            ).fetchall()
+    items = [dict(r) for r in rows]
+    _annotate_figure_mm(runtime, items)
+    return JSONResponse(
+        {
+            "document": dict(doc),
+            "query": needle,
+            "total": len(items),
+            "chunks": items,
+        }
+    )
 
 
 @router.get("/chunks/documents/{doc_id}/export")

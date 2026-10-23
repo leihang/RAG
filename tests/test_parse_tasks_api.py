@@ -63,9 +63,12 @@ async def test_parse_endpoints_require_permission(client, seeded) -> None:
         ("get", "/api/v1/parse/tasks", {}),
         ("get", f"/api/v1/parse/tasks/{doc_id}", {}),
         ("get", f"/api/v1/parse/tasks/{doc_id}/result", {}),
+        ("get", f"/api/v1/parse/tasks/{doc_id}/draft", {}),
         ("get", "/api/v1/parse/config", {}),
         ("post", f"/api/v1/parse/tasks/{doc_id}/retry", {}),
         ("post", f"/api/v1/parse/tasks/{doc_id}/cancel", {}),
+        ("post", f"/api/v1/parse/tasks/{doc_id}/approve", {}),
+        ("post", f"/api/v1/parse/tasks/{doc_id}/reject", {}),
     ):
         assert (await getattr(client, method)(path, headers=end_user, **kwargs)).status_code == 403
         assert (await getattr(client, method)(path, **kwargs)).status_code == 401
@@ -109,7 +112,15 @@ async def test_task_detail_explains_missing_error_column(client, seeded) -> None
     assert body["task"]["task_id" if "task_id" in body["task"] else "doc_id"] == doc_id
     assert "error" not in body["task"], "不得凭空造一个 Schema 里没有的字段"
     assert "worker" in body["failure_hint"]
-    assert body["state_machine"] == ["pending", "parsing", "indexing", "published", "failed", "offline"]
+    assert body["state_machine"] == [
+        "pending",
+        "parsing",
+        "review",
+        "indexing",
+        "published",
+        "failed",
+        "offline",
+    ]
 
 
 async def test_task_result_returns_structure_and_preview(client, seeded) -> None:
@@ -192,6 +203,31 @@ async def test_cancel_only_for_pending_and_explains_schema_gap(client, seeded) -
     assert (
         await client.post(f"/api/v1/parse/tasks/{parsing}/cancel", headers=headers)
     ).status_code == 409
+
+
+async def test_published_draft_is_readable(client, seeded) -> None:
+    """已入库的文档仍要能打开原件对照，不能只在待复核时读得到清洗稿。"""
+    from ekbs.ingest.scan_review import save_review_draft
+
+    runtime, _ = seeded
+    admin_id = grant(runtime, "demo_carol", "kb_admin")
+    headers = headers_for(admin_id)
+    pending = make_pending(runtime, title="还没解析", status="pending")
+    assert (await client.get(f"/api/v1/parse/tasks/{pending}/draft", headers=headers)).status_code == 409
+
+    doc_id = make_pending(runtime, title="已发布对照", status="published")
+    save_review_draft(
+        data_dir=runtime.settings.data_dir,
+        doc_id=doc_id,
+        markdown="确认过的清洗稿",
+        engine="docx",
+    )
+    resp = await client.get(f"/api/v1/parse/tasks/{doc_id}/draft", headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "published"
+    assert body["read_only"] is True
+    assert "确认过的清洗稿" in body["markdown"]
 
 
 async def test_parse_config_is_read_only(client, seeded) -> None:

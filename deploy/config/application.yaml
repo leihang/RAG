@@ -118,12 +118,12 @@ parse:
 # ---------- 权限 ----------
 permission:
   default_level: 2
-  l4_enabled: false        # 首期 L4 不入库（00 §3.2）
-  l3_ingest_enabled: false # 未落地 C5 前禁止真实 L3 入库（00 C5 / 03 §5.2.1）
+  l4_enabled: true         # 2026-10-09 用户确认（测试期）：全部闸门打开
+  l3_ingest_enabled: true  # 2026-10-09 用户确认（测试期）：L3 允许入库
   policy_cache_ttl: 300
   # 合规闸：云端嵌入 = 全量语料出网。书面确认前保持 false（00 §7）
-  corpus_egress_ack: false
-  corpus_egress_ack_ticket: ""   # 书面确认编号 / 链接，便于审计
+  corpus_egress_ack: true  # 2026-10-09 用户确认（测试期）
+  corpus_egress_ack_ticket: "2026-10-09 用户确认：测试期全部闸门打开（合规书暂缓）"   # 书面确认编号 / 链接，便于审计
 
 # ---------- 钉钉（凭据在 secrets.env）----------
 # 01 §7 原有键 + 04 §5.2 补齐键；本节是 04 §5.2 与 01 §7 的合并结果
@@ -170,6 +170,9 @@ session:
   context_ttl_seconds: 604800          # 会话 2 小时过期（按 ekbs_session_ctx.updated_at 判定）
   group_share_context: false         # 群聊不共享上下文（默认）
 
+qa:
+  auto_numeric: true                  # mode=auto 时按意图进取数；管理台可显式 prose/numeric
+
 # ---------- 限流与输入闸门（04 §5.2）----------
 # ---------- 上传行为（05 §6.5）----------
 upload:
@@ -183,6 +186,7 @@ limits:
   per_conversation_qps: 3
   max_question_chars: 2000
   max_file_size_mb: 500              # 与方案 §6.5 / parse.max_file_mb 对齐
+  personal_storage_mb: 1024          # 每个用户私有库总容量
   file_ext_whitelist: [pdf, docx, doc, pptx, ppt, xlsx, xls, txt, md, html, png, jpg, jpeg]
 
 # ---------- 内容安全（04 §5.2 + §6.4）----------
@@ -198,3 +202,9 @@ security:
     - image/jpeg
   sensitive_words_path: "/opt/ekbs/etc/sensitive_words.txt"   # L1 敏感词库（pyahocorasick AC 自动机，支持热加载）
   content_security_enabled: true
+  # ---- 本机账号登录（管理台第二种登录方式；见 ekbs/local_auth.py）----
+  # 日常用钉钉免登；本机账号只在「人就在服务器前 / 钉钉不可用」时兜底。
+  local_login_enabled: true          # 关掉后 /auth/local-login 直接 404
+  local_login_allow_remote: false    # ⚠️ 保持 false：true = 内网任何机器都能试密码（不推荐）
+  local_login_max_failures: 5        # 连续失败次数上限
+  local_login_lock_minutes: 15       # 达到上限后的锁定时长

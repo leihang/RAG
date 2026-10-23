@@ -32,6 +32,8 @@ var-cloud/
 secrets.env
 .env
 *.pem
+# 双机热备节点配置：文件头约定「含内网拓扑，同样不入 git」，模板留本地
+deploy/config/node.env.example
 
 # ---- macOS ----
 .DS_Store

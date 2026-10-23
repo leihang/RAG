@@ -12,6 +12,8 @@ from ekbs.ingest.chunker import (
     content_coverage,
     count_tokens,
     ensure_heading_path,
+    major_heading_path,
+    pack_major_sections,
     split_sections,
 )
 
@@ -158,14 +160,47 @@ def test_adjacent_children_share_overlap() -> None:
 
 
 def test_small_section_becomes_a_small_parent() -> None:
-    """小节本身不足 1024 token 时**不跨标题合并** —— 合并会破坏 heading_path 与页码归属。
+    """小节本身不足 1024 token 时**不跨中文条款/Markdown 标题合并**。
 
     此时父块就是该小节全文（小于 ``PARENT_MIN_TOKENS``），这是有意的取舍：
     检索精度与引用可溯源优先于「父块必须够大」。
+    点分嵌套小节（``4.1``）另见 ``test_pack_major_dotted_sections``。
     """
     result = chunk_markdown(SHORT_DOC)
     assert result.parents
     assert all(node.token_count < PARENT_MIN_TOKENS for node in result.parents)
+    # 「第一条 / 第二条」不得被大节优先误合并
+    assert len(result.parents) >= 2
+
+
+def test_major_heading_path_strips_nested_dotted() -> None:
+    assert major_heading_path("4． 制度 > 4.1 接班") == "4． 制度"
+    assert major_heading_path("交接班 > 4． 制度 > 4.6 重要事项") == "交接班 > 4． 制度"
+    assert major_heading_path("1． 目的") == "1． 目的"
+    assert major_heading_path("4.1 孤儿条款") == "4．"
+
+
+def test_pack_major_dotted_sections() -> None:
+    """4.1 / 4.2 各自成块，不按长度并进「4． 制度」。"""
+    long_41 = "4.1 " + ("接班人应提前到岗并完成检查。" * 8)
+    md = f"""# 交接班
+
+4． 制度
+{long_41}
+4.2 接班人员未能到岗，值班人员必须坚持岗位。
+4.3 接班人员酗酒时交班人员应拒绝交班。
+4.4 设备交班人向接班人介绍各系统运行状态。
+"""
+    sections = pack_major_sections(split_sections(md))
+    rule = [s for s in sections if "4." in s.heading_path or "4．" in s.heading_path]
+    assert len(rule) >= 4, [s.heading_path for s in rule]
+    result = chunk_markdown(md, doc_title="交接班管理制度")
+    leaves = [n for n in result.nodes if n.chunk_type in {"parent", "child"}]
+    assert any("4.1" in n.heading_path for n in leaves)
+    assert any("4.4" in n.heading_path for n in leaves)
+    for node in leaves:
+        text = node.content
+        assert not ("接班人应提前到岗" in text and "介绍各系统运行状态" in text)
 
 
 def test_children_are_smaller_than_or_equal_to_parents() -> None:
@@ -250,7 +285,7 @@ def test_single_line_clauses_are_not_swallowed() -> None:
 
 
 def test_dotted_clauses_are_not_swallowed() -> None:
-    """``4.1 …`` 这类半角点条款同样不能丢（全角点 ``4．`` 本来走正文，不受影响）。"""
+    """``4.1 …`` / ``4． …`` / ``1. 目的`` 都要切节，且长条款行不能丢正文。"""
     md = (
         "4． 制度\n"
         "4.1 值班人员应认真遵守公司的各项规范制度，接班人应提前15分钟到达现场。\n"
@@ -261,6 +296,41 @@ def test_dotted_clauses_are_not_swallowed() -> None:
     assert ratio == 1.0, f"覆盖率 {ratio:.0%}，丢失 {lost[:2]}"
     joined = "\n".join(node.content for node in result.nodes)
     assert "接班人应提前15分钟" in joined and "必须坚持岗位并汇报" in joined
+    paths = {node.heading_path for node in result.nodes}
+    assert any("4．" in p and "制度" in p for p in paths)
+    # 短节合并后 4.1 可能落在正文而非 heading_path，词面仍须可检索
+    assert any("4.1" in p for p in paths) or "4.1" in joined
+
+
+def test_chapter_and_fullwidth_dotted_headings() -> None:
+    """一级半角/全角编号要切章；子节挂在对应章下，且不被「文件信息」污染。"""
+    md = (
+        "## 文件信息\n"
+        "文件编号：XJWY-GC-02\n"
+        "\n"
+        "1. 目的\n"
+        "满足公共设备管理需要。\n"
+        "2．范围\n"
+        "适用于工程中心。\n"
+        "4．方法和过程控制\n"
+        "4.1 设备编号组成\n"
+        "编号由四段组成。\n"
+        "4.3 设备编号规则\n"
+        "按类别编码。\n"
+    )
+    result = chunk_markdown(md)
+    ratio, lost = content_coverage(md, result.nodes)
+    assert ratio == 1.0 and not lost, f"覆盖率 {ratio:.0%}，丢失 {lost[:3]}"
+    paths = [node.heading_path for node in result.nodes]
+    assert any(p == "文件信息" or p.endswith("文件信息") for p in paths)
+    assert any(p == "1. 目的" for p in paths)
+    assert any(p == "2． 范围" for p in paths)
+    # 4.1 / 4.3 各自留在标题路径里，不并进上一节
+    assert any("4.1" in p for p in paths)
+    assert any("4.3" in p for p in paths)
+    joined = "\n".join(f"{n.heading_path}\n{n.content}" for n in result.nodes)
+    assert "4.1" in joined and "4.3" in joined
+    assert not any(p.startswith("文件信息 >") for p in paths if "4." in p or "目的" in p)
 
 
 def test_short_clause_title_keeps_behaviour_without_duplication() -> None:
