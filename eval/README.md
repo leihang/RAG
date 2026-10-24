@@ -145,3 +145,9 @@ zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/crud_eval.py --stage judge -
 
 指标：`retrieval_keyinfo_recall@10`、`retrieval_hit_rate`、`answer_keyinfo_recall`、
 `answer_correct_rate`、`refused_rate`；结果在 `var/eval/crud/{summary,judge_summary}.json`。
+
+## 十一、CRUD-RAG 收窄口径说明
+
+全量 83,814 篇灌库在 13.6k 篇时被 API 限流/欠费打断；评测改用「13,608 篇干扰池 +
+全部可定位源文档（1,627 篇）」的收窄口径，并用 `eval/crud_sources.py` 定位源文档。
+该口径用于跨语料回归，不与官方 80k 全库成绩对比。完整结果见 `var/eval/rgb/REPORT.md` 第十二节。

@@ -66,6 +66,7 @@ async def main() -> int:
     parser.add_argument("--root", default=str(RGB), help="语料目录（manifest.json + docs/）")
     parser.add_argument("--kb-code", default=KB_CODE)
     parser.add_argument("--source-prefix", default=SOURCE_PREFIX)
+    parser.add_argument("--manifest", default="", help="自定义 manifest 路径（默认 <root>/manifest.json）")
     args = parser.parse_args()
 
     settings = load_settings(REPO / args.config)
@@ -82,7 +83,8 @@ async def main() -> int:
     )
 
     root = Path(args.root)
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest_path = Path(args.manifest) if args.manifest else (root / "manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     docs: dict[str, dict[str, Any]] = manifest["docs"]
     done = _done_hashes(runtime, args.source_prefix)
     todo = [(h, m) for h, m in docs.items() if h not in done]
