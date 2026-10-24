@@ -37,6 +37,19 @@ SYSTEM = (
 )
 
 
+CLAIM_SYSTEM = (
+    "你是企业知识库问答的答案核验判官。给你问题、资料片段和候选回答，请做 claim 分解核验。\n"
+    "步骤：\n"
+    "1) 把候选回答拆成若干条事实性 claim（数字/日期/主体/条款/结论各算一条）；\n"
+    "2) 对每条 claim，从资料中找出能逐字支持它的原文；找不到就标 supported=false；\n"
+    "3) 只要有一条关键 claim 没有原文依据，整体 supported=false；\n"
+    "4) 答非所问/资料不足同样 supported=false；\n"
+    "5) 只输出 JSON：{\"supported\": true/false, \"claims\": [{\"claim\": \"...\", \"supported\": true/false, \"quote\": \"原文\"}], \"reason\": \"一句话\"}。"
+)
+
+_VERIFY_SYSTEMS = {"basic": SYSTEM, "claim": CLAIM_SYSTEM}
+
+
 def _load(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -58,11 +71,11 @@ def _contexts_text(contexts: list[str], limit: int = 5, per: int = 900, total: i
     return "\n\n".join(parts) or "（无资料）"
 
 
-async def _verify(client: httpx.AsyncClient, sem: asyncio.Semaphore, row: dict, model: str) -> dict:
+async def _verify(client: httpx.AsyncClient, sem: asyncio.Semaphore, row: dict, model: str, system: str = SYSTEM) -> dict:
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SYSTEM},
+            {"role": "system", "content": system},
             {
                 "role": "user",
                 "content": (
@@ -72,7 +85,7 @@ async def _verify(client: httpx.AsyncClient, sem: asyncio.Semaphore, row: dict, 
             },
         ],
         "temperature": 0,
-        "max_tokens": 200,
+        "max_tokens": 800,
         "response_format": {"type": "json_object"},
     }
     headers = {"Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}"}
@@ -123,6 +136,7 @@ async def main() -> int:
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--out", default=str(RGB / "answer_verify.jsonl"))
+    parser.add_argument("--prompt", default="basic", choices=["basic", "claim"])
     args = parser.parse_args()
     if not os.environ.get("DEEPSEEK_API_KEY"):
         print("缺少 DEEPSEEK_API_KEY（用 zsh -ic 运行）", file=sys.stderr)
@@ -144,7 +158,7 @@ async def main() -> int:
     sem = asyncio.Semaphore(max(1, args.concurrency))
     async with httpx.AsyncClient() as client:
         verdicts = await asyncio.gather(
-            *(_verify(client, sem, c, args.model) for c in cases)
+            *(_verify(client, sem, c, args.model, _VERIFY_SYSTEMS[args.prompt]) for c in cases)
         )
     rows = [{**case, **verdict, "pipeline_refused": bool(case.get("refused"))} for case, verdict in zip(cases, verdicts)]
     out = Path(args.out)
@@ -156,6 +170,7 @@ async def main() -> int:
     neg = [r for r in rows if r["kind"] == "negative"]
     summary = {
         "model": args.model,
+        "prompt": args.prompt,
         "positive": _summ(pos),
         "positive_correct": _summ([r for r in pos if r.get("official_match")]),
         "negative": _summ(neg),

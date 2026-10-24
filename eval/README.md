@@ -100,3 +100,26 @@ zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/answer_verify.py --concurren
 ```
 
 结果：可答误拒 2.9% / 负例拒答 35.4%；与阈值 0.80 级联后 2.9% / 46.4%。
+
+## 八、RAGAS 5 项指标（DeepSeek judge）
+
+```bash
+zsh -ic 'cd "$PWD" && set -a; . "$HOME/.ekbs/secrets.env"; set +a; \
+  var/eval/venv/bin/python eval/ragas_judge.py --per-subset 10 --out var/eval/rgb/ragas_report_5m.json'
+```
+
+要点：DashScope embedding 必须关掉 langchain 的 tiktoken 预分词
+（`tiktoken_enabled=False, check_embedding_ctx_length=False`），否则会报
+`contents is neither str nor list of str`。30 题分层结果：Faithfulness 0.937 /
+Answer Relevancy 0.904 / Context Recall 0.947 / Context Precision 0.714 /
+Answer Correctness 0.641。
+
+## 九、claim 分解核验
+
+```bash
+zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/answer_verify.py --concurrency 8 \
+  --prompt claim --out var/eval/rgb/answer_verify_claim2.jsonl'
+```
+
+`--prompt claim` 要求逐条 claim 找原文引用（max_tokens=800 才能完整输出）；
+结果：误拒 1.8% / 负例拒答 27.8%，与阈值 0.85 级联后 2.6% / 49.4%。

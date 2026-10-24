@@ -95,6 +95,10 @@ def main() -> int:
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
             api_key=dashscope_key,
             dimensions=1024,
+            # 关键：关掉 tiktoken 预分词，否则 langchain 会把 input 变成 token id 数组，
+            # DashScope 兼容端点会报 "contents is neither str nor list of str"
+            tiktoken_enabled=False,
+            check_embedding_ctx_length=False,
         )
     )
     if args.no_embeddings:
@@ -107,7 +111,7 @@ def main() -> int:
         llm=llm,
         embeddings=None if args.no_embeddings else embeddings,
         raise_exceptions=False,
-        run_config=RunConfig(timeout=180, max_workers=2),
+        run_config=RunConfig(timeout=180, max_workers=4),
     )
     frame = result.to_pandas()
     skip = {"user_input", "retrieved_contexts", "response", "reference"}
