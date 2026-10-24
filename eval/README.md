@@ -86,3 +86,17 @@ zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/no_answer_judge.py --concurr
 
 结果：见 `var/eval/rgb/no_answer_judge*_summary.json`；basic 判官把负例拒答从 7.6% 提到
 46.4%（可答误拒 5.2%），strict 提到 58.1%（误拒 7.1%）。
+
+## 七、动作1续：answer-then-verify
+
+```bash
+# 1) 负例库先生成候选答案（qwen-max）
+set -a; . ~/.ekbs/secrets.env; set +a
+.venv/bin/python eval/answer_eval.py --root var/eval/rgb-neg --kb-code rgb_neg \
+  --config config/application.eval-neg.yaml --concurrency 6
+
+# 2) DeepSeek 逐条核验
+zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/answer_verify.py --concurrency 8'
+```
+
+结果：可答误拒 2.9% / 负例拒答 35.4%；与阈值 0.80 级联后 2.9% / 46.4%。

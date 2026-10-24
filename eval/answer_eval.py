@@ -59,12 +59,14 @@ async def main() -> int:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--config", default="config/application.eval.yaml")
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--root", default=str(RGB))
+    parser.add_argument("--kb-code", default=KB_CODE)
     args = parser.parse_args()
 
     settings = load_settings(REPO / args.config)
     runtime = Runtime.create(settings, service="eval_answer")
     with runtime.db.sync_connect() as conn:
-        kb = conn.execute("SELECT kb_id FROM ekbs_kb WHERE code = ?", (KB_CODE,)).fetchone()
+        kb = conn.execute("SELECT kb_id FROM ekbs_kb WHERE code = ?", (args.kb_code,)).fetchone()
         shard_rows = conn.execute("SELECT shard_id FROM ekbs_shard WHERE status = 'active'").fetchall()
     if kb is None:
         print("评测库还没有 RGB 语料", file=sys.stderr)
@@ -79,12 +81,13 @@ async def main() -> int:
         policy_version=1,
     )
 
+    root = Path(args.root)
     wanted = {s.strip() for s in args.subsets.split(",") if s.strip()}
-    questions = [q for q in _load(RGB / "questions.jsonl") if q["subset"] in wanted]
+    questions = [q for q in _load(root / "questions.jsonl") if q["subset"] in wanted]
     if args.limit:
         questions = questions[: args.limit]
 
-    out_path = RGB / "answers.jsonl"
+    out_path = root / "answers.jsonl"
     done: set[str] = set()
     if out_path.exists():
         for row in _load(out_path):
@@ -160,7 +163,7 @@ async def main() -> int:
     if fact_rows:
         summary["fact"]["official_accuracy_on_correct"] = sum(r["official_match"] for r in fact_rows) / len(fact_rows)
         summary["fact"]["fake_answer_seen_rate"] = sum(r["fake_answer_seen"] for r in fact_rows) / len(fact_rows)
-    (RGB / "answer_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    (root / "answer_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
