@@ -70,3 +70,19 @@ zsh -ic 'cd "$PWD" && set -a; . "$HOME/.ekbs/secrets.env"; set +a; \
 说明：`--no-embeddings` 只跑 Faithfulness / ContextPrecision / ContextRecall；
 AnswerRelevancy、AnswerCorrectness 依赖 embedding，当前 RAGAS 的 wrapper 与 DashScope
 兼容端点不匹配（`embed_query` 缺失 / 请求体被拒），暂缺。
+
+## 六、回答侧 no-answer 判官（动作1）
+
+```bash
+# 1) 采集负例库上下文
+set -a; . ~/.ekbs/secrets.env; set +a
+.venv/bin/python eval/collect_contexts.py
+
+# 2) DeepSeek 判官（basic / strict 两版；DEEPSEEK_API_KEY 在 ~/.zshrc）
+zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/no_answer_judge.py --concurrency 8'
+zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/no_answer_judge.py --concurrency 8 \
+  --prompt strict --out var/eval/rgb/no_answer_judge_strict.jsonl'
+```
+
+结果：见 `var/eval/rgb/no_answer_judge*_summary.json`；basic 判官把负例拒答从 7.6% 提到
+46.4%（可答误拒 5.2%），strict 提到 58.1%（误拒 7.1%）。
