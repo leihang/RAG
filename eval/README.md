@@ -123,3 +123,25 @@ zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/answer_verify.py --concurren
 
 `--prompt claim` 要求逐条 claim 找原文引用（max_tokens=800 才能完整输出）；
 结果：误拒 1.8% / 负例拒答 27.8%，与阈值 0.85 级联后 2.6% / 49.4%。
+
+## 十、CRUD-RAG（第二阶段）
+
+```bash
+# 1) 语料：48 个分片（186MB）→ 去重 83,814 篇；题集抽样 773 题
+#    数据下载到 var/eval/datasets/crud/{corpus,QuestAnswer*.json}
+.venv/bin/python eval/crud_prepare.py --entries-1doc 100 --entries-2docs 50 --entries-3docs 50
+
+# 2) 灌库（隔离 data_dir=var/eval/runtime-crud；约 40–60 分钟）
+set -a; . ~/.ekbs/secrets.env; set +a
+.venv/bin/python eval/ingest_rgb.py --root var/eval/crud --kb-code crud_bench \
+  --source-prefix "bench://crud/" --config config/application.eval-crud.yaml --concurrency 24
+
+# 3) 检索 key_info 覆盖 + 答案生成
+.venv/bin/python eval/crud_eval.py --stage run --concurrency 4
+
+# 4) DeepSeek 判官（答案覆盖 key_info / 与参考答案一致性）
+zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/crud_eval.py --stage judge --concurrency 8'
+```
+
+指标：`retrieval_keyinfo_recall@10`、`retrieval_hit_rate`、`answer_keyinfo_recall`、
+`answer_correct_rate`、`refused_rate`；结果在 `var/eval/crud/{summary,judge_summary}.json`。
