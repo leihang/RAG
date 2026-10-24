@@ -29,6 +29,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="RAGAS 答案质量评测")
     parser.add_argument("--limit", type=int, default=0, help="只判前 N 条（试跑建议 30–80）")
     parser.add_argument("--out", default="var/eval/rgb/ragas_report.json")
+    parser.add_argument("--per-subset", type=int, default=0, help="每个子集取前 N 条（0=用 --limit 口径）")
     args = parser.parse_args()
 
     api_key = os.environ.get("DASHSCOPE_API_KEY")
@@ -36,10 +37,11 @@ def main() -> int:
         print("缺少 DASHSCOPE_API_KEY（先 source ~/.ekbs/secrets.env）")
         return 2
 
-    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-    from ragas import EvaluationDataset, SingleTurnSample, evaluate
-    from ragas.embeddings import LangchainEmbeddingsWrapper
-    from ragas.llms import LangchainLLMWrapper
+    from openai import OpenAI
+
+    from ragas import EvaluationDataset, RunConfig, SingleTurnSample, evaluate
+    from ragas.embeddings import OpenAIEmbeddings as RagasOpenAIEmbeddings
+    from ragas.llms import llm_factory
     from ragas.metrics import (
         AnswerCorrectness,
         AnswerRelevancy,
@@ -49,7 +51,12 @@ def main() -> int:
     )
 
     rows = [r for r in _load_jsonl(RGB / "answers.jsonl") if not r["holdout"]]
-    if args.limit:
+    if args.per_subset:
+        picked: list[dict] = []
+        for subset in ("refine", "int", "fact"):
+            picked.extend([r for r in rows if r["subset"] == subset][: args.per_subset])
+        rows = picked
+    elif args.limit:
         rows = rows[: args.limit]
     samples = [
         SingleTurnSample(
@@ -64,17 +71,9 @@ def main() -> int:
     print(f"待判 {len(samples)} 条（来自 {len(rows)} 条可答样本）")
 
     base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    llm = LangchainLLMWrapper(
-        ChatOpenAI(model="qwen-max", base_url=base_url, api_key=api_key, temperature=0)
-    )
-    embeddings = LangchainEmbeddingsWrapper(
-        OpenAIEmbeddings(
-            model="qwen3.7-text-embedding-flash",
-            base_url=base_url,
-            api_key=api_key,
-            dimensions=1024,
-        )
-    )
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=120, max_retries=3)
+    llm = llm_factory("qwen-max", client=client)
+    embeddings = RagasOpenAIEmbeddings(client=client, model="qwen3.7-text-embedding-flash")
     metrics = [Faithfulness(), AnswerRelevancy(), ContextPrecision(), ContextRecall(), AnswerCorrectness()]
     result = evaluate(
         dataset=EvaluationDataset(samples=samples),
@@ -82,21 +81,23 @@ def main() -> int:
         llm=llm,
         embeddings=embeddings,
         raise_exceptions=False,
+        run_config=RunConfig(timeout=180, max_workers=2),
     )
-    scores = {
-        k: (None if v is None else round(float(v), 4))
-        for k, v in dict(result).items()
-        if isinstance(v, (int, float)) or v is None
-    }
+    frame = result.to_pandas()
+    skip = {"user_input", "retrieved_contexts", "response", "reference"}
+    metric_cols = [c for c in frame.columns if c not in skip]
+    import math
+    scores = {}
+    for col in metric_cols:
+        vals = [float(x) for x in frame[col].tolist() if isinstance(x, (int, float)) and not math.isnan(float(x))]
+        scores[col] = round(sum(vals) / len(vals), 4) if vals else None
+    scores["valid_counts"] = {col: int(sum(1 for x in frame[col].tolist() if isinstance(x, (int, float)) and not math.isnan(float(x)))) for col in metric_cols}
     report = {
         "samples": len(samples),
         "judge": "qwen-max (temperature=0)",
         "embedding": "qwen3.7-text-embedding-flash@1024",
         "scores": scores,
-        "per_sample": [
-            {k: (None if v is None else (round(float(v), 4) if isinstance(v, (int, float)) else v)) for k, v in row.items()}
-            for row in result.to_pandas().to_dict(orient="records")
-        ],
+        "per_sample": frame.to_dict(orient="records"),
     }
     out = REPO / args.out
     out.parent.mkdir(parents=True, exist_ok=True)

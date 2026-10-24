@@ -41,3 +41,12 @@ var/eval/venv/bin/python eval/embedding_eval.py
 - **可比性**：这是"公开基准题集 + 本项目管道"，与论文数字不可直接横比；报告需附配置/模型指纹。
 - **费用**：RGB 灌库 embedding ≈ 0.2 元；DuRetrieval 向量评测 ≈ 2 元；答案生成 + RAGAS judge 另计。
 - **隔离**：`var/index` 是业务库，评测全程只读写 `var/eval/runtime`。
+
+## 四、RAGAS 说明（2026-10-24 实测）
+
+RAGAS 0.4.3 直连 DashScope 兼容端点时**不可用**：
+- `LangchainLLMWrapper` → 结构化输出 schema 校验失败（instructor 把对象解成字符串）；
+- `llm_factory` 原生路径 → `OpenAIEmbeddings` 缺 `embed_query` / 同样有 schema 问题；
+- 结论：RAGAS 需要 OpenAI 兼容且支持 structured output 的 judge（如 OpenAI、DeepSeek 官方 API），
+  或改用自研 judge（同一套 RAGAS 指标定义）。本仓库先以「RGB 官方 checkanswer + 项目内置
+  rule-based faithfulness」作为答案侧指标，见 `var/eval/rgb/answer_summary.json`。
