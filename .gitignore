@@ -57,3 +57,6 @@ ekbs-admin-web/*.tsbuildinfo
 # 根目录误装的前端依赖
 node_modules/
 :memory:.ses
+
+# 本地评测专用配置（隔离 data_dir，不入库）
+config/application.eval.yaml
