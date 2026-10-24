@@ -50,3 +50,23 @@ RAGAS 0.4.3 直连 DashScope 兼容端点时**不可用**：
 - 结论：RAGAS 需要 OpenAI 兼容且支持 structured output 的 judge（如 OpenAI、DeepSeek 官方 API），
   或改用自研 judge（同一套 RAGAS 指标定义）。本仓库先以「RGB 官方 checkanswer + 项目内置
   rule-based faithfulness」作为答案侧指标，见 `var/eval/rgb/answer_summary.json`。
+
+## 五、负例拒答 + RAGAS（DeepSeek judge）
+
+```bash
+# 负例-only 语料（官方 noise_rate=1 口径；7,604 篇 / 962k tokens）
+.venv/bin/python eval/negative_prepare.py
+set -a; . ~/.ekbs/secrets.env; set +a
+.venv/bin/python eval/ingest_rgb.py --root var/eval/rgb-neg --kb-code rgb_neg \
+  --source-prefix "bench://rgbneg/" --config config/application.eval-neg.yaml --concurrency 16
+.venv/bin/python eval/retrieval_eval.py --root var/eval/rgb-neg --kb-code rgb_neg \
+  --config config/application.eval-neg.yaml --subsets refine,int,fact
+
+# RAGAS（judge 用 DeepSeek：DEEPSEEK_API_KEY 在 ~/.zshrc，用 zsh -ic 运行）
+zsh -ic 'cd "$PWD" && set -a; . "$HOME/.ekbs/secrets.env"; set +a; \
+  var/eval/venv/bin/python eval/ragas_judge.py --per-subset 10 --no-embeddings'
+```
+
+说明：`--no-embeddings` 只跑 Faithfulness / ContextPrecision / ContextRecall；
+AnswerRelevancy、AnswerCorrectness 依赖 embedding，当前 RAGAS 的 wrapper 与 DashScope
+兼容端点不匹配（`embed_query` 缺失 / 请求体被拒），暂缺。

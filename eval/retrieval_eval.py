@@ -76,12 +76,14 @@ async def main() -> int:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--config", default="config/application.eval.yaml")
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--root", default=str(RGB), help="语料/题集目录")
+    parser.add_argument("--kb-code", default=KB_CODE)
     args = parser.parse_args()
 
     settings = load_settings(REPO / args.config)
     runtime = Runtime.create(settings, service="eval_retrieval")
     with runtime.db.sync_connect() as conn:
-        kb = conn.execute("SELECT kb_id FROM ekbs_kb WHERE code = ?", (KB_CODE,)).fetchone()
+        kb = conn.execute("SELECT kb_id FROM ekbs_kb WHERE code = ?", (args.kb_code,)).fetchone()
         shard_rows = conn.execute(
             "SELECT shard_id FROM ekbs_shard WHERE status = 'active'"
         ).fetchall()
@@ -101,7 +103,8 @@ async def main() -> int:
     )
 
     wanted = {s.strip() for s in args.subsets.split(",") if s.strip()}
-    questions = [q for q in _load(RGB / "questions.jsonl") if q["subset"] in wanted]
+    root = Path(args.root)
+    questions = [q for q in _load(root / "questions.jsonl") if q["subset"] in wanted]
     if args.limit:
         questions = questions[: args.limit]
 
@@ -168,7 +171,7 @@ async def main() -> int:
     summary["config"] = args.config
     summary["visible_shards"] = list(visible)
 
-    (RGB / "retrieval_report.json").write_text(
+    (root / "retrieval_report.json").write_text(
         json.dumps({"summary": summary, "cases": results}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )

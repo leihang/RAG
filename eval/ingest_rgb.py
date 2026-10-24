@@ -37,23 +37,23 @@ KB_CODE = "rgb_bench"
 SOURCE_PREFIX = "bench://rgb/"
 
 
-def _ensure_kb(runtime: Runtime) -> int:
+def _ensure_kb(runtime: Runtime, kb_code: str = KB_CODE) -> int:
     with runtime.db.sync_connect() as conn:
         conn.execute(
             "INSERT INTO ekbs_kb(code, name, description, default_level, status, created_at) "
             "VALUES (?, ?, ?, 1, 1, datetime('now')) ON CONFLICT(code) DO NOTHING",
-            (KB_CODE, "RGB 评测语料", "公开基准 RGB 中文语料（仅评测）"),
+            (kb_code, f"{kb_code} 评测语料", "公开基准 RGB 中文语料（仅评测）"),
         )
-        row = conn.execute("SELECT kb_id FROM ekbs_kb WHERE code = ?", (KB_CODE,)).fetchone()
+        row = conn.execute("SELECT kb_id FROM ekbs_kb WHERE code = ?", (kb_code,)).fetchone()
         conn.commit()
     return int(row["kb_id"])
 
 
-def _done_hashes(runtime: Runtime) -> set[str]:
+def _done_hashes(runtime: Runtime, source_prefix: str = SOURCE_PREFIX) -> set[str]:
     with runtime.db.sync_connect() as conn:
         rows = conn.execute(
             "SELECT source_path FROM ekbs_document WHERE source_path LIKE ?",
-            (f"{SOURCE_PREFIX}%",),
+            (f"{source_prefix}%",),
         ).fetchall()
     return {str(r["source_path"]).rsplit("/", 1)[-1] for r in rows}
 
@@ -63,12 +63,15 @@ async def main() -> int:
     parser.add_argument("--limit", type=int, default=0, help="只灌前 N 篇（试跑用）")
     parser.add_argument("--concurrency", type=int, default=1, help="并发入库数（默认 1）")
     parser.add_argument("--config", default="config/application.eval.yaml")
+    parser.add_argument("--root", default=str(RGB), help="语料目录（manifest.json + docs/）")
+    parser.add_argument("--kb-code", default=KB_CODE)
+    parser.add_argument("--source-prefix", default=SOURCE_PREFIX)
     args = parser.parse_args()
 
     settings = load_settings(REPO / args.config)
     configure_logging(settings, "eval_ingest")
     runtime = Runtime.create(settings, service="eval_ingest", init_schema=True)
-    kb_id = _ensure_kb(runtime)
+    kb_id = _ensure_kb(runtime, args.kb_code)
     pipeline = IngestPipeline(
         db=runtime.db,
         settings=settings,
@@ -78,9 +81,10 @@ async def main() -> int:
         figure_index=runtime.figure_index,
     )
 
-    manifest = json.loads((RGB / "manifest.json").read_text(encoding="utf-8"))
+    root = Path(args.root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     docs: dict[str, dict[str, Any]] = manifest["docs"]
-    done = _done_hashes(runtime)
+    done = _done_hashes(runtime, args.source_prefix)
     todo = [(h, m) for h, m in docs.items() if h not in done]
     if args.limit:
         todo = todo[: args.limit]
@@ -103,7 +107,7 @@ async def main() -> int:
                     kb_id=kb_id,
                     level=1,
                     visible_dept_ids=[],
-                    source_path=f"{SOURCE_PREFIX}{h}",
+                    source_path=f"{args.source_prefix}{h}",
                     real_corpus=True,
                 )
                 results.append({"hash": h, **result.as_dict()})
@@ -125,7 +129,7 @@ async def main() -> int:
         "config": args.config,
         "kb_id": kb_id,
     }
-    (RGB / "ingest_report.json").write_text(
+    (root / "ingest_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     with runtime.db.sync_connect() as conn:

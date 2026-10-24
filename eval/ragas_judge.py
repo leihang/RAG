@@ -30,17 +30,33 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0, help="只判前 N 条（试跑建议 30–80）")
     parser.add_argument("--out", default="var/eval/rgb/ragas_report.json")
     parser.add_argument("--per-subset", type=int, default=0, help="每个子集取前 N 条（0=用 --limit 口径）")
+    parser.add_argument("--judge-provider", default="deepseek", choices=["deepseek", "dashscope"])
+    parser.add_argument("--judge-model", default="")
+    parser.add_argument("--judge-base-url", default="")
+    parser.add_argument("--no-embeddings", action="store_true", help="只跑 LLM-only 指标（跳过需要 embedding 的 2 项）")
     args = parser.parse_args()
 
-    api_key = os.environ.get("DASHSCOPE_API_KEY")
-    if not api_key:
-        print("缺少 DASHSCOPE_API_KEY（先 source ~/.ekbs/secrets.env）")
+    dashscope_key = os.environ.get("DASHSCOPE_API_KEY")
+    if not dashscope_key:
+        print("缺少 DASHSCOPE_API_KEY（先 source ~/.ekbs/secrets.env；RAGAS 的 embedding 指标要用它）")
         return 2
+    if args.judge_provider == "deepseek":
+        judge_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not judge_key:
+            print("缺少 DEEPSEEK_API_KEY（在 ~/.zshrc，需用 zsh -ic 运行本脚本）")
+            return 2
+        judge_base = args.judge_base_url or "https://api.deepseek.com/v1"
+        judge_model = args.judge_model or "deepseek-chat"
+    else:
+        judge_key = dashscope_key
+        judge_base = args.judge_base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        judge_model = args.judge_model or "qwen-max"
 
     from openai import OpenAI
 
+    from langchain_openai import OpenAIEmbeddings as LangchainOpenAIEmbeddings
     from ragas import EvaluationDataset, RunConfig, SingleTurnSample, evaluate
-    from ragas.embeddings import OpenAIEmbeddings as RagasOpenAIEmbeddings
+    from ragas.embeddings import LangchainEmbeddingsWrapper
     from ragas.llms import llm_factory
     from ragas.metrics import (
         AnswerCorrectness,
@@ -70,16 +86,26 @@ def main() -> int:
     ]
     print(f"待判 {len(samples)} 条（来自 {len(rows)} 条可答样本）")
 
-    base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=120, max_retries=3)
-    llm = llm_factory("qwen-max", client=client)
-    embeddings = RagasOpenAIEmbeddings(client=client, model="qwen3.7-text-embedding-flash")
-    metrics = [Faithfulness(), AnswerRelevancy(), ContextPrecision(), ContextRecall(), AnswerCorrectness()]
+    # judge：DeepSeek（OpenAI 兼容 + JSON 输出）或 DashScope；embedding 指标固定走 DashScope
+    judge_client = OpenAI(api_key=judge_key, base_url=judge_base, timeout=120, max_retries=3)
+    llm = llm_factory(judge_model, client=judge_client)
+    embeddings = LangchainEmbeddingsWrapper(
+        LangchainOpenAIEmbeddings(
+            model="qwen3.7-text-embedding-flash",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            api_key=dashscope_key,
+            dimensions=1024,
+        )
+    )
+    if args.no_embeddings:
+        metrics = [Faithfulness(), ContextPrecision(), ContextRecall()]
+    else:
+        metrics = [Faithfulness(), AnswerRelevancy(), ContextPrecision(), ContextRecall(), AnswerCorrectness()]
     result = evaluate(
         dataset=EvaluationDataset(samples=samples),
         metrics=metrics,
         llm=llm,
-        embeddings=embeddings,
+        embeddings=None if args.no_embeddings else embeddings,
         raise_exceptions=False,
         run_config=RunConfig(timeout=180, max_workers=2),
     )
@@ -94,7 +120,7 @@ def main() -> int:
     scores["valid_counts"] = {col: int(sum(1 for x in frame[col].tolist() if isinstance(x, (int, float)) and not math.isnan(float(x)))) for col in metric_cols}
     report = {
         "samples": len(samples),
-        "judge": "qwen-max (temperature=0)",
+        "judge": f"{judge_model} @ {judge_base}",
         "embedding": "qwen3.7-text-embedding-flash@1024",
         "scores": scores,
         "per_sample": frame.to_dict(orient="records"),
