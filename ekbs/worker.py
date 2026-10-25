@@ -464,6 +464,7 @@ async def run_forever(runtime: Runtime) -> None:
 
     requeue_orphans(runtime)
     log.info("worker_started", concurrency=runtime.settings.parse.worker_concurrency)
+    last_compact = 0.0
     while not stop.is_set():
         try:
             worked = await process_once(runtime, ingest)
@@ -471,6 +472,15 @@ async def run_forever(runtime: Runtime) -> None:
             log.error("worker_loop_error", error=str(exc))
             worked = False
         if not worked:
+            # 分段索引：空闲时做 compaction（10 分钟一次，避免空闲轮询反复加载分片）
+            if getattr(runtime.shards, "layout", "single") == "segmented" and time.monotonic() - last_compact > 600:
+                try:
+                    results = await asyncio.to_thread(runtime.shards.compact_all)
+                    if results:
+                        log.info("segmented_compacted", results=results)
+                except Exception as exc:  # noqa: BLE001 - compaction 失败不影响入库
+                    log.warning("segmented_compact_failed", error=str(exc)[:200])
+                last_compact = time.monotonic()
             try:
                 await asyncio.wait_for(stop.wait(), timeout=IDLE_SLEEP_SECONDS)
             except asyncio.TimeoutError:

@@ -207,6 +207,17 @@ class ShardIndex:
             if int(label) >= 0
         ]
 
+    def export(self) -> tuple[np.ndarray, list[int]]:
+        """导出全部向量与标签（compaction 合并段用）。"""
+        faiss = _import_faiss()
+        idmap = self.index
+        total = int(idmap.ntotal)
+        if total == 0:
+            return np.empty((0, self.dim), dtype="float32"), []
+        ids = [int(i) for i in faiss.vector_to_array(idmap.id_map)]
+        vectors = idmap.index.reconstruct_n(0, total)
+        return np.asarray(vectors, dtype="float32"), ids
+
     def save(self, path: Path | None = None, *, atomic: bool = True) -> None:
         faiss = _import_faiss()
         target = Path(path or self.path)
@@ -359,6 +370,49 @@ class SegmentedShard:
         save_manifest(self.dir, self.manifest)
         return removed
 
+    def compact(self, *, max_segments: int | None = None) -> dict[str, int | bool]:
+        """把小段合并成一个段（保留最大的段不重写），只重写被合并的小段。"""
+        limit = int(max_segments if max_segments is not None else self.manager.settings.index.segment.compaction_max_segments)
+        if len(self.segments) <= limit:
+            return {"compacted": False, "segments_before": len(self.segments)}
+        pairs = list(zip(self.manifest.segments, self.segments))
+        pairs.sort(key=lambda pair: pair[1].vector_count, reverse=True)
+        keep_info, keep_idx = pairs[0]
+        merge_pairs = pairs[1:]
+        vectors_parts: list[np.ndarray] = []
+        ids: list[int] = []
+        for _info, index in merge_pairs:
+            vecs, labels = index.export()
+            if len(labels):
+                vectors_parts.append(vecs)
+                ids.extend(labels)
+        if not ids:
+            return {"compacted": False, "segments_before": len(self.segments)}
+        merged_vectors = np.concatenate(vectors_parts, axis=0) if len(vectors_parts) > 1 else vectors_parts[0]
+        name = f"seg_compact_{self.manifest.version:04d}.faiss"
+        target = self.dir / name
+        merged = ShardIndex.create(self.shard_id, target, self.dim, self.fingerprint)
+        merged.add(merged_vectors, ids)
+        merged.save()
+        self.manifest.segments = [
+            SegmentInfo(id=keep_info.id, path=keep_info.path, count=keep_idx.vector_count, mode=keep_info.mode),
+            SegmentInfo(id=name[:-6], path=name, count=len(ids), mode="batch"),
+        ]
+        self.manifest.version += 1
+        save_manifest(self.dir, self.manifest)
+        for info, _index in merge_pairs:
+            old = self.dir / info.path
+            if old.exists():
+                old.unlink()
+        self.segments = [ShardIndex.load(self.shard_id, self.dir / i.path, expected_dim=self.dim)
+                         for i in self.manifest.segments if (self.dir / i.path).exists()]
+        return {
+            "compacted": True,
+            "segments_before": len(pairs),
+            "segments_after": len(self.manifest.segments),
+            "merged_vectors": len(ids),
+        }
+
     def flush(self) -> None:
         if self.active is not None and self.active.vector_count > 0:
             self.active.save()
@@ -430,6 +484,24 @@ class ShardIndexManager:
     def flush_all(self) -> None:
         for shard in self._segmented.values():
             shard.flush()
+
+    def compact(self, shard_id: str) -> dict[str, int | bool]:
+        if self.layout != "segmented":
+            return {"compacted": False, "reason": "single_layout"}
+        shard = self._get_segmented(shard_id)
+        return shard.compact()
+
+    def compact_all(self) -> dict[str, dict[str, int | bool]]:
+        if self.layout != "segmented":
+            return {}
+        results: dict[str, dict[str, int | bool]] = {}
+        for row in self.registry():
+            try:
+                results[row.shard_id] = self.compact(row.shard_id)
+            except Exception as exc:  # noqa: BLE001 - 单个分片失败不影响其它
+                log.error("segmented_compact_failed", shard_id=row.shard_id, error=str(exc)[:200])
+                results[row.shard_id] = {"compacted": False, "error": str(exc)[:200]}
+        return results
 
     def registry(self, *, status: str | None = "active") -> list[ShardRow]:
         sql = (

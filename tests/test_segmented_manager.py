@@ -64,3 +64,23 @@ def test_segmented_remove(runtime) -> None:
     assert removed == 1
     ids = [cid for cid, _ in manager.search("kb_all_L1", vectors[1], top_k=5)]
     assert 302 not in ids
+
+
+def test_compaction_merges_small_segments(runtime) -> None:
+    manager = _manager(runtime)
+    manager.settings.index.segment.batch_max_vectors = 1
+    manager.settings.index.segment.compaction_max_segments = 2
+    manager.create_shard("kb_all_L1")
+    vectors = _vectors(3)
+    for i in range(3):
+        manager.append("kb_all_L1", [401 + i], vectors[i : i + 1])
+
+    shard = manager._get_segmented("kb_all_L1")
+    assert len(shard.segments) >= 3
+    before = manager.search("kb_all_L1", vectors[0], top_k=3)
+    result = manager.compact("kb_all_L1")
+    assert result["compacted"] is True
+    shard = manager._get_segmented("kb_all_L1")
+    assert len(shard.segments) <= 2
+    after = manager.search("kb_all_L1", vectors[0], top_k=3)
+    assert [cid for cid, _ in after] == [cid for cid, _ in before]
