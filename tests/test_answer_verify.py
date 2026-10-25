@@ -137,3 +137,21 @@ async def test_gate_fail_open_and_fail_closed(seeded) -> None:
     answer = await runtime.pipeline.generate("年假有多少天", retrieval, alice)
     assert answer.refused is True
     assert answer.refusal_reason == REFUSE_ANSWER_VERIFY_UNAVAILABLE
+
+
+def test_band_config_rejects_inverted_range() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        AnswerVerifyCfg(min_score=0.9, max_score=0.5)
+
+
+async def test_verifier_bad_json_returns_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(200, json={"choices": [{"message": {"content": "not json"}}]})
+    )
+    verifier = AnswerVerifier(AnswerVerifyCfg(), transport=transport)
+    result = await verifier.verify("q", "a", ["c"])
+    assert result.supported is None
+    assert result.error == "bad_json"
