@@ -30,18 +30,36 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description="重试未入库成功的 RGB 文档")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--config", default="config/application.eval.yaml")
+    parser.add_argument("--root", default=str(RGB))
+    parser.add_argument("--kb-code", default="rgb_bench")
+    parser.add_argument("--source-prefix", default=SOURCE_PREFIX)
+    parser.add_argument(
+        "--defer-faiss-save", action="store_true",
+        help="评测加速：重试期间跳过逐篇全量写 FAISS（结束一次性落盘）",
+    )
     args = parser.parse_args()
 
     settings = load_settings(REPO / args.config)
     runtime = Runtime.create(settings, service="eval_retry", init_schema=False)
-    manifest = json.loads((RGB / "manifest.json").read_text(encoding="utf-8"))
+    defer_save = bool(args.defer_faiss_save)
+    original_save = None
+    if defer_save:
+        from ekbs.index.faiss_store import ShardIndex
+
+        original_save = ShardIndex.save
+
+        def _defer_save(self, path=None, *, atomic=True):  # type: ignore[no-untyped-def]
+            return None
+
+        ShardIndex.save = _defer_save  # type: ignore[method-assign]
+    manifest = json.loads((Path(args.root) / "manifest.json").read_text(encoding="utf-8"))
     docs = manifest["docs"]
     with runtime.db.sync_connect() as conn:
-        kb = conn.execute("SELECT kb_id FROM ekbs_kb WHERE code='rgb_bench'").fetchone()
+        kb = conn.execute("SELECT kb_id FROM ekbs_kb WHERE code = ?", (args.kb_code,)).fetchone()
         bad = conn.execute(
             "SELECT doc_id, source_path, status FROM ekbs_document "
             "WHERE source_path LIKE ? AND status != 'published'",
-            (f"{SOURCE_PREFIX}%",),
+            (f"{args.source_prefix}%",),
         ).fetchall()
     kb_id = int(kb["kb_id"])
     print(f"待重试 {len(bad)} 篇：{[(r['doc_id'], r['status']) for r in bad[:5]]} ...")
@@ -68,7 +86,7 @@ async def main() -> int:
                     kb_id=kb_id,
                     level=1,
                     visible_dept_ids=[],
-                    source_path=f"{SOURCE_PREFIX}{h}",
+                    source_path=f"{args.source_prefix}{h}",
                     real_corpus=True,
                     existing_doc_id=int(row["doc_id"]),
                 )
@@ -76,11 +94,16 @@ async def main() -> int:
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{h}: {type(exc).__name__}: {exc}"[:300])
 
-    await asyncio.gather(*(one(r) for r in bad))
+    try:
+        await asyncio.gather(*(one(r) for r in bad))
+    finally:
+        if defer_save and original_save is not None:
+            for index in runtime.shards._loaded.values():
+                original_save(index)
     with runtime.db.sync_connect() as conn:
         left = conn.execute(
             "SELECT COUNT(*) c FROM ekbs_document WHERE source_path LIKE ? AND status != 'published'",
-            (f"{SOURCE_PREFIX}%",),
+            (f"{args.source_prefix}%",),
         ).fetchone()["c"]
         chunks = conn.execute("SELECT COUNT(*) c FROM ekbs_chunk").fetchone()["c"]
         vectors = conn.execute("SELECT vector_count FROM ekbs_shard WHERE status='active'").fetchone()[

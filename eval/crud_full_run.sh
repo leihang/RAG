@@ -7,7 +7,8 @@ set -a; . "$HOME/.ekbs/secrets.env"; set +a
 
 echo "== 1) 补灌失败文档 =="
 .venv/bin/python eval/retry_failed.py --root var/eval/crud --kb-code crud_bench \
-  --config config/application.eval-crud.yaml --source-prefix "bench://crud/" || true
+  --config config/application.eval-crud.yaml --source-prefix "bench://crud/" \
+  --defer-faiss-save || true
 
 echo "== 2) 全量基线评测（门禁关闭） =="
 .venv/bin/python eval/crud_eval.py --stage run \

@@ -67,11 +67,30 @@ async def main() -> int:
     parser.add_argument("--kb-code", default=KB_CODE)
     parser.add_argument("--source-prefix", default=SOURCE_PREFIX)
     parser.add_argument("--manifest", default="", help="自定义 manifest 路径（默认 <root>/manifest.json）")
+    parser.add_argument(
+        "--defer-faiss-save", action="store_true",
+        help="评测加速：入库期间跳过逐篇全量写 FAISS（结束/异常时一次性落盘）",
+    )
     args = parser.parse_args()
 
     settings = load_settings(REPO / args.config)
     configure_logging(settings, "eval_ingest")
     runtime = Runtime.create(settings, service="eval_ingest", init_schema=True)
+
+    defer_save = bool(args.defer_faiss_save)
+    original_save = None
+    if defer_save:
+        # 实测：append() 每篇都会 index.save() 全量重写（72k 文档时索引 531MB ⇒ ~1.6GB/s
+        # 写放大，速率从 24 篇/s 掉到 3 篇/s）。评测灌库期间先跳过落盘，结束一次性写。
+        from ekbs.index.faiss_store import ShardIndex
+
+        original_save = ShardIndex.save
+
+        def _defer_save(self, path=None, *, atomic=True):  # type: ignore[no-untyped-def]
+            return None
+
+        ShardIndex.save = _defer_save  # type: ignore[method-assign]
+        print("defer-faiss-save: 入库期间跳过 FAISS 逐篇落盘", flush=True)
     kb_id = _ensure_kb(runtime, args.kb_code)
     pipeline = IngestPipeline(
         db=runtime.db,
@@ -120,7 +139,15 @@ async def main() -> int:
                 rate = written / max(1e-9, time.perf_counter() - t0)
                 print(f"  {written}/{len(todo)}  {rate:.1f} 篇/s", flush=True)
 
-    await asyncio.gather(*(one(h, m) for h, m in todo))
+    try:
+        await asyncio.gather(*(one(h, m) for h, m in todo))
+    finally:
+        if defer_save and original_save is not None:
+            saved = 0
+            for index in runtime.shards._loaded.values():
+                original_save(index)
+                saved += 1
+            print(f"defer-faiss-save: 已落盘 {saved} 个分片", flush=True)
 
     elapsed = time.perf_counter() - t0
     report = {
