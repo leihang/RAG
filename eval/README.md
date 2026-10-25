@@ -151,3 +151,8 @@ zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/crud_eval.py --stage judge -
 全量 83,814 篇灌库在 13.6k 篇时被 API 限流/欠费打断；评测改用「13,608 篇干扰池 +
 全部可定位源文档（1,627 篇）」的收窄口径，并用 `eval/crud_sources.py` 定位源文档。
 该口径用于跨语料回归，不与官方 80k 全库成绩对比。完整结果见 `var/eval/rgb/REPORT.md` 第十二节。
+
+**已完成结果（收窄口径，773 题全量）**：key_info recall@10 = 0.362、hit 71.3%；
+答案 key_info 覆盖 0.246、完全正确 32.1%、部分 24.5%%；拒答 21.6%。
+与 RGB 对比：RGB Recall@10 0.62 / 正确率 91.1% / 拒答 2.9% —— CRUD 明显更难，
+且当前干扰池仅 1.36 万篇（官方 8 万），全量只会更低。详见 REPORT 第十二节。
