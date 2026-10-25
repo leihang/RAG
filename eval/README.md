@@ -198,3 +198,19 @@ zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/crud_questeval.py --concurre
 
 773 题：quest_recall **0.265**、quest_f1 0.144，与自建判官的 key_info 覆盖（0.263）一致
 → 答案不完整是真实问题，不是判分口径造成的。
+
+## 十五、拒答判官模型对比（DeepSeek / qwen-max / MiniMax）
+
+```bash
+zsh -ic 'cd "$PWD" && set -a; . "$HOME/.ekbs/secrets.env"; set +a; \
+  var/eval/venv/bin/python eval/judge_model_ab.py --pos 120 --neg 120'
+# MiniMax 账号限流：用同一 60 题子集串行（concurrency 1 + 2s 间隔）
+zsh -ic 'cd "$PWD" && set -a; . "$HOME/.ekbs/secrets.env"; set +a; \
+  var/eval/venv/bin/python eval/judge_model_ab.py --pos 120 --neg 120 \
+  --subset-from deepseek-chat --subset-n 30 \
+  --only minimax-m3-off,minimax-m3-adaptive,minimax-m31flash-adaptive'
+```
+
+结果（240 题；MiniMax 60 题）：deepseek-reasoner 误拒 5.9%/拒答 **56.3%**；
+qwen-max 5.0%/47.1%；MiniMax M3-off 13.3%/31.0%（另有 adaptive 更慢更差）。
+结论：优先 DeepSeek reasoner（要高拒答）或 qwen-max（平衡/免新 provider）；MiniMax 暂不选。
