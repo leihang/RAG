@@ -24,6 +24,8 @@
 | `scripts/smoke.sh` | 249 | 冒烟集：SQLite + 表数 + 完整性 + FTS5/JSON1 + FAISS 一致性 + 4 个服务 + 健康端点 + Caddy | `01` §14 + `04` §7.3 |
 | `scripts/backup.sh` | 45 | 本地备份（`.backup` + rsync + 保留 30 天） | `01` §13 |
 | `scripts/release.sh` | 76 | 版本切换与逐个重启（release 目录 + `ln -sfn` + 按序 `kickstart`） | `04` §7.6 |
+| `RUNBOOK-回答核验灰度.md` | 96 | 回答后置核验 `answer_verify` 的灰度开启/观测/回滚步骤 | 公开基准报告 §6.5/§6.6 |
+| `scripts/answer_verify_gray_check.sh` | 55 | 灰度巡检（**只读**）：配置开关、密钥、近 24h 审计事件、判官失败数、服务状态 | 同上 |
 
 ---
 
@@ -93,3 +95,17 @@ bash deploy/scripts/release.sh /opt/ekbs/releases/20260926-1430
 `01` §14 的旧写法用过 `/health/ready`，而 `04` §7.3 定义的是 `/livez`、`/healthz`、`/readyz`、`/health/deps`。
 **现以 `04` §7.3 为准**（`01` §8.3 与 §14 已改为 `/readyz`）。
 `/health/deps` **会真实出网**（探测云端三模型），因此**绝不能作为 readiness 探针**；探针只用 `/readyz`。
+
+---
+
+## 十二、回答核验灰度（answer_verify）
+
+默认关闭；灰度步骤见 `RUNBOOK-回答核验灰度.md`，巡检用：
+
+```bash
+bash deploy/scripts/answer_verify_gray_check.sh
+```
+
+只看不改：配置开关、`DEEPSEEK_API_KEY`、近 24h `answer_verify_refused` 审计事件、
+`answer_verify_failed` 日志数、`com.ekbs.api` 状态。回滚只需把 `answer_verify.enabled`
+改回 `false` 并 `launchctl kickstart -k`。
