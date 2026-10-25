@@ -198,3 +198,22 @@ security:
   local_login_allow_remote: false    # ⚠️ 保持 false：true = 内网任何机器都能试密码（不推荐）
   local_login_max_failures: 5        # 连续失败次数上限
   local_login_lock_minutes: 15       # 达到上限后的锁定时长
+
+# 生成后置「资料充分性」核验（默认关闭；只对 rerank 边界分调用）
+# 选型见公开基准评测报告 §6.5：显式模型 deepseek-flash + reasoning_effort=high，
+# 密钥从环境变量 DEEPSEEK_API_KEY 读（secrets.env），不写进本文件。
+answer_verify:
+  enabled: false
+  provider: deepseek
+  base_url: https://api.deepseek.com/v1
+  model: deepseek-flash
+  key_env: DEEPSEEK_API_KEY
+  reasoning_effort: high
+  max_tokens: 4000
+  timeout_seconds: 180
+  max_retries: 3
+  min_score: 0.65
+  max_score: 0.85
+  max_contexts: 5
+  max_context_chars: 900
+  fail_open: true

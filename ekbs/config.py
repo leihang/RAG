@@ -215,6 +215,46 @@ class LLMCfg(_Section):
     fallback: LLMFallbackCfg = Field(default_factory=LLMFallbackCfg)
 
 
+class AnswerVerifyCfg(_Section):
+    """回答侧"资料充分性"核验（生成后置门禁，**默认关闭**）。
+
+    设计要点：
+    * 只对 **rerank 分数落在 [min_score, max_score] 的边界题** 调用判官，控制延迟/成本；
+    * 判官用显式模型名（``deepseek-flash``）+ ``reasoning_effort``，不用 ``deepseek-chat``
+      这类会随版本漂移的旧别名；
+    * ``fail_open=True`` 时判官不可用不阻断回答（只记审计），避免门禁本身造成不可用；
+    * 密钥只从环境变量读（``api_key_env``），不写进 yaml。
+    """
+
+    enabled: bool = False
+    provider: str = "deepseek"
+    base_url: str = "https://api.deepseek.com/v1"
+    model: str = "deepseek-flash"
+    #: 密钥所在环境变量名（不能叫 api_key_env：配置层会把它当"密钥写进 yaml"直接报错）
+    key_env: str = "DEEPSEEK_API_KEY"
+    #: 思考强度：none=关，low/high/max=开（实测 high 的拒答最好）
+    reasoning_effort: str = "high"
+    max_tokens: int = 4000
+    temperature: float = 0.0
+    timeout_seconds: float = 180.0
+    max_retries: int = 3
+    #: 只核验边界分：低于 min_score 已有阈值拒答，高于 max_score 直接放行
+    min_score: float = 0.65
+    max_score: float = 0.85
+    max_contexts: int = 5
+    max_context_chars: int = 900
+    #: 判官不可用（缺 key/超时/解析失败）时是否放行回答
+    fail_open: bool = True
+
+    @field_validator("max_score")
+    @classmethod
+    def _band_order(cls, v: float, info: Any) -> float:
+        min_score = info.data.get("min_score", 0.0)
+        if v < min_score:
+            raise ValueError("answer_verify.max_score 必须 >= min_score")
+        return v
+
+
 class ModelsCfg(_Section):
     embed: EmbedCfg = Field(default_factory=EmbedCfg)
     llm: LLMCfg = Field(default_factory=LLMCfg)
@@ -300,6 +340,8 @@ class Settings(BaseSettings):
     database: DatabaseCfg = Field(default_factory=DatabaseCfg)
     retrieval: RetrievalCfg = Field(default_factory=RetrievalCfg)
     models: ModelsCfg = Field(default_factory=ModelsCfg)
+    #: 生成后置的"资料充分性"核验（默认关闭，见 AnswerVerifyCfg）
+    answer_verify: AnswerVerifyCfg = Field(default_factory=AnswerVerifyCfg)
     parse: ParseCfg = Field(default_factory=ParseCfg)
     upload: UploadCfg = Field(default_factory=UploadCfg)
     permission: PermissionCfg = Field(default_factory=PermissionCfg)

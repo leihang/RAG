@@ -445,3 +445,55 @@ bash scripts/dev_smoke.sh --start --with-qa --redline
 
 `config/application.dev.yaml` 的**检索参数与生产逐字一致**，改的只有目录与 provider（mock ↔ dashscope），
 因此「开发机上跑通的链路 = 生产链路」。
+
+---
+
+## 八、回答后置核验 `answer_verify`（默认关闭）
+
+背景：公开基准负例口径下，仅靠 `rerank.min_score=0.65` 拒答只有 **7.6%**；离线实验里
+「claim 分解 + 逐条找原文」可把负例拒答提到 ~35–50%，代价是可答误拒 2–3%。该门禁把核验
+做成**可配置、默认关闭**的生成后置开关。
+
+### 行为
+
+- 只在 `rerank` 分数落在 `[min_score, max_score]` 的**边界题**上调用（默认 0.65–0.85）：
+  低分已由阈值拒答，高分直接放行，避免每题都多打一次判官；
+- 判官用**显式模型名** `deepseek-flash` + `reasoning_effort: high`（公开基准选型，见
+  `docs/公开基准评测报告-2026-10-25.md` §6.5）；不用 `deepseek-chat` 这类会随版本漂移的旧别名；
+- 判官判定 `supported=false` → 返回 `refused=true`、`refusal_reason=answer_verify_unsupported`、
+  清空引用（与现有拒答语义一致）；
+- 判官不可用（缺 key / 超时 / 解析失败）按 `fail_open: true` **放行**，只记审计
+  `answer_verify_refused`，门禁本身不制造不可用；`fail_open: false` 才按不可用拒答。
+
+### 配置（三个配置文件已同步，默认 `enabled: false`）
+
+```yaml
+answer_verify:
+  enabled: false            # 默认关闭；灰度时改 true
+  provider: deepseek
+  base_url: https://api.deepseek.com/v1
+  model: deepseek-flash     # DeepSeek-V4.1-Flash
+  key_env: DEEPSEEK_API_KEY # 密钥只从环境变量读
+  reasoning_effort: high    # none=关思考，low/high/max
+  max_tokens: 4000
+  timeout_seconds: 180
+  max_retries: 3
+  min_score: 0.65
+  max_score: 0.85
+  max_contexts: 5
+  max_context_chars: 900
+  fail_open: true
+```
+
+### 启用步骤
+
+1. 生产 `~/.ekbs/secrets.env` 里加 `DEEPSEEK_API_KEY=...`（`deploy/config/secrets.env.example`
+   已有该键名）；launchd 重启服务；
+2. 对应环境 `application.yaml` 里把 `answer_verify.enabled` 改为 `true`；
+3. 先灰度观察：`refused_rate`、`answer_verify_refused` 审计事件、`answer_verify_failed` 日志；
+4. 回滚：把 `enabled` 改回 `false` 即可（无需重启数据库/索引）。
+
+### 测试
+
+`tests/test_answer_verify.py` 覆盖：输出解析容错、429 重试、默认关闭、边界分过滤、
+判官判定不支持时拒答、`fail_open` 开/关。全量 `pytest tests/ -q` 通过（990 用例）。

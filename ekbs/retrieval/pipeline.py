@@ -38,6 +38,7 @@ from ekbs.permission.acl import DocumentGate
 from ekbs.permission.context import PermContext
 from ekbs.provider.base import RerankDoc
 from ekbs.provider.registry import Providers
+from ekbs.retrieval.answer_verify import AnswerVerifier, VerifyResult
 from ekbs.retrieval.faithfulness import (
     DEGRADED_UNSUPPORTED,
     REFUSE_MISSING_CITATION,
@@ -74,6 +75,9 @@ _BUDGET_MIN_CHUNK_TOKENS = 128
 REFUSE_ALL_DENIED = "all_denied_by_c5"
 REFUSE_EMPTY_ANSWER = "empty_answer"
 REFUSE_NO_BASIS = "no_basis_in_context"
+#: 生成后置"资料充分性"核验判定为不支持（见 ekbs/retrieval/answer_verify.py）
+REFUSE_ANSWER_VERIFY = "answer_verify_unsupported"
+REFUSE_ANSWER_VERIFY_UNAVAILABLE = "answer_verify_unavailable"
 # REFUSE_MISSING_CITATION / REFUSE_UNSUPPORTED_CLAIM 自 faithfulness 导入后原样再导出
 
 #: 提示词约定的「资料不足」口径（`00` §2.1 要求「直接回复『未找到可靠依据』」）。
@@ -290,6 +294,8 @@ class RetrievalPipeline:
         # 内容安全闸门（04 §6.4）：L4 输出侧检测未授权文档名
         self.content_guard = content_guard
         self.figure_index = figure_index
+        # 生成后置核验（默认关闭；只对边界分调用，见 AnswerVerifyCfg）
+        self.answer_verifier = AnswerVerifier(settings.answer_verify)
 
     # ------------------------------------------------------------------
     # 查询嵌入（含缓存与「不可用即拒答」）
@@ -1445,6 +1451,38 @@ class RetrievalPipeline:
                 **timing_kw,
             )
 
+        verdict = await self._verify_answer(question, answer_text, chunks, retrieval)
+        if verdict is not None and verdict.supported is not True:
+            cfg = self.settings.answer_verify
+            # supported=None 表示判官不可用；fail_open 时放行，否则按"不可用"拒答
+            if verdict.supported is False or not cfg.fail_open:
+                reason = REFUSE_ANSWER_VERIFY if verdict.supported is False else REFUSE_ANSWER_VERIFY_UNAVAILABLE
+                self.gate.record_security_event(
+                    "answer_verify_refused",
+                    user_id=perm.user_id,
+                    severity="medium" if verdict.supported is False else "low",
+                    detail={
+                        "reason": reason,
+                        "verifier_reason": verdict.reason,
+                        "error": verdict.error,
+                        "top_score": retrieval.top_score,
+                        "model": verdict.model,
+                    },
+                )
+                timing_kw["total_ms"] = int(_ms(started))
+                return AnswerResult(
+                    answer=f"{NO_BASIS_MARKER}。",
+                    citations=[],
+                    retrieval=retrieval,
+                    model=llm_result.model,
+                    refused=True,
+                    refusal_reason=reason,
+                    hallucinated_citations=hallucinated,
+                    faithfulness=report.as_dict(),
+                    degraded=degraded,
+                    **timing_kw,
+                )
+
         citations = self._post_check_citations(answer_text, chunks, perm)
         return AnswerResult(
             answer=answer_text,
@@ -1460,6 +1498,28 @@ class RetrievalPipeline:
             context_truncated=bool(budget["truncated"]),
             **timing_kw,
         )
+
+    async def _verify_answer(
+        self,
+        question: str,
+        answer_text: str,
+        chunks: Sequence[Any],
+        retrieval: RetrievalResult,
+    ) -> VerifyResult | None:
+        """按配置对"边界分"答案做资料充分性核验；返回 None 表示不需要核验。"""
+        cfg = self.settings.answer_verify
+        if not cfg.enabled:
+            return None
+        score = retrieval.top_score
+        if score is None or not (cfg.min_score <= float(score) <= cfg.max_score):
+            return None
+        try:
+            return await self.answer_verifier.verify(
+                question, answer_text, [str(getattr(c, "content", "")) for c in chunks]
+            )
+        except Exception as exc:  # noqa: BLE001 - 门禁失败不能拖垮问答
+            log.warning("answer_verify_failed", error=str(exc))
+            return VerifyResult(supported=None, error=f"{type(exc).__name__}: {exc}")
 
     async def _answer_numeric(
         self, question: str, retrieval: RetrievalResult, perm: PermContext
