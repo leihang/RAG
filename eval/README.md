@@ -218,11 +218,12 @@ qwen-max 5.0%/47.1%；MiniMax M3-off 13.3%/31.0%（另有 adaptive 更慢更差�
 ### DeepSeek V4 补充（2026-10-25）
 
 `/models` 现只列 `deepseek-flash`（DeepSeek-V4.1-Flash）与 `deepseek-v4-pro`；
-旧别名 `deepseek-reasoner` 仍可用但映射到新模型。实测（240 题；*为 60 题子集）：
+`deepseek-chat`/`deepseek-reasoner` 是兼容别名，响应 `model` 字段显示都映射到 `deepseek-flash`
+（chat=thinking off，reasoner=thinking on）。显式控制思考：`reasoning_effort: none|low|high`。实测（240 题；*为 60 题子集）：
 
 | 模型 | effort | 误拒 | 拒答 | 延迟 |
 |---|---|---|---|---|
-| deepseek-chat | 关 | 3.3% | 29.2% | 1.2s |
+| deepseek-flash（thinking off，旧别名 deepseek-chat） | 关 | 3.3% | 30.0% | 1.2s |
 | **deepseek-flash** | **high** | **5.8%** | **58.0%** | 5.4s |
 | deepseek-flash | default | 6.7%* | 60.0%* | 5.1s* |
 | deepseek-flash | low | 10.0%* | 60.0%* | 4.4s* |

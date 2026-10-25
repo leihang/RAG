@@ -44,6 +44,7 @@ CONFIGS = [
     {"name": "deepseek-chat", "base": "https://api.deepseek.com/v1", "model": "deepseek-chat", "key": "DEEPSEEK_API_KEY"},
     {"name": "deepseek-reasoner", "base": "https://api.deepseek.com/v1", "model": "deepseek-reasoner", "key": "DEEPSEEK_API_KEY", "max_tokens": 4000},
     {"name": "deepseek-flash", "base": "https://api.deepseek.com/v1", "model": "deepseek-flash", "key": "DEEPSEEK_API_KEY", "max_tokens": 4000, "body_extra": {"reasoning_effort": "high"}},
+    {"name": "deepseek-flash-none", "base": "https://api.deepseek.com/v1", "model": "deepseek-flash", "key": "DEEPSEEK_API_KEY", "max_tokens": 4000, "body_extra": {"reasoning_effort": "none"}},
     {"name": "deepseek-flash-low", "base": "https://api.deepseek.com/v1", "model": "deepseek-flash", "key": "DEEPSEEK_API_KEY", "max_tokens": 4000, "body_extra": {"reasoning_effort": "low"}},
     {"name": "deepseek-flash-default", "base": "https://api.deepseek.com/v1", "model": "deepseek-flash", "key": "DEEPSEEK_API_KEY", "max_tokens": 4000},
     {"name": "deepseek-v4-pro", "base": "https://api.deepseek.com/v1", "model": "deepseek-v4-pro", "key": "DEEPSEEK_API_KEY", "max_tokens": 4000, "body_extra": {"reasoning_effort": "high"}},
