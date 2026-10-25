@@ -189,3 +189,12 @@ set -a; . ~/.ekbs/secrets.env; set +a
 
 结论：整篇文档聚合相比当前上下文仅 +0.2–0.3pp；keep20/top_k100 下源文档全召回仍只有 22.7%
 → 瓶颈在文档排序/候选生成，不在切块。
+
+## 十四、QuestEval 口径对齐（CRUD）
+
+```bash
+zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/crud_questeval.py --concurrency 8'
+```
+
+773 题：quest_recall **0.265**、quest_f1 0.144，与自建判官的 key_info 覆盖（0.263）一致
+→ 答案不完整是真实问题，不是判分口径造成的。
