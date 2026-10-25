@@ -217,3 +217,15 @@ answer_verify:
   max_contexts: 5
   max_context_chars: 900
   fail_open: true
+
+# 分段索引（方案 B）开关：默认 single = 现有单文件行为；灰度时改 segmented。
+# P0 只落盘格式与迁移工具，检索路径暂不切换（P1 再接活跃段/跨段归并）。
+index:
+  layout: single
+  writer: worker
+  segment:
+    batch_max_vectors: 12000
+    personal_max_vectors: 1
+    idle_flush_seconds: 5
+    compaction_max_segments: 8
+    compaction_personal_min_segments: 4

@@ -255,6 +255,51 @@ class AnswerVerifyCfg(_Section):
         return v
 
 
+class SegmentCfg(_Section):
+    """分段索引的 flush / compaction 参数（``index.layout=segmented`` 时生效）。"""
+
+    #: 批量入库：活跃段达到多少向量才落盘（越大写盘越少、可见越晚）
+    batch_max_vectors: int = 12000
+    #: 个人库：单篇即 flush，保证秒级可搜（小段交给 compaction 合并）
+    personal_max_vectors: int = 1
+    #: 批量入库空闲多久强制 flush（防止最后一批迟迟不落盘）
+    idle_flush_seconds: float = 5.0
+    #: 段数超过该值触发 compaction
+    compaction_max_segments: int = 8
+    #: 个人小段达到该数量优先合并
+    compaction_personal_min_segments: int = 4
+
+    @field_validator("batch_max_vectors", "personal_max_vectors", "compaction_max_segments")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("segment 参数必须 >= 1")
+        return v
+
+
+class IndexCfg(_Section):
+    """索引布局开关。默认 ``single``（现有单文件行为），灰度时切 ``segmented``。"""
+
+    layout: str = "single"
+    #: 向量写入者：``worker``（推荐，单写者）/ ``api``（兼容旧行为）
+    writer: str = "worker"
+    segment: SegmentCfg = Field(default_factory=SegmentCfg)
+
+    @field_validator("layout")
+    @classmethod
+    def _layout(cls, v: str) -> str:
+        if v not in {"single", "segmented"}:
+            raise ValueError("index.layout 只能是 single / segmented")
+        return v
+
+    @field_validator("writer")
+    @classmethod
+    def _writer(cls, v: str) -> str:
+        if v not in {"worker", "api"}:
+            raise ValueError("index.writer 只能是 worker / api")
+        return v
+
+
 class ModelsCfg(_Section):
     embed: EmbedCfg = Field(default_factory=EmbedCfg)
     llm: LLMCfg = Field(default_factory=LLMCfg)
@@ -339,6 +384,7 @@ class Settings(BaseSettings):
     server: ServerCfg = Field(default_factory=ServerCfg)
     database: DatabaseCfg = Field(default_factory=DatabaseCfg)
     retrieval: RetrievalCfg = Field(default_factory=RetrievalCfg)
+    index: IndexCfg = Field(default_factory=IndexCfg)
     models: ModelsCfg = Field(default_factory=ModelsCfg)
     #: 生成后置的"资料充分性"核验（默认关闭，见 AnswerVerifyCfg）
     answer_verify: AnswerVerifyCfg = Field(default_factory=AnswerVerifyCfg)
