@@ -156,3 +156,20 @@ zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/crud_eval.py --stage judge -
 答案 key_info 覆盖 0.246、完全正确 32.1%、部分 24.5%%；拒答 21.6%。
 与 RGB 对比：RGB Recall@10 0.62 / 正确率 91.1% / 拒答 2.9% —— CRUD 明显更难，
 且当前干扰池仅 1.36 万篇（官方 8 万），全量只会更低。详见 REPORT 第十二节。
+
+## 十二、质量改进实验（CRUD）
+
+```bash
+# 检索参数矩阵（retrieval-only，6 组配置见 config/application.eval-crud-*.yaml）
+.venv/bin/python eval/crud_eval.py --stage run --retrieval-only \
+  --config config/application.eval-crud-wide-a05.yaml \
+  --out var/eval/crud/results_wide_a05.jsonl --summary-out var/eval/crud/summary_wide_a05.json
+
+# 答案 prompt A/B（同一检索结果，直连 qwen-max，不改业务代码）
+.venv/bin/python eval/crud_answer_ab.py --concurrency 6
+zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/crud_eval.py --stage judge \
+  --results var/eval/crud/results_enh_prompt.jsonl --judge-out var/eval/crud/judge_enh_prompt.jsonl'
+```
+
+结论：宽检索 + alpha0.5 把 key_info recall 从 0.362 提到 **0.417**（+15% 相对）；
+答案 prompt 改为"逐点全覆盖"没有收益（32.2%→30.5%），瓶颈在判分口径而非提示词。

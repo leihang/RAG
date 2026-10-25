@@ -88,7 +88,7 @@ async def _run(args: argparse.Namespace) -> int:
     questions = _load(ROOT / "questions.jsonl")
     if args.limit:
         questions = questions[: args.limit]
-    out_path = ROOT / "results.jsonl"
+    out_path = Path(args.out) if args.out else (ROOT / "results.jsonl")
     done = {r["id"] for r in _load(out_path)}
     todo = [q for q in questions if q["id"] not in done]
     print(f"待跑 {len(todo)} / {len(questions)}")
@@ -100,7 +100,10 @@ async def _run(args: argparse.Namespace) -> int:
         nonlocal written
         async with sem:
             retrieval = await runtime.pipeline.retrieve(q["query"], perm)
-            answer = await runtime.pipeline.generate(q["query"], retrieval, perm)
+            if args.retrieval_only:
+                answer = None
+            else:
+                answer = await runtime.pipeline.generate(q["query"], retrieval, perm)
             contexts = [c.content for c in retrieval.chunks]
             row = {
                 "id": q["id"],
@@ -108,9 +111,9 @@ async def _run(args: argparse.Namespace) -> int:
                 "query": q["query"],
                 "reference": q.get("reference") or "",
                 "key_info": q.get("key_info") or [],
-                "answer": answer.answer,
-                "refused": answer.refused,
-                "refusal_reason": answer.refusal_reason,
+                "answer": answer.answer if answer is not None else "",
+                "refused": retrieval.refused if answer is None else answer.refused,
+                "refusal_reason": retrieval.refusal_reason if answer is None else answer.refusal_reason,
                 "top_score": retrieval.top_score,
                 "contexts": contexts,
                 **_coverage(q.get("key_info") or [], contexts),
@@ -123,7 +126,8 @@ async def _run(args: argparse.Namespace) -> int:
                     print(f"  {written}/{len(todo)}", flush=True)
 
     await asyncio.gather(*(one(q) for q in todo))
-    _summarize(ROOT / "results.jsonl", ROOT / "summary.json")
+    summary_path = Path(args.summary_out) if args.summary_out else (ROOT / "summary.json")
+    _summarize(out_path, summary_path)
     return 0
 
 
@@ -157,10 +161,10 @@ async def _judge(args: argparse.Namespace) -> int:
     if not os.environ.get("DEEPSEEK_API_KEY"):
         print("缺少 DEEPSEEK_API_KEY", file=sys.stderr)
         return 2
-    rows = _load(ROOT / "results.jsonl")
+    rows = _load(Path(args.results) if args.results else (ROOT / "results.jsonl"))
     if args.limit:
         rows = rows[: args.limit]
-    out_path = ROOT / "judge.jsonl"
+    out_path = Path(args.judge_out) if args.judge_out else (ROOT / "judge.jsonl")
     done = {r["id"] for r in _load(out_path)}
     todo = [r for r in rows if r["id"] not in done]
     print(f"待判 {len(todo)} / {len(rows)}")
@@ -244,7 +248,8 @@ async def _judge(args: argparse.Namespace) -> int:
         "answer_correct_rate": sum(1 for r in valid if r.get("correct") in (1, 1.0)) / (len(valid) or 1),
         "partial_rate": sum(1 for r in valid if r.get("correct") in (0.5,)) / (len(valid) or 1),
     }
-    (ROOT / "judge_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary_path = out_path.with_name(f"judge_summary_{out_path.stem}.json")
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
@@ -256,6 +261,11 @@ def main() -> int:
     parser.add_argument("--kb-code", default="crud_bench")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--retrieval-only", action="store_true", help="只跑检索（不生成答案），用于参数实验")
+    parser.add_argument("--out", default="", help="结果文件（默认 <root>/results.jsonl）")
+    parser.add_argument("--summary-out", default="", help="汇总文件")
+    parser.add_argument("--results", default="", help="judge 阶段输入（默认 <root>/results.jsonl）")
+    parser.add_argument("--judge-out", default="", help="judge 阶段输出（默认 <root>/judge.jsonl）")
     args = parser.parse_args()
     if args.stage == "run":
         return asyncio.run(_run(args))
