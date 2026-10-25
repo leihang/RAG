@@ -214,3 +214,18 @@ zsh -ic 'cd "$PWD" && set -a; . "$HOME/.ekbs/secrets.env"; set +a; \
 结果（240 题；MiniMax 60 题）：deepseek-reasoner 误拒 5.9%/拒答 **56.3%**；
 qwen-max 5.0%/47.1%；MiniMax M3-off 13.3%/31.0%（另有 adaptive 更慢更差）。
 结论：优先 DeepSeek reasoner（要高拒答）或 qwen-max（平衡/免新 provider）；MiniMax 暂不选。
+
+### DeepSeek V4 补充（2026-10-25）
+
+`/models` 现只列 `deepseek-flash`（DeepSeek-V4.1-Flash）与 `deepseek-v4-pro`；
+旧别名 `deepseek-reasoner` 仍可用但映射到新模型。实测（240 题；*为 60 题子集）：
+
+| 模型 | effort | 误拒 | 拒答 | 延迟 |
+|---|---|---|---|---|
+| deepseek-chat | 关 | 3.3% | 29.2% | 1.2s |
+| **deepseek-flash** | **high** | **5.8%** | **58.0%** | 5.4s |
+| deepseek-flash | default | 6.7%* | 60.0%* | 5.1s* |
+| deepseek-flash | low | 10.0%* | 60.0%* | 4.4s* |
+| deepseek-v4-pro | high | 7.4%* | 60.7%* | 18.9s* |
+
+结论：生产门禁选 `deepseek-flash` + `reasoning_effort: high`。

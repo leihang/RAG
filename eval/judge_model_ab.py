@@ -43,6 +43,10 @@ SYSTEM = (
 CONFIGS = [
     {"name": "deepseek-chat", "base": "https://api.deepseek.com/v1", "model": "deepseek-chat", "key": "DEEPSEEK_API_KEY"},
     {"name": "deepseek-reasoner", "base": "https://api.deepseek.com/v1", "model": "deepseek-reasoner", "key": "DEEPSEEK_API_KEY", "max_tokens": 4000},
+    {"name": "deepseek-flash", "base": "https://api.deepseek.com/v1", "model": "deepseek-flash", "key": "DEEPSEEK_API_KEY", "max_tokens": 4000, "body_extra": {"reasoning_effort": "high"}},
+    {"name": "deepseek-flash-low", "base": "https://api.deepseek.com/v1", "model": "deepseek-flash", "key": "DEEPSEEK_API_KEY", "max_tokens": 4000, "body_extra": {"reasoning_effort": "low"}},
+    {"name": "deepseek-flash-default", "base": "https://api.deepseek.com/v1", "model": "deepseek-flash", "key": "DEEPSEEK_API_KEY", "max_tokens": 4000},
+    {"name": "deepseek-v4-pro", "base": "https://api.deepseek.com/v1", "model": "deepseek-v4-pro", "key": "DEEPSEEK_API_KEY", "max_tokens": 4000, "body_extra": {"reasoning_effort": "high"}},
     {"name": "qwen-max", "base": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-max", "key": "DASHSCOPE_API_KEY"},
     {"name": "minimax-m3-off", "concurrency": 1, "delay": 2.0, "base": "https://api.minimaxi.com/v1", "model": "MiniMax-M3", "key": "MINIMAX_API_KEY", "thinking": {"type": "disabled"}, "max_tokens": 1500},
     {"name": "minimax-m3-adaptive", "concurrency": 1, "delay": 2.0, "base": "https://api.minimaxi.com/v1", "model": "MiniMax-M3", "key": "MINIMAX_API_KEY", "thinking": {"type": "adaptive"}, "max_tokens": 8000},
@@ -122,6 +126,8 @@ async def run_config(cfg: dict, cases: list[dict], concurrency: int, timeout: in
         }
         if "thinking" in cfg:
             payload["thinking"] = cfg["thinking"]
+        if "body_extra" in cfg:
+            payload.update(cfg["body_extra"])
         headers = {"Authorization": f"Bearer {key}"}
         result = {"id": case["id"], "kind": case["kind"], "subset": case["subset"], "supported": None,
                   "parse_ok": False, "latency": None, "total_tokens": None, "error": ""}
