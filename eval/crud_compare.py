@@ -44,6 +44,7 @@ def main() -> None:
     scoped_ans = ans("judge_summary")
     scoped_ref = retr("summary")
     full_retr = retr("summary_full")
+    full_ref = retr("summary_full")
     full_ans = ans("judge_summary_judge_full")
     gate_retr = retr("summary_full_gate")
     gate_ans = ans("judge_summary_judge_full_gate")
@@ -56,7 +57,7 @@ def main() -> None:
               f"| {pct(scoped_ans['answer_correct_rate'])} | {pct(scoped_ref.get('refused_rate') if scoped_ref else None)} |")
     if full_retr and full_ans:
         print(f"| 全量（83,814 篇） | {full_retr['n']} | {num(full_retr['retrieval_keyinfo_recall@10'])} "
-              f"| {pct(full_ans['answer_correct_rate'])} | {pct(full_ans.get('refused_rate'))} |")
+              f"| {pct(full_ans['answer_correct_rate'])} | {pct(full_ref.get('refused_rate') if full_ref else None)} |")
     print("\n> 全量结果未生成时留空；生成后重跑本脚本即可。\n")
 
     if full_retr and gate_retr and full_ans and gate_ans:
