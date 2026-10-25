@@ -497,3 +497,19 @@ answer_verify:
 
 `tests/test_answer_verify.py` 覆盖：输出解析容错、429 重试、默认关闭、边界分过滤、
 判官判定不支持时拒答、`fail_open` 开/关。全量 `pytest tests/ -q` 通过（990 用例）。
+
+---
+
+## 九、评测与灰度工具索引
+
+| 内容 | 位置 |
+|---|---|
+| 公开基准评测报告（RGB / DuRetrieval / RAGAS / CRUD-RAG / 门禁回归） | `docs/公开基准评测报告-2026-10-25.md` |
+| 评测脚本用法与复现命令 | `eval/README.md` |
+| 指标核对（只读汇总各结果 JSON） | `eval/metrics_audit.py` |
+| CRUD 全量收尾（补失败 → 基线 → 门禁 → 两次判分） | `eval/crud_full_run.sh` |
+| 生产灰度步骤 | `deploy/RUNBOOK-回答核验灰度.md` |
+| 生产灰度巡检（只读） | `deploy/scripts/answer_verify_gray_check.sh` |
+
+> `answer_verify` 默认关闭；开启/回滚见 runbook，模型固定为 `deepseek-flash` +
+> `reasoning_effort: high`（选型依据见评测报告 §6.5）。
