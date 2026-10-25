@@ -173,3 +173,19 @@ zsh -ic 'cd "$PWD" && var/eval/venv/bin/python eval/crud_eval.py --stage judge \
 
 结论：宽检索 + alpha0.5 把 key_info recall 从 0.362 提到 **0.417**（+15% 相对）；
 答案 prompt 改为"逐点全覆盖"没有收益（32.2%→30.5%），瓶颈在判分口径而非提示词。
+
+## 十三、长文档切块/证据聚合实验
+
+```bash
+set -a; . ~/.ekbs/secrets.env; set +a
+# wide（keep10）聚合对照
+.venv/bin/python eval/crud_aggregation.py --concurrency 6
+# 极宽候选池（keep20 / top_k100）
+.venv/bin/python eval/crud_aggregation.py \
+  --config config/application.eval-crud-xwide.yaml \
+  --out var/eval/crud/aggregation_xwide.jsonl \
+  --summary-out var/eval/crud/aggregation_summary_xwide.json --concurrency 6
+```
+
+结论：整篇文档聚合相比当前上下文仅 +0.2–0.3pp；keep20/top_k100 下源文档全召回仍只有 22.7%
+→ 瓶颈在文档排序/候选生成，不在切块。
