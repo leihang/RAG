@@ -23,6 +23,15 @@ import numpy as np
 from ekbs.config import Settings
 from ekbs.db import Database
 from ekbs.errors import EmbeddingFingerprintMismatch, SchemaError
+from ekbs.index.segmented import (
+    SegmentInfo,
+    ShardManifest,
+    load_manifest,
+    manifest_path,
+    migrate_single_to_segments,
+    save_manifest,
+    validate_manifest,
+)
 from ekbs.index.shard import make_shard_id, parse_shard_id
 from ekbs.logging import get_logger
 
@@ -218,6 +227,149 @@ class ShardCheck:
     detail: str
 
 
+class SegmentedShard:
+    """分段分片：不可变 base 段 + 一个可追加的 active 段，检索跨段归并。
+
+    P1b 只做“base + active + 冻结”：active 每次 add 后写盘（文件只含新增向量，
+    大小受 ``index.segment.*_max_vectors`` 限制），达到阈值后冻结成不可变段；
+    小段合并（compaction）留给 P2。
+    """
+
+    ACTIVE_NAME = "seg_active.faiss"
+
+    def __init__(self, manager: "ShardIndexManager", shard_id: str, directory: Path,
+                 dim: int, fingerprint: str) -> None:
+        self.manager = manager
+        self.shard_id = shard_id
+        self.dir = Path(directory)
+        self.dim = int(dim)
+        self.fingerprint = fingerprint
+        self.dir.mkdir(parents=True, exist_ok=True)
+        manifest = load_manifest(self.dir)
+        if manifest is None:
+            manifest = ShardManifest(shard_id=shard_id, dim=dim, embedding_fingerprint=fingerprint)
+        self.manifest = manifest
+        self.segments: list[ShardIndex] = []
+        self.active: ShardIndex | None = None
+        self._stamp = self._manifest_stamp()
+        self._reload()
+
+    def _manifest_stamp(self) -> tuple[int, int]:
+        p = manifest_path(self.dir)
+        try:
+            st = p.stat()
+            return (int(st.st_mtime_ns), int(st.st_size))
+        except OSError:
+            return (0, 0)
+
+    def _reload(self) -> None:
+        self.segments = []
+        for info in self.manifest.segments:
+            path = self.dir / info.path
+            if path.exists():
+                self.segments.append(ShardIndex.load(self.shard_id, path, expected_dim=self.dim))
+        active = self.manifest.active
+        active_path = self.dir / (active.path if active else self.ACTIVE_NAME)
+        if active_path.exists():
+            self.active = ShardIndex.load(self.shard_id, active_path, expected_dim=self.dim)
+        else:
+            self.active = ShardIndex.create(self.shard_id, active_path, self.dim, self.fingerprint)
+        self._stamp = self._manifest_stamp()
+
+    def refresh_if_changed(self) -> None:
+        if self._manifest_stamp() != self._stamp:
+            validate_manifest(self.manifest, dim=self.dim, embedding_fingerprint=self.fingerprint)
+            self.manifest = load_manifest(self.dir) or self.manifest
+            self._reload()
+
+    @property
+    def count(self) -> int:
+        return sum(i.vector_count for i in self.segments) + int(self.active.vector_count if self.active else 0)
+
+    @property
+    def path(self) -> Path:
+        return manifest_path(self.dir)
+
+    def _threshold(self, personal: bool) -> int:
+        seg = self.manager.settings.index.segment
+        return int(seg.personal_max_vectors if personal else seg.batch_max_vectors)
+
+    def add(self, vectors: np.ndarray, ids: Sequence[int], *, personal: bool = False) -> list[int]:
+        if self.active is None:
+            self.active = ShardIndex.create(self.shard_id, self.dir / self.ACTIVE_NAME, self.dim, self.fingerprint)
+        labels = self.active.add(vectors, ids)
+        self.active.save()
+        self.manifest.active = SegmentInfo(
+            id="seg_active", path=self.ACTIVE_NAME, count=self.active.vector_count,
+            mode="personal" if personal else "batch",
+        )
+        self.manifest.version += 1
+        save_manifest(self.dir, self.manifest)
+        if self.active.vector_count >= self._threshold(personal):
+            self._freeze()
+        return labels
+
+    def _freeze(self) -> None:
+        assert self.active is not None
+        if self.active.vector_count == 0:
+            return
+        name = f"seg_{self.manifest.version:04d}.faiss"
+        target = self.dir / name
+        self.active.save(target)
+        self.manifest.segments.append(SegmentInfo(
+            id=name[:-6], path=name, count=self.active.vector_count, mode=(self.manifest.active.mode if self.manifest.active else "batch"),
+        ))
+        self.manifest.active = None
+        self.manifest.version += 1
+        save_manifest(self.dir, self.manifest)
+        # 新的空 active
+        self.active = ShardIndex.create(self.shard_id, self.dir / self.ACTIVE_NAME, self.dim, self.fingerprint)
+        if (self.dir / self.ACTIVE_NAME).exists():
+            (self.dir / self.ACTIVE_NAME).unlink()
+        self.segments = [ShardIndex.load(self.shard_id, self.dir / i.path, expected_dim=self.dim)
+                         for i in self.manifest.segments if (self.dir / i.path).exists()]
+
+    def search(self, vector: np.ndarray, top_k: int) -> list[tuple[int, float]]:
+        merged: dict[int, float] = {}
+        for index in [*self.segments, self.active]:
+            if index is None:
+                continue
+            for cid, score in index.search(vector, top_k):
+                if cid not in merged or score > merged[cid]:
+                    merged[cid] = score
+        return sorted(merged.items(), key=lambda kv: kv[1], reverse=True)[: int(top_k)]
+
+    def remove(self, ids: Sequence[int]) -> int:
+        removed = 0
+        for index in self.segments:
+            removed += index.remove(ids)
+            if removed:
+                index.save()
+        if self.active is not None:
+            removed += self.active.remove(ids)
+            if removed:
+                self.active.save()
+        self.manifest.segments = [
+            SegmentInfo(**{**i.__dict__, "count": seg.vector_count})
+            for i, seg in zip(self.manifest.segments, self.segments)
+        ]
+        if self.active is not None and self.manifest.active is not None:
+            self.manifest.active.count = self.active.vector_count
+        self.manifest.version += 1
+        save_manifest(self.dir, self.manifest)
+        return removed
+
+    def flush(self) -> None:
+        if self.active is not None and self.active.vector_count > 0:
+            self.active.save()
+            self.manifest.active = SegmentInfo(
+                id="seg_active", path=self.ACTIVE_NAME, count=self.active.vector_count,
+                mode=(self.manifest.active.mode if self.manifest.active else "batch"),
+            )
+            self.manifest.version += 1
+            save_manifest(self.dir, self.manifest)
+
+
 class ShardIndexManager:
     """分片索引的加载、创建、追加与自检（与 ``ekbs_shard`` 表联动）。"""
 
@@ -227,6 +379,9 @@ class ShardIndexManager:
         self.dim = int(dim)
         self.fingerprint = fingerprint
         self._loaded: dict[str, ShardIndex] = {}
+        index_cfg = getattr(settings, "index", None)
+        self.layout = str(getattr(index_cfg, "layout", "single")) if index_cfg is not None else "single"
+        self._segmented: dict[str, SegmentedShard] = {}
 
     # ------------------------------------------------------------------
     # 登记表
@@ -240,6 +395,41 @@ class ShardIndexManager:
 
     def faiss_path(self, shard_id: str) -> Path:
         return self.index_dir / f"{shard_id}.faiss"
+
+    def segmented_dir(self, shard_id: str) -> Path:
+        return self.index_dir / "shards" / shard_id
+
+    def _get_segmented(self, shard_id: str) -> SegmentedShard:
+        cached = self._segmented.get(shard_id)
+        if cached is not None:
+            cached.refresh_if_changed()
+            return cached
+        rows = [r for r in self.registry() if r.shard_id == shard_id]
+        if not rows:
+            raise SchemaError(f"分片未登记：{shard_id}（先用 ekbs.tools.new_shard 建分片）")
+        directory = self.segmented_dir(shard_id)
+        manifest = load_manifest(directory)
+        if manifest is None:
+            single = self.faiss_path(shard_id)
+            if single.exists():
+                migrate_single_to_segments(
+                    shard_id=shard_id, single_faiss=single, target_dir=directory,
+                    dim=self.dim, embedding_fingerprint=self.fingerprint, dry_run=False,
+                )
+            else:
+                save_manifest(directory, ShardManifest(
+                    shard_id=shard_id, dim=self.dim, embedding_fingerprint=self.fingerprint,
+                ))
+            manifest = load_manifest(directory)
+        assert manifest is not None
+        validate_manifest(manifest, dim=self.dim, embedding_fingerprint=self.fingerprint)
+        shard = SegmentedShard(self, shard_id, directory, self.dim, self.fingerprint)
+        self._segmented[shard_id] = shard
+        return shard
+
+    def flush_all(self) -> None:
+        for shard in self._segmented.values():
+            shard.flush()
 
     def registry(self, *, status: str | None = "active") -> list[ShardRow]:
         sql = (
@@ -281,6 +471,27 @@ class ShardIndexManager:
     ) -> ShardIndex:
         """建空分片：写 ``.faiss`` 文件 + 登记 ``ekbs_shard``（`01` §6.3）。"""
         dept_code, level = parse_shard_id(shard_id)
+        if self.layout == "segmented":
+            directory = self.segmented_dir(shard_id)
+            save_manifest(directory, ShardManifest(
+                shard_id=shard_id, dim=self.dim, embedding_fingerprint=str(fingerprint or self.fingerprint),
+            ))
+            with self.db.sync_connect() as conn:
+                conn.execute(
+                    "INSERT INTO ekbs_shard(shard_id, dept_code, level, faiss_path, dim, "
+                    "embedding_fingerprint, vector_count, index_type, status, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'active', datetime('now')) "
+                    "ON CONFLICT(shard_id) DO UPDATE SET faiss_path = excluded.faiss_path, "
+                    "dim = excluded.dim, embedding_fingerprint = excluded.embedding_fingerprint, "
+                    "index_type = excluded.index_type, status = 'active', updated_at = datetime('now')",
+                    (shard_id, dept_code, level, str(manifest_path(directory)), self.dim,
+                     str(fingerprint or self.fingerprint), index_type),
+                )
+                conn.commit()
+            shard = self._get_segmented(shard_id)
+            assert shard.active is not None
+            log.info("segmented_shard_created", shard_id=shard_id, path=str(directory))
+            return shard.active
         if index_type != ShardIndex.INDEX_TYPE:
             # 06 §2.3：ivf 仅在规模超过阈值后启用（开放项 O6-3）。
             # 默认格式现在是 idmap2（标签=chunk_id，可真删单条），不再是 flat。
@@ -317,6 +528,8 @@ class ShardIndexManager:
         （本仓库实测踩到过）。这里按 ``(mtime_ns, size)`` 判断，变了就重载；
         ``06`` §2.4 提到的 reload 机制即此，只是用文件指纹代替了显式的 reload 调用。
         """
+        if self.layout == "segmented":
+            return self._get_segmented(shard_id).active
         cached = self._loaded.get(shard_id)
         if cached is not None:
             if cached.stat_stamp() == cached.file_stamp:
@@ -371,9 +584,26 @@ class ShardIndexManager:
     # ------------------------------------------------------------------
 
     def append(
-        self, shard_id: str, chunk_ids: Sequence[int], vectors: np.ndarray
+        self, shard_id: str, chunk_ids: Sequence[int], vectors: np.ndarray,
+        *, personal: bool = False,
     ) -> list[int]:
         """追加向量并回写 ``ekbs_chunk.faiss_row`` 与 ``ekbs_shard.vector_count``。"""
+        if self.layout == "segmented":
+            shard = self._get_segmented(shard_id)
+            labels = shard.add(vectors, chunk_ids, personal=personal)
+            with self.db.sync_connect() as conn:
+                conn.executemany(
+                    "UPDATE ekbs_chunk SET faiss_row = ?, embedding_fingerprint = ?, shard_id = ? "
+                    "WHERE chunk_id = ?",
+                    [(row, self.fingerprint, shard_id, int(cid)) for row, cid in zip(labels, chunk_ids)],
+                )
+                conn.execute(
+                    "UPDATE ekbs_shard SET vector_count = ?, embedding_fingerprint = ?, dim = ?, "
+                    "faiss_path = ?, updated_at = datetime('now') WHERE shard_id = ?",
+                    (shard.count, self.fingerprint, self.dim, str(shard.path), shard_id),
+                )
+                conn.commit()
+            return labels
         index = self.get(shard_id)
         if index is None:
             raise SchemaError(f"分片未登记：{shard_id}（先用 ekbs.tools.new_shard 建分片）")
@@ -407,6 +637,23 @@ class ShardIndexManager:
         与 :meth:`append` 的区别只有一个：append 假定这些 id 是**新的**（入库路径
         的 chunk_id 由自增主键保证不重复），upsert 则先把旧的删掉。
         """
+        if self.layout == "segmented":
+            shard = self._get_segmented(shard_id)
+            shard.remove(chunk_ids)
+            labels = shard.add(vectors, chunk_ids, personal=True)
+            with self.db.sync_connect() as conn:
+                conn.executemany(
+                    "UPDATE ekbs_chunk SET faiss_row = ?, embedding_fingerprint = ?, shard_id = ? "
+                    "WHERE chunk_id = ?",
+                    [(label, self.fingerprint, shard_id, int(cid)) for label, cid in zip(labels, chunk_ids)],
+                )
+                conn.execute(
+                    "UPDATE ekbs_shard SET vector_count = ?, embedding_fingerprint = ?, dim = ?, "
+                    "faiss_path = ?, updated_at = datetime('now') WHERE shard_id = ?",
+                    (shard.count, self.fingerprint, self.dim, str(shard.path), shard_id),
+                )
+                conn.commit()
+            return labels
         index = self.get(shard_id)
         if index is None:
             raise SchemaError(f"分片未登记：{shard_id}")
@@ -438,6 +685,18 @@ class ShardIndexManager:
         ids = [int(c) for c in chunk_ids]
         if not ids:
             return 0
+        if self.layout == "segmented":
+            shard = self._get_segmented(shard_id)
+            removed = shard.remove(ids)
+            if removed:
+                with self.db.sync_connect() as conn:
+                    conn.execute(
+                        "UPDATE ekbs_shard SET vector_count = ?, updated_at = datetime('now') "
+                        "WHERE shard_id = ?",
+                        (shard.count, shard_id),
+                    )
+                    conn.commit()
+            return removed
         index = self.get(shard_id)
         if index is None:
             log.warning("shard_remove_skipped_missing", shard_id=shard_id, count=len(ids))
@@ -456,6 +715,9 @@ class ShardIndexManager:
         return removed
 
     def search(self, shard_id: str, vector: np.ndarray, top_k: int) -> list[tuple[int, float]]:
+        if self.layout == "segmented":
+            shard = self._get_segmented(shard_id)
+            return shard.search(vector, top_k)
         index = self.get(shard_id)
         if index is None:
             log.warning("shard_missing_skip", shard_id=shard_id)

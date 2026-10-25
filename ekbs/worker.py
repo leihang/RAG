@@ -359,6 +359,7 @@ async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:
                 existing_doc_id=doc_id,
                 checksum=(str(doc["checksum"]) if doc.get("checksum") else None),
                 real_corpus=True,
+                personal=True,
             )
             log.info("personal_doc_published", doc_id=doc_id)
             return True

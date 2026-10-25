@@ -128,6 +128,7 @@ class IngestPipeline:
         existing_doc_id: int | None = None,
         figures: Sequence[FigureInput] = (),
         tables: Sequence[TableInput] = (),
+        personal: bool = False,
     ) -> IngestResult:
         """把一份 Markdown 入库（清洗与解析由调用方完成，见 :mod:`ekbs.ingest.parser`）。
 
@@ -270,7 +271,7 @@ class IngestPipeline:
             cloud_tokens = int(embed_stats.get("cloud_tokens") or 0)
             local_tokens = int(embed_stats.get("local_tokens") or 0)
             if vectors is not None and len(vectors):
-                self.shards.append(shard_id, child_ids, vectors)
+                self.shards.append(shard_id, child_ids, vectors, personal=personal)
             figure_vector_count, figure_vectors_failed = (
                 await self._embed_figures_multimodal(doc_id)
             )

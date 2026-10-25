@@ -23,6 +23,7 @@ import asyncio
 import sys
 
 from ekbs.config import Secrets, load_settings
+from ekbs.errors import SchemaError
 from ekbs.index.faiss_store import ShardIndex, ShardIndexManager
 from ekbs.ingest.chunker import retrieval_text
 from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
@@ -34,6 +35,12 @@ log = get_logger(component="tools.rebuild_shard")
 
 
 async def rebuild(runtime: Runtime, shard_id: str, *, dry_run: bool = False) -> dict[str, object]:
+    index_cfg = getattr(runtime.settings, "index", None)
+    if getattr(index_cfg, "layout", "single") == "segmented":
+        raise SchemaError(
+            "segmented 布局暂不支持 rebuild_shard（会只保存 active 段而丢掉 base 段）；"
+            "请等 P2 的 compaction/重建工具，或先切回 index.layout=single"
+        )
     embed = build_embedding(runtime.settings, Secrets())
     manager = ShardIndexManager(
         runtime.db, runtime.settings, dim=int(embed.ref.dim or 0), fingerprint=embed.ref.fingerprint

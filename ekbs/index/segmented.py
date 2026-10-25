@@ -51,6 +51,8 @@ class ShardManifest:
     embedding_fingerprint: str
     version: int = 1
     segments: list[SegmentInfo] = field(default_factory=list)
+    #: 当前活跃段（可追加、每次 add 后落盘；达到阈值后冻结为 segments 里的不可变段）
+    active: SegmentInfo | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,18 +61,22 @@ class ShardManifest:
             "embedding_fingerprint": self.embedding_fingerprint,
             "version": self.version,
             "segments": [asdict(s) for s in self.segments],
+            "active": asdict(self.active) if self.active else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ShardManifest:
         try:
             segments = [SegmentInfo(**s) for s in data.get("segments", [])]
+            active_raw = data.get("active")
+            active = SegmentInfo(**active_raw) if active_raw else None
             return cls(
                 shard_id=str(data["shard_id"]),
                 dim=int(data["dim"]),
                 embedding_fingerprint=str(data["embedding_fingerprint"]),
                 version=int(data.get("version", 1)),
                 segments=segments,
+                active=active,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"manifest 格式非法：{exc}") from exc
