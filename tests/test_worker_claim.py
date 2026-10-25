@@ -131,3 +131,20 @@ def test_peer_worker_pids_fails_closed_when_ps_broken(monkeypatch) -> None:
     monkeypatch.setattr("ekbs.worker.subprocess.check_output", _boom)
     with pytest.raises(WorkerProcessScanError):
         _peer_worker_pids()
+
+
+def test_claim_pending_index_marks_indexing(runtime, seeded) -> None:
+    """方案 B：approve 入队的 pending_index 文档，认领后置 indexing（跳过解析）。"""
+    runtime, summary = seeded
+    doc_id = int(summary["documents"][0]["doc_id"])
+    for d in summary["documents"][1:]:
+        _force_published(runtime, int(d["doc_id"]))
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "UPDATE ekbs_document SET status = 'pending_index' WHERE doc_id = ?", (doc_id,)
+        )
+    claimed = _claim_next_pending(runtime)
+    assert claimed is not None
+    assert int(claimed["doc_id"]) == doc_id
+    assert claimed["_claimed_status"] == "indexing"
+    assert _status(runtime, doc_id) == "indexing"

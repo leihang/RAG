@@ -598,6 +598,26 @@ async def approve_parse_task(
     except ValueError:
         visible = []
 
+    # 方案 B：分段索引模式下，向量写入者固定为 worker（单写者），
+    # API 只把文档从 review 置为 pending_index 入队，worker 统一分块/嵌入/flush/发布。
+    if runtime.settings.index.layout == "segmented":
+        with runtime.db.sync_connect() as conn:
+            conn.execute(
+                "UPDATE ekbs_document SET status = 'pending_index', updated_at = datetime('now') "
+                "WHERE doc_id = ? AND status = ?",
+                (task_id, STATUS_REVIEW),
+            )
+            conn.execute(
+                "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
+                "field, old_value, new_value, reason) "
+                "VALUES (?, 'document', ?, 'review_approve_queued', 'status', ?, 'pending_index', "
+                "'api:approve:queued')",
+                (principal.user_id, str(task_id), STATUS_REVIEW),
+            )
+            conn.commit()
+        log.info("review_approve_queued", task_id=task_id, operator=principal.user_id)
+        return JSONResponse({"task_id": task_id, "status": "pending_index"})
+
     ingest = IngestPipeline(
         db=runtime.db,
         settings=runtime.settings,
@@ -660,6 +680,59 @@ async def approve_parse_task(
             "vector_count": result.vector_count,
         }
     )
+
+
+class ApproveBatchBody(BaseModel):
+    task_ids: list[int] = Field(min_length=1, max_length=200)
+
+
+@router.post("/parse/tasks/approve-batch")
+async def approve_parse_tasks_batch(
+    payload: ApproveBatchBody,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """批量"手动向量入库"：把 review 文档置 pending_index，由 worker 统一处理。
+
+    仅 ``index.layout=segmented`` 可用（单写者约束）；single 布局仍走单篇同步 approve。
+    """
+    principal = _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "parse:task:manage"
+    )
+    runtime = request.app.state.runtime
+    if runtime.settings.index.layout != "segmented":
+        raise HTTPException(
+            status_code=409,
+            detail="批量向量入库需要 index.layout=segmented（单写者模式）",
+        )
+    queued: list[int] = []
+    skipped: list[dict[str, Any]] = []
+    with runtime.db.sync_connect() as conn:
+        for task_id in payload.task_ids:
+            row = conn.execute(
+                "SELECT status FROM ekbs_document WHERE doc_id = ?", (task_id,)
+            ).fetchone()
+            if row is None or str(row["status"]) != STATUS_REVIEW:
+                skipped.append({"task_id": task_id, "reason": "not_in_review"})
+                continue
+            conn.execute(
+                "UPDATE ekbs_document SET status = 'pending_index', updated_at = datetime('now') "
+                "WHERE doc_id = ? AND status = ?",
+                (task_id, STATUS_REVIEW),
+            )
+            conn.execute(
+                "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
+                "field, old_value, new_value, reason) "
+                "VALUES (?, 'document', ?, 'review_approve_queued', 'status', ?, 'pending_index', "
+                "'api:approve_batch:queued')",
+                (principal.user_id, str(task_id), STATUS_REVIEW),
+            )
+            queued.append(task_id)
+        conn.commit()
+    log.info("review_approve_batch_queued", operator=principal.user_id, queued=len(queued), skipped=len(skipped))
+    return JSONResponse({"queued": queued, "skipped": skipped, "status": "pending_index"})
 
 
 @router.post("/parse/tasks/{task_id}/reject")

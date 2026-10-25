@@ -178,25 +178,62 @@ def _claim_next_pending(runtime: Runtime) -> dict[str, Any] | None:
         try:
             row = conn.execute(
                 "SELECT doc_id, kb_id, title, source_path, level, visible_dept_ids, "
-                "doc_version, checksum "
-                "FROM ekbs_document WHERE status = 'pending' ORDER BY doc_id LIMIT 1"
+                "doc_version, checksum, status, parse_path "
+                "FROM ekbs_document WHERE status IN ('pending', 'pending_index') "
+                "ORDER BY doc_id LIMIT 1"
             ).fetchone()
             if row is None:
                 conn.execute("ROLLBACK")
                 return None
+            claimed_status = "parsing" if str(row["status"]) == "pending" else "indexing"
             cur = conn.execute(
-                "UPDATE ekbs_document SET status = 'parsing', updated_at = datetime('now') "
-                "WHERE doc_id = ? AND status = 'pending'",
-                (int(row["doc_id"]),),
+                "UPDATE ekbs_document SET status = ?, updated_at = datetime('now') "
+                "WHERE doc_id = ? AND status = ?",
+                (claimed_status, int(row["doc_id"]), str(row["status"])),
             )
             if cur.rowcount != 1:
                 conn.execute("ROLLBACK")
                 return None
             conn.execute("COMMIT")
-            return dict(row)
+            claimed = dict(row)
+            claimed["_claimed_status"] = claimed_status
+            return claimed
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+
+async def _index_review_document(runtime: Runtime, ingest: IngestPipeline, doc: dict[str, Any]) -> None:
+    """``pending_index`` 文档：跳过解析，直接对 review 草稿分块/嵌入/发布。
+
+    这是"手动向量入库"的入队执行端，保证向量写入者只有 worker 一个进程
+    （方案 B 的单写者约束；API 只负责把 review → pending_index）。
+    """
+    doc_id = int(doc["doc_id"])
+    markdown = await asyncio.to_thread(load_review_markdown, runtime.settings.data_dir, doc_id)
+    sidecar = await asyncio.to_thread(load_review_sidecar, runtime.settings.data_dir, doc_id)
+    try:
+        visible = json.loads(doc.get("visible_dept_ids") or "[]")
+    except ValueError:
+        visible = []
+    await ingest.ingest_markdown(
+        title=str(doc.get("title") or ""),
+        markdown=markdown,
+        kb_id=int(doc["kb_id"]),
+        level=int(doc.get("level") or 2),
+        visible_dept_ids=list(visible),
+        source_path=str(doc.get("source_path") or ""),
+        doc_version=str(doc.get("doc_version") or "v1"),
+        page_map=page_map_from_sidecar(sidecar),
+        figures=[
+            fig for fig in figures_from_sidecar(sidecar)
+            if not str(fig.figure_id or "").startswith("handwrite")
+        ],
+        tables=tables_from_sidecar(sidecar),
+        existing_doc_id=doc_id,
+        checksum=(str(doc["checksum"]) if doc.get("checksum") else None),
+        real_corpus=True,
+    )
 
 
 async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:
@@ -206,7 +243,16 @@ async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:
         return False
 
     doc_id = int(doc["doc_id"])
+    claimed_status = str(doc.pop("_claimed_status", "parsing"))
     started = time.perf_counter()
+    if claimed_status == "indexing":
+        try:
+            await _index_review_document(runtime, ingest, doc)
+            log.info("doc_indexed_from_queue", doc_id=doc_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("doc_index_failed", doc_id=doc_id, error=str(exc)[:300])
+            await asyncio.to_thread(_mark_failed, runtime, doc_id)
+        return True
     try:
         # 图片落盘目录：**不能**用临时目录（临时目录一删，文档内插图全成死链）。
         # 约定 <data_dir>/parse/<doc_id>/images/<文件>，与 /assets/figure 的解析基准一致。
