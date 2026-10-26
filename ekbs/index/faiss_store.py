@@ -601,7 +601,10 @@ class ShardIndexManager:
         ``06`` §2.4 提到的 reload 机制即此，只是用文件指纹代替了显式的 reload 调用。
         """
         if self.layout == "segmented":
-            return self._get_segmented(shard_id).active
+            try:
+                return self._get_segmented(shard_id).active
+            except SchemaError:
+                return None
         cached = self._loaded.get(shard_id)
         if cached is not None:
             if cached.stat_stamp() == cached.file_stamp:

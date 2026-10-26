@@ -26,6 +26,8 @@
 | `scripts/release.sh` | 76 | 版本切换与逐个重启（release 目录 + `ln -sfn` + 按序 `kickstart`） | `04` §7.6 |
 | `RUNBOOK-回答核验灰度.md` | 96 | 回答后置核验 `answer_verify` 的灰度开启/观测/回滚步骤 | 公开基准报告 §6.5/§6.6 |
 | `scripts/answer_verify_gray_check.sh` | 55 | 灰度巡检（**只读**）：配置开关、密钥、近 24h 审计事件、判官失败数、服务状态 | 同上 |
+| `RUNBOOK-分段索引迁移.md` | — | 分片从单文件迁到「base 段 + manifest」的迁移/切换/回滚步骤 | 方案 B / P3 |
+| `scripts/migrate_segments_all.sh` | — | 遍历 active 分片执行迁移（默认 dry-run，`--apply` 真复制） | 同上 |
 
 ---
 
