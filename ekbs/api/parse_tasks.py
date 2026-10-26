@@ -870,6 +870,7 @@ async def get_parse_config(
             "timeout_s": cfg.timeout_s,
             "worker_concurrency": cfg.worker_concurrency,
             "keep_tmp_days": cfg.keep_tmp_days,
+            "index_layout": runtime.settings.index.layout,
             "writable_via_api": False,
             "note": "解析参数写在 /opt/ekbs/etc/application.yaml，走 Git 评审（05 §8.1）",
         }

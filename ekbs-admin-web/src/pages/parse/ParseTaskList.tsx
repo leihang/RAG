@@ -3,7 +3,7 @@
  * 扫描件 review → 跳转双栏复核页；已完成 → 跳转分块预览。
  * **禁止**再弹 Drawer / alert 倾倒全文。
  */
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ProTable, type ActionType, type ProColumns } from '@ant-design/pro-components'
 import { Button, Card, Space, Statistic, Tag, Typography, message } from 'antd'
 import { Link, useNavigate } from 'react-router-dom'
@@ -16,6 +16,8 @@ import {
   approveParseTask,
   approveParseTasksBatch,
   cancelParseTask,
+  getParseConfig,
+  getParseTask,
   listParseTasks,
   rejectParseTask,
   retryParseTask,
@@ -33,11 +35,19 @@ export default function ParseTaskList() {
   const [selectedMap, setSelectedMap] = useState<Record<string, ParseTask>>({})
   const [approvingId, setApprovingId] = useState<number | null>(null)
   const [vectorizingId, setVectorizingId] = useState<number | null>(null)
+  const [indexLayout, setIndexLayout] = useState<string>('single')
+  const [batchRunning, setBatchRunning] = useState(false)
   const [pending, setPending] = useState<{
     kind: 'retry' | 'cancel' | 'reject'
     docId: number | null
     title: string
   } | null>(null)
+
+  useEffect(() => {
+    getParseConfig()
+      .then((cfg) => setIndexLayout(String(cfg.index_layout ?? 'single')))
+      .catch(() => { /* 读不到就按 single 逐篇处理 */ })
+  }, [])
 
   const openTask = (r: ParseTask) => {
     const id = parseTaskId(r)
@@ -233,30 +243,53 @@ export default function ParseTaskList() {
       message.warning('单次最多批量 200 篇，请分批提交')
       return
     }
-    try {
-      const res = await approveParseTasksBatch(readyIds)
-      message.success(
-        `已提交向量入库 ${res.queued.length} 篇` +
-          (res.skipped.length ? `，跳过 ${res.skipped.length} 篇` : ''),
-      )
-      setSelectedKeys([])
-      setSelectedMap({})
-      actionRef.current?.reload()
-    } catch (err) {
-      const text = err instanceof Error ? err.message : String(err)
-      // single 布局没有批量队列（单写者约束）：自动回退为逐篇同步入库
-      if (/segmented|单写者/.test(text)) {
-        for (const id of readyIds) {
-          await vectorizeParseTask(id)
-        }
-        message.success(`已按单篇模式完成 ${readyIds.length} 篇向量入库`)
+    if (indexLayout === 'segmented') {
+      try {
+        const res = await approveParseTasksBatch(readyIds)
+        message.success(
+          `已提交向量入库 ${res.queued.length} 篇` +
+            (res.skipped.length ? `，跳过 ${res.skipped.length} 篇` : ''),
+        )
         setSelectedKeys([])
         setSelectedMap({})
         actionRef.current?.reload()
-        return
+      } catch (err) {
+        message.error(err instanceof Error ? err.message : String(err))
       }
-      message.error(text)
+      return
     }
+    // single 布局没有批量队列：直接逐篇同步向量入库，避免先打批量接口拿 409
+    setBatchRunning(true)
+    let ok = 0
+    const skipped: string[] = []
+    for (const [i, id] of readyIds.entries()) {
+      const tip = message.loading(`正在逐篇向量入库（${i + 1}/${readyIds.length}）…`, 0)
+      try {
+        // 选中后状态可能已变化（例如刚被单篇入库）：先查一次，非 chunked 直接跳过，
+        // 避免对 published 行发 vectorize 拿 409、弹无意义的错误。
+        const detail = await getParseTask(id)
+        if (String(detail.task.status ?? '') !== 'chunked') {
+          skipped.push(`doc ${id} 状态 ${detail.task.status}`)
+          continue
+        }
+        await vectorizeParseTask(id)
+        ok += 1
+      } catch (err) {
+        const text = err instanceof Error ? err.message : String(err)
+        skipped.push(text)
+      } finally {
+        tip()
+      }
+    }
+    setBatchRunning(false)
+    if (ok || skipped.length) {
+      message.success(
+        `已完成 ${ok} 篇向量入库` + (skipped.length ? `，跳过 ${skipped.length} 篇（状态已变化）` : ''),
+      )
+    }
+    setSelectedKeys([])
+    setSelectedMap({})
+    actionRef.current?.reload()
   }
 
   const doAction = async () => {
@@ -347,7 +380,12 @@ export default function ParseTaskList() {
         }}
         toolBarRender={() => [
           <Auth key="batch-approve" code="parse:task:manage">
-            <Button type="primary" disabled={readyIds.length === 0} onClick={batchApprove}>
+            <Button
+              type="primary"
+              loading={batchRunning}
+              disabled={readyIds.length === 0 || batchRunning}
+              onClick={batchApprove}
+            >
               批量向量入库{readyIds.length ? `（${readyIds.length}）` : ''}
             </Button>
           </Auth>,
@@ -359,6 +397,18 @@ export default function ParseTaskList() {
             status: params.status as string | undefined,
           })
           setSummary(res)
+          setSelectedMap((prev) => {
+            let changed = false
+            const next = { ...prev }
+            for (const item of res.items) {
+              const key = String(parseTaskId(item) ?? '')
+              if (key && next[key] && next[key].status !== item.status) {
+                next[key] = item
+                changed = true
+              }
+            }
+            return changed ? next : prev
+          })
           return { data: res.items, total: res.total, success: true }
         }}
         rowClassName={(r) =>
