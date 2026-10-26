@@ -192,7 +192,7 @@ export default function ParseTaskList() {
 
   const batchApprove = async () => {
     if (!reviewIds.length) {
-      message.warning('请先勾选“待复核”的任务')
+      message.warning(selectedRows.length ? '勾选的行里没有“待复核”任务' : '请先勾选“待复核”的任务')
       return
     }
     try {
@@ -204,7 +204,18 @@ export default function ParseTaskList() {
       setSelectedRows([])
       actionRef.current?.reload()
     } catch (err) {
-      message.error(err instanceof Error ? err.message : String(err))
+      const text = err instanceof Error ? err.message : String(err)
+      // single 布局没有批量队列（单写者约束）：自动回退为逐篇同步入库
+      if (/segmented|单写者/.test(text)) {
+        for (const id of reviewIds) {
+          await approveParseTask(id)
+        }
+        message.success(`已按单篇模式完成 ${reviewIds.length} 篇向量入库`)
+        setSelectedRows([])
+        actionRef.current?.reload()
+        return
+      }
+      message.error(text)
     }
   }
 
@@ -278,7 +289,6 @@ export default function ParseTaskList() {
             .map((r) => parseTaskId(r))
             .filter((id): id is number => id != null),
           onChange: (_keys, rows) => setSelectedRows(rows),
-          getCheckboxProps: (r) => ({ disabled: !canReviewTask(r.status) }),
         }}
         toolBarRender={() => [
           <Auth key="batch-approve" code="parse:task:manage">
