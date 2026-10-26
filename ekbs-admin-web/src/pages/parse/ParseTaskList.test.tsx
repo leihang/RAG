@@ -91,6 +91,17 @@ describe('清洗解析列表', () => {
     expect(await screen.findByText('双栏复核页')).toBeInTheDocument()
   })
 
+  it('表格渲染行选择复选框（批量向量入库依赖）', async () => {
+    render(
+      <MemoryRouter>
+        <ParseTaskList />
+      </MemoryRouter>,
+    )
+    await screen.findByText('空调保养合同')
+    const boxes = await screen.findAllByRole('checkbox')
+    expect(boxes.length).toBeGreaterThan(1)
+  })
+
   it('文档名链接指向 /docs/<task_id>', async () => {
     render(
       <MemoryRouter>

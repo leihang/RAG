@@ -317,6 +317,8 @@ export default function ParseTaskList() {
         scroll={{ x: 1200 }}
         pagination={{ defaultPageSize: 20, showSizeChanger: true }}
         rowSelection={{
+          fixed: true,
+          columnWidth: 48,
           selectedRowKeys: selectedRows
             .map((r) => parseTaskId(r))
             .filter((id): id is number => id != null),
