@@ -467,7 +467,7 @@ export default function DocumentUpload() {
     const hasOwnDept = (folder?.visible_dept_ids.length ?? 0) > 0
     if (!personal && !hasOwnDept) {
       message.error(dest
-        ? '这个文件夹还没有自己的部门和密级。点「修改权限」写好后再上传。'
+        ? '这个文件夹和它的上级都没有部门设置。点「修改权限」写好后再上传。'
         : '请先新建文件夹，在弹窗里写上密级和部门，再选中它上传。')
       return
     }
@@ -542,11 +542,12 @@ export default function DocumentUpload() {
       Number(id),
       rows.map((folder) => {
         const deptCount = folder.visible_dept_ids.length
+        const inherited = folder.policy_from != null && folder.policy_from !== folder.path
         const mark = folder.level == null
           ? '未设置'
           : deptCount === 0
-            ? `密级沿用上级 L${folder.level}，部门未设置`
-            : `L${folder.level} · 部门 ${deptCount} 个 · 额外 ${folder.viewer_user_ids.length} 人`
+            ? `L${folder.level} · 部门未设置`
+            : `${inherited ? `继承自 ${folder.policy_from} · ` : ''}L${folder.level} · 部门 ${deptCount} 个 · 额外 ${folder.viewer_user_ids.length} 人`
         return { path: folder.path, mark }
       }),
     ])),
@@ -889,8 +890,8 @@ export default function DocumentUpload() {
                     type="success"
                     showIcon
                     style={{ marginBottom: 16 }}
-                    message={`按文件夹「${folder.path}」入库：L${folder.level}，可见部门 ${folder.visible_dept_ids.length} 个，额外可查看 ${folder.viewer_user_ids.length} 人`}
-                    description="权限只记在文件夹上，这里不再选一遍。"
+                    message={`按文件夹「${folder.path}」入库：${folder.policy_from && folder.policy_from !== folder.path ? `继承自 ${folder.policy_from}，` : ''}L${folder.level}，可见部门 ${folder.visible_dept_ids.length} 个，额外可查看 ${folder.viewer_user_ids.length} 人`}
+                    description="未单独设置时默认继承上级权限；这里不再选一遍。"
                     action={(
                       <Button htmlType="button" size="small" onClick={() => openFolderModal(folder)}>
                         修改权限
@@ -902,9 +903,9 @@ export default function DocumentUpload() {
                     type="info"
                     showIcon
                     style={{ marginBottom: 16 }}
-                    message={folder ? `文件夹「${folder.path}」还没有自己的部门` : '先新建或选中文件夹'}
+                    message={folder ? `文件夹「${folder.path}」及其上级都没有部门设置` : '先新建或选中文件夹'}
                     description={folder
-                      ? '密级和部门在「修改权限」里写。不会沿用上级文件夹的部门。'
+                      ? '默认继承上级文件夹的密级与部门；也可以点「修改权限」单独覆盖。'
                       : '密级、部门和额外可查看的人只在新建文件夹时填写。'}
                     action={folder ? (
                       <Button htmlType="button" size="small" onClick={() => openFolderModal(folder)}>

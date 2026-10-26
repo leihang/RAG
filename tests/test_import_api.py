@@ -619,12 +619,11 @@ async def test_folder_policy_is_listed_and_disappears_when_the_dir_is_gone(clien
     assert blocked.status_code == 409
 
 
-def test_child_folder_does_not_take_the_parent_department(runtime) -> None:
-    """物业中心下面的工程部、客服部各自用自己的部门，不套用上级。"""
+def test_child_folder_inherits_parent_department_by_default(runtime) -> None:
+    """子目录未设策略时继承最近上级的部门；自己的策略优先；密级取整链更严者。"""
     import json
 
-    from ekbs.errors import ConfigError
-    from ekbs.ingest.folder_policy import policy_for_upload
+    from ekbs.ingest.folder_policy import policy_for_upload, policy_view
 
     root = raw_root(runtime.settings)
     parent = root / "wuye" / "物业中心"
@@ -635,28 +634,45 @@ def test_child_folder_does_not_take_the_parent_department(runtime) -> None:
     (parent / ".ekbs-folder.json").write_text(json.dumps({
         "level": 2, "visible_dept_ids": ["97478025"], "viewer_user_ids": [],
     }), encoding="utf-8")
-    (engineering / ".ekbs-folder.json").write_text(json.dumps({
-        "level": 2, "visible_dept_ids": ["97486022"], "viewer_user_ids": [],
-    }), encoding="utf-8")
     (service / ".ekbs-folder.json").write_text(json.dumps({
         "level": 2, "visible_dept_ids": ["97346041"], "viewer_user_ids": [],
     }), encoding="utf-8")
 
+    # 工程部没写策略 → 继承物业中心的部门
     eng = policy_for_upload(runtime.settings, "wuye", "物业中心/工程部/制度.docx")
     srv = policy_for_upload(runtime.settings, "wuye", "物业中心/客服部/制度.docx")
     center = policy_for_upload(runtime.settings, "wuye", "物业中心/中心通知.docx")
-    assert eng is not None and eng["visible_dept_ids"] == ["97486022"] and eng["level"] == 2
+    assert eng is not None
+    assert eng["visible_dept_ids"] == ["97478025"] and eng["level"] == 2
+    assert eng["policy_from"] == "wuye/物业中心"
     assert srv is not None and srv["visible_dept_ids"] == ["97346041"]
     assert center is not None and center["visible_dept_ids"] == ["97478025"]
 
+    # 子目录自己写策略 → 覆盖继承的部门
+    (engineering / ".ekbs-folder.json").write_text(json.dumps({
+        "level": 2, "visible_dept_ids": ["97486022"], "viewer_user_ids": [],
+    }), encoding="utf-8")
+    own = policy_for_upload(runtime.settings, "wuye", "物业中心/工程部/制度.docx")
+    assert own is not None and own["visible_dept_ids"] == ["97486022"]
+
+    # 上级改严 L3：子目录仍用自己的部门，但密级取更严
     (parent / ".ekbs-folder.json").write_text(json.dumps({
         "level": 3, "visible_dept_ids": ["97478025"], "viewer_user_ids": [],
     }), encoding="utf-8")
-    raised = policy_for_upload(runtime.settings, "wuye", "物业中心/工程部/制度.docx")
-    assert raised is not None
-    assert raised["level"] == 3
-    assert raised["visible_dept_ids"] == ["97486022"]
+    stricter = policy_for_upload(runtime.settings, "wuye", "物业中心/工程部/制度.docx")
+    assert stricter is not None
+    assert stricter["level"] == 3 and stricter["visible_dept_ids"] == ["97486022"]
 
+    # 删掉子目录策略 → 回到继承上级（部门+密级）
     (engineering / ".ekbs-folder.json").unlink()
-    with pytest.raises(ConfigError, match="单独选择可见部门"):
-        policy_for_upload(runtime.settings, "wuye", "物业中心/工程部/制度.docx")
+    inherited = policy_for_upload(runtime.settings, "wuye", "物业中心/工程部/制度.docx")
+    assert inherited is not None
+    assert inherited["level"] == 3 and inherited["visible_dept_ids"] == ["97478025"]
+    view = policy_view(runtime.settings, "wuye/物业中心/工程部")
+    assert view["visible_dept_ids"] == ["97478025"]
+    assert view["policy_from"] == "wuye/物业中心"
+
+    # 整条链都没有策略 → 返回 None（走上传表单）
+    bare = root / "wuye" / "未设置目录" / "子目录"
+    bare.mkdir(parents=True)
+    assert policy_for_upload(runtime.settings, "wuye", "未设置目录/子目录/制度.docx") is None

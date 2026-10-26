@@ -1,8 +1,9 @@
 """文件夹上的入库权限。
 
 密级向下生效：子文件夹里的文件不能比上级文件夹更公开，没另写密级时用上级的密级。
-可见部门不向下套用：工程部、客服部即使都在物业中心下面，也各自只看自己的部门。
-物业中心这一层直接存放的文件，才使用物业中心自己的可见部门。
+权限默认向下继承：子目录没有自己的 ``.ekbs-folder.json`` 时，沿用最近的上级目录的
+可见部门/额外可查看人（密级取整条链上更严者），便于多级目录管理。
+子目录一旦写了自己的策略，就只用自己的部门（可覆盖继承）。
 
 设置写在该目录里的 ``.ekbs-folder.json``。目录从磁盘删除后，这份设置一起消失，
 界面再列目录时不会留下已经不存在的文件夹。
@@ -127,6 +128,16 @@ def _ancestor_level(chain: list[tuple[str, dict[str, Any] | None]]) -> tuple[int
     return best, owner
 
 
+def _nearest_ancestor_policy(
+    chain: list[tuple[str, dict[str, Any] | None]],
+) -> tuple[str, dict[str, Any]] | None:
+    """最近一层写了策略的上级目录（部门继承来源）。"""
+    for rel, policy in chain[1:]:
+        if policy is not None:
+            return rel, policy
+    return None
+
+
 def effective_folder_policy(settings: Settings, rel: str) -> tuple[dict[str, Any] | None, str | None]:
     """文件的生效权限。
 
@@ -139,13 +150,19 @@ def effective_folder_policy(settings: Settings, rel: str) -> tuple[dict[str, Any
     here, own = chain[0]
     ancestor_level, ancestor_rel = _ancestor_level(chain)
     if own is None:
-        if ancestor_level is None:
+        inherited = _nearest_ancestor_policy(chain)
+        if inherited is None:
             return None, None
-        return None, (
-            f"密级沿用上级「{ancestor_rel}」的 L{ancestor_level}。"
-            f"请给「{here}」单独选择可见部门，不要用上级文件夹的部门，"
-            f"否则不同子部门会互相看见。"
-        )
+        source_rel, source = inherited
+        level = int(source["level"])
+        if ancestor_level is not None and ancestor_level > level:
+            level = ancestor_level
+        return {
+            "level": level,
+            "visible_dept_ids": list(source["visible_dept_ids"]),
+            "viewer_user_ids": list(source["viewer_user_ids"]),
+            "policy_from": source_rel,
+        }, None
     level = int(own["level"])
     if ancestor_level is not None and ancestor_level > level:
         level = ancestor_level
@@ -169,14 +186,19 @@ def policy_view(settings: Settings, rel: str) -> dict[str, Any]:
         return empty
     here, own = chain[0]
     ancestor_level, ancestor_rel = _ancestor_level(chain)
-    if own is None and ancestor_level is None:
-        return empty
     if own is None:
+        inherited = _nearest_ancestor_policy(chain)
+        if inherited is None:
+            return empty
+        source_rel, source = inherited
+        level = int(source["level"])
+        if ancestor_level is not None and ancestor_level > level:
+            level = ancestor_level
         return {
-            "level": ancestor_level,
-            "visible_dept_ids": [],
-            "viewer_user_ids": [],
-            "policy_from": ancestor_rel,
+            "level": level,
+            "visible_dept_ids": list(source["visible_dept_ids"]),
+            "viewer_user_ids": list(source["viewer_user_ids"]),
+            "policy_from": source_rel,
         }
     level = int(own["level"])
     source = here
