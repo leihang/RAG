@@ -29,7 +29,8 @@ export default function ParseTaskList() {
   const navigate = useNavigate()
   const actionRef = useRef<ActionType>()
   const [summary, setSummary] = useState<ParseTaskListResp | null>(null)
-  const [selectedRows, setSelectedRows] = useState<ParseTask[]>([])
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([])
+  const [selectedMap, setSelectedMap] = useState<Record<string, ParseTask>>({})
   const [approvingId, setApprovingId] = useState<number | null>(null)
   const [vectorizingId, setVectorizingId] = useState<number | null>(null)
   const [pending, setPending] = useState<{
@@ -187,6 +188,7 @@ export default function ParseTaskList() {
     },
   ]
 
+  const selectedRows = Object.values(selectedMap)
   const readyIds = selectedRows
     .filter((r) => r.status === 'chunked')
     .map((r) => parseTaskId(r))
@@ -233,7 +235,8 @@ export default function ParseTaskList() {
         `已提交向量入库 ${res.queued.length} 篇` +
           (res.skipped.length ? `，跳过 ${res.skipped.length} 篇` : ''),
       )
-      setSelectedRows([])
+      setSelectedKeys([])
+      setSelectedMap({})
       actionRef.current?.reload()
     } catch (err) {
       const text = err instanceof Error ? err.message : String(err)
@@ -243,7 +246,8 @@ export default function ParseTaskList() {
           await vectorizeParseTask(id)
         }
         message.success(`已按单篇模式完成 ${readyIds.length} 篇向量入库`)
-        setSelectedRows([])
+        setSelectedKeys([])
+        setSelectedMap({})
         actionRef.current?.reload()
         return
       }
@@ -319,13 +323,23 @@ export default function ParseTaskList() {
         rowSelection={{
           fixed: true,
           columnWidth: 48,
-          selectedRowKeys: selectedRows
-            .map((r) => {
-              const id = parseTaskId(r)
-              return id == null ? null : String(id)
+          preserveSelectedRowKeys: true,
+          selectedRowKeys: selectedKeys,
+          onChange: (keys, rows) => {
+            const nextKeys = keys.map(String)
+            setSelectedKeys(nextKeys)
+            setSelectedMap((prev) => {
+              const next = { ...prev }
+              for (const row of rows) {
+                const id = parseTaskId(row)
+                if (id != null) next[String(id)] = row
+              }
+              for (const key of Object.keys(next)) {
+                if (!nextKeys.includes(key)) delete next[key]
+              }
+              return next
             })
-            .filter((id): id is string => id != null),
-          onChange: (_keys, rows) => setSelectedRows(rows),
+          },
         }}
         toolBarRender={() => [
           <Auth key="batch-approve" code="parse:task:manage">
