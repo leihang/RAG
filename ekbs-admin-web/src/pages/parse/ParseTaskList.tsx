@@ -320,8 +320,11 @@ export default function ParseTaskList() {
           fixed: true,
           columnWidth: 48,
           selectedRowKeys: selectedRows
-            .map((r) => parseTaskId(r))
-            .filter((id): id is number => id != null),
+            .map((r) => {
+              const id = parseTaskId(r)
+              return id == null ? null : String(id)
+            })
+            .filter((id): id is string => id != null),
           onChange: (_keys, rows) => setSelectedRows(rows),
         }}
         toolBarRender={() => [
