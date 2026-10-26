@@ -23,7 +23,6 @@ import asyncio
 import sys
 
 from ekbs.config import Secrets, load_settings
-from ekbs.errors import SchemaError
 from ekbs.index.faiss_store import ShardIndex, ShardIndexManager
 from ekbs.ingest.chunker import retrieval_text
 from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
@@ -36,11 +35,7 @@ log = get_logger(component="tools.rebuild_shard")
 
 async def rebuild(runtime: Runtime, shard_id: str, *, dry_run: bool = False) -> dict[str, object]:
     index_cfg = getattr(runtime.settings, "index", None)
-    if getattr(index_cfg, "layout", "single") == "segmented":
-        raise SchemaError(
-            "segmented 布局暂不支持 rebuild_shard（会只保存 active 段而丢掉 base 段）；"
-            "请等 P2 的 compaction/重建工具，或先切回 index.layout=single"
-        )
+    segmented = getattr(index_cfg, "layout", "single") == "segmented"
     embed = build_embedding(runtime.settings, Secrets())
     manager = ShardIndexManager(
         runtime.db, runtime.settings, dim=int(embed.ref.dim or 0), fingerprint=embed.ref.fingerprint
@@ -72,7 +67,29 @@ async def rebuild(runtime: Runtime, shard_id: str, *, dry_run: bool = False) -> 
         # 标签用 chunk_id（IDMap2）：重建不再"重排行号"，也就没有了
         # "重建完所有 faiss_row 全体错位"的风险 —— 这是本次换格式的主要收益之一。
         index.add(np.asarray(vectors, dtype="float32"), chunk_ids)
-    index.save()  # 原子替换
+    if segmented:
+        # 分段布局：重建为一个新的 base 段 + manifest（不保留旧段，避免重复向量）
+        import time as _time
+
+        from ekbs.index.segmented import SegmentInfo, ShardManifest, manifest_path, save_manifest
+
+        directory = manager.segmented_dir(shard_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        name = f"seg_rebuild_{int(_time.time())}.faiss"
+        index = ShardIndex.create(shard_id, directory / name, dim=dim, fingerprint=embed.ref.fingerprint)
+        index.add(np.asarray(vectors, dtype="float32"), chunk_ids)
+        index.save()
+        for old in directory.glob("seg_*.faiss"):
+            if old.name != name:
+                old.unlink()
+        save_manifest(directory, ShardManifest(
+            shard_id=shard_id, dim=dim, embedding_fingerprint=embed.ref.fingerprint,
+            segments=[SegmentInfo(id=name[:-6], path=name, count=index.vector_count)],
+        ))
+        faiss_path = str(manifest_path(directory))
+    else:
+        index.save()  # 原子替换
+        faiss_path = str(index.path)
 
     with runtime.db.sync_connect() as conn:
         # 仍然先清空该分片所有行的 faiss_row：被剔除的块（例如已删除文档的残留）
@@ -85,11 +102,13 @@ async def rebuild(runtime: Runtime, shard_id: str, *, dry_run: bool = False) -> 
             )
         conn.execute(
             "UPDATE ekbs_shard SET dim = ?, embedding_fingerprint = ?, vector_count = ?, "
-            "index_type = ?, updated_at = datetime('now') WHERE shard_id = ?",
-            (dim, embed.ref.fingerprint, index.vector_count, ShardIndex.INDEX_TYPE, shard_id),
+            "index_type = ?, faiss_path = ?, updated_at = datetime('now') WHERE shard_id = ?",
+            (dim, embed.ref.fingerprint, index.vector_count, ShardIndex.INDEX_TYPE, faiss_path, shard_id),
         )
         conn.commit()
     manager.drop_from_cache(shard_id)
+    if segmented:
+        manager._segmented.pop(shard_id, None)
     return {
         "shard_id": shard_id,
         "chunks": len(chunk_ids),

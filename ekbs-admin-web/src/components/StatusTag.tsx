@@ -2,13 +2,14 @@
 import { Badge } from 'antd'
 
 type StatusKey =
-  | 'published' | 'parsing' | 'indexing' | 'pending' | 'review' | 'failed' | 'offline'
+  | 'published' | 'parsing' | 'indexing' | 'pending_index' | 'pending' | 'review' | 'failed' | 'offline'
   | 'queued' | 'cancelled' | 'success' | 'denied' | 'deleted'
 
 const META: Record<StatusKey, { text: string; status: 'success' | 'processing' | 'warning' | 'error' | 'default' }> = {
   published: { text: '已发布', status: 'success' },
   parsing: { text: '解析中', status: 'processing' },
   indexing: { text: '索引中', status: 'processing' },
+  pending_index: { text: '待向量入库', status: 'processing' },
   pending: { text: '待解析', status: 'processing' },
   review: { text: '待复核', status: 'warning' },
   queued: { text: '排队中', status: 'processing' },

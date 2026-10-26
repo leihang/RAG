@@ -123,6 +123,14 @@ export const approveParseTask = (taskId: number, markdown?: string) =>
     child_count?: number
   }>
 
+/** 批量“手动向量入库”：把 review 文档置 pending_index，由 worker 统一处理（segmented 布局） */
+export const approveParseTasksBatch = (taskIds: number[]) =>
+  http.post('/parse/tasks/approve-batch', { task_ids: taskIds }) as Promise<{
+    queued: number[]
+    skipped: Array<{ task_id: number; reason: string }>
+    status: string
+  }>
+
 export const rejectParseTask = (taskId: number) =>
   http.post(`/parse/tasks/${taskId}/reject`) as Promise<unknown>
 

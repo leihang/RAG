@@ -5,14 +5,20 @@
  */
 import { useRef, useState } from 'react'
 import { ProTable, type ActionType, type ProColumns } from '@ant-design/pro-components'
-import { Card, Space, Statistic, Tag, Typography, message } from 'antd'
+import { Button, Card, Space, Statistic, Tag, Typography, message } from 'antd'
 import { Link, useNavigate } from 'react-router-dom'
 import Auth from '@/components/Auth'
 import ClearanceTag from '@/components/ClearanceTag'
 import StatusTag from '@/components/StatusTag'
 import EmptyState from '@/components/EmptyState'
 import ImpactConfirmModal from '@/pages/docs/ImpactConfirmModal'
-import { cancelParseTask, listParseTasks, rejectParseTask, retryParseTask } from '@/api/parse'
+import {
+  approveParseTasksBatch,
+  cancelParseTask,
+  listParseTasks,
+  rejectParseTask,
+  retryParseTask,
+} from '@/api/parse'
 import type { ParseTask, ParseTaskList as ParseTaskListResp } from '@/api/types'
 import { canReviewTask, parseTaskId } from './parseModel'
 import { formatBytes, formatDurationMs, formatPercent, formatTime } from '@/utils/format'
@@ -21,6 +27,7 @@ export default function ParseTaskList() {
   const navigate = useNavigate()
   const actionRef = useRef<ActionType>()
   const [summary, setSummary] = useState<ParseTaskListResp | null>(null)
+  const [selectedRows, setSelectedRows] = useState<ParseTask[]>([])
   const [pending, setPending] = useState<{
     kind: 'retry' | 'cancel' | 'reject'
     docId: number | null
@@ -64,6 +71,7 @@ export default function ParseTaskList() {
         pending: { text: '待解析' },
         parsing: { text: '解析中' },
         review: { text: '待复核' },
+        pending_index: { text: '待向量入库' },
         indexing: { text: '索引中' },
         published: { text: '已完成' },
         failed: { text: '失败' },
@@ -149,6 +157,29 @@ export default function ParseTaskList() {
     },
   ]
 
+  const reviewIds = selectedRows
+    .filter((r) => canReviewTask(r.status))
+    .map((r) => parseTaskId(r))
+    .filter((id): id is number => id != null)
+
+  const batchApprove = async () => {
+    if (!reviewIds.length) {
+      message.warning('请先勾选“待复核”的任务')
+      return
+    }
+    try {
+      const res = await approveParseTasksBatch(reviewIds)
+      message.success(
+        `已提交向量入库 ${res.queued.length} 篇` +
+          (res.skipped.length ? `，跳过 ${res.skipped.length} 篇` : ''),
+      )
+      setSelectedRows([])
+      actionRef.current?.reload()
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err))
+    }
+  }
+
   const doAction = async () => {
     if (!pending) return
     if (pending.docId == null) {
@@ -214,6 +245,20 @@ export default function ParseTaskList() {
         columns={columns}
         scroll={{ x: 1200 }}
         pagination={{ defaultPageSize: 20, showSizeChanger: true }}
+        rowSelection={{
+          selectedRowKeys: selectedRows
+            .map((r) => parseTaskId(r))
+            .filter((id): id is number => id != null),
+          onChange: (_keys, rows) => setSelectedRows(rows),
+          getCheckboxProps: (r) => ({ disabled: !canReviewTask(r.status) }),
+        }}
+        toolBarRender={() => [
+          <Auth key="batch-approve" code="parse:task:manage">
+            <Button type="primary" disabled={reviewIds.length === 0} onClick={batchApprove}>
+              批量向量入库{reviewIds.length ? `（${reviewIds.length}）` : ''}
+            </Button>
+          </Auth>,
+        ]}
         request={async (params) => {
           const res = await listParseTasks({
             limit: params.pageSize,

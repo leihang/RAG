@@ -84,3 +84,23 @@ def test_compaction_merges_small_segments(runtime) -> None:
     assert len(shard.segments) <= 2
     after = manager.search("kb_all_L1", vectors[0], top_k=3)
     assert [cid for cid, _ in after] == [cid for cid, _ in before]
+
+
+async def test_rebuild_shard_segmented(seeded) -> None:
+    from ekbs.index.segmented import load_manifest
+    from ekbs.tools.rebuild_shard import rebuild
+
+    runtime, _summary = seeded
+    runtime.settings.index.layout = "segmented"
+    result = await rebuild(runtime, "kb_all_L1")
+    assert result["vectors"] > 0
+    directory = runtime.shards.segmented_dir("kb_all_L1")
+    manifest = load_manifest(directory)
+    assert manifest is not None
+    assert len(manifest.segments) == 1
+    assert manifest.segments[0].count == result["vectors"]
+    with runtime.db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT vector_count FROM ekbs_shard WHERE shard_id='kb_all_L1'"
+        ).fetchone()
+    assert int(row["vector_count"]) == result["vectors"]
