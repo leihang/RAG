@@ -13,6 +13,7 @@ import StatusTag from '@/components/StatusTag'
 import EmptyState from '@/components/EmptyState'
 import ImpactConfirmModal from '@/pages/docs/ImpactConfirmModal'
 import {
+  approveParseTask,
   approveParseTasksBatch,
   cancelParseTask,
   listParseTasks,
@@ -28,6 +29,7 @@ export default function ParseTaskList() {
   const actionRef = useRef<ActionType>()
   const [summary, setSummary] = useState<ParseTaskListResp | null>(null)
   const [selectedRows, setSelectedRows] = useState<ParseTask[]>([])
+  const [approvingId, setApprovingId] = useState<number | null>(null)
   const [pending, setPending] = useState<{
     kind: 'retry' | 'cancel' | 'reject'
     docId: number | null
@@ -136,6 +138,15 @@ export default function ParseTaskList() {
         }
         if (canReviewTask(r.status) && id != null) {
           items.push(
+            <Auth key="approve" code="parse:task:manage">
+              <a
+                onClick={() => approveOne(id)}
+                aria-disabled={approvingId === id}
+                style={{ pointerEvents: approvingId === id ? 'none' : undefined, opacity: approvingId === id ? 0.5 : 1 }}
+              >
+                {approvingId === id ? '入库中…' : '手动向量入库'}
+              </a>
+            </Auth>,
             <Link key="doc" to={`/docs/${id}`}>
               文档详情
             </Link>,
@@ -161,6 +172,23 @@ export default function ParseTaskList() {
     .filter((r) => canReviewTask(r.status))
     .map((r) => parseTaskId(r))
     .filter((id): id is number => id != null)
+
+  const approveOne = async (id: number) => {
+    setApprovingId(id)
+    try {
+      const res = await approveParseTask(id)
+      message.success(
+        res.status === 'pending_index'
+          ? '已提交向量入库，worker 处理中（可在状态列查看进度）'
+          : '已通过复核并完成向量入库',
+      )
+      actionRef.current?.reload()
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setApprovingId(null)
+    }
+  }
 
   const batchApprove = async () => {
     if (!reviewIds.length) {
