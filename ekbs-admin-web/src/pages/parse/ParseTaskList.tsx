@@ -229,6 +229,10 @@ export default function ParseTaskList() {
       message.warning(selectedRows.length ? '勾选的行里没有“已分块待入库”任务' : '请先勾选“已分块待入库”的任务')
       return
     }
+    if (readyIds.length > 200) {
+      message.warning('单次最多批量 200 篇，请分批提交')
+      return
+    }
     try {
       const res = await approveParseTasksBatch(readyIds)
       message.success(
