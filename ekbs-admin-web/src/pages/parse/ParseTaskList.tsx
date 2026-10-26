@@ -19,6 +19,7 @@ import {
   listParseTasks,
   rejectParseTask,
   retryParseTask,
+  vectorizeParseTask,
 } from '@/api/parse'
 import type { ParseTask, ParseTaskList as ParseTaskListResp } from '@/api/types'
 import { canReviewTask, parseTaskId } from './parseModel'
@@ -30,6 +31,7 @@ export default function ParseTaskList() {
   const [summary, setSummary] = useState<ParseTaskListResp | null>(null)
   const [selectedRows, setSelectedRows] = useState<ParseTask[]>([])
   const [approvingId, setApprovingId] = useState<number | null>(null)
+  const [vectorizingId, setVectorizingId] = useState<number | null>(null)
   const [pending, setPending] = useState<{
     kind: 'retry' | 'cancel' | 'reject'
     docId: number | null
@@ -73,6 +75,7 @@ export default function ParseTaskList() {
         pending: { text: '待解析' },
         parsing: { text: '解析中' },
         review: { text: '待复核' },
+        chunked: { text: '已分块待入库' },
         pending_index: { text: '待向量入库' },
         indexing: { text: '索引中' },
         published: { text: '已完成' },
@@ -144,7 +147,7 @@ export default function ParseTaskList() {
                 aria-disabled={approvingId === id}
                 style={{ pointerEvents: approvingId === id ? 'none' : undefined, opacity: approvingId === id ? 0.5 : 1 }}
               >
-                {approvingId === id ? '入库中…' : '手动向量入库'}
+                {approvingId === id ? '分块中…' : '确认合格并分块'}
               </a>
             </Auth>,
             <Link key="doc" to={`/docs/${id}`}>
@@ -153,6 +156,22 @@ export default function ParseTaskList() {
             <Auth key="reject" code="parse:task:manage">
               <a onClick={() => setPending({ kind: 'reject', docId: id, title: r.title })}>驳回</a>
             </Auth>,
+          )
+        }
+        if (r.status === 'chunked' && id != null) {
+          items.push(
+            <Auth key="vectorize" code="parse:task:manage">
+              <a
+                onClick={() => vectorizeOne(id)}
+                aria-disabled={vectorizingId === id}
+                style={{ pointerEvents: vectorizingId === id ? 'none' : undefined, opacity: vectorizingId === id ? 0.5 : 1 }}
+              >
+                {vectorizingId === id ? '入库中…' : '向量入库'}
+              </a>
+            </Auth>,
+            <Link key="doc2" to={`/docs/${id}`}>
+              文档详情
+            </Link>,
           )
         }
         items.push(
@@ -168,20 +187,16 @@ export default function ParseTaskList() {
     },
   ]
 
-  const reviewIds = selectedRows
-    .filter((r) => canReviewTask(r.status))
+  const readyIds = selectedRows
+    .filter((r) => r.status === 'chunked')
     .map((r) => parseTaskId(r))
     .filter((id): id is number => id != null)
 
   const approveOne = async (id: number) => {
     setApprovingId(id)
     try {
-      const res = await approveParseTask(id)
-      message.success(
-        res.status === 'pending_index'
-          ? '已提交向量入库，worker 处理中（可在状态列查看进度）'
-          : '已通过复核并完成向量入库',
-      )
+      await approveParseTask(id)
+      message.success('已确认合格并完成分块；请勾选后做向量入库')
       actionRef.current?.reload()
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err))
@@ -190,13 +205,30 @@ export default function ParseTaskList() {
     }
   }
 
+  const vectorizeOne = async (id: number) => {
+    setVectorizingId(id)
+    try {
+      const res = await vectorizeParseTask(id)
+      message.success(
+        res.status === 'pending_index'
+          ? '已提交向量入库，worker 处理中'
+          : `已完成向量入库（${res.vector_count ?? 0} 个向量）`,
+      )
+      actionRef.current?.reload()
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setVectorizingId(null)
+    }
+  }
+
   const batchApprove = async () => {
-    if (!reviewIds.length) {
-      message.warning(selectedRows.length ? '勾选的行里没有“待复核”任务' : '请先勾选“待复核”的任务')
+    if (!readyIds.length) {
+      message.warning(selectedRows.length ? '勾选的行里没有“已分块待入库”任务' : '请先勾选“已分块待入库”的任务')
       return
     }
     try {
-      const res = await approveParseTasksBatch(reviewIds)
+      const res = await approveParseTasksBatch(readyIds)
       message.success(
         `已提交向量入库 ${res.queued.length} 篇` +
           (res.skipped.length ? `，跳过 ${res.skipped.length} 篇` : ''),
@@ -207,10 +239,10 @@ export default function ParseTaskList() {
       const text = err instanceof Error ? err.message : String(err)
       // single 布局没有批量队列（单写者约束）：自动回退为逐篇同步入库
       if (/segmented|单写者/.test(text)) {
-        for (const id of reviewIds) {
-          await approveParseTask(id)
+        for (const id of readyIds) {
+          await vectorizeParseTask(id)
         }
-        message.success(`已按单篇模式完成 ${reviewIds.length} 篇向量入库`)
+        message.success(`已按单篇模式完成 ${readyIds.length} 篇向量入库`)
         setSelectedRows([])
         actionRef.current?.reload()
         return
@@ -292,8 +324,8 @@ export default function ParseTaskList() {
         }}
         toolBarRender={() => [
           <Auth key="batch-approve" code="parse:task:manage">
-            <Button type="primary" disabled={reviewIds.length === 0} onClick={batchApprove}>
-              批量向量入库{reviewIds.length ? `（${reviewIds.length}）` : ''}
+            <Button type="primary" disabled={readyIds.length === 0} onClick={batchApprove}>
+              批量向量入库{readyIds.length ? `（${readyIds.length}）` : ''}
             </Button>
           </Auth>,
         ]}

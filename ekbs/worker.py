@@ -204,36 +204,13 @@ def _claim_next_pending(runtime: Runtime) -> dict[str, Any] | None:
 
 
 async def _index_review_document(runtime: Runtime, ingest: IngestPipeline, doc: dict[str, Any]) -> None:
-    """``pending_index`` 文档：跳过解析，直接对 review 草稿分块/嵌入/发布。
+    """``pending_index`` 文档：对已分块（chunked）文档做向量入库。
 
-    这是"手动向量入库"的入队执行端，保证向量写入者只有 worker 一个进程
-    （方案 B 的单写者约束；API 只负责把 review → pending_index）。
+    复核确认只落分块；本函数只读现有块做 embedding/分片/FTS/发布，
+    **不重新分块**，避免覆盖用户在分块预览里的编辑。
     """
     doc_id = int(doc["doc_id"])
-    markdown = await asyncio.to_thread(load_review_markdown, runtime.settings.data_dir, doc_id)
-    sidecar = await asyncio.to_thread(load_review_sidecar, runtime.settings.data_dir, doc_id)
-    try:
-        visible = json.loads(doc.get("visible_dept_ids") or "[]")
-    except ValueError:
-        visible = []
-    await ingest.ingest_markdown(
-        title=str(doc.get("title") or ""),
-        markdown=markdown,
-        kb_id=int(doc["kb_id"]),
-        level=int(doc.get("level") or 2),
-        visible_dept_ids=list(visible),
-        source_path=str(doc.get("source_path") or ""),
-        doc_version=str(doc.get("doc_version") or "v1"),
-        page_map=page_map_from_sidecar(sidecar),
-        figures=[
-            fig for fig in figures_from_sidecar(sidecar)
-            if not str(fig.figure_id or "").startswith("handwrite")
-        ],
-        tables=tables_from_sidecar(sidecar),
-        existing_doc_id=doc_id,
-        checksum=(str(doc["checksum"]) if doc.get("checksum") else None),
-        real_corpus=True,
-    )
+    await ingest.index_existing_document(doc_id)
 
 
 async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:

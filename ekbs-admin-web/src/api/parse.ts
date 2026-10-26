@@ -131,6 +131,16 @@ export const approveParseTasksBatch = (taskIds: number[]) =>
     status: string
   }>
 
+/** 对已分块待入库（chunked）文档做向量入库 */
+export const vectorizeParseTask = (taskId: number) =>
+  http.post(`/parse/tasks/${taskId}/vectorize`) as Promise<{
+    task_id: number
+    status: string
+    parent_count?: number
+    child_count?: number
+    vector_count?: number
+  }>
+
 export const rejectParseTask = (taskId: number) =>
   http.post(`/parse/tasks/${taskId}/reject`) as Promise<unknown>
 

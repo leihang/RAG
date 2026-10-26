@@ -183,7 +183,7 @@ async def test_scan_doc_stops_at_review_then_approve(client, seeded) -> None:
         json={"markdown": edited},
     )
     assert ok.status_code == 200, ok.text
-    assert ok.json()["status"] == "published"
+    assert ok.json()["status"] == "chunked"
 
     with runtime.db.sync_connect() as conn:
         st = conn.execute(
@@ -194,8 +194,64 @@ async def test_scan_doc_stops_at_review_then_approve(client, seeded) -> None:
                 "SELECT COUNT(*) AS c FROM ekbs_chunk WHERE doc_id = ?", (doc_id,)
             ).fetchone()["c"]
         )
-    assert st == "published"
+    assert st == "chunked"
     assert chunks > 0
+
+    # 分块预览能看到 chunked；文档管理默认看不到
+    chunk_list = await http.get(
+        "/api/v1/docs/documents?include_chunked=true", headers=headers
+    )
+    assert chunk_list.status_code == 200
+    assert doc_id in {item["doc_id"] for item in chunk_list.json()["items"]}
+    default_list = await http.get("/api/v1/docs/documents", headers=headers)
+    assert doc_id not in {item["doc_id"] for item in default_list.json()["items"]}
+
+    # 分块后、向量前允许编辑块：直接改一个 child 块内容，向量入库必须 embed 编辑后的文本
+    with runtime.db.sync_connect() as conn:
+        edited = conn.execute(
+            "SELECT c.chunk_id FROM ekbs_chunk c WHERE c.doc_id = ? "
+            "AND NOT EXISTS (SELECT 1 FROM ekbs_chunk k WHERE k.parent_id = c.chunk_id) "
+            "ORDER BY c.chunk_id LIMIT 1", (doc_id,)
+        ).fetchone()
+        assert edited is not None
+        conn.execute(
+            "UPDATE ekbs_chunk SET content = '编辑后的块内容ZZZ' WHERE chunk_id = ?",
+            (int(edited["chunk_id"]),),
+        )
+        conn.commit()
+    captured_texts: list[str] = []
+    # client 用的是 create_app 自己的 runtime（共享 DB），捕获它那边的 embed 调用
+    app_runtime = http._transport.app.state.runtime  # type: ignore[attr-defined]
+    original_embed = app_runtime.providers.embed.embed
+    async def capture_embed(texts):
+        captured_texts.extend(texts)
+        return await original_embed(texts)
+    app_runtime.providers.embed.embed = capture_embed
+
+    # 向量入库：对已分块（可编辑后）的块直接 embed，不重新分块
+    with runtime.db.sync_connect() as conn:
+        block_ids_before = [r["chunk_id"] for r in conn.execute(
+            "SELECT chunk_id FROM ekbs_chunk WHERE doc_id = ? ORDER BY chunk_id", (doc_id,)
+        )]
+    vec = await http.post(f"/api/v1/parse/tasks/{doc_id}/vectorize", headers=headers)
+    assert vec.status_code == 200, vec.text
+    assert vec.json()["status"] == "published"
+    assert vec.json()["vector_count"] > 0
+    with runtime.db.sync_connect() as conn:
+        st = conn.execute(
+            "SELECT status FROM ekbs_document WHERE doc_id = ?", (doc_id,)
+        ).fetchone()["status"]
+        block_ids_after = [r["chunk_id"] for r in conn.execute(
+            "SELECT chunk_id FROM ekbs_chunk WHERE doc_id = ? ORDER BY chunk_id", (doc_id,)
+        )]
+        vectors = conn.execute(
+            "SELECT vector_count FROM ekbs_shard WHERE shard_id = "
+            "(SELECT shard_id FROM ekbs_chunk WHERE doc_id = ? LIMIT 1)", (doc_id,)
+        ).fetchone()["vector_count"]
+    assert st == "published"
+    assert block_ids_after == block_ids_before
+    assert int(vectors) > 0
+    assert any("编辑后的块内容ZZZ" in text for text in captured_texts), captured_texts[:3]
 
 
 async def test_mineru_pdf_without_scan_hint_stops_at_review(

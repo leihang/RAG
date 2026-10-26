@@ -41,6 +41,7 @@ export default function ChunkDocList() {
       width: 110,
       valueType: 'select',
       valueEnum: {
+        chunked: { text: '已分块待入库' },
         published: { text: '已发布' },
         offline: { text: '已下线' },
       },
@@ -98,6 +99,7 @@ export default function ChunkDocList() {
             limit: params.pageSize,
             offset: ((params.current ?? 1) - 1) * (params.pageSize ?? 20),
             status: params.status as string | undefined,
+            include_chunked: true,
             level: params.level as number | undefined,
             q: (params as Record<string, unknown>).title as string | undefined,
           })

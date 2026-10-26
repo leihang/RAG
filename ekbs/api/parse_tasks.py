@@ -69,6 +69,7 @@ VALID_STATUSES = (
     "pending",
     "parsing",
     "review",
+    "chunked",
     "indexing",
     "published",
     "failed",
@@ -566,8 +567,9 @@ async def approve_parse_task(
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """人工确认复核通过 → 分块 / 嵌入 / published。
+    """人工确认复核通过 → **只分块**（状态 chunked），不向量、不发布。
 
+    向量入库由清洗解析页的"向量入库/批量向量入库"触发。
     可选 body.markdown：通过前最后一次覆盖草稿（便于粘贴 WPS 识别结果）。
     """
     principal = _principal(
@@ -598,26 +600,8 @@ async def approve_parse_task(
     except ValueError:
         visible = []
 
-    # 方案 B：分段索引模式下，向量写入者固定为 worker（单写者），
-    # API 只把文档从 review 置为 pending_index 入队，worker 统一分块/嵌入/flush/发布。
-    if runtime.settings.index.layout == "segmented":
-        with runtime.db.sync_connect() as conn:
-            conn.execute(
-                "UPDATE ekbs_document SET status = 'pending_index', updated_at = datetime('now') "
-                "WHERE doc_id = ? AND status = ?",
-                (task_id, STATUS_REVIEW),
-            )
-            conn.execute(
-                "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
-                "field, old_value, new_value, reason) "
-                "VALUES (?, 'document', ?, 'review_approve_queued', 'status', ?, 'pending_index', "
-                "'api:approve:queued')",
-                (principal.user_id, str(task_id), STATUS_REVIEW),
-            )
-            conn.commit()
-        log.info("review_approve_queued", task_id=task_id, operator=principal.user_id)
-        return JSONResponse({"task_id": task_id, "status": "pending_index"})
-
+    # 复核确认只做"分块落库"：不嵌入、不写分片、不发布。
+    # 向量入库由清洗解析页的"向量入库/批量向量入库"触发（单写者约束下由 worker 执行）。
     ingest = IngestPipeline(
         db=runtime.db,
         settings=runtime.settings,
@@ -643,6 +627,7 @@ async def approve_parse_task(
             tables=tables_from_sidecar(sidecar),
             existing_doc_id=task_id,
             checksum=(str(row["checksum"]) if row["checksum"] else None),
+            defer_vector=True,
         )
     except Exception as exc:
         log.error("review_approve_failed", task_id=task_id, error=str(exc)[:240])
@@ -653,14 +638,14 @@ async def approve_parse_task(
                 (task_id,),
             )
             conn.commit()
-        raise HTTPException(status_code=500, detail=f"分块入库失败：{exc}") from exc
+        raise HTTPException(status_code=500, detail=f"分块失败：{exc}") from exc
 
     with runtime.db.sync_connect() as conn:
         conn.execute(
             "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
             "field, old_value, new_value, reason) "
-            "VALUES (?, 'document', ?, 'review_approve', 'status', 'review', 'published', "
-            "'api:approve')",
+            "VALUES (?, 'document', ?, 'review_approve', 'status', 'review', 'chunked', "
+            "'api:approve:chunked')",
             (principal.user_id, str(task_id)),
         )
         conn.commit()
@@ -673,8 +658,91 @@ async def approve_parse_task(
     return JSONResponse(
         {
             "task_id": task_id,
-            "status": "published",
+            "status": "chunked",
             "previous_status": STATUS_REVIEW,
+            "parent_count": result.parent_count,
+            "child_count": result.child_count,
+            "vector_count": 0,
+        }
+    )
+
+
+@router.post("/parse/tasks/{task_id}/vectorize")
+async def vectorize_parse_task(
+    task_id: int,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """对已分块（chunked）文档做向量入库。
+
+    - single 布局：API 同步对现有块 embedding 并发布；
+    - segmented 布局：置 pending_index，由 worker 执行（单写者）。
+    """
+    principal = _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "parse:task:manage"
+    )
+    runtime = request.app.state.runtime
+    row = _task_row(runtime, task_id)
+    if str(row["status"]) != "chunked":
+        raise HTTPException(
+            status_code=409,
+            detail=f"仅已分块待入库（chunked）状态可向量入库（当前 {row['status']}）",
+        )
+    if runtime.settings.index.layout == "segmented":
+        with runtime.db.sync_connect() as conn:
+            conn.execute(
+                "UPDATE ekbs_document SET status = 'pending_index', updated_at = datetime('now') "
+                "WHERE doc_id = ? AND status = 'chunked'",
+                (task_id,),
+            )
+            conn.execute(
+                "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
+                "field, old_value, new_value, reason) "
+                "VALUES (?, 'document', ?, 'vectorize_queued', 'status', 'chunked', 'pending_index', "
+                "'api:vectorize:queued')",
+                (principal.user_id, str(task_id)),
+            )
+            conn.commit()
+        log.info("vectorize_queued", task_id=task_id, operator=principal.user_id)
+        return JSONResponse({"task_id": task_id, "status": "pending_index"})
+
+    ingest = IngestPipeline(
+        db=runtime.db,
+        settings=runtime.settings,
+        providers=runtime.providers,
+        shards=runtime.shards,
+        fts=runtime.fts,
+        figure_index=runtime.figure_index,
+    )
+    try:
+        result = await ingest.index_existing_document(task_id)
+    except Exception as exc:
+        log.error("vectorize_failed", task_id=task_id, error=str(exc)[:240])
+        with runtime.db.sync_connect() as conn:
+            conn.execute(
+                "UPDATE ekbs_document SET status = 'failed', updated_at = datetime('now') "
+                "WHERE doc_id = ?",
+                (task_id,),
+            )
+            conn.commit()
+        raise HTTPException(status_code=500, detail=f"向量入库失败：{exc}") from exc
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
+            "field, old_value, new_value, reason) "
+            "VALUES (?, 'document', ?, 'vectorize', 'status', 'chunked', 'published', "
+            "'api:vectorize')",
+            (principal.user_id, str(task_id)),
+        )
+        conn.commit()
+    log.info("vectorized", task_id=task_id, operator=principal.user_id, vector_count=result.vector_count)
+    return JSONResponse(
+        {
+            "task_id": task_id,
+            "status": "published",
+            "previous_status": "chunked",
             "parent_count": result.parent_count,
             "child_count": result.child_count,
             "vector_count": result.vector_count,
@@ -694,7 +762,7 @@ async def approve_parse_tasks_batch(
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """批量"手动向量入库"：把 review 文档置 pending_index，由 worker 统一处理。
+    """批量"向量入库"：把 chunked 文档置 pending_index，由 worker 统一处理。
 
     仅 ``index.layout=segmented`` 可用（单写者约束）；single 布局仍走单篇同步 approve。
     """
@@ -714,24 +782,24 @@ async def approve_parse_tasks_batch(
             row = conn.execute(
                 "SELECT status FROM ekbs_document WHERE doc_id = ?", (task_id,)
             ).fetchone()
-            if row is None or str(row["status"]) != STATUS_REVIEW:
-                skipped.append({"task_id": task_id, "reason": "not_in_review"})
+            if row is None or str(row["status"]) != "chunked":
+                skipped.append({"task_id": task_id, "reason": "not_chunked"})
                 continue
             conn.execute(
                 "UPDATE ekbs_document SET status = 'pending_index', updated_at = datetime('now') "
-                "WHERE doc_id = ? AND status = ?",
-                (task_id, STATUS_REVIEW),
+                "WHERE doc_id = ? AND status = 'chunked'",
+                (task_id,),
             )
             conn.execute(
                 "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
                 "field, old_value, new_value, reason) "
-                "VALUES (?, 'document', ?, 'review_approve_queued', 'status', ?, 'pending_index', "
-                "'api:approve_batch:queued')",
-                (principal.user_id, str(task_id), STATUS_REVIEW),
+                "VALUES (?, 'document', ?, 'vectorize_batch_queued', 'status', 'chunked', 'pending_index', "
+                "'api:vectorize_batch:queued')",
+                (principal.user_id, str(task_id)),
             )
             queued.append(task_id)
         conn.commit()
-    log.info("review_approve_batch_queued", operator=principal.user_id, queued=len(queued), skipped=len(skipped))
+    log.info("vectorize_batch_queued", operator=principal.user_id, queued=len(queued), skipped=len(skipped))
     return JSONResponse({"queued": queued, "skipped": skipped, "status": "pending_index"})
 
 

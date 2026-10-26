@@ -129,6 +129,7 @@ class IngestPipeline:
         figures: Sequence[FigureInput] = (),
         tables: Sequence[TableInput] = (),
         personal: bool = False,
+        defer_vector: bool = False,
     ) -> IngestResult:
         """把一份 Markdown 入库（清洗与解析由调用方完成，见 :mod:`ekbs.ingest.parser`）。
 
@@ -267,6 +268,31 @@ class IngestPipeline:
                 )
             self._insert_chunks(doc_id, shard_id, chunking.nodes)
             child_ids = self._child_chunk_ids(doc_id)
+            if defer_vector:
+                # 复核只做到"分块落库"：不调嵌入、不写分片、不发布。
+                # 等清洗解析页的"向量入库"再对已（可能被编辑过的）块做 embedding。
+                self._publish(
+                    doc_id,
+                    page_count=_page_count(page_map),
+                    status="chunked",
+                )
+                result = IngestResult(
+                    doc_id=doc_id,
+                    shard_id=shard_id,
+                    parent_count=len(chunking.parents),
+                    child_count=len(chunking.children),
+                    vector_count=0,
+                    figure_vector_count=0,
+                    figure_vectors_failed=0,
+                    cloud_tokens=0,
+                    local_tokens=0,
+                    content_coverage=content_ratio,
+                    content_lost_lines=len(lost_lines),
+                    status="chunked",
+                    checksum=checksum,
+                )
+                log.info("ingest_chunked", **result.as_dict())
+                return result
             vectors, embed_stats = await self._embed_children(doc_id, child_ids)
             cloud_tokens = int(embed_stats.get("cloud_tokens") or 0)
             local_tokens = int(embed_stats.get("local_tokens") or 0)
@@ -303,6 +329,96 @@ class IngestPipeline:
             checksum=checksum,
         )
         log.info("ingest_done", **result.as_dict())
+        return result
+
+    async def index_existing_document(self, doc_id: int) -> IngestResult:
+        """对已分块（``chunked``）文档做向量入库：**不重新分块**，直接 embed 现有块。
+
+        复核确认后用户可能已在分块预览里改过块；重新走 chunker 会把这些修改覆盖掉，
+        所以这里只读 ``ekbs_chunk`` 的叶子块，嵌入后写分片/FTS/发布。
+        """
+        import json as _json
+
+        with self.db.sync_connect() as conn:
+            doc = conn.execute(
+                "SELECT doc_id, kb_id, title, level, visible_dept_ids, status, checksum, "
+                "page_count FROM ekbs_document WHERE doc_id = ?",
+                (doc_id,),
+            ).fetchone()
+            if doc is None:
+                raise ConfigError(f"文档不存在：doc_id={doc_id}")
+            status = str(doc["status"])
+            if status not in ("chunked", "indexing"):
+                raise ConfigError(
+                    f"文档状态 {status} 不能向量入库（需要 chunked）；doc_id={doc_id}"
+                )
+            row = conn.execute(
+                "SELECT shard_id FROM ekbs_chunk WHERE doc_id = ? LIMIT 1", (doc_id,)
+            ).fetchone()
+            if row is None:
+                raise ConfigError(f"文档没有分块，无法向量入库：doc_id={doc_id}")
+            shard_id = str(row["shard_id"])
+            child_ids = self._child_chunk_ids(doc_id)
+            if not child_ids:
+                raise ConfigError(f"文档没有可向量化的叶子块：doc_id={doc_id}")
+            conn.execute(
+                "UPDATE ekbs_document SET status = 'indexing', updated_at = datetime('now') "
+                "WHERE doc_id = ?",
+                (doc_id,),
+            )
+            conn.commit()
+
+        try:
+            visible = _json.loads(doc["visible_dept_ids"] or "[]")
+        except ValueError:
+            visible = []
+        placement = resolve_shard_for_document(
+            level=int(doc["level"]), visible_dept_ids=list(visible), settings=self.settings
+        )
+        dept_code, shard_level = parse_shard_id(shard_id)
+        ensure_shard_for_placement(
+            self.shards,
+            shard_id,
+            level=shard_level,
+            dept_code=dept_code,
+            fingerprint=self.providers.embed.ref.fingerprint,
+        )
+        vectors, embed_stats = await self._embed_children(doc_id, child_ids)
+        figure_vector_count = 0
+        figure_vectors_failed = 0
+        if vectors is not None and len(vectors):
+            # 分块阶段用户可能在分块预览里改过块并触发过单块重嵌入；
+            # 这里按 chunk_id 先清掉旧向量再统一 append，避免重复向量。
+            try:
+                self.shards.remove(shard_id, child_ids)
+            except Exception as exc:  # noqa: BLE001 - 清理旧向量失败不应阻断入库
+                log.warning("vector_cleanup_before_append_failed", doc_id=doc_id, error=str(exc)[:200])
+            self.shards.append(shard_id, child_ids, vectors, personal=False)
+        figure_vector_count, figure_vectors_failed = await self._embed_figures_multimodal(doc_id)
+        self._index_fts(doc_id, shard_id, ())
+        self._grant_extra_depts(doc_id, placement.extra_grants, int(doc["level"]))
+        with self.db.sync_connect() as conn:
+            parent_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS c FROM ekbs_chunk WHERE doc_id = ? AND chunk_type = 'parent'",
+                    (doc_id,),
+                ).fetchone()["c"]
+            )
+        self._publish(doc_id, page_count=doc["page_count"], status="published")
+        result = IngestResult(
+            doc_id=doc_id,
+            shard_id=shard_id,
+            parent_count=parent_count,
+            child_count=len(child_ids),
+            vector_count=len(child_ids),
+            figure_vector_count=figure_vector_count,
+            figure_vectors_failed=figure_vectors_failed,
+            cloud_tokens=int(embed_stats.get("cloud_tokens") or 0),
+            local_tokens=int(embed_stats.get("local_tokens") or 0),
+            status="published",
+            checksum=str(doc["checksum"] or ""),
+        )
+        log.info("ingest_indexed_existing", **result.as_dict())
         return result
 
     # ------------------------------------------------------------------

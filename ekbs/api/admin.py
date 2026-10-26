@@ -447,6 +447,7 @@ async def list_documents(
     request: Request,
     kb_id: int | None = Query(default=None),
     status: str | None = Query(default=None),
+    include_chunked: bool = Query(default=False, description="分块预览：同时返回已分块待入库"),
     level: int | None = Query(default=None),
     q: str | None = Query(default=None, description="标题模糊匹配"),
     limit: int = Query(default=50),
@@ -481,8 +482,11 @@ async def list_documents(
     if status:
         where.append("d.status = ?")
         params.append(str(status))
+    elif include_chunked:
+        # 分块预览：已分块待入库也要能看块（但文档管理默认仍不显示）。
+        where.append("d.status IN ('chunked', 'published', 'offline')")
     else:
-        # 文档管理/分块预览默认只展示"完成解析+清洗+分块+向量"的文档；
+        # 文档管理默认只展示"完成解析+清洗+分块+向量"的文档；
         # 未完成的 pending/parsing/review/indexing/failed 只在「清洗解析」页处理。
         where.append("d.status IN ('published', 'offline')")
     if level is not None:

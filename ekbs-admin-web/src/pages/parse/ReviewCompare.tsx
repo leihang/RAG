@@ -331,12 +331,8 @@ export default function ReviewCompare() {
   const approve = async () => {
     setActing(true)
     try {
-      const result = await approveParseTask(docId, readDraft())
-      message.success(
-        result.status === 'pending_index'
-          ? '已提交向量入库，worker 处理中；完成后可在分块预览查看'
-          : '已完成分块与向量入库；可在分块预览查看',
-      )
+      await approveParseTask(docId, readDraft())
+      message.success('已确认合格并完成分块；请在清洗解析页勾选后做向量入库')
       navigate(`/chunks/${docId}`)
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err))
@@ -396,7 +392,7 @@ export default function ReviewCompare() {
             {editable ? (
               <Auth code="parse:task:manage">
                 <Button type="primary" loading={acting} onClick={() => void approve()}>
-                  确认通过并向量入库
+                  确认合格并分块
                 </Button>
               </Auth>
             ) : null}

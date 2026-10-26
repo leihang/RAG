@@ -116,6 +116,7 @@ async def test_task_detail_explains_missing_error_column(client, seeded) -> None
         "pending",
         "parsing",
         "review",
+        "chunked",
         "indexing",
         "published",
         "failed",

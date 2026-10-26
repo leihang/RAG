@@ -6,6 +6,7 @@ export interface DocListQuery {
   offset?: number
   kb_id?: number
   status?: string
+  include_chunked?: boolean
   level?: number
   q?: string
 }
