@@ -284,7 +284,8 @@ class SegmentedShard:
         if active_path.exists():
             self.active = ShardIndex.load(self.shard_id, active_path, expected_dim=self.dim)
         else:
-            self.active = ShardIndex.create(self.shard_id, active_path, self.dim, self.fingerprint)
+            # 不在加载时创建空 active 文件：没有新增向量就不该留一个空 .faiss。
+            self.active = None
         self._stamp = self._manifest_stamp()
 
     def refresh_if_changed(self) -> None:
@@ -350,6 +351,29 @@ class SegmentedShard:
                     merged[cid] = score
         return sorted(merged.items(), key=lambda kv: kv[1], reverse=True)[: int(top_k)]
 
+    def _prune_empty(self) -> None:
+        """删掉 0 向量的 base 段/active 文件，避免“删完留空文件”的污染。"""
+        kept_infos = []
+        kept_segments = []
+        for info, index in zip(self.manifest.segments, self.segments):
+            if index.vector_count == 0:
+                path = self.dir / info.path
+                if path.exists():
+                    path.unlink()
+            else:
+                kept_infos.append(info)
+                kept_segments.append(index)
+        self.manifest.segments = kept_infos
+        self.segments = kept_segments
+        if self.active is not None and self.active.vector_count == 0:
+            path = self.dir / self.ACTIVE_NAME
+            if path.exists():
+                path.unlink()
+            self.active = None
+            self.manifest.active = None
+        elif self.active is not None and self.manifest.active is not None:
+            self.manifest.active.count = self.active.vector_count
+
     def remove(self, ids: Sequence[int]) -> int:
         removed = 0
         for index in self.segments:
@@ -364,8 +388,7 @@ class SegmentedShard:
             SegmentInfo(**{**i.__dict__, "count": seg.vector_count})
             for i, seg in zip(self.manifest.segments, self.segments)
         ]
-        if self.active is not None and self.manifest.active is not None:
-            self.manifest.active.count = self.active.vector_count
+        self._prune_empty()
         self.manifest.version += 1
         save_manifest(self.dir, self.manifest)
         return removed
@@ -561,7 +584,12 @@ class ShardIndexManager:
                 )
                 conn.commit()
             shard = self._get_segmented(shard_id)
-            assert shard.active is not None
+            if shard.active is None:
+                # create_shard 的调用方要拿到一个可 add 的 ShardIndex；
+                # 这里只在内存里建空 active，不落盘（没向量就不留空文件）。
+                shard.active = ShardIndex.create(
+                    shard_id, directory / shard.ACTIVE_NAME, self.dim, str(fingerprint or self.fingerprint)
+                )
             log.info("segmented_shard_created", shard_id=shard_id, path=str(directory))
             return shard.active
         if index_type != ShardIndex.INDEX_TYPE:

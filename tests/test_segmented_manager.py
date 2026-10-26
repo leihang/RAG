@@ -104,3 +104,25 @@ async def test_rebuild_shard_segmented(seeded) -> None:
             "SELECT vector_count FROM ekbs_shard WHERE shard_id='kb_all_L1'"
         ).fetchone()
     assert int(row["vector_count"]) == result["vectors"]
+
+
+def test_remove_all_vectors_prunes_empty_segments(runtime) -> None:
+    """删完一个分片的全部向量后，不留空 base/active 文件。"""
+    manager = _manager(runtime)
+    manager.create_shard("kb_all_L1")
+    vectors = _vectors(2)
+    manager.append("kb_all_L1", [501, 502], vectors)
+    shard = manager._get_segmented("kb_all_L1")
+    base_path = shard.dir / shard.manifest.segments[0].path
+    assert base_path.exists()
+    removed = manager.remove("kb_all_L1", [501, 502])
+    assert removed == 2
+    shard = manager._get_segmented("kb_all_L1")
+    assert shard.segments == []
+    assert shard.active is None
+    assert shard.count == 0
+    assert not list(shard.dir.glob("seg_*.faiss"))
+    import json
+    manifest = json.loads((shard.dir / "manifest.json").read_text())
+    assert manifest["segments"] == []
+    assert manifest.get("active") is None
