@@ -28,7 +28,10 @@ export function formatPercent(value?: number | null, digits = 1): string {
 /** 解析耗时。无记录时用全角破折号，和「还没跑过」区分开。 */
 export function formatDurationMs(ms?: number | null): string {
   if (ms == null || Number.isNaN(Number(ms)) || Number(ms) < 0) return '—'
-  const sec = Math.max(0, Math.round(Number(ms) / 1000))
+  const value = Number(ms)
+  // 解析一页 docx 常常只有几毫秒；统一按秒取整会显示成 "0 秒"，看起来像没耗时。
+  if (value < 1000) return `${Math.round(value)} 毫秒`
+  const sec = Math.max(1, Math.round(value / 1000))
   if (sec < 60) return `${sec} 秒`
   const minutes = Math.floor(sec / 60)
   const rest = sec % 60
