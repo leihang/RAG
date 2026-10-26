@@ -89,9 +89,7 @@ export default function ParseTaskList() {
         chunked: { text: '已分块待入库' },
         pending_index: { text: '待向量入库' },
         indexing: { text: '索引中' },
-        published: { text: '已完成' },
         failed: { text: '失败' },
-        offline: { text: '已下线' },
       },
       render: (_, r) => <StatusTag status={r.status} />,
     },
@@ -346,7 +344,7 @@ export default function ParseTaskList() {
           </Typography.Paragraph>
         ) : null}
         <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
-          扫描件待复核：点「查看清洗稿」进入原件↔清洗稿双栏页（不再弹全文预览）。已完成任务点「打开分块」，也可以点「原件对照」回看原件排版。
+          扫描件待复核：点「查看清洗稿」进入原件↔清洗稿双栏页。已完成（已发布/已下线）的文档不再出现在这里，请到「文档管理 / 分块预览」查看。
         </Typography.Paragraph>
       </Card>
 

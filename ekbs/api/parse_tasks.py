@@ -171,6 +171,10 @@ async def list_parse_tasks(
     if status:
         where.append("d.status = ?")
         params.append(status)
+    else:
+        # 清洗解析是"进行中"工作台：已发布/已下线不再出现在这里；
+        # 它们去文档管理/分块预览，避免已完成的文档一直占着流程列表。
+        where.append("d.status NOT IN ('published', 'offline', 'deleted')")
     if kb_id is not None:
         where.append("d.kb_id = ?")
         params.append(int(kb_id))
@@ -185,17 +189,21 @@ async def list_parse_tasks(
     with runtime.db.sync_connect() as conn:
         rows = [dict(r) for r in conn.execute(sql, (*params, limit, offset)).fetchall()]
         total = int(conn.execute(count_sql, tuple(params)).fetchone()["c"])
-        # 按状态汇总，便于一眼看出成功率（01 §12 的 98% 验收线）
-        by_status = {
+        # 按状态汇总（只汇总进行中）；成功率另用全量终态算
+        all_by_status = {
             str(r["status"]): int(r["c"])
             for r in conn.execute(
                 "SELECT status, COUNT(*) AS c FROM ekbs_document GROUP BY status"
             ).fetchall()
         }
+        by_status = {
+            k: v for k, v in all_by_status.items()
+            if k not in ("published", "offline", "deleted")
+        }
     # 成功率只看终态（published/failed/offline），排除 pending/parsing/review/indexing，
     # 否则「待复核」堆积会把成功率虚低，误触 98% 验收线。
-    published = by_status.get("published", 0)
-    terminal = published + by_status.get("failed", 0) + by_status.get("offline", 0)
+    published = all_by_status.get("published", 0)
+    terminal = published + all_by_status.get("failed", 0) + all_by_status.get("offline", 0)
     success_rate = round(published / terminal, 4) if terminal else 0.0
     return JSONResponse(
         {
@@ -206,8 +214,8 @@ async def list_parse_tasks(
             "by_status": by_status,
             "success_rate": success_rate,
             "success_rate_target": 0.98,
-            "note": "task_id 即 doc_id；success_rate = published / (published+failed+offline)，"
-            "不含进行中/待复核",
+            "note": "task_id 即 doc_id；列表只含进行中（pending/parsing/review/chunked/indexing/failed）；"
+            "已发布/已下线请到文档管理；success_rate = published / (published+failed+offline)",
         }
     )
 

@@ -83,9 +83,13 @@ async def test_list_tasks_reports_success_rate(client, seeded) -> None:
     body = (
         await client.get("/api/v1/parse/tasks", headers=headers_for(auditor_id))
     ).json()
-    assert body["total"] >= 5
-    assert body["by_status"]["published"] >= 3
+    assert body["total"] >= 2
+    assert "published" not in body["by_status"]  # 已完成文档不留在清洗解析列表
     assert body["by_status"]["pending"] >= 1
+    completed = (
+        await client.get("/api/v1/parse/tasks?status=published", headers=headers_for(auditor_id))
+    ).json()
+    assert completed["total"] >= 3
     assert body["success_rate_target"] == 0.98
     assert 0 < body["success_rate"] <= 1
     assert "task_id" in body["items"][0]
