@@ -41,11 +41,7 @@ export default function ChunkDocList() {
       width: 110,
       valueType: 'select',
       valueEnum: {
-        pending: { text: '待解析' },
-        parsing: { text: '解析中' },
-        review: { text: '待复核' },
         published: { text: '已发布' },
-        failed: { text: '失败' },
         offline: { text: '已下线' },
       },
       render: (_, row) => <StatusTag status={row.status} />,
@@ -82,7 +78,7 @@ export default function ChunkDocList() {
   return (
     <Space direction="vertical" size={12} style={{ width: '100%' }}>
       <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-        处理流程第 3 步：选择文档进入父子块树，可编辑 / 拆合 / 重嵌入。待复核文档尚未分块，请先在「清洗解析」完成双栏复核。
+        处理流程第 3 步：只展示已完成解析、清洗、分块和向量的文档。未完成文档请先在「清洗解析」处理。
       </Typography.Paragraph>
       <ProTable<DocumentItem, DocListQuery>
         headerTitle="分块预览"

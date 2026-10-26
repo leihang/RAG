@@ -242,3 +242,25 @@ async def test_me_returns_permissions_for_menu_filtering(client, seeded) -> None
     plain = (await client.get("/api/v1/auth/me", headers=headers_for(end_user))).json()
     # 方案 03 §3.2：end_user = 发起问答 + 查看目录；两者都不授予任何管理接口
     assert sorted(plain["permissions"]) == ["audit:qa:chat"]
+
+
+async def test_documents_list_hides_incomplete_documents(client, seeded) -> None:
+    """文档管理/分块预览默认只展示已完成解析+清洗+分块+向量的文档。"""
+    runtime, summary = seeded
+    admin_id = grant_role(runtime, "demo_root", "super_admin")
+    headers = headers_for(admin_id)
+    docs = summary["documents"]
+    with runtime.db.sync_connect() as conn:
+        conn.execute("UPDATE ekbs_document SET status='pending' WHERE doc_id=?", (int(docs[0]["doc_id"]),))
+        conn.execute("UPDATE ekbs_document SET status='review' WHERE doc_id=?", (int(docs[1]["doc_id"]),))
+        conn.commit()
+    body = (await client.get("/api/v1/docs/documents", headers=headers)).json()
+    statuses = {item["status"] for item in body["items"]}
+    assert statuses <= {"published", "offline"}
+    titles = {item["title"] for item in body["items"]}
+    assert docs[0]["title"] not in titles
+    assert docs[1]["title"] not in titles
+    assert docs[2]["title"] in titles
+    # 明确按状态查仍可拿到（供清洗解析/运维使用），但默认列表不展示
+    review = (await client.get("/api/v1/docs/documents?status=review", headers=headers)).json()
+    assert [item["doc_id"] for item in review["items"]] == [int(docs[1]["doc_id"])]

@@ -67,7 +67,7 @@ export default function DocumentList() {
       valueEnum: { 1: { text: 'L1' }, 2: { text: 'L2' }, 3: { text: 'L3' }, 4: { text: 'L4' } },
       render: (_, row) => <ClearanceTag level={row.level} /> },
     { title: '状态', dataIndex: 'status', width: 110, valueType: 'select',
-      valueEnum: { pending: { text: '待解析' }, parsing: { text: '解析中' }, review: { text: '待复核' }, published: { text: '已发布' }, failed: { text: '失败' }, offline: { text: '已下线' } },
+      valueEnum: { published: { text: '已发布' }, offline: { text: '已下线' } },
       render: (_, row) => <StatusTag status={row.status} /> },
     { title: '页数', dataIndex: 'page_count', width: 80, search: false, render: (_, r) => (r.page_count == null ? '-' : String(r.page_count)) },
     { title: '分块', dataIndex: 'chunk_count', width: 80, search: false,

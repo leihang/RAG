@@ -482,7 +482,9 @@ async def list_documents(
         where.append("d.status = ?")
         params.append(str(status))
     else:
-        where.append("d.status != 'deleted'")
+        # 文档管理/分块预览默认只展示"完成解析+清洗+分块+向量"的文档；
+        # 未完成的 pending/parsing/review/indexing/failed 只在「清洗解析」页处理。
+        where.append("d.status IN ('published', 'offline')")
     if level is not None:
         where.append("d.level = ?")
         params.append(int(level))
