@@ -296,7 +296,7 @@ answer_verify:
 # 分段索引（方案 B）开关：默认 single = 现有单文件行为；灰度时改 segmented。
 # P0 只落盘格式与迁移工具，检索路径暂不切换（P1 再接活跃段/跨段归并）。
 index:
-  layout: single
+  layout: segmented
   writer: worker
   segment:
     batch_max_vectors: 12000

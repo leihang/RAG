@@ -11,6 +11,10 @@ const api = vi.hoisted(() => ({
 
 vi.mock('@/api/parse', () => ({
   listParseTasks: api.listParseTasks,
+  getParseConfig: vi.fn().mockResolvedValue({ index_layout: 'single' }),
+  approveParseTask: vi.fn(),
+  approveParseTasksBatch: vi.fn(),
+  vectorizeParseTask: vi.fn(),
   retryParseTask: vi.fn(),
   cancelParseTask: vi.fn(),
   rejectParseTask: vi.fn(),
