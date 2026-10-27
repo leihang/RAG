@@ -265,6 +265,16 @@ def _literal_surfaces(text: str) -> list[tuple[str, float]]:
     return found
 
 
+def _normalize_for_match(text: str) -> str:
+    """抄写校验的归一化：只抹掉排版分隔符，不改数字/文字。
+
+    Excel 行级表格序列化成 ``单价（元）=3.456``；模型常写成
+    ``单价（元） 3.456``（空格）或 ``单价（元）：3.456``（冒号）。
+    这些是同一段原文的排版差异，不应判成“编造”。
+    """
+    return re.sub(r"[\s=:：|]+", "", str(text or ""))
+
+
 def verify_copied(
     answer: NumericAnswer,
     chunks: Sequence[Any],
@@ -279,13 +289,13 @@ def verify_copied(
     """
     if answer.is_na:
         return False, None
-    quote_key = re.sub(r"\s+", "", answer.quote or "")
+    quote_key = _normalize_for_match(answer.quote or "")
     if not quote_key:
         return False, None
     value = float(answer.value)
     surfaces = _literal_surfaces(answer.quote)
     for index, chunk in enumerate(chunks, start=1):
-        content = re.sub(r"\s+", "", str(getattr(chunk, "content", "") or ""))
+        content = _normalize_for_match(str(getattr(chunk, "content", "") or ""))
         if not content or quote_key not in content:
             continue
         for surface, literal in surfaces:
@@ -309,20 +319,24 @@ def _format_value(value: float) -> str:
 
 
 def verify_scope(answer: NumericAnswer, chunks: Sequence[Any], cite_index: int | None) -> bool:
-    """口径必须能从**它引用的那个分块**里逐字核到（空口径视为通过）。
+    """口径必须能从**它引用的那个分块**里核到（空口径视为通过）。
 
-    为什么要单独核：数字抄对了、口径是编的，等于**答非所问还显得权威** ——
-    比错的数字更难被发现。核法抄写校验同一套：子串（去空白）。
+    模型给的口径常是多段拼起来的（``2026年9月 燃气分析 食堂7259882331``），
+    在分块里可能分散在表名/表头/数据行，不能要求整串连续子串；
+    按空白/逗号/分号拆开，每一段都必须在该分块里出现。
     """
-    scope = re.sub(r"\s+", "", answer.scope or "")
+    scope = str(answer.scope or "").strip()
     if not scope:
         return True
-    if not 1 <= len(chunks) and cite_index is None:
+    if cite_index is None or cite_index < 1 or cite_index > len(chunks):
         return False
-    target = chunks[(cite_index or 1) - 1] if cite_index else chunks[0]
-    content = re.sub(r"\s+", "", str(getattr(target, "content", "") or ""))
-    return bool(content) and scope in content
-
+    content = _normalize_for_match(str(getattr(chunks[cite_index - 1], "content", "") or ""))
+    if not content:
+        return False
+    parts = [p for p in re.split(r"[\s,，;；/]+", scope) if p.strip()]
+    if not parts:
+        return True
+    return all(_normalize_for_match(part) in content for part in parts)
 
 #: 行标签与数字之间的分隔符（`总用电/度: 26087023` 里的 `: `）
 _LABEL_SEP = re.compile(r"[:：=＝\s\-—/]*$")
@@ -381,7 +395,7 @@ def find_scope_alternatives(
     label = label[-24:]  # 取尾部，避免把整段前缀当标签
     found: dict[str, dict[str, Any]] = {}
     for chunk in chunks:
-        content = re.sub(r"\s+", "", str(getattr(chunk, "content", "") or ""))
+        content = _normalize_for_match(str(getattr(chunk, "content", "") or ""))
         if not content:
             continue
         for match in re.finditer(re.escape(label) + r"[:：=＝]?([0-9][0-9,]*(?:\.\d+)?)", content):

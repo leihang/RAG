@@ -555,3 +555,29 @@ async def test_pinned_question_does_not_disclose_alternatives(seeded, monkeypatc
     )
     assert result.numeric and not result.numeric.get("alternatives")
     assert not any(d.startswith("numeric_scope_ambiguity") for d in result.degraded)
+
+
+def test_verify_accepts_row_table_separator_variants() -> None:
+    """Excel 行级块 `单价（元）=3.456` 与模型 quote `单价（元） 3.456` 应视为同一原文。"""
+    parsed = parse_numeric_payload(json.dumps({
+        "value": "3.456", "unit": "元", "quote": "单价（元） 3.456",
+        "indicator": "9月用气单价",
+    }))
+    ok, index = verify_copied(parsed, [_chunk(
+        "表名: 燃气分析\n相关表头: 类别 | 2026年9月用量 | 单价（元） | 金额\n"
+        "类别=食堂7259882331; 2026年9月用量=181; 单价（元）=3.456; 金额=625.536"
+    )])
+    assert ok is True and index == 1
+
+
+def test_verify_scope_accepts_multi_part_scope() -> None:
+    """口径分散在表名/表头/数据行时，应按组件核对，而不是整串连续子串。"""
+    from ekbs.retrieval.numeric import NumericAnswer, verify_scope
+    chunk = _chunk(
+        "表名: 燃气分析（熙街气分析）\n"
+        "相关表头: 类别 | 2026年9月用量 | 单价（元） | 金额\n"
+        "类别=食堂7259882331; 2026年9月用量=181; 单价（元）=3.456"
+    )
+    answer = NumericAnswer(value=3.456, unit="元", quote="单价（元） 3.456",
+                          scope="2026年9月 燃气分析（熙街气分析） 食堂7259882331")
+    assert verify_scope(answer, [chunk], 1) is True
