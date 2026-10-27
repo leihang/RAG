@@ -212,3 +212,26 @@ def test_split_rows_at_image_anchors_repeats_header() -> None:
     assert parts[1][0][1] == ["项目", "金额"]
     assert [r[0] for r in parts[0]] == [1, 2]
     assert [r[0] for r in parts[1]] == [1, 3, 4]
+
+
+def test_single_cell_section_title_splits_sheet(tmp_path) -> None:
+    """表之间用单格标题行分节（不是空行）时，必须切成多张表。"""
+    from openpyxl import Workbook
+    from ekbs.ingest.parser import parse_file
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "气分析"
+    ws.append(["熙街气分析"])
+    ws.append(["类别", "2026年9月用量", "单价"])
+    ws.append(["锅炉", "0", "3.606"])
+    ws.append(["年用气量统计对比（m³)"])
+    ws.append(["项目", "年", "1月", "2月"])
+    ws.append(["锅炉", "2023", "24506", "23361"])
+    path = tmp_path / "gas.xlsx"
+    wb.save(path)
+    doc = parse_file(path)
+    assert len(doc.tables) >= 2
+    texts = [serialize_table_body(caption=t.caption, body=t.body)[0] for t in doc.tables]
+    assert any("2026年9月用量=0" in t for t in texts)
+    assert any("1月=24506" in t for t in texts)

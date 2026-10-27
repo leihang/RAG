@@ -581,3 +581,41 @@ def test_verify_scope_accepts_multi_part_scope() -> None:
     answer = NumericAnswer(value=3.456, unit="元", quote="单价（元） 3.456",
                           scope="2026年9月 燃气分析（熙街气分析） 食堂7259882331")
     assert verify_scope(answer, [chunk], 1) is True
+
+
+def test_verify_accepts_compressed_row_quote() -> None:
+    """模型把行压缩成 `锅炉... : 0`（省略列名）时，标签+数值同一行仍可核验。"""
+    parsed = parse_numeric_payload(json.dumps({
+        "value": 0, "unit": "m³", "quote": "锅炉181201207896 : 0",
+        "scope": "2026年9月 燃气分析 锅炉181201207896",
+    }, ensure_ascii=False))
+    ok, index = verify_copied(parsed, [_chunk(
+        "表名: 燃气分析\n类别=锅炉181201207896; 2026年9月用量=0; 单价（元）=3.606; 金额=0"
+    )])
+    assert ok is True and index == 1
+
+
+def test_verify_fallback_picks_value_column_not_first_number() -> None:
+    """锅炉编号很长时，标签不能被截成“锅炉”，否则会误配到年用量表。"""
+    wrong = _chunk("表名: 年用气量\n项目=锅炉; 年月份=2026; 9月=0")
+    right = _chunk("类别=锅炉181201207896; 2026年9月用量=0; 单价（元）=3.606")
+    parsed = parse_numeric_payload(json.dumps({
+        "value": 0, "unit": "m³", "quote": "锅炉181201207896 : 0", "scope": "2026年9月",
+    }, ensure_ascii=False))
+    ok, index = verify_copied(parsed, [wrong, right])
+    assert ok is True and index == 2
+    from ekbs.retrieval.numeric import NumericAnswer as _NumericAnswer, verify_scope as _verify_scope
+    assert _verify_scope(_NumericAnswer(value=0, scope="2026年9月"), [wrong, right], index) is True
+
+
+def test_verify_accepts_full_row_quote() -> None:
+    """模型整行抄写（带 #DIV/0!）时，按首个 token 行标签 + 数值核验。"""
+    parsed = parse_numeric_payload(json.dumps({
+        "value": 0, "unit": "m³",
+        "quote": "锅炉181201207896 0 3.606 0 0 #DIV/0! 0 #DIV/0!",
+        "scope": "2026年9月",
+    }, ensure_ascii=False))
+    ok, index = verify_copied(parsed, [_chunk(
+        "类别=锅炉181201207896; 2026年9月用量=0; 单价（元）=3.606; 金额=0"
+    )])
+    assert ok is True and index == 1

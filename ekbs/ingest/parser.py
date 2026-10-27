@@ -656,6 +656,16 @@ def _split_rows_at_image_anchors(
     return parts or [rows_with_nums]
 
 
+def _is_section_title_row(values: list[str]) -> bool:
+    """单格短标题行（如 "年用气量统计对比（m³)"）应切成新表段。
+
+    复杂 Excel 一个 sheet 常含多张表，表之间不是空行，而是一行单格分节标题。
+    不切段会把后面的表错套第一张表的表头（实测：锅炉 2023 年被当成 2026年9月用量）。
+    """
+    nonempty = [str(v).strip() for v in values if str(v).strip()]
+    return len(nonempty) == 1 and len(nonempty[0]) <= 40 and len(str(values)) >= 1
+
+
 def _fill_xlsx_merged_header(
     sheet: Any,
     rows_with_nums: list[tuple[int, list[str]]],
@@ -727,6 +737,10 @@ def _parse_xlsx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
                     blocks.append(buf)
                     buf = []
                 continue
+            # 单格分节标题：当前块已有内容时，先结束上一张表，标题归到下一段
+            if len(buf) >= 2 and _is_section_title_row(values):
+                blocks.append(buf)
+                buf = []
             buf.append((row_number, values))
         if buf:
             blocks.append(buf)
@@ -1274,6 +1288,9 @@ def _parse_xls(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
                     blocks.append(buf)
                     buf = []
                 continue
+            if len(buf) >= 2 and _is_section_title_row(values):
+                blocks.append(buf)
+                buf = []
             buf.append((row_index + 1, values))
         if buf:
             blocks.append(buf)
