@@ -91,3 +91,59 @@ def test_table_with_only_title_rows_keeps_content() -> None:
     """极端：整张表只有标题行 → 内容必须保留（当单列数据），不能返回空。"""
     blocks = serialize_information_blocks(caption="", rows=[["只有标题"], [""]])
     assert blocks and "只有标题" in blocks[0]
+
+
+def test_form_like_sheet_does_not_fake_header() -> None:
+    """表单型 sheet 第 1 行是字段而不是列头：不能被当成 header。"""
+    rows = [
+        ["重庆.熙街商铺撤场清算表", "", "", "", "", "", "", ""],
+        ["填表日期：", "2025.10.16", "", "品牌", "尊宝比萨", "", "", ""],
+        ["承租人", "刘国静", "", "经营方式", "个体", "", "", ""],
+        ["部门", "清算明细", "审核情况及处理意见", "", "", "审核人及部门负责人签字", "", ""],
+        ["营运部", "①货品撤场日", "", "", "", "", "", ""],
+    ]
+    blocks = serialize_information_blocks(caption="商户撤柜清算表", rows=rows)
+    text = blocks[0]
+    assert "表格形态: 表单型" in text
+    assert "相关表头: 列1 | 列2" in text
+    assert "列1=填表日期：; 列2=2025.10.16" in text
+    assert "填表日期：=2025.10.16" not in text
+
+
+def test_xlsx_blank_rows_split_sheet_into_multiple_tables(tmp_path) -> None:
+    from openpyxl import Workbook
+    from ekbs.ingest.parser import parse_file
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "清算表"
+    ws.append(["重庆.熙街商铺撤场清算表"])
+    ws.append(["填表日期：", "2025.10.16", "", "品牌", "尊宝比萨"])
+    ws.append([])
+    ws.append(["部门", "清算明细", "审核情况及处理意见"])
+    ws.append(["营运部", "①货品撤场日", ""])
+    path = tmp_path / "清算表.xlsx"
+    wb.save(path)
+    doc = parse_file(path)
+    assert len(doc.tables) >= 2
+    assert any("第1段" in t.caption for t in doc.tables)
+    assert any("第2段" in t.caption for t in doc.tables)
+    from ekbs.ingest.table_serialize import serialize_table_body
+    first = serialize_table_body(caption=doc.tables[0].caption, body=doc.tables[0].body)
+    second = serialize_table_body(caption=doc.tables[1].caption, body=doc.tables[1].body)
+    assert "填表日期" in first[0] and "表单型" in first[0]
+    assert "部门" in second[0] and "清算明细" in second[0]
+
+
+def test_two_row_header_is_merged() -> None:
+    rows = [
+        ["部门", "清算明细", "审核情况及处理意见", "", "审核人及部门负责人签字", ""],
+        ["", "", "检查结果", "金额", "营运部经办人签字", "财务审核"],
+        ["营运部", "①货品撤场日", "合格", "0", "张三", "李四"],
+    ]
+    blocks = serialize_information_blocks(caption="清算表", rows=rows)
+    text = blocks[0]
+    assert "审核情况及处理意见/检查结果" in text
+    assert "审核人及部门负责人签字/营运部经办人签字" in text
+    assert "部门=营运部; 清算明细=①货品撤场日" in text
+    assert "检查结果=合格" in text

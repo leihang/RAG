@@ -121,6 +121,21 @@ def _is_title_row(row: Sequence[str]) -> bool:
     return len(cells) >= 3 and sum(1 for c in cells if c) <= 1
 
 
+def _looks_like_form(matrix: Sequence[Sequence[str]]) -> bool:
+    """表单型 sheet：前几行是"标签：值"字段，而不是列名。
+
+    复杂 Excel（如商户撤场清算表）第 1 行是 `填表日期：|2025.10.16|品牌|尊宝比萨`，
+    不是表头；若直接拿它当 header，整表会变成 `填表日期：=营运部` 这种错位文本。
+    这里只做**保守**识别：首行至少两个单元格以冒号结尾，或首行有冒号且非空格≥3。
+    """
+    if not matrix:
+        return False
+    first = [str(c).strip() for c in matrix[0]]
+    nonempty = [c for c in first if c]
+    colon = [c for c in nonempty if c.endswith(("：", ":"))]
+    return len(colon) >= 2 or (len(colon) >= 1 and len(nonempty) >= 3)
+
+
 def serialize_information_blocks(
     *,
     caption: str = "",
@@ -155,12 +170,38 @@ def serialize_information_blocks(
         base = caption.strip()
         caption = f"{base}（{title_text}）" if base else title_text
 
-    headers = [str(c).strip() or f"列{i + 1}" for i, c in enumerate(matrix[0])]
-    data_rows = matrix[1:] if len(matrix) > 1 else []
-    # 无表头只有一行时：整行当数据，用列序号作表头
-    if not data_rows:
-        data_rows = [matrix[0]]
-        headers = [f"列{i + 1}" for i in range(len(matrix[0]))]
+    def merge_header_rows() -> tuple[list[str], list[list[str]]]:
+        """两行表头（如 审核意见 / 检查结果、日期、金额）合并成 "父/子"。"""
+        if len(matrix) < 2:
+            return [str(c).strip() or f"列{i+1}" for i, c in enumerate(matrix[0])], []
+        top = [str(c).strip() for c in matrix[0]]
+        sub = [str(c).strip() for c in matrix[1]]
+        width = max(len(top), len(sub))
+        top += [""] * (width - len(top))
+        sub += [""] * (width - len(sub))
+        # 仅当第一行有空列、第二行恰好补上这些列时，才认为是两行表头
+        filled = [i for i, c in enumerate(sub) if c]
+        if not top or not any(not top[i] and sub[i] for i in filled):
+            return [h or f"列{i+1}" for i, h in enumerate(top)], matrix[1:]
+        headers = []
+        for i in range(width):
+            if top[i] and sub[i] and top[i] != sub[i]:
+                headers.append(f"{top[i]}/{sub[i]}")
+            else:
+                headers.append(top[i] or sub[i] or f"列{i+1}")
+        return headers, matrix[2:]
+
+    form_like = _looks_like_form(matrix)
+    if form_like:
+        # 表单不伪造表头：保留所有行，列名用列序号，行内仍是原值（标签在值里）。
+        headers = [f"列{i + 1}" for i in range(max(len(r) for r in matrix))]
+        data_rows = matrix
+    else:
+        headers, data_rows = merge_header_rows()
+        # 无表头只有一行时：整行当数据，用列序号作表头
+        if not data_rows:
+            data_rows = [matrix[0]]
+            headers = [f"列{i + 1}" for i in range(len(matrix[0]))]
 
     subject = caption.strip() or (table_id.strip() and f"表 {table_id}") or headers[0]
     header_line = " | ".join(headers)
@@ -169,6 +210,8 @@ def serialize_information_blocks(
         f"核心实体: {subject}",
         f"相关表头: {header_line}",
     ]
+    if form_like:
+        preamble.append("表格形态: 表单型（按行保留字段值，不做列头推断）")
 
     def format_row(cells: Sequence[str]) -> str:
         parts: list[str] = []

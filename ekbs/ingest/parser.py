@@ -650,24 +650,46 @@ def _parse_xlsx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
 
     for sheet_index, sheet in enumerate(workbook.worksheets, start=1):
         lines.append(f"## {sheet.title}")
-        rows: list[list[str]] = []
+        # 一个 sheet 可能是"表单 + 多个表段"（商户撤场清算表就是典型）：
+        # 先按空行切连续块，再逐块序列化，不能把整个 sheet 硬当成一张表。
+        blocks: list[list[list[str]]] = []
+        buf: list[list[str]] = []
         for row in sheet.iter_rows(values_only=True):
             values = ["" if cell is None else str(cell).strip() for cell in row]
             if not any(v for v in values):
+                if buf:
+                    blocks.append(buf)
+                    buf = []
                 continue
-            rows.append(values)
-        body = _rows_to_pipe_markdown(rows)
-        if body:
+            buf.append(values)
+        if buf:
+            blocks.append(buf)
+        # 单行块通常是标题行：并到下一块，避免产出只有标题的“表”
+        merged_blocks: list[list[list[str]]] = []
+        pending: list[list[str]] = []
+        for block in blocks:
+            if len(block) == 1 and not pending:
+                pending = block
+                continue
+            merged_blocks.append([*pending, *block] if pending else block)
+            pending = []
+        if pending:
+            merged_blocks.append(pending)
+        for block_index, rows in enumerate(merged_blocks, start=1):
+            body = _rows_to_pipe_markdown(rows)
+            if not body:
+                continue
             table_seq += 1
+            caption = sheet.title if len(merged_blocks) == 1 else f"{sheet.title}（第{block_index}段）"
             tables.append(
                 ParsedTable(
                     body=body,
-                    caption=sheet.title,
+                    caption=caption,
                     page=sheet_index,
                     table_id=str(table_seq),
                 )
             )
-            lines.append(f"[表格 {table_seq}] {sheet.title}".rstrip())
+            lines.append(f"[表格 {table_seq}] {caption}".rstrip())
 
         for image in getattr(sheet, "_images", []) or []:
             try:
@@ -1096,25 +1118,45 @@ def _parse_xls(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
     table_seq = 0
     for sheet_index, sheet in enumerate(book.sheets(), start=1):
         lines.append(f"## {sheet.name}")
-        rows: list[list[str]] = []
+        # 与 xlsx 同口径：按空行切连续块，一个 sheet 可以有多段表/表单。
+        blocks: list[list[list[str]]] = []
+        buf: list[list[str]] = []
         for row_index in range(sheet.nrows):
             # xlrd 把所有数字读成 float，整数会显示成 "1.0" —— 归一化成 "1"
             values = [_cell_text(v) for v in sheet.row_values(row_index)]
             if not any(values):
+                if buf:
+                    blocks.append(buf)
+                    buf = []
                 continue
-            rows.append(values)
-        body = _rows_to_pipe_markdown(rows)
-        if body:
+            buf.append(values)
+        if buf:
+            blocks.append(buf)
+        merged_blocks: list[list[list[str]]] = []
+        pending: list[list[str]] = []
+        for block in blocks:
+            if len(block) == 1 and not pending:
+                pending = block
+                continue
+            merged_blocks.append([*pending, *block] if pending else block)
+            pending = []
+        if pending:
+            merged_blocks.append(pending)
+        for block_index, rows in enumerate(merged_blocks, start=1):
+            body = _rows_to_pipe_markdown(rows)
+            if not body:
+                continue
             table_seq += 1
+            caption = sheet.name if len(merged_blocks) == 1 else f"{sheet.name}（第{block_index}段）"
             tables.append(
                 ParsedTable(
                     body=body,
-                    caption=sheet.name,
+                    caption=caption,
                     page=sheet_index,
                     table_id=str(table_seq),
                 )
             )
-            lines.append(f"[表格 {table_seq}] {sheet.name}".rstrip())
+            lines.append(f"[表格 {table_seq}] {caption}".rstrip())
         lines.append("")
 
     if assets_dir is not None:
