@@ -275,10 +275,31 @@ class SegmentedShard:
 
     def _reload(self) -> None:
         self.segments = []
+        known = {info.path for info in self.manifest.segments}
         for info in self.manifest.segments:
             path = self.dir / info.path
             if path.exists():
                 self.segments.append(ShardIndex.load(self.shard_id, path, expected_dim=self.dim))
+        # 自愈：manifest 丢失但文件还在的 base 段（实测重入库中途曾出现 segments=[]、
+        # 文件仍存在）→ 重新挂回 manifest，避免“向量还在但检索不到/计数偏小”。
+        recovered = False
+        for path in sorted(self.dir.glob("seg_*.faiss")):
+            if path.name == self.ACTIVE_NAME or path.name in known:
+                continue
+            try:
+                index = ShardIndex.load(self.shard_id, path, expected_dim=self.dim)
+            except Exception:
+                continue
+            if index.vector_count <= 0:
+                continue
+            self.segments.append(index)
+            self.manifest.segments.append(
+                SegmentInfo(id=path.stem, path=path.name, count=index.vector_count, mode="batch")
+            )
+            recovered = True
+        if recovered:
+            self.manifest.version += 1
+            save_manifest(self.dir, self.manifest)
         active = self.manifest.active
         active_path = self.dir / (active.path if active else self.ACTIVE_NAME)
         if active_path.exists():
@@ -353,6 +374,14 @@ class SegmentedShard:
 
     def _prune_empty(self) -> None:
         """删掉 0 向量的 base 段/active 文件，避免“删完留空文件”的污染。"""
+        if len(self.manifest.segments) != len(self.segments):
+            # 列表错位时不要按 zip 截断（会把仍在的段从 manifest 里抹掉）；
+            # 按当前加载到的段重建 manifest。
+            self.manifest.segments = [
+                SegmentInfo(id=index.path.stem, path=index.path.name,
+                            count=index.vector_count, mode="batch")
+                for index in self.segments
+            ]
         kept_infos = []
         kept_segments = []
         for info, index in zip(self.manifest.segments, self.segments):

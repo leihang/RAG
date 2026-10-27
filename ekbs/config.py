@@ -153,6 +153,8 @@ class RetrievalCfg(_Section):
     dense_multi_query: int = 1
     #: figure 图片进多模态旁路索引，检索时作为 RRF 第三路（课程 17）
     figure_multimodal: bool = True
+    #: 表格按"一行一个块"切（RAGFlow spreadsheet 口径）；False=整表块（默认）
+    table_row_chunks: bool = False
 
 
 class EmbedCfg(_Section):

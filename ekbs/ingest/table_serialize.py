@@ -181,6 +181,7 @@ def serialize_information_blocks(
     caption: str = "",
     rows: Sequence[Sequence[str]] = (),
     table_id: str = "",
+    row_chunks: bool = False,
 ) -> list[str]:
     """把二维表打成一段或多段自解释文本（超长按行批拆）。"""
     # 单元格也过一遍公式/单位规整：xlsx/docx 的原生表格不经 Markdown 清洗那一路，
@@ -263,6 +264,12 @@ def serialize_information_blocks(
             parts.append(f"{header}={value}")
         return "; ".join(parts)
 
+    if row_chunks:
+        # RAGFlow spreadsheet 口径：一行一个块，每块重复表头；header-only 保留表头。
+        if not data_rows:
+            return ["\n".join(preamble)]
+        return ["\n".join([*preamble, format_row(cells)]) for cells in data_rows]
+
     blocks: list[str] = []
     current_lines = list(preamble)
     for cells in data_rows:
@@ -280,10 +287,12 @@ def serialize_information_blocks(
     return blocks
 
 
-def serialize_table_body(*, caption: str = "", body: str = "", table_id: str = "") -> list[str]:
+def serialize_table_body(
+    *, caption: str = "", body: str = "", table_id: str = "", row_chunks: bool = False
+) -> list[str]:
     """从 MinerU ``table_body`` / 题注直接序列化。"""
     return serialize_information_blocks(
-        caption=caption, rows=coerce_rows(body), table_id=table_id
+        caption=caption, rows=coerce_rows(body), table_id=table_id, row_chunks=row_chunks
     )
 
 

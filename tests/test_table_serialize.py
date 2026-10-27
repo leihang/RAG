@@ -191,3 +191,24 @@ def test_xlsx_merged_header_inherits_master(tmp_path) -> None:
 def test_single_row_table_does_not_crash_header_scan() -> None:
     blocks = serialize_information_blocks(caption="单行", rows=[["只有一行"]])
     assert blocks and "只有一行" in blocks[0]
+
+
+def test_table_row_chunks_repeat_header() -> None:
+    rows = [["项目", "金额"], ["A", "100"], ["B", "200"]]
+    blocks = serialize_information_blocks(caption="费用", rows=rows, row_chunks=True)
+    assert len(blocks) == 2
+    for block in blocks:
+        assert "相关表头: 项目 | 金额" in block
+    assert "项目=A; 金额=100" in blocks[0]
+    assert "项目=B; 金额=200" in blocks[1]
+
+
+def test_split_rows_at_image_anchors_repeats_header() -> None:
+    from ekbs.ingest.parser import _split_rows_at_image_anchors
+    rows = [(1, ["项目", "金额"]), (2, ["A", "1"]), (3, ["B", "2"]), (4, ["C", "3"])]
+    parts = _split_rows_at_image_anchors(rows, 0, [3])
+    assert len(parts) == 2
+    assert parts[0][0][1] == ["项目", "金额"]
+    assert parts[1][0][1] == ["项目", "金额"]
+    assert [r[0] for r in parts[0]] == [1, 2]
+    assert [r[0] for r in parts[1]] == [1, 3, 4]

@@ -64,6 +64,7 @@ retrieval:
   # 取 0.85 保留 15% 词法权重作为"精确编号/金额"类查询的保险。依据见 README §四 第 75 条。
   fusion: alpha
   hybrid_alpha: 0.75
+  table_row_chunks: true
   cache:
     # 本栈无 Redis：L1 为进程内 LRU，L2 为 SQLite 表 ekbs_cache（键必须含 perm_fingerprint）
     backend: memory+sqlite

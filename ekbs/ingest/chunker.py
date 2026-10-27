@@ -597,6 +597,7 @@ def chunk_markdown(
     figures: Sequence[FigureInput] = (),
     tables: Sequence[TableInput] = (),
     doc_title: str = "",
+    table_row_chunks: bool = False,
 ) -> ChunkingResult:
     """Markdown → 父块 + 子块 + 图片块 + 表格块（`06` §3 的口径）。
 
@@ -682,7 +683,10 @@ def chunk_markdown(
 
     for table in tables:
         blocks = serialize_table_body(
-            caption=table.caption, body=table.body, table_id=table.table_id
+            caption=table.caption,
+            body=table.body,
+            table_id=table.table_id,
+            row_chunks=table_row_chunks,
         )
         table_heading = ensure_heading_path(
             table.caption or (f"表 {table.table_id}" if table.table_id else ""),

@@ -630,6 +630,32 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
     )
 
 
+def _split_rows_at_image_anchors(
+    rows_with_nums: list[tuple[int, list[str]]],
+    header_idx: int,
+    anchor_rows: list[int],
+) -> list[list[tuple[int, list[str]]]]:
+    """按图片锚点切表段；每段重复表头（RAGFlow spreadsheet 口径）。"""
+    if not rows_with_nums or header_idx < 0 or header_idx >= len(rows_with_nums):
+        return [rows_with_nums]
+    header = rows_with_nums[header_idx]
+    data = rows_with_nums[header_idx + 1 :]
+    cuts = sorted({a for a in anchor_rows if a > header[0] and a <= (data[-1][0] if data else -1)})
+    if not cuts or not data:
+        return [rows_with_nums]
+    parts: list[list[tuple[int, list[str]]]] = []
+    current: list[tuple[int, list[str]]] = []
+    cut_set = set(cuts)
+    for row in data:
+        if row[0] in cut_set and current:
+            parts.append([header, *current])
+            current = []
+        current.append(row)
+    if current:
+        parts.append([header, *current])
+    return parts or [rows_with_nums]
+
+
 def _fill_xlsx_merged_header(
     sheet: Any,
     rows_with_nums: list[tuple[int, list[str]]],
@@ -746,21 +772,35 @@ def _parse_xlsx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
                         header_abs = row_nums[idx]
             if header_abs is not None:
                 _fill_xlsx_merged_header(sheet, rows_with_nums, header_abs)
-                rows = [values for _n, values in rows_with_nums]
-            body = _rows_to_pipe_markdown(rows)
-            if not body:
-                continue
-            table_seq += 1
-            caption = sheet.title if len(merged_blocks) == 1 else f"{sheet.title}（第{block_index}段）"
-            tables.append(
-                ParsedTable(
-                    body=body,
-                    caption=caption,
-                    page=sheet_index,
-                    table_id=str(table_seq),
+                rows_with_nums = [(n, list(v)) for n, v in rows_with_nums]
+            anchor_rows: list[int] = []
+            for image in getattr(sheet, "_images", []) or []:
+                try:
+                    anchor_rows.append(int(image.anchor._from.row) + 1)
+                except Exception:
+                    continue
+            header_idx = row_nums.index(header_abs) if header_abs in row_nums else 0
+            if not form_like and header_abs is not None:
+                parts = _split_rows_at_image_anchors(rows_with_nums, header_idx, anchor_rows)
+            else:
+                parts = [rows_with_nums]
+            for part_index, part in enumerate(parts, start=1):
+                part_rows = [values for _n, values in part]
+                body = _rows_to_pipe_markdown(part_rows)
+                if not body:
+                    continue
+                table_seq += 1
+                base_caption = sheet.title if len(merged_blocks) == 1 else f"{sheet.title}（第{block_index}段）"
+                caption = base_caption if len(parts) == 1 else f"{base_caption}（图片段{part_index}）"
+                tables.append(
+                    ParsedTable(
+                        body=body,
+                        caption=caption,
+                        page=sheet_index,
+                        table_id=str(table_seq),
+                    )
                 )
-            )
-            lines.append(f"[表格 {table_seq}] {caption}".rstrip())
+                lines.append(f"[表格 {table_seq}] {caption}".rstrip())
 
         for image in getattr(sheet, "_images", []) or []:
             try:
@@ -1166,6 +1206,40 @@ def _pptx_chart_rows(shape: Any) -> list[list[str]] | None:
         return None
 
 
+def _fill_xls_merged_header(
+    sheet: Any,
+    rows_with_nums: list[tuple[int, list[str]]],
+    header_row: int,
+) -> None:
+    """xlrd (.xls) 的合并单元格表头继承（与 xlsx 同口径）。"""
+    try:
+        merged = list(getattr(sheet, "merged_cells", []) or [])
+    except Exception:
+        return
+    index = {row_number: i for i, (row_number, _values) in enumerate(rows_with_nums)}
+    for rlo, rhi, clo, chi in merged:
+        # xlrd: rlo/rhi/clo/chi 是 0-based、右开区间
+        first_row, last_row = rlo + 1, rhi
+        if not (first_row <= header_row <= last_row):
+            continue
+        try:
+            master = _cell_text(sheet.cell_value(rlo, clo))
+        except Exception:
+            continue
+        if not master:
+            continue
+        for row_number in range(first_row, last_row + 1):
+            idx = index.get(row_number)
+            if idx is None:
+                continue
+            values = rows_with_nums[idx][1]
+            if len(values) < chi:
+                values.extend([""] * (chi - len(values)))
+            for col in range(clo, chi):
+                if not values[col]:
+                    values[col] = master
+
+
 def _parse_xls(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
     """旧版 `.xls` —— 用 `xlrd` 按工作表抽成 Markdown 表格（与 xlsx 分支同口径）。
 
@@ -1190,8 +1264,8 @@ def _parse_xls(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
     for sheet_index, sheet in enumerate(book.sheets(), start=1):
         lines.append(f"## {sheet.name}")
         # 与 xlsx 同口径：按空行切连续块，一个 sheet 可以有多段表/表单。
-        blocks: list[list[list[str]]] = []
-        buf: list[list[str]] = []
+        blocks: list[list[tuple[int, list[str]]]] = []
+        buf: list[tuple[int, list[str]]] = []
         for row_index in range(sheet.nrows):
             # xlrd 把所有数字读成 float，整数会显示成 "1.0" —— 归一化成 "1"
             values = [_cell_text(v) for v in sheet.row_values(row_index)]
@@ -1200,11 +1274,11 @@ def _parse_xls(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
                     blocks.append(buf)
                     buf = []
                 continue
-            buf.append(values)
+            buf.append((row_index + 1, values))
         if buf:
             blocks.append(buf)
-        merged_blocks: list[list[list[str]]] = []
-        pending: list[list[str]] = []
+        merged_blocks: list[list[tuple[int, list[str]]]] = []
+        pending: list[tuple[int, list[str]]] = []
         for block in blocks:
             if len(block) == 1 and not pending:
                 pending = block
@@ -1213,7 +1287,17 @@ def _parse_xls(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
             pending = []
         if pending:
             merged_blocks.append(pending)
-        for block_index, rows in enumerate(merged_blocks, start=1):
+
+        from ekbs.ingest.table_serialize import _looks_like_form, _pick_header_index
+
+        for block_index, rows_with_nums in enumerate(merged_blocks, start=1):
+            rows = [values for _n, values in rows_with_nums]
+            row_nums = [n for n, _values in rows_with_nums]
+            if not _looks_like_form(rows):
+                idx = _pick_header_index(rows)
+                if 0 <= idx < len(row_nums):
+                    _fill_xls_merged_header(sheet, rows_with_nums, row_nums[idx])
+                    rows = [values for _n, values in rows_with_nums]
             body = _rows_to_pipe_markdown(rows)
             if not body:
                 continue

@@ -126,3 +126,23 @@ def test_remove_all_vectors_prunes_empty_segments(runtime) -> None:
     manifest = json.loads((shard.dir / "manifest.json").read_text())
     assert manifest["segments"] == []
     assert manifest.get("active") is None
+
+
+def test_orphan_base_segment_is_recovered(runtime) -> None:
+    """manifest.segments 丢了但 .faiss 还在：加载时自愈，不能静默丢向量。"""
+    from ekbs.index.segmented import load_manifest, save_manifest
+    manager = _manager(runtime)
+    manager.create_shard("kb_all_L1")
+    vectors = _vectors(2)
+    manager.append("kb_all_L1", [601, 602], vectors)
+    shard = manager._get_segmented("kb_all_L1")
+    manifest = load_manifest(shard.dir)
+    assert manifest is not None and manifest.segments
+    manifest.segments = []
+    save_manifest(shard.dir, manifest)
+    manager._segmented.pop("kb_all_L1", None)
+    recovered = manager._get_segmented("kb_all_L1")
+    assert recovered.count == 2
+    assert recovered.manifest.segments
+    hits = manager.search("kb_all_L1", vectors[0], top_k=3)
+    assert hits and hits[0][0] == 601

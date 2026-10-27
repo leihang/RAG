@@ -252,6 +252,7 @@ class IngestPipeline:
                     figures=figures,
                     tables=tables,
                     doc_title=title,
+                    table_row_chunks=bool(getattr(self.settings.retrieval, "table_row_chunks", False)),
                 )
             # **零丢失守卫**：分块把"整行当标题"时文字会静默消失（实测 22 段丢 11 段，
             # 而空页率/乱码率/空 heading 全 PASS）。这里逐行核对，丢实质内容就打警告 +
