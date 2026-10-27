@@ -365,13 +365,28 @@ def verify_scope(answer: NumericAnswer, chunks: Sequence[Any], cite_index: int |
         return True
     if cite_index is None or cite_index < 1 or cite_index > len(chunks):
         return False
-    content = _normalize_for_match(str(getattr(chunks[cite_index - 1], "content", "") or ""))
-    if not content:
+    target = chunks[cite_index - 1]
+    content = _normalize_for_match(str(getattr(target, "content", "") or ""))
+    extra = " ".join(
+        str(getattr(target, attr, "") or "") for attr in ("doc_title", "heading_path")
+    )
+    extra = _normalize_for_match(extra)
+    if not content and not extra:
         return False
-    parts = [p for p in re.split(r"[\s,，;；/]+", scope) if p.strip()]
+    # 先把页码从整段口径里剥掉，再按空白拆段；否则 "第 8 页" 会被空格拆成
+    # "（第"/"8"/"页）" 三个必然匹配不上的片段。
+    scope_clean = re.sub(r"[（(]?\s*第\s*\d+\s*页\s*[）)]?", "", scope)
+    parts = [p for p in re.split(r"[\s,，;；/]+", scope_clean) if p.strip()]
     if not parts:
         return True
-    return all(_normalize_for_match(part) in content for part in parts)
+
+    def _part_matches(part: str) -> bool:
+        key = _normalize_for_match(part)
+        if not key:
+            return True
+        return key in content or key in extra
+
+    return all(_part_matches(part) for part in parts)
 
 #: 行标签与数字之间的分隔符（`总用电/度: 26087023` 里的 `: `）
 _LABEL_SEP = re.compile(r"[:：=＝\s\-—/]*$")

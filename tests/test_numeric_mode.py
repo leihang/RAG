@@ -619,3 +619,14 @@ def test_verify_accepts_full_row_quote() -> None:
         "类别=锅炉181201207896; 2026年9月用量=0; 单价（元）=3.606; 金额=0"
     )])
     assert ok is True and index == 1
+
+
+def test_verify_scope_accepts_doc_title_and_page_prefix() -> None:
+    """口径里带文档标题/页码时，标题可在 doc_title 中核到，页码可忽略。"""
+    chunk = _chunk("表名: 燃气分析（第2段）\n项目=锅炉; 年月份=2026; 2月=17462")
+    chunk.doc_title = "工程部受控文件L3/2026年9月能耗分析/2026年9月能耗分析"
+    chunk.heading_path = "燃气分析（第2段）"
+    from ekbs.retrieval.numeric import NumericAnswer, verify_scope
+    answer = NumericAnswer(value=17462, quote="2月 17462",
+                           scope="2026年9月能耗分析（第 8 页） 燃气分析（第2段） 2026")
+    assert verify_scope(answer, [chunk], 1) is True
