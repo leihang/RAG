@@ -81,7 +81,7 @@ retrieval:
   # 作为"精确编号/金额"类查询的保险（原题集里那些编号/金额题在 1.0 下也只是持平，无证据有害）。
   # ⚠️ 语料仅 16 份，扩语料后应按同一套题复测（python -m ekbs.tools.eval_switch_sweep）。
   fusion: alpha
-  hybrid_alpha: 0.85
+  hybrid_alpha: 0.75  # α=稠密权重；关键词/BM25 权重=1-α=25%（原 15%）
   # 确定性 Doc2Query：假设问句进 FTS（口语召回）；不写 FAISS、不调 LLM
   doc2query_enabled: true
   doc2query_max: 4
