@@ -237,8 +237,9 @@ session:
 
 # ---------- 问答通道（取数自动路由）----------
 qa:
-  # mode=auto 时：意图为 numeric 则走取数（类型锁死+抄写校验）；false=auto 一律 prose
-  auto_numeric: true
+  # 统一策略：auto 一律 prose（与管理台默认一致）；取数模式只由显式 mode=numeric 触发。
+  # 避免同一个问题在钉钉/管理台因为意图分类不同而回答形态不一致。
+  auto_numeric: false
 
 # ---------- 上传行为（05 §6.5）----------
 upload:
