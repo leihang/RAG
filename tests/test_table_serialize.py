@@ -235,3 +235,42 @@ def test_single_cell_section_title_splits_sheet(tmp_path) -> None:
     texts = [serialize_table_body(caption=t.caption, body=t.body)[0] for t in doc.tables]
     assert any("2026年9月用量=0" in t for t in texts)
     assert any("1月=24506" in t for t in texts)
+
+
+def test_xlsx_date_cell_converted_from_serial(tmp_path) -> None:
+    """Excel 日期单元格不能以序列号 46295 入库，应转为可读日期。"""
+    from datetime import date
+    from openpyxl import Workbook
+    from ekbs.ingest.parser import parse_file
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "用电分析"
+    ws["A1"] = "日期"
+    ws["B1"] = date(2026, 9, 30)
+    ws["B1"].number_format = "yyyy-mm-dd"
+    ws["A2"] = "总电量"
+    ws["B2"] = 4379405
+    path = tmp_path / "date.xlsx"
+    wb.save(path)
+    doc = parse_file(path)
+    body = doc.tables[0].body
+    assert "46295" not in body
+    assert "2026-09-30" in body
+
+
+def test_general_format_date_serials_in_date_header(tmp_path) -> None:
+    """日期行里的 General 格式序列号（46295）也应转日期。"""
+    from openpyxl import Workbook
+    from ekbs.ingest.parser import parse_file
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "用电分析"
+    ws.append(["用量   日期", 46295, 45930, 46265, "同比"])
+    ws.append(["总电量", 4379405, 4616475, 5288426, "-5%"])
+    path = tmp_path / "serial.xlsx"
+    wb.save(path)
+    doc = parse_file(path)
+    body = doc.tables[0].body
+    assert "46295" not in body and "2026-09-30" in body

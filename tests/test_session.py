@@ -295,15 +295,17 @@ async def test_pipeline_multi_turn_records_rewrite_and_context(seeded) -> None:
 
 
 async def test_answer_cache_is_partitioned_by_history(seeded) -> None:
-    """同一问题：**无历史** 与 **有历史** 必须落到不同的缓存键。
+    """只有追问（rewrite 用到历史）才分缓存键；自包含问题不带历史、可共享。
 
-    （注意：两个都还没历史的会话共用缓存是**正确**的 —— 那种情况下答案确实相同，
-    所以这里用「同一会话的第一轮 vs 第二轮」来构造真正的上下文差异。）
+    自包含问题重复问时，UI/钉钉应产出同一份 prompt、同一答案，
+    所以历史指纹不进键；真正的上下文差异来自“追问/指代”。
     """
     runtime, _ = seeded
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
-    await runtime.pipeline.answer("年假有多少天", alice, conversation_id="c-a")
-    await runtime.pipeline.answer("年假有多少天", alice, conversation_id="c-a")
+    first = await runtime.pipeline.answer("年假有多少天", alice, conversation_id="c-a")
+    second = await runtime.pipeline.answer("那它需要提前几天申请", alice, conversation_id="c-a")
+    assert first.history_used is False
+    assert second.history_used is True
     with runtime.db.sync_connect() as conn:
         keys = [
             str(r["cache_key"])
@@ -311,7 +313,7 @@ async def test_answer_cache_is_partitioned_by_history(seeded) -> None:
                 "SELECT cache_key FROM ekbs_cache WHERE cache_key LIKE 'ekbs:cache:answer:%'"
             ).fetchall()
         ]
-    assert len(keys) == 2, f"有/无历史必须是不同的缓存键：{keys}"
+    assert len(keys) == 2, f"追问必须与首轮分缓存键：{keys}"
     assert all(alice.fingerprint in key for key in keys)
 
 

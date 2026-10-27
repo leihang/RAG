@@ -1877,6 +1877,10 @@ class RetrievalPipeline:
         intent = str(getattr(rewrite, "intent", "factual") or "factual")
         auto_numeric = bool((getattr(self.settings, "qa", None) or {}).get("auto_numeric", True))
         mode_used = resolve_answer_mode(mode, intent, auto_numeric=auto_numeric)
+        # 关键：只有“追问/指代”（rewrite 实际用到历史）才把历史带进生成 prompt。
+        # 自包含问题不带历史 → 钉钉与 UI 用同一份 prompt，答案一致；
+        # 多轮追问仍保留上下文，不被误伤。
+        generation_history = messages if bool(getattr(rewrite, "used_history", False)) else []
 
         cached = None
         # 答案缓存键必须含**历史指纹**：同一问题在不同上下文下答案不同，
@@ -1887,10 +1891,10 @@ class RetrievalPipeline:
         # `refused=false + 5 条引用 + 答案「未找到可靠依据」`。
         cache_key = CacheStore.answer_key(
             perm.fingerprint,
-            f"{rewrite.rewritten}|{_history_digest(messages)}|gen={int(allow_generation)}"
+            f"{rewrite.rewritten}|{_history_digest(generation_history)}|gen={int(allow_generation)}"
             # 模式必须进键：取数模式与业务问答的答案形态完全不同，
             # 用解析后的 mode_used（auto→prose/numeric），避免同意图重复缓存两套键。
-            f"|mode={mode_used}|rc={self.retrieval_cache_revision()}",
+            f"|mode={mode_used}|rc={self.retrieval_cache_revision()}|idx={self.index_cache_revision()}",
         )
         if use_cache and not collect_debug:
             cached = await self.cache.get(cache_key)
@@ -1925,7 +1929,7 @@ class RetrievalPipeline:
         if allow_generation and mode_used == MODE_NUMERIC:
             result = await self._answer_numeric(question, retrieval, perm)
         elif allow_generation:
-            result = await self.generate(question, retrieval, perm, history=messages)
+            result = await self.generate(question, retrieval, perm, history=generation_history)
         else:
             result = self._retrieval_only_answer(question, retrieval, perm)
         result.rewritten_query = rewrite.rewritten
@@ -2183,6 +2187,26 @@ class RetrievalPipeline:
                 {"role": "assistant", "content": result.answer},
             ],
         )
+
+    def index_cache_revision(self) -> str:
+        """数据/索引版本（进答案缓存键）：重入库/重建后自动失效，避免旧答案被缓存。"""
+        import hashlib
+
+        parts: list[str] = []
+        try:
+            with self.db.sync_connect() as conn:
+                for row in conn.execute(
+                    "SELECT shard_id, vector_count, updated_at FROM ekbs_shard ORDER BY shard_id"
+                ):
+                    parts.append(f"{row['shard_id']}:{row['vector_count']}:{row['updated_at']}")
+                doc_row = conn.execute(
+                    "SELECT MAX(updated_at) AS t FROM ekbs_document"
+                ).fetchone()
+                if doc_row and doc_row["t"]:
+                    parts.append(f"doc:{doc_row['t']}")
+        except Exception as exc:  # noqa: BLE001 - 版本计算失败只影响缓存，不应拖垮问答
+            log.warning("index_cache_revision_failed", error=str(exc)[:120])
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
     def retrieval_cache_revision(self) -> str:
         """检索配置版本（进答案缓存键）：影响答案的每一个开关都必须进来。

@@ -666,6 +666,52 @@ def _is_section_title_row(values: list[str]) -> bool:
     return len(nonempty) == 1 and len(nonempty[0]) <= 40 and len(str(values)) >= 1
 
 
+def _convert_date_serials_in_header(values: list[str]) -> list[str]:
+    """无日期格式的 Excel 日期序列号：仅当本行含“日期/date”时按日期转换。
+
+    实测《2026年9月能耗分析》表头 B3:D3 = 46295/45930/46265，单元格格式是 General，
+    openpyxl 不会标记为日期；不转换会让模型把三列当成三个无名字段。
+    """
+    if not any(("日期" in v) or ("date" in v.lower()) for v in values):
+        return values
+    out = list(values)
+    for i, value in enumerate(out):
+        text = str(value).strip()
+        if not text.isdigit():
+            continue
+        n = int(text)
+        # Excel 日期序列：约 1954-2119 年；只在该行明确是日期行时启用
+        if not (20000 <= n <= 80000):
+            continue
+        try:
+            from openpyxl.utils.datetime import from_excel
+
+            out[i] = from_excel(n).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    return out
+
+
+def _xlsx_cell_text(cell: Any) -> str:
+    """Excel 单元格 → 文本；日期序列号转成可读日期，避免表头出现 46295。"""
+    value = getattr(cell, "value", None)
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y-%m-%d")
+        except Exception:
+            return str(value).strip()
+    if isinstance(value, (int, float)) and getattr(cell, "is_date", False):
+        try:
+            from openpyxl.utils.datetime import from_excel
+
+            return from_excel(value).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return str(value).strip()
+
+
 def _fill_xlsx_merged_header(
     sheet: Any,
     rows_with_nums: list[tuple[int, list[str]]],
@@ -730,8 +776,8 @@ def _parse_xlsx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
         # 先按空行切连续块，再逐块序列化，不能把整个 sheet 硬当成一张表。
         blocks: list[list[tuple[int, list[str]]]] = []
         buf: list[tuple[int, list[str]]] = []
-        for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-            values = ["" if cell is None else str(cell).strip() for cell in row]
+        for row_number, row in enumerate(sheet.iter_rows(), start=1):
+            values = _convert_date_serials_in_header([_xlsx_cell_text(cell) for cell in row])
             if not any(v for v in values):
                 if buf:
                     blocks.append(buf)
@@ -1281,8 +1327,21 @@ def _parse_xls(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
         blocks: list[list[tuple[int, list[str]]]] = []
         buf: list[tuple[int, list[str]]] = []
         for row_index in range(sheet.nrows):
-            # xlrd 把所有数字读成 float，整数会显示成 "1.0" —— 归一化成 "1"
-            values = [_cell_text(v) for v in sheet.row_values(row_index)]
+            # xlrd 把所有数字读成 float，整数会显示成 "1.0" —— 归一化成 "1"；
+            # 日期格式单元格按 XL_CELL_DATE 转可读日期（与 xlsx 同口径）。
+            values = []
+            for col_index in range(sheet.ncols):
+                cell = sheet.cell(row_index, col_index)
+                if cell.ctype == xlrd.XL_CELL_DATE:
+                    try:
+                        values.append(
+                            xlrd.xldate_as_datetime(cell.value, book.datemode).strftime("%Y-%m-%d")
+                        )
+                    except Exception:
+                        values.append(_cell_text(cell.value))
+                else:
+                    values.append(_cell_text(cell.value))
+            values = _convert_date_serials_in_header(values)
             if not any(values):
                 if buf:
                     blocks.append(buf)
