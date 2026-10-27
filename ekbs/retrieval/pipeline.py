@@ -648,12 +648,31 @@ class RetrievalPipeline:
                 },
                 "merged_chunk_ids": dense_ids,
             }
+            sparse_top = sparse_scored[: params["sparse_top_k"]]
+            shard_by_chunk: dict[int, str] = {}
+            if sparse_top:
+                ids = [chunk_id for chunk_id, _score in sparse_top]
+                ph = ",".join("?" for _ in ids)
+                with self.db.sync_connect() as conn:
+                    shard_by_chunk = {
+                        int(row["chunk_id"]): str(row["shard_id"])
+                        for row in conn.execute(
+                            f"SELECT chunk_id, shard_id FROM ekbs_chunk WHERE chunk_id IN ({ph})",
+                            ids,
+                        )
+                    }
             result.stage_debug["sparse"] = {
                 "requested_top_k": params["sparse_top_k"],
                 "variants": variants,
                 "hits": [
-                    {"chunk_id": chunk_id, "score": round(score, 6)}
-                    for chunk_id, score in sparse_scored[: params["sparse_top_k"]]
+                    {
+                        "chunk_id": chunk_id,
+                        # 前端列名是 BM25 分数；同时保留 score 兼容旧调试台契约
+                        "bm25": round(score, 6),
+                        "score": round(score, 6),
+                        "shard_id": shard_by_chunk.get(int(chunk_id)),
+                    }
+                    for chunk_id, score in sparse_top
                 ],
             }
             result.stage_debug["figure_mm"] = {

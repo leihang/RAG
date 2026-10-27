@@ -52,6 +52,8 @@ function ParamsCard({ params }: { params: StageParams }) {
 function DenseCard({ dense }: { dense: NonNullable<DebugStages['dense']> }) {
   const [expanded, setExpanded] = useState(false)
   const total = dense.perShard.reduce((sum, shard) => sum + shard.hits.length, 0)
+  // 只渲染有命中的分片：没有任何向量的分片在调试台里是一块空卡片，只会造成误导。
+  const visibleShards = dense.perShard.filter((shard) => shard.hits.length > 0)
   return (
     <Card
       size="small"
@@ -67,11 +69,11 @@ function DenseCard({ dense }: { dense: NonNullable<DebugStages['dense']> }) {
         </Typography.Text>
       }
     >
-      {dense.perShard.length === 0 ? (
+      {visibleShards.length === 0 ? (
         <EmptyState description="本次没有分片级向量命中明细" />
       ) : (
         <>
-          {dense.perShard.map((shard) => (
+          {visibleShards.map((shard) => (
             <ShardHits key={shard.shard_id} shard={shard} expanded={expanded} />
           ))}
           <ExpandHint total={total} expanded={expanded} onToggle={() => setExpanded((v) => !v)} />
