@@ -161,3 +161,33 @@ def test_header_row_not_first_uses_numeric_contrast() -> None:
     text = blocks[0]
     assert "相关表头: 项目 | 数量 | 金额" in text
     assert "项目=A; 数量=100; 金额=200" in text
+
+
+def test_xlsx_merged_header_inherits_master(tmp_path) -> None:
+    """表头行里的横向合并单元格：从格应继承主格文字，不出现 列N 占位。"""
+    from openpyxl import Workbook
+    from ekbs.ingest.parser import parse_file
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "检查表"
+    ws.merge_cells("A1:B1")
+    ws["A1"] = "审核意见"
+    ws["C1"] = "日期"
+    ws["A2"] = "营运部"
+    ws["B2"] = "合格"
+    ws["C2"] = "2026-10-01"
+    path = tmp_path / "merged.xlsx"
+    wb.save(path)
+    doc = parse_file(path)
+    tables = doc.tables
+    assert tables
+    blocks = serialize_table_body(caption=tables[0].caption, body=tables[0].body)
+    text = blocks[0]
+    assert "审核意见" in text
+    assert "列2" not in text.split("相关表头:", 1)[1].split("\n", 1)[0]
+
+
+def test_single_row_table_does_not_crash_header_scan() -> None:
+    blocks = serialize_information_blocks(caption="单行", rows=[["只有一行"]])
+    assert blocks and "只有一行" in blocks[0]

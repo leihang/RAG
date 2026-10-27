@@ -153,7 +153,9 @@ def _pick_header_index(matrix: Sequence[Sequence[str]]) -> int:
     找不到时退回第 1 行（保持原行为）。
     """
     n = len(matrix)
-    scan = min(4, max(1, n - 1))
+    if n < 2:
+        return 0
+    scan = min(4, n - 1)
     for k in range(scan):
         row = [str(c).strip() for c in matrix[k]]
         nonempty = [c for c in row if c]

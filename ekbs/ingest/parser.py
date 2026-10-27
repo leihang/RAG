@@ -630,6 +630,46 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
     )
 
 
+def _fill_xlsx_merged_header(
+    sheet: Any,
+    rows_with_nums: list[tuple[int, list[str]]],
+    header_row: int,
+) -> None:
+    """把表头行里的合并单元格主格文字继承到从格（RAGFlow 同口径）。
+
+    只填与 header_row 相交的合并区；不碰正文行，避免合并标题/字段被复制到整行。
+    """
+    try:
+        from openpyxl.utils import range_boundaries
+
+        ranges = list(sheet.merged_cells.ranges)
+    except Exception:
+        return
+    index = {row_number: i for i, (row_number, _values) in enumerate(rows_with_nums)}
+    for merged in ranges:
+        min_col, min_row, max_col, max_row = range_boundaries(str(merged))
+        if not (min_row <= header_row <= max_row):
+            continue
+        master = sheet.cell(min_row, min_col).value
+        if master is None:
+            continue
+        text = str(master).strip()
+        if not text:
+            continue
+        for row_number in range(min_row, max_row + 1):
+            idx = index.get(row_number)
+            if idx is None:
+                continue
+            values = rows_with_nums[idx][1]
+            width = max_col
+            if len(values) < width:
+                values.extend([""] * (width - len(values)))
+            for col in range(min_col, max_col + 1):
+                pos = col - 1
+                if not values[pos]:
+                    values[pos] = text
+
+
 def _parse_xlsx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
     """`.xlsx` —— 工作表 → 表格块；嵌入图片（``sheet._images`` / ``xl/media``）→ figure。
 
@@ -652,21 +692,21 @@ def _parse_xlsx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
         lines.append(f"## {sheet.title}")
         # 一个 sheet 可能是"表单 + 多个表段"（商户撤场清算表就是典型）：
         # 先按空行切连续块，再逐块序列化，不能把整个 sheet 硬当成一张表。
-        blocks: list[list[list[str]]] = []
-        buf: list[list[str]] = []
-        for row in sheet.iter_rows(values_only=True):
+        blocks: list[list[tuple[int, list[str]]]] = []
+        buf: list[tuple[int, list[str]]] = []
+        for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
             values = ["" if cell is None else str(cell).strip() for cell in row]
             if not any(v for v in values):
                 if buf:
                     blocks.append(buf)
                     buf = []
                 continue
-            buf.append(values)
+            buf.append((row_number, values))
         if buf:
             blocks.append(buf)
         # 单行块通常是标题行：并到下一块，避免产出只有标题的“表”
-        merged_blocks: list[list[list[str]]] = []
-        pending: list[list[str]] = []
+        merged_blocks: list[list[tuple[int, list[str]]]] = []
+        pending: list[tuple[int, list[str]]] = []
         for block in blocks:
             if len(block) == 1 and not pending:
                 pending = block
@@ -675,7 +715,38 @@ def _parse_xlsx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
             pending = []
         if pending:
             merged_blocks.append(pending)
-        for block_index, rows in enumerate(merged_blocks, start=1):
+
+        # ListObject（Excel 内建表）直接给出表头/数据范围；没有时用结构启发式。
+        table_header_rows: list[int] = []
+        try:
+            from openpyxl.utils import range_boundaries
+
+            for tbl in (getattr(sheet, "tables", {}) or {}).values():
+                try:
+                    table_header_rows.append(int(range_boundaries(tbl.ref)[1]))
+                except Exception:
+                    continue
+        except Exception:
+            table_header_rows = []
+
+        from ekbs.ingest.table_serialize import _looks_like_form, _pick_header_index
+
+        for block_index, rows_with_nums in enumerate(merged_blocks, start=1):
+            rows = [values for _n, values in rows_with_nums]
+            row_nums = [n for n, _values in rows_with_nums]
+            form_like = _looks_like_form(rows)
+            header_abs: int | None = None
+            if not form_like:
+                in_block = [n for n in table_header_rows if n in row_nums]
+                if in_block:
+                    header_abs = in_block[0]
+                else:
+                    idx = _pick_header_index(rows)
+                    if 0 <= idx < len(row_nums):
+                        header_abs = row_nums[idx]
+            if header_abs is not None:
+                _fill_xlsx_merged_header(sheet, rows_with_nums, header_abs)
+                rows = [values for _n, values in rows_with_nums]
             body = _rows_to_pipe_markdown(rows)
             if not body:
                 continue
