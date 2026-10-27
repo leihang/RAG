@@ -539,8 +539,9 @@ class StreamMessageHandler:
             "question": message.text,
             "stream": False,
             "conversation_id": message.conversation_id or None,
-            # 钉钉默认 auto：数字题走取数+抄写校验，制度解释仍走 prose（见 qa.auto_numeric）
+            # 钉钉 auto；重复提问时忽略该问题的旧回答，避免修复后仍被旧单值答案带偏
             "mode": "auto",
+            "fresh_on_repeat": True,
         }
         return await self._api_request(
             "POST", "/api/v1/qa/chat", user_id=user_id, json_body=body

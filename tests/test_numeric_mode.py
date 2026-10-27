@@ -630,3 +630,17 @@ def test_verify_scope_accepts_doc_title_and_page_prefix() -> None:
     answer = NumericAnswer(value=17462, quote="2月 17462",
                            scope="2026年9月能耗分析（第 8 页） 燃气分析（第2段） 2026")
     assert verify_scope(answer, [chunk], 1) is True
+
+
+def test_repeated_question_drops_old_answer_from_history() -> None:
+    from ekbs.retrieval.pipeline import RetrievalPipeline
+    messages = [
+        {"role": "user", "content": "2月锅炉用气量是多少"},
+        {"role": "assistant", "content": "2026年2月 17462 m³"},
+        {"role": "user", "content": "别的"},
+        {"role": "assistant", "content": "x"},
+    ]
+    trimmed = RetrievalPipeline._drop_repeated_question_history(messages, "2月锅炉用气量是多少？")
+    assert trimmed == []
+    trimmed2 = RetrievalPipeline._drop_repeated_question_history(messages, "别的")
+    assert len(trimmed2) == 2

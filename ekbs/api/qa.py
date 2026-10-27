@@ -49,6 +49,8 @@ class QaRequest(BaseModel):
     #: 作答模式：``auto``（默认，按意图路由）| ``prose`` | ``numeric``。
     #: 取数见 ekbs/retrieval/numeric.py；``qa.auto_numeric`` 控制 auto 是否进取数。
     mode: str = Field(default="auto", pattern="^(auto|prose|numeric)$")
+    #: 长会话入口（钉钉）重复提问时，忽略历史里该问题的旧回答，避免旧答案污染
+    fresh_on_repeat: bool = False
 
 
 class RetrieveRequest(BaseModel):
@@ -199,6 +201,7 @@ async def qa_chat(
         use_cache=payload.use_cache,
         allow_generation=allow_generation,
         mode=payload.mode,
+        fresh_on_repeat=payload.fresh_on_repeat,
     )
 
     # 审计（append-only；引用只存 hash 与页码）
@@ -351,7 +354,7 @@ async def qa_chat_stream(
     safe_question, allow_generation = _guard_input(runtime, perm, payload.question)
     answer = await runtime.pipeline.answer(
         safe_question, perm, conversation_id=payload.conversation_id, use_cache=False,
-        allow_generation=allow_generation,
+        allow_generation=allow_generation, fresh_on_repeat=payload.fresh_on_repeat,
     )
 
     async def event_stream() -> Any:

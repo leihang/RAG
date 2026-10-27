@@ -1815,6 +1815,23 @@ class RetrievalPipeline:
             )
         return citations
 
+    @staticmethod
+    def _drop_repeated_question_history(
+        messages: list[dict[str, Any]], question: str
+    ) -> list[dict[str, Any]]:
+        """同一问题重复问时，丢掉历史里该问题的旧问答，避免旧回答把模型带偏。"""
+        def norm(text: Any) -> str:
+            return re.sub(r"\s+|[，。；：,.;:!?！？]", "", str(text or ""))
+
+        target = norm(question)
+        if not target:
+            return messages
+        for i in range(len(messages) - 1, -1, -1):
+            item = messages[i]
+            if str(item.get("role")) == "user" and norm(item.get("content")) == target:
+                return messages[:i]
+        return messages
+
     async def answer(
         self,
         question: str,
@@ -1827,6 +1844,7 @@ class RetrievalPipeline:
         overrides: RetrievalOverrides | None = None,
         collect_debug: bool = False,
         mode: str = MODE_AUTO,
+        fresh_on_repeat: bool = False,
     ) -> AnswerResult:
         """检索 + 生成的一条龙（供 API 与钉钉适配器调用）。
 
@@ -1849,6 +1867,10 @@ class RetrievalPipeline:
             messages = await asyncio.to_thread(
                 self.sessions.load, conversation_id, perm.dingtalk_userid
             )
+        # 重复问题：钉钉等长会话入口可要求不让该问题的旧回答参与本轮生成
+        # （修复后重问/换模式场景）；默认保留历史，以兼容“同一会话追问”的缓存契约。
+        if fresh_on_repeat:
+            messages = self._drop_repeated_question_history(messages, question)
 
         # ② 查询改写（00 §2.1 的第一步）；改写后的查询才是检索输入
         rewrite = await self._rewrite(question, messages)
