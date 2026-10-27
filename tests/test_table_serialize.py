@@ -147,3 +147,17 @@ def test_two_row_header_is_merged() -> None:
     assert "审核人及部门负责人签字/营运部经办人签字" in text
     assert "部门=营运部; 清算明细=①货品撤场日" in text
     assert "检查结果=合格" in text
+
+
+def test_header_row_not_first_uses_numeric_contrast() -> None:
+    """首行是元数据、第二行才是表头：用"文字下方是数字"的对比信号找表头。"""
+    rows = [
+        ["填报单位", "工程部", ""],
+        ["项目", "数量", "金额"],
+        ["A", "100", "200"],
+        ["B", "300", "400"],
+    ]
+    blocks = serialize_information_blocks(caption="统计表", rows=rows)
+    text = blocks[0]
+    assert "相关表头: 项目 | 数量 | 金额" in text
+    assert "项目=A; 数量=100; 金额=200" in text

@@ -136,6 +136,44 @@ def _looks_like_form(matrix: Sequence[Sequence[str]]) -> bool:
     return len(colon) >= 2 or (len(colon) >= 1 and len(nonempty) >= 3)
 
 
+_NUMERIC_CELL_RE = re.compile(r"^[\$\+\-]?[\d,]+(\.\d+)?%?$")
+
+
+def _is_numeric_cell(value: str) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and bool(_NUMERIC_CELL_RE.match(text))
+
+
+def _pick_header_index(matrix: Sequence[Sequence[str]]) -> int:
+    """在开头最多 4 行里找表头（借鉴 RAGFlow 的 contrast 信号）。
+
+    - 少于 2 个非空格的标题/分节行跳过；
+    - 非空单元格一半以上是数字的行是数据行，跳过；
+    - 某行的文字列下方（下一行同列）出现 >=2 个数字 → 该行更像表头。
+    找不到时退回第 1 行（保持原行为）。
+    """
+    n = len(matrix)
+    scan = min(4, max(1, n - 1))
+    for k in range(scan):
+        row = [str(c).strip() for c in matrix[k]]
+        nonempty = [c for c in row if c]
+        if len(nonempty) < 2:
+            continue
+        numeric = sum(1 for c in nonempty if _is_numeric_cell(c))
+        if numeric and numeric * 2 >= len(nonempty):
+            continue
+        below = [str(c).strip() for c in matrix[k + 1]]
+        contrast = 0
+        for i, value in enumerate(row):
+            if not value or _is_numeric_cell(value):
+                continue
+            if i < len(below) and _is_numeric_cell(below[i]):
+                contrast += 1
+        if contrast >= 2:
+            return k
+    return 0
+
+
 def serialize_information_blocks(
     *,
     caption: str = "",
@@ -170,26 +208,26 @@ def serialize_information_blocks(
         base = caption.strip()
         caption = f"{base}（{title_text}）" if base else title_text
 
-    def merge_header_rows() -> tuple[list[str], list[list[str]]]:
+    def merge_header_rows_from(rows: Sequence[Sequence[str]]) -> tuple[list[str], list[list[str]]]:
         """两行表头（如 审核意见 / 检查结果、日期、金额）合并成 "父/子"。"""
-        if len(matrix) < 2:
-            return [str(c).strip() or f"列{i+1}" for i, c in enumerate(matrix[0])], []
-        top = [str(c).strip() for c in matrix[0]]
-        sub = [str(c).strip() for c in matrix[1]]
+        if len(rows) < 2:
+            return [str(c).strip() or f"列{i+1}" for i, c in enumerate(rows[0])], []
+        top = [str(c).strip() for c in rows[0]]
+        sub = [str(c).strip() for c in rows[1]]
         width = max(len(top), len(sub))
         top += [""] * (width - len(top))
         sub += [""] * (width - len(sub))
         # 仅当第一行有空列、第二行恰好补上这些列时，才认为是两行表头
         filled = [i for i, c in enumerate(sub) if c]
         if not top or not any(not top[i] and sub[i] for i in filled):
-            return [h or f"列{i+1}" for i, h in enumerate(top)], matrix[1:]
+            return [h or f"列{i+1}" for i, h in enumerate(top)], list(rows[1:])
         headers = []
         for i in range(width):
             if top[i] and sub[i] and top[i] != sub[i]:
                 headers.append(f"{top[i]}/{sub[i]}")
             else:
                 headers.append(top[i] or sub[i] or f"列{i+1}")
-        return headers, matrix[2:]
+        return headers, list(rows[2:])
 
     form_like = _looks_like_form(matrix)
     if form_like:
@@ -197,7 +235,10 @@ def serialize_information_blocks(
         headers = [f"列{i + 1}" for i in range(max(len(r) for r in matrix))]
         data_rows = matrix
     else:
-        headers, data_rows = merge_header_rows()
+        header_index = _pick_header_index(matrix)
+        before_header = matrix[:header_index]
+        headers, data_rows = merge_header_rows_from(matrix[header_index:])
+        data_rows = [*before_header, *data_rows]
         # 无表头只有一行时：整行当数据，用列序号作表头
         if not data_rows:
             data_rows = [matrix[0]]
