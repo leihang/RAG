@@ -11,4 +11,5 @@ respx==0.21.1
 deepdiff==8.0.1
 ruff==0.17.2
 mypy==2.4.0
+xlwt==1.3.0
 pre-commit==4.7.0
