@@ -31,9 +31,8 @@ filterwarnings = ["ignore::DeprecationWarning"]
 target-version = "py311"
 line-length = 120
 # 只查 Python；文档里的示例代码块按"示意"处理，不当可运行代码要求
-# excel_rag / excel_rag_parser 是独立交付物（原型 / 独立 pip 包，各有自己的测试与配置），
-# 不纳入 EKBS 的 CI 门禁。
-extend-exclude = ["*.md", "var", "var-cloud", "excel_rag", "excel_rag_parser"]
+# excel_rag_parser 是独立 pip 包（有自己的测试与配置），不纳入 EKBS 的 CI 门禁。
+extend-exclude = ["*.md", "var", "var-cloud", "excel_rag_parser"]
 
 [tool.ruff.lint]
 # 先只开「零争议」规则：语法错误 / 未定义名 / 未使用 import·变量 / 重复定义。
