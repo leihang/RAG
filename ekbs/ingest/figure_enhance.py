@@ -62,11 +62,13 @@ def enhance_figure_image(
     ink = 255.0 - g
 
     if meta.kind == "blank":
-        # 仍做一次抬升，避免「完全看不见」；并标 blank
-        mx = float(ink.max()) or 1.0
+        # 仍做一次抬升，避免「完全看不见」；并标 blank。
+        # 用 np.max(..., initial=0.0) 而非 ink.max()：后者走 numpy 的 _NoValue sentinel，
+        # 在 coverage 等重入场景下 C 层会把 sentinel 当数值 float() 而抛 TypeError。
+        mx = float(np.max(ink, initial=0.0)) or 1.0
         m = np.power(np.clip(ink / mx, 0, 1), 0.5)
     elif meta.kind == "faint":
-        mx = float(ink.max()) or 1.0
+        mx = float(np.max(ink, initial=0.0)) or 1.0
         mask = np.power(np.clip(ink / mx, 0, 1), 0.35)
         bin_im = Image.fromarray((mask * 255).astype("uint8"), mode="L")
         bin_im = bin_im.point(lambda x: 255 if x > 18 else 0)
