@@ -60,3 +60,15 @@ files = [
     "ekbs/retrieval/intent.py",
     "ekbs/retrieval/rrf.py",
 ]
+
+[tool.coverage.run]
+# 覆盖率门禁只统计 ekbs/ 主包（excel_rag_parser 是独立包，不在 EKBS CI 内）。
+source = ["ekbs"]
+branch = false
+
+[tool.coverage.report]
+# 覆盖率棘轮：只防退步，不追高。全量基线 81%（19440 语句），留 3pp 缓冲吸收
+# 环境差异 / 可选依赖跳过用例。改用例后如需上调，先跑 `bash scripts/ci.sh --coverage` 看实际值。
+fail_under = 78
+show_missing = true
+skip_covered = false

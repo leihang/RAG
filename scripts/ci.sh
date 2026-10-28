@@ -2,13 +2,16 @@
 # scripts/ci.sh —— 本地 CI 门禁（与远端 CI 同口径）
 #
 # 跑什么：
-#   ① ruff check .              静态检查（配置在 pyproject.toml）
-#   ② pytest tests/             全量离线用例（约 85s）
+#   ⓪ 环境检查（python / ruff / mypy）
+#   ① ruff check .              静态检查（配置在 pyproject.toml，含 C901 棘轮）
+#   ①.5 mypy                    类型检查（白名单见 pyproject [tool.mypy].files）
+#   ② pytest tests/             全量离线用例（默认含覆盖率门禁，约 140s；--no-coverage 约 85s）
 #   ③ 管理台前端 typecheck / vitest / build（有 node_modules 才跑）
 #
 # 用法：
-#   bash scripts/ci.sh                # 全跑
+#   bash scripts/ci.sh                # 全跑（含覆盖率门禁）
 #   bash scripts/ci.sh --no-frontend  # 跳过前端（无 node_modules 时也会自动跳过）
+#   bash scripts/ci.sh --no-coverage  # 跳过覆盖率门禁（只求快时用；阈值见 pyproject [tool.coverage.report]）
 #
 # 退出码：0 = 全绿；1 = 有 FAIL；2 = 参数错误。
 set -uo pipefail
@@ -21,12 +24,14 @@ RUFF="$ROOT/.venv/bin/ruff"
 MYPY="$ROOT/.venv/bin/mypy"
 WEB="$ROOT/ekbs-admin-web"
 RUN_FRONTEND=1
+RUN_COVERAGE=1
 
 for arg in "$@"; do
   case "$arg" in
     --no-frontend) RUN_FRONTEND=0 ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
-    *) echo "未知参数：${arg}（用法：bash scripts/ci.sh [--no-frontend]）"; exit 2 ;;
+    --no-coverage) RUN_COVERAGE=0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    *) echo "未知参数：${arg}（用法：bash scripts/ci.sh [--no-frontend] [--no-coverage]）"; exit 2 ;;
   esac
 done
 
@@ -50,7 +55,16 @@ if [ "$FAIL" -eq 0 ]; then
 
   stage "2. 契约测试（pytest，离线）"
   # 注意：不要再传 -q —— pyproject 的 addopts 已有 -q，双 quiet 会吞掉汇总行
-  if "$PY" -m pytest tests/; then ok "pytest 全绿"; else bad "pytest 未全绿"; fi
+  if [ "$RUN_COVERAGE" -eq 1 ]; then
+    echo "（附带覆盖率门禁：fail_under 见 pyproject [tool.coverage.report]）"
+    if "$PY" -m pytest tests/ --cov=ekbs --cov-report=term-missing; then
+      ok "pytest 全绿（覆盖率达标）"
+    else
+      bad "pytest 未全绿或覆盖率未达标"
+    fi
+  else
+    if "$PY" -m pytest tests/; then ok "pytest 全绿"; else bad "pytest 未全绿"; fi
+  fi
 fi
 
 if [ "$RUN_FRONTEND" -eq 0 ]; then
