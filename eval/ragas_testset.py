@@ -79,7 +79,7 @@ def _sample_docs(limit_docs: int, seed: int) -> list[dict]:
     return picked
 
 
-def main() -> int:
+def main() -> int:  # noqa: C901 - 一次性评测脚本（argparse + 生成循环）
     parser = argparse.ArgumentParser()
     parser.add_argument("--size", type=int, default=20, help="生成题数")
     parser.add_argument("--docs", type=int, default=30, help="抽样文档数")

@@ -186,6 +186,104 @@ def _page_coverage_chars(
     return coverage
 
 
+def _visual_page_set(chunks: Sequence[Mapping[str, Any]]) -> set[int]:
+    """「有图 / 有表」的页不算空页：正文短不等于没内容。
+
+    PPT 的章节过渡页、扫描件的插图页都是这一类（实测 doc 33/41 的闸门假警报全来自这里）。
+    """
+    visual: set[int] = set()
+    for row in chunks:
+        if str(row.get("chunk_type") or "") not in ("figure", "table"):
+            continue
+        pf = row.get("page_from")
+        if pf is None:
+            continue
+        pt = row.get("page_to")
+        start = int(pf)
+        end = int(pt) if pt is not None else start
+        if end < start:
+            start, end = end, start
+        visual.update(range(start, end + 1))
+    return visual
+
+
+def _page_metrics(
+    chunks: Sequence[Mapping[str, Any]], coverage: Mapping[int, int], thr: Thresholds,
+) -> dict[str, Any]:
+    visual = _visual_page_set(chunks)
+    page_min = min(coverage)
+    page_max = max(coverage)
+    empty_pages = sum(
+        1
+        for page, chars in coverage.items()
+        if chars < thr.empty_page_char_threshold and page not in visual
+    )
+    expected = set(range(page_min, page_max + 1))
+    missing = sorted(expected - set(coverage))
+    return {
+        "page_min": page_min,
+        "page_max": page_max,
+        "visual": visual,
+        "empty_pages": empty_pages,
+        "missing": missing,
+        "continuity_ok": not missing,
+    }
+
+
+def _append_quality_warnings(
+    report: ParseQuality,
+    *,
+    continuity_ok: bool,
+    pages_applicable: bool,
+    missing: list[int],
+    slide_based: bool,
+    empty_ok: bool | None,
+    empty_rate: float,
+    empty_pages: int,
+    coverage: Mapping[int, int],
+    visual_page_set: set[int],
+    lost_pages: list[int],
+    source_page_count: int | None,
+    garbled_ok: bool,
+    rate: float,
+    bad: int,
+    total: int,
+    table_ok: bool | None,
+    table_rate: float | None,
+    table_nonempty: int,
+    table_count: int,
+    thr: Thresholds,
+) -> None:
+    if not continuity_ok and pages_applicable:
+        report.warnings.append(
+            f"页码不连续：缺失 {missing[:20]}{'…' if len(missing) > 20 else ''}（WARN，不阻断）"
+        )
+    if slide_based:
+        report.warnings.append(
+            "幻灯片类文档（.ppt/.pptx）：空页率**不作准出**（该指标为页面型文档设计）；"
+            "请改看零产出页与图表抽取情况"
+        )
+    if empty_ok is False:
+        report.warnings.append(
+            f"空页率 {empty_rate:.2%} > {thr.empty_page_rate_max:.0%}"
+            f"（空页 {empty_pages}/{len(coverage)}；已排除只有图/表的页 {len(visual_page_set & set(coverage))} 页）"
+        )
+    if lost_pages:
+        report.warnings.append(
+            f"零产出页 {len(lost_pages)}/{source_page_count}：{lost_pages[:20]}"
+            " —— 这些页**一个块都没有**，可能是源文件空白页，也可能是解析丢失，需对源文件核"
+            "（WARN，不阻断）"
+        )
+    if not garbled_ok:
+        report.warnings.append(
+            f"乱码率 {rate:.2%} > {thr.garbled_rate_max:.1%}（U+FFFD {bad}/{total}）"
+        )
+    if table_ok is False:
+        report.warnings.append(
+            f"表格存活率 {table_rate:.2%} < {thr.table_survival_min:.0%}（非空 {table_nonempty}/{table_count}）"
+        )
+
+
 def assess_parse_quality(
     *,
     doc_id: int,
@@ -210,30 +308,13 @@ def assess_parse_quality(
     continuity_ok = True
     visual_page_set: set[int] = set()
     if pages_applicable:
-        page_min = min(coverage)
-        page_max = max(coverage)
-        # 「有图 / 有表」的页不算空页：正文短不等于没内容。
-        # PPT 的章节过渡页、扫描件的插图页都是这一类（实测 doc 33/41 的闸门假警报全来自这里）。
-        for row in chunks:
-            if str(row.get("chunk_type") or "") not in ("figure", "table"):
-                continue
-            pf = row.get("page_from")
-            if pf is None:
-                continue
-            pt = row.get("page_to")
-            start = int(pf)
-            end = int(pt) if pt is not None else start
-            if end < start:
-                start, end = end, start
-            visual_page_set.update(range(start, end + 1))
-        empty_pages = sum(
-            1
-            for page, chars in coverage.items()
-            if chars < thr.empty_page_char_threshold and page not in visual_page_set
-        )
-        expected = set(range(page_min, page_max + 1))
-        missing = sorted(expected - set(coverage))
-        continuity_ok = not missing
+        metrics = _page_metrics(chunks, coverage, thr)
+        page_min = metrics["page_min"]
+        page_max = metrics["page_max"]
+        visual_page_set = metrics["visual"]
+        empty_pages = metrics["empty_pages"]
+        missing = metrics["missing"]
+        continuity_ok = metrics["continuity_ok"]
 
     empty_rate = (empty_pages / len(coverage)) if coverage else 0.0
 
@@ -301,34 +382,29 @@ def assess_parse_quality(
         "table_survival_ok": table_ok,
         "page_continuity_ok": continuity_ok if pages_applicable else None,
     }
-    if not continuity_ok and pages_applicable:
-        report.warnings.append(
-            f"页码不连续：缺失 {missing[:20]}{'…' if len(missing) > 20 else ''}（WARN，不阻断）"
-        )
-    if slide_based:
-        report.warnings.append(
-            "幻灯片类文档（.ppt/.pptx）：空页率**不作准出**（该指标为页面型文档设计）；"
-            "请改看零产出页与图表抽取情况"
-        )
-    if empty_ok is False:
-        report.warnings.append(
-            f"空页率 {empty_rate:.2%} > {thr.empty_page_rate_max:.0%}"
-            f"（空页 {empty_pages}/{len(coverage)}；已排除只有图/表的页 {len(visual_page_set & set(coverage))} 页）"
-        )
-    if lost_pages:
-        report.warnings.append(
-            f"零产出页 {len(lost_pages)}/{source_page_count}：{lost_pages[:20]}"
-            " —— 这些页**一个块都没有**，可能是源文件空白页，也可能是解析丢失，需对源文件核"
-            "（WARN，不阻断）"
-        )
-    if not garbled_ok:
-        report.warnings.append(
-            f"乱码率 {rate:.2%} > {thr.garbled_rate_max:.1%}（U+FFFD {bad}/{total}）"
-        )
-    if table_ok is False:
-        report.warnings.append(
-            f"表格存活率 {table_rate:.2%} < {thr.table_survival_min:.0%}（非空 {table_nonempty}/{table_count}）"
-        )
+    _append_quality_warnings(
+        report,
+        continuity_ok=continuity_ok,
+        pages_applicable=pages_applicable,
+        missing=missing,
+        slide_based=slide_based,
+        empty_ok=empty_ok,
+        empty_rate=empty_rate,
+        empty_pages=empty_pages,
+        coverage=coverage,
+        visual_page_set=visual_page_set,
+        lost_pages=lost_pages,
+        source_page_count=source_page_count,
+        garbled_ok=garbled_ok,
+        rate=rate,
+        bad=bad,
+        total=total,
+        table_ok=table_ok,
+        table_rate=table_rate,
+        table_nonempty=table_nonempty,
+        table_count=table_count,
+        thr=thr,
+    )
     return report
 
 

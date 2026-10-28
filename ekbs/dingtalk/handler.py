@@ -218,7 +218,7 @@ class StreamMessageHandler:
 
     # ------------------------------------------------------------------
 
-    async def handle(self, data: dict[str, Any]) -> ReplyResult:
+    async def handle(self, data: dict[str, Any]) -> ReplyResult:  # noqa: C901 - 历史债：消息路由巨型函数待拆分
         message = InboundMessage.from_payload(data)
         if message.err_msg or message.msgtype == ERR_CODE_MESSAGE_QUOTA:
             # 官方 20001：钉钉侧消息服务被暂停。此时**重投没有意义**（不是我们的故障），

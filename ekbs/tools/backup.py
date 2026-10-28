@@ -232,30 +232,8 @@ def prune_backups(
 # ---------------------------------------------------------------------------
 
 
-def restore_and_verify(
-    archive_path: Path, target_dir: Path, *, clean: bool = True
-) -> VerifyReport:
-    """把备份解到独立目录并逐项核对（`01` §13 的恢复演练）。"""
-    archive_path = Path(archive_path)
-    report = VerifyReport(archive=str(archive_path), ok=False)
-    if not archive_path.is_file():
-        report.problems.append(f"备份文件不存在：{archive_path}")
-        return report
-
-    if clean and target_dir.exists():
-        shutil.rmtree(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive_path, "r:gz") as tar:
-        tar.extractall(target_dir)  # noqa: S202 - 备份包由本工具生成
-
-    root = target_dir / "ekbs"
-    manifest_path = root / MANIFEST_NAME
-    if not manifest_path.is_file():
-        report.problems.append("备份包缺少 manifest.json")
-        return report
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-
-    # ① 文件完整性（sha256）
+def _verify_manifest_files(root: Path, manifest: dict, report: VerifyReport) -> None:
+    """① 文件完整性（sha256）。"""
     bad_files: list[str] = []
     for name, expected in (manifest.get("files") or {}).items():
         path = root / name
@@ -267,11 +245,12 @@ def restore_and_verify(
     if bad_files:
         report.problems.extend(bad_files)
 
-    # ② 数据库
-    db_path = root / "index" / "ekbs.db"
+
+def _read_db_checks(db_path: Path, report: VerifyReport) -> dict[str, Any] | None:
+    """② 开库读 integrity/表数/触发器/口径版本/分片/消息数。"""
     if not db_path.is_file():
         report.problems.append("备份包缺少 index/ekbs.db")
-        return report
+        return None
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
@@ -299,61 +278,110 @@ def restore_and_verify(
         messages = int(conn.execute("SELECT COUNT(*) FROM ekbs_qa_message").fetchone()[0])
     finally:
         conn.close()
+    return {
+        "integrity": integrity,
+        "tables": tables,
+        "triggers": triggers,
+        "policy_version": policy_version,
+        "live_shards": live_shards,
+        "messages": messages,
+    }
 
+
+def _compare_db_checks(manifest: dict, checks: dict[str, Any], report: VerifyReport) -> None:
     report.checks.update(
-        integrity=integrity,
-        tables=tables,
-        triggers=triggers,
-        policy_version=policy_version,
-        shards_in_db=len(live_shards),
-        audit_messages=messages,
+        integrity=checks["integrity"],
+        tables=checks["tables"],
+        triggers=checks["triggers"],
+        policy_version=checks["policy_version"],
+        shards_in_db=len(checks["live_shards"]),
+        audit_messages=checks["messages"],
     )
-    if integrity != "ok":
-        report.problems.append(f"integrity_check = {integrity}")
-    if tables != EXPECTED_TABLES:
-        report.problems.append(f"表数 {tables} ≠ {EXPECTED_TABLES}")
-    if triggers != EXPECTED_TRIGGERS:
-        report.problems.append(f"触发器数 {triggers} ≠ {EXPECTED_TRIGGERS}")
+    if checks["integrity"] != "ok":
+        report.problems.append(f"integrity_check = {checks['integrity']}")
+    if checks["tables"] != EXPECTED_TABLES:
+        report.problems.append(f"表数 {checks['tables']} ≠ {EXPECTED_TABLES}")
+    if checks["triggers"] != EXPECTED_TRIGGERS:
+        report.problems.append(f"触发器数 {checks['triggers']} ≠ {EXPECTED_TRIGGERS}")
     expected_policy = (manifest.get("schema") or {}).get("policy_version")
-    if expected_policy is not None and policy_version != expected_policy:
-        report.problems.append(f"policy_version {policy_version} ≠ manifest {expected_policy}")
+    if expected_policy is not None and checks["policy_version"] != expected_policy:
+        report.problems.append(
+            f"policy_version {checks['policy_version']} ≠ manifest {expected_policy}"
+        )
 
-    # ③ FAISS 分片：能读、dim/ntotal 与 manifest 一致（这就是 RTO 演练的核心动作）
+
+def _verify_one_shard(faiss: Any, root: Path, shard: dict, report: VerifyReport) -> dict[str, Any]:
+    path = root / str(shard["file"])
+    entry: dict[str, Any] = {"shard_id": shard["shard_id"], "ok": True}
+    try:
+        index = faiss.read_index(str(path))
+    except Exception as exc:
+        entry.update(ok=False, error=f"{type(exc).__name__}: {exc}")
+        report.problems.append(f"{shard['shard_id']} 索引读取失败")
+        return entry
+    entry.update(dim=int(index.d), ntotal=int(index.ntotal))
+    if int(index.d) != int(shard["dim"]):
+        entry["ok"] = False
+        report.problems.append(
+            f"{shard['shard_id']} dim {index.d} ≠ manifest {shard['dim']}"
+        )
+    if int(index.ntotal) != int(shard["vector_count"]):
+        # 陈旧向量会让 ntotal 大于登记值（见 changes.py 的迁移说明），
+        # 只有「少于」才是真问题：说明索引丢了向量。
+        if int(index.ntotal) < int(shard["vector_count"]):
+            entry["ok"] = False
+            report.problems.append(
+                f"{shard['shard_id']} ntotal {index.ntotal} < manifest "
+                f"{shard['vector_count']}（索引丢向量）"
+            )
+        else:
+            entry["stale_vectors"] = int(index.ntotal) - int(shard["vector_count"])
+    return entry
+
+
+def _verify_shards(root: Path, manifest: dict, report: VerifyReport) -> None:
+    """③ FAISS 分片：能读、dim/ntotal 与 manifest 一致（这就是 RTO 演练的核心动作）。"""
     shard_checks: list[dict[str, Any]] = []
     try:
         import faiss
-
-        for shard in manifest.get("shards") or []:
-            path = root / str(shard["file"])
-            entry: dict[str, Any] = {"shard_id": shard["shard_id"], "ok": True}
-            try:
-                index = faiss.read_index(str(path))
-            except Exception as exc:
-                entry.update(ok=False, error=f"{type(exc).__name__}: {exc}")
-                report.problems.append(f"{shard['shard_id']} 索引读取失败")
-                shard_checks.append(entry)
-                continue
-            entry.update(dim=int(index.d), ntotal=int(index.ntotal))
-            if int(index.d) != int(shard["dim"]):
-                entry["ok"] = False
-                report.problems.append(
-                    f"{shard['shard_id']} dim {index.d} ≠ manifest {shard['dim']}"
-                )
-            if int(index.ntotal) != int(shard["vector_count"]):
-                # 陈旧向量会让 ntotal 大于登记值（见 changes.py 的迁移说明），
-                # 只有「少于」才是真问题：说明索引丢了向量。
-                if int(index.ntotal) < int(shard["vector_count"]):
-                    entry["ok"] = False
-                    report.problems.append(
-                        f"{shard['shard_id']} ntotal {index.ntotal} < manifest "
-                        f"{shard['vector_count']}（索引丢向量）"
-                    )
-                else:
-                    entry["stale_vectors"] = int(index.ntotal) - int(shard["vector_count"])
-            shard_checks.append(entry)
     except ImportError:  # pragma: no cover - 环境缺少 faiss
         report.problems.append("faiss 不可用，无法校验分片索引")
+        report.checks["shards"] = shard_checks
+        return
+    for shard in manifest.get("shards") or []:
+        shard_checks.append(_verify_one_shard(faiss, root, shard, report))
     report.checks["shards"] = shard_checks
+
+
+def restore_and_verify(
+    archive_path: Path, target_dir: Path, *, clean: bool = True
+) -> VerifyReport:
+    """把备份解到独立目录并逐项核对（`01` §13 的恢复演练）。"""
+    archive_path = Path(archive_path)
+    report = VerifyReport(archive=str(archive_path), ok=False)
+    if not archive_path.is_file():
+        report.problems.append(f"备份文件不存在：{archive_path}")
+        return report
+
+    if clean and target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path, "r:gz") as tar:
+        tar.extractall(target_dir)  # noqa: S202 - 备份包由本工具生成
+
+    root = target_dir / "ekbs"
+    manifest_path = root / MANIFEST_NAME
+    if not manifest_path.is_file():
+        report.problems.append("备份包缺少 manifest.json")
+        return report
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    _verify_manifest_files(root, manifest, report)
+    checks = _read_db_checks(root / "index" / "ekbs.db", report)
+    if checks is None:
+        return report
+    _compare_db_checks(manifest, checks, report)
+    _verify_shards(root, manifest, report)
 
     report.ok = not report.problems
     log.info("restore_verified", **report.as_dict())

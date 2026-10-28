@@ -85,53 +85,73 @@ def sample_from_chunks(limit: int) -> list[str]:
     return rows
 
 
+def _sample_docx_paragraphs(base: pathlib.Path) -> list[str]:
+    segs: list[str] = []
+    for path in sorted(base.rglob("*.docx")):
+        try:
+            import docx
+
+            for para in docx.Document(str(path)).paragraphs:
+                if len(para.text.strip()) >= 20:
+                    segs.append(para.text.strip())
+        except Exception:  # noqa: BLE001
+            continue
+    return segs
+
+
+def _sample_xlsx_rows(base: pathlib.Path) -> list[str]:
+    segs: list[str] = []
+    for path in sorted(base.rglob("*.xlsx")):
+        try:
+            from openpyxl import load_workbook
+
+            wb = load_workbook(str(path), data_only=True)
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(values_only=True):
+                    line = " | ".join("" if c is None else str(c) for c in row)
+                    if len(line.strip(" |")) >= 20:
+                        segs.append(line.strip(" |"))
+        except Exception:  # noqa: BLE001
+            continue
+    return segs
+
+
+def _sample_pdf_paragraphs(base: pathlib.Path) -> list[str]:
+    """用仓库内 mineru-venv 的 pypdfium2 抽 PDF 文本层；venv 缺失则跳过。"""
+    pdfs = sorted(base.rglob("*.pdf"))
+    if not pdfs:
+        return []
+    reader = (
+        "import json,sys,pypdfium2 as pdfium;"
+        "d=pdfium.PdfDocument(sys.argv[1]);"
+        "print(json.dumps([d[i].get_textpage().get_text_range() for i in range(len(d))]))"
+    )
+    py = pathlib.Path(__file__).resolve().parents[2] / "var" / "mineru-venv/bin/python"
+    segs: list[str] = []
+    for path in pdfs[:3]:
+        if not py.is_file():
+            break
+        out = subprocess.run(
+            [str(py), "-c", reader, str(path)], capture_output=True, text=True, timeout=600
+        )
+        if out.returncode != 0:
+            continue
+        for page_text in json.loads(out.stdout or "[]"):
+            for para in re.split(r"\n\s*\n", str(page_text)):
+                if len(para.strip()) >= 20:
+                    segs.append(para.strip())
+    return segs
+
+
 def sample_from_files(limit: int, source_dirs: list[pathlib.Path]) -> list[str]:
     """语料不足时的替代样本：从源文件抽段落（docx / xlsx / 有文本层 PDF）。"""
     segs: list[str] = []
     for base in source_dirs:
         if not base.is_dir():
             continue
-        for path in sorted(base.rglob("*.docx")):
-            try:
-                import docx
-
-                for para in docx.Document(str(path)).paragraphs:
-                    if len(para.text.strip()) >= 20:
-                        segs.append(para.text.strip())
-            except Exception:  # noqa: BLE001
-                continue
-        for path in sorted(base.rglob("*.xlsx")):
-            try:
-                from openpyxl import load_workbook
-
-                wb = load_workbook(str(path), data_only=True)
-                for ws in wb.worksheets:
-                    for row in ws.iter_rows(values_only=True):
-                        line = " | ".join("" if c is None else str(c) for c in row)
-                        if len(line.strip(" |")) >= 20:
-                            segs.append(line.strip(" |"))
-            except Exception:  # noqa: BLE001
-                continue
-        pdfs = [p for p in sorted(base.rglob("*.pdf"))]
-        if pdfs:
-            reader = (
-                "import json,sys,pypdfium2 as pdfium;"
-                "d=pdfium.PdfDocument(sys.argv[1]);"
-                "print(json.dumps([d[i].get_textpage().get_text_range() for i in range(len(d))]))"
-            )
-            py = pathlib.Path(__file__).resolve().parents[2] / "var" / "mineru-venv/bin/python"
-            for path in pdfs[:3]:
-                if not py.is_file():
-                    break
-                out = subprocess.run(
-                    [str(py), "-c", reader, str(path)], capture_output=True, text=True, timeout=600
-                )
-                if out.returncode != 0:
-                    continue
-                for page_text in json.loads(out.stdout or "[]"):
-                    for para in re.split(r"\n\s*\n", str(page_text)):
-                        if len(para.strip()) >= 20:
-                            segs.append(para.strip())
+        segs.extend(_sample_docx_paragraphs(base))
+        segs.extend(_sample_xlsx_rows(base))
+        segs.extend(_sample_pdf_paragraphs(base))
     segs = [s[:2000] for s in segs]
     if len(segs) > limit:
         step = len(segs) / limit

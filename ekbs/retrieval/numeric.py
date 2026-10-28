@@ -275,6 +275,65 @@ def _normalize_for_match(text: str) -> str:
     return re.sub(r"[\s=:：|]+", "", str(text or ""))
 
 
+def _quote_matches_chunk(
+    answer: NumericAnswer, chunks: Sequence[Any], *, quote_key: str, value: float, rel_tol: float,
+) -> tuple[bool, int | None]:
+    """第一轮：``quote`` 整段出现在某分块里，且该分块有等值数字。"""
+    surfaces = _literal_surfaces(answer.quote)
+    for index, chunk in enumerate(chunks, start=1):
+        content = _normalize_for_match(str(getattr(chunk, "content", "") or ""))
+        if not content or quote_key not in content:
+            continue
+        for surface, literal in surfaces:
+            if abs(literal - value) <= max(rel_tol * max(abs(value), 1.0), 1e-9):
+                answer.surface = surface
+                return True, index
+    return False, None
+
+
+def _picked_number(raw_quote: str, value: float, rel_tol: float) -> Any:
+    """取“数值所在的那个数字”匹配对象；取不到时退回最后一个数字。"""
+    num_matches = list(_NUMBER_TOKEN.finditer(raw_quote))
+    for match in reversed(num_matches):
+        try:
+            literal = float(match.group(0).replace(",", ""))
+        except ValueError:
+            continue
+        if abs(literal - value) <= max(rel_tol * max(abs(value), 1.0), 1e-9):
+            return match
+    return num_matches[-1] if num_matches else None
+
+
+def _line_label_candidates(answer: NumericAnswer, value: float, rel_tol: float) -> list[str]:
+    """行标签候选：数值前的内容 + 首个空白 token（模型常把整行抄进来）。"""
+    raw_quote = re.sub(r"\s+", "", answer.quote or "")
+    picked = _picked_number(raw_quote, value, rel_tol)
+    label = _normalize_for_match(raw_quote[: picked.start()]) if picked else ""
+    label = re.sub(r"[:：=＝]+$", "", label)
+    candidates = [label] if len(label) >= 2 else []
+    first_token = re.split(r"\s+", (answer.quote or "").strip())[0] if (answer.quote or "").strip() else ""
+    token_label = re.sub(r"[:：=＝]+$", "", _normalize_for_match(first_token))
+    if len(token_label) >= 2 and token_label not in candidates:
+        candidates.append(token_label)
+    return candidates
+
+
+def _match_by_line_label(
+    candidates: list[str], chunks: Sequence[Any], value: float, rel_tol: float,
+) -> tuple[bool, int | None, str]:
+    """回退：标签和数值出现在**同一行**。"""
+    for label_text in candidates:
+        for index, chunk in enumerate(chunks, start=1):
+            for line in str(getattr(chunk, "content", "") or "").splitlines():
+                line_norm = _normalize_for_match(line)
+                if label_text not in line_norm:
+                    continue
+                for surface, literal in _literal_surfaces(line):
+                    if abs(literal - value) <= max(rel_tol * max(abs(value), 1.0), 1e-9):
+                        return True, index, surface
+    return False, None, ""
+
+
 def verify_copied(
     answer: NumericAnswer,
     chunks: Sequence[Any],
@@ -293,50 +352,18 @@ def verify_copied(
     if not quote_key:
         return False, None
     value = float(answer.value)
-    surfaces = _literal_surfaces(answer.quote)
-    for index, chunk in enumerate(chunks, start=1):
-        content = _normalize_for_match(str(getattr(chunk, "content", "") or ""))
-        if not content or quote_key not in content:
-            continue
-        for surface, literal in surfaces:
-            if abs(literal - value) <= max(rel_tol * max(abs(value), 1.0), 1e-9):
-                answer.surface = surface
-                return True, index
+    matched, index = _quote_matches_chunk(
+        answer, chunks, quote_key=quote_key, value=value, rel_tol=rel_tol
+    )
+    if matched:
+        return True, index
     # 回退：模型常把行压缩成 "锅炉181201207896 : 0"（省略了中间的“2026年9月用量”列名），
     # 只要求标签和数值出现在**同一行**，仍能防止把别的行/别的数字抄过来。
-    raw_quote = re.sub(r"\s+", "", answer.quote or "")
-    num_matches = list(_NUMBER_TOKEN.finditer(raw_quote))
-    # 取“数值所在的那个数字”之前的内容作标签：锅炉181201207896 : 0 的标签
-    # 是 锅炉181201207896，不是 锅炉（否则会先匹配到年用量表里锅炉 9月=0 的行）。
-    picked = None
-    for match in reversed(num_matches):
-        try:
-            literal = float(match.group(0).replace(",", ""))
-        except ValueError:
-            continue
-        if abs(literal - value) <= max(rel_tol * max(abs(value), 1.0), 1e-9):
-            picked = match
-            break
-    if picked is None and num_matches:
-        picked = num_matches[-1]
-    label = _normalize_for_match(raw_quote[: picked.start()]) if picked else ""
-    label = re.sub(r"[:：=＝]+$", "", label)
-    candidates = [label] if len(label) >= 2 else []
-    # 模型也可能把整行抄进来（锅炉<编号> 0 3.606 ...），此时用第一个空白 token 当行标签。
-    first_token = re.split(r"\s+", (answer.quote or "").strip())[0] if (answer.quote or "").strip() else ""
-    token_label = re.sub(r"[:：=＝]+$", "", _normalize_for_match(first_token))
-    if len(token_label) >= 2 and token_label not in candidates:
-        candidates.append(token_label)
-    for label_text in candidates:
-        for index, chunk in enumerate(chunks, start=1):
-            for line in str(getattr(chunk, "content", "") or "").splitlines():
-                line_norm = _normalize_for_match(line)
-                if label_text not in line_norm:
-                    continue
-                for surface, literal in _literal_surfaces(line):
-                    if abs(literal - value) <= max(rel_tol * max(abs(value), 1.0), 1e-9):
-                        answer.surface = surface
-                        return True, index
+    candidates = _line_label_candidates(answer, value, rel_tol)
+    matched, index, surface = _match_by_line_label(candidates, chunks, value, rel_tol)
+    if matched:
+        answer.surface = surface
+        return True, index
     return False, None
 
 

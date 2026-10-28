@@ -176,104 +176,102 @@ def _pick_header_index(matrix: Sequence[Sequence[str]]) -> int:
     return 0
 
 
-def serialize_information_blocks(
-    *,
-    caption: str = "",
-    rows: Sequence[Sequence[str]] = (),
-    table_id: str = "",
-    row_chunks: bool = False,
-) -> list[str]:
-    """把二维表打成一段或多段自解释文本（超长按行批拆）。"""
-    # 单元格也过一遍公式/单位规整：xlsx/docx 的原生表格不经 Markdown 清洗那一路，
-    # 但 MinerU/Office 同样会把 `50%` 写成 `$5 0 \\%$`（见 ekbs/ingest/clean.py）。
-    matrix = [
+def _normalize_matrix(rows: Sequence[Sequence[str]]) -> list[list[str]]:
+    """单元格过一遍公式/单位规整，并丢掉整行空行。"""
+    # xlsx/docx 的原生表格不经 Markdown 清洗那一路，但 MinerU/Office 同样会把
+    # `50%` 写成 `$5 0 \\%$`（见 ekbs/ingest/clean.py）。
+    return [
         [normalize_math_in_text(str(c))[0] for c in r]
         for r in rows
         if any(str(c).strip() for c in r)
     ]
-    if not matrix:
-        return []
 
-    # 先剥掉开头的标题行（合并单元格），它们**不当表头**；文字折叠进 caption 而不是丢掉 ——
-    # 第 2 行那种常常是单位口径（`电量分析(KW/h）`），丢了会让数值无法解读。
+
+def _strip_title_rows(matrix: list[list[str]]) -> tuple[list[str], list[list[str]]]:
+    """剥掉开头的标题行（合并单元格），它们**不当表头**；文字折叠进 caption 而不是丢掉 ——
+    第 2 行那种常常是单位口径（`电量分析(KW/h）`），丢了会让数值无法解读。
+    """
     titles: list[str] = []
     while matrix and _is_title_row(matrix[0]):
         title = next((str(c).strip() for c in matrix[0] if str(c).strip()), "")
         if title:
             titles.append(title)
         matrix = matrix[1:]
-    if not matrix:
-        # 极端：整张表只有标题行 → 保留内容（当单列数据），不丢
-        matrix = [[t] for t in titles]
-        titles = []
-    if titles:
-        title_text = " / ".join(dict.fromkeys(titles))
-        base = caption.strip()
-        caption = f"{base}（{title_text}）" if base else title_text
+    return titles, matrix
 
-    def merge_header_rows_from(rows: Sequence[Sequence[str]]) -> tuple[list[str], list[list[str]]]:
-        """两行表头（如 审核意见 / 检查结果、日期、金额）合并成 "父/子"。"""
-        if len(rows) < 2:
-            return [str(c).strip() or f"列{i+1}" for i, c in enumerate(rows[0])], []
-        top = [str(c).strip() for c in rows[0]]
-        sub = [str(c).strip() for c in rows[1]]
-        width = max(len(top), len(sub))
-        top += [""] * (width - len(top))
-        sub += [""] * (width - len(sub))
-        # 仅当第一行有空列、第二行恰好补上这些列时，才认为是两行表头
-        filled = [i for i, c in enumerate(sub) if c]
-        if not top or not any(not top[i] and sub[i] for i in filled):
-            return [h or f"列{i+1}" for i, h in enumerate(top)], list(rows[1:])
-        headers = []
-        for i in range(width):
-            if top[i] and sub[i] and top[i] != sub[i]:
-                headers.append(f"{top[i]}/{sub[i]}")
-            else:
-                headers.append(top[i] or sub[i] or f"列{i+1}")
-        return headers, list(rows[2:])
 
+def _split_header_rows(
+    rows: Sequence[Sequence[str]],
+) -> tuple[list[str], list[list[str]]]:
+    """两行表头（如 审核意见 / 检查结果、日期、金额）合并成 "父/子"。"""
+    if len(rows) < 2:
+        return [str(c).strip() or f"列{i+1}" for i, c in enumerate(rows[0])], []
+    top = [str(c).strip() for c in rows[0]]
+    sub = [str(c).strip() for c in rows[1]]
+    width = max(len(top), len(sub))
+    top += [""] * (width - len(top))
+    sub += [""] * (width - len(sub))
+    # 仅当第一行有空列、第二行恰好补上这些列时，才认为是两行表头
+    filled = [i for i, c in enumerate(sub) if c]
+    if not top or not any(not top[i] and sub[i] for i in filled):
+        return [h or f"列{i+1}" for i, h in enumerate(top)], list(rows[1:])
+    headers: list[str] = []
+    for i in range(width):
+        if top[i] and sub[i] and top[i] != sub[i]:
+            headers.append(f"{top[i]}/{sub[i]}")
+        else:
+            headers.append(top[i] or sub[i] or f"列{i+1}")
+    return headers, list(rows[2:])
+
+
+def _resolve_headers_and_data(
+    matrix: list[list[str]],
+) -> tuple[bool, list[str], list[list[str]]]:
+    """确定 (form_like, headers, data_rows)。"""
     form_like = _looks_like_form(matrix)
     if form_like:
         # 表单不伪造表头：保留所有行，列名用列序号，行内仍是原值（标签在值里）。
         headers = [f"列{i + 1}" for i in range(max(len(r) for r in matrix))]
-        data_rows = matrix
-    else:
-        header_index = _pick_header_index(matrix)
-        before_header = matrix[:header_index]
-        headers, data_rows = merge_header_rows_from(matrix[header_index:])
-        data_rows = [*before_header, *data_rows]
-        # 无表头只有一行时：整行当数据，用列序号作表头
-        if not data_rows:
-            data_rows = [matrix[0]]
-            headers = [f"列{i + 1}" for i in range(len(matrix[0]))]
+        return True, headers, matrix
+    header_index = _pick_header_index(matrix)
+    before_header = matrix[:header_index]
+    headers, data_rows = _split_header_rows(matrix[header_index:])
+    data_rows = [*before_header, *data_rows]
+    # 无表头只有一行时：整行当数据，用列序号作表头
+    if not data_rows:
+        data_rows = [matrix[0]]
+        headers = [f"列{i + 1}" for i in range(len(matrix[0]))]
+    return False, headers, data_rows
 
+
+def _build_preamble(caption: str, table_id: str, headers: list[str], form_like: bool) -> list[str]:
     subject = caption.strip() or (table_id.strip() and f"表 {table_id}") or headers[0]
-    header_line = " | ".join(headers)
     preamble = [
         f"表名: {caption.strip() or subject}",
         f"核心实体: {subject}",
-        f"相关表头: {header_line}",
+        f"相关表头: {' | '.join(headers)}",
     ]
     if form_like:
         preamble.append("表格形态: 表单型（按行保留字段值，不做列头推断）")
+    return preamble
 
-    def format_row(cells: Sequence[str]) -> str:
-        parts: list[str] = []
-        for i, header in enumerate(headers):
-            value = str(cells[i]).strip() if i < len(cells) else ""
-            parts.append(f"{header}={value}")
-        return "; ".join(parts)
 
-    if row_chunks:
-        # RAGFlow spreadsheet 口径：一行一个块，每块重复表头；header-only 保留表头。
-        if not data_rows:
-            return ["\n".join(preamble)]
-        return ["\n".join([*preamble, format_row(cells)]) for cells in data_rows]
+def _format_row(cells: Sequence[str], headers: Sequence[str]) -> str:
+    parts: list[str] = []
+    for i, header in enumerate(headers):
+        value = str(cells[i]).strip() if i < len(cells) else ""
+        parts.append(f"{header}={value}")
+    return "; ".join(parts)
 
+
+def _chunk_by_budget(
+    preamble: list[str], data_rows: list[list[str]], headers: list[str],
+) -> list[str]:
+    """按 token 预算把数据行分批，每批重复 preamble。"""
     blocks: list[str] = []
     current_lines = list(preamble)
     for cells in data_rows:
-        line = format_row(cells)
+        line = _format_row(cells, headers)
         candidate = "\n".join([*current_lines, line])
         if current_lines is not preamble and count_tokens(candidate) > TABLE_MAX_TOKENS:
             blocks.append("\n".join(current_lines))
@@ -285,6 +283,36 @@ def serialize_information_blocks(
     elif not blocks and data_rows:
         blocks.append("\n".join(current_lines))
     return blocks
+
+
+def serialize_information_blocks(
+    *,
+    caption: str = "",
+    rows: Sequence[Sequence[str]] = (),
+    table_id: str = "",
+    row_chunks: bool = False,
+) -> list[str]:
+    """把二维表打成一段或多段自解释文本（超长按行批拆）。"""
+    matrix = _normalize_matrix(rows)
+    if not matrix:
+        return []
+    titles, matrix = _strip_title_rows(matrix)
+    if not matrix:
+        # 极端：整张表只有标题行 → 保留内容（当单列数据），不丢
+        matrix = [[t] for t in titles]
+        titles = []
+    if titles:
+        title_text = " / ".join(dict.fromkeys(titles))
+        base = caption.strip()
+        caption = f"{base}（{title_text}）" if base else title_text
+    form_like, headers, data_rows = _resolve_headers_and_data(matrix)
+    preamble = _build_preamble(caption, table_id, headers, form_like)
+    if row_chunks:
+        # RAGFlow spreadsheet 口径：一行一个块，每块重复表头；header-only 保留表头。
+        if not data_rows:
+            return ["\n".join(preamble)]
+        return ["\n".join([*preamble, _format_row(cells, headers)]) for cells in data_rows]
+    return _chunk_by_budget(preamble, data_rows, headers)
 
 
 def serialize_table_body(

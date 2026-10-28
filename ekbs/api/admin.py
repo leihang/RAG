@@ -442,6 +442,107 @@ async def system_shards(
 # ---------------------------------------------------------------------------
 
 
+def _documents_where(
+    *, kb_id: int | None, status: str | None, include_chunked: bool,
+    level: int | None, q: str | None,
+) -> tuple[list[str], list[Any]]:
+    where = ["1=1"]
+    params: list[Any] = []
+    if kb_id is not None:
+        where.append("d.kb_id = ?")
+        params.append(int(kb_id))
+    if status:
+        where.append("d.status = ?")
+        params.append(str(status))
+    elif include_chunked:
+        # 分块预览：已分块待入库也要能看块（但文档管理默认仍不显示）。
+        where.append("d.status IN ('chunked', 'published', 'offline')")
+    else:
+        # 文档管理默认只展示"完成解析+清洗+分块+向量"的文档；
+        # 未完成的 pending/parsing/review/indexing/failed 只在「清洗解析」页处理。
+        where.append("d.status IN ('published', 'offline')")
+    if level is not None:
+        where.append("d.level = ?")
+        params.append(int(level))
+    if q:
+        where.append("d.title LIKE ?")
+        params.append(f"%{q}%")
+    return where, params
+
+
+def _apply_perm_scope(
+    where: list[str], params: list[Any], perm, *, admin_bypass: bool,
+) -> bool:
+    """SQL 先收窄：密级 + 可见知识库（超管跳过，否则跨部门运维看不到库）。
+
+    返回 False 表示用户没有任何可见知识库（调用方直接给空结果）。
+    """
+    if admin_bypass:
+        return True
+    where.append("d.level <= ?")
+    params.append(int(perm.clearance))
+    if not perm.visible_kb_ids:
+        return False
+    placeholders = ",".join("?" for _ in perm.visible_kb_ids)
+    where.append(f"d.kb_id IN ({placeholders})")
+    params.extend(int(k) for k in perm.visible_kb_ids)
+    return True
+
+
+def _filter_visible_docs(
+    runtime, perm, raw_rows: list[dict[str, Any]], *,
+    allow_deleted: bool, admin_bypass: bool,
+) -> list[dict[str, Any]]:
+    """逐行 ACL（行级可见性）。"""
+    import json as _json
+
+    from ekbs.permission.acl import DocumentFacts
+
+    doc_ids = [int(r["doc_id"]) for r in raw_rows]
+    acl_map = runtime.gate.load_document_acl(doc_ids)
+    visible: list[dict[str, Any]] = []
+    for record in raw_rows:
+        try:
+            record["visible_dept_ids"] = _json.loads(record.get("visible_dept_ids") or "[]")
+        except ValueError:
+            record["visible_dept_ids"] = []
+        facts = DocumentFacts.from_row(record)
+        decision = runtime.gate.can_see_document(
+            perm, facts, acl_map.get(int(record["doc_id"]), []),
+            for_retrieval=False, allow_deleted=allow_deleted, admin_bypass=admin_bypass,
+        )
+        if decision.allowed:
+            visible.append(record)
+    return visible
+
+
+def _count_visible_docs(
+    runtime, conn, perm, where: list[str], params: list[Any], *,
+    allow_deleted: bool, admin_bypass: bool,
+) -> int:
+    """若触顶仍可能漏计：再做一次全量精滤计数（试点文档量可接受）。"""
+    from ekbs.permission.acl import DocumentFacts
+
+    count_sql = (
+        "SELECT d.doc_id, d.kb_id, d.title, d.level, d.status, d.visible_dept_ids, "
+        "d.effective_date, d.expire_date, d.doc_version, "
+        "(SELECT c.shard_id FROM ekbs_chunk c WHERE c.doc_id = d.doc_id LIMIT 1) AS shard_id "
+        f"FROM ekbs_document d WHERE {' AND '.join(where)}"
+    )
+    all_rows = conn.execute(count_sql, tuple(params)).fetchall()
+    all_ids = [int(r["doc_id"]) for r in all_rows]
+    all_acl = runtime.gate.load_document_acl(all_ids)
+    total = 0
+    for row in all_rows:
+        facts = DocumentFacts.from_row(row)
+        if runtime.gate.can_see_document(
+            perm, facts, all_acl.get(int(row["doc_id"]), []),
+            for_retrieval=False, allow_deleted=allow_deleted, admin_bypass=admin_bypass,
+        ):
+            total += 1
+    return total
+
+
 @router.get("/docs/documents")
 async def list_documents(
     request: Request,
@@ -474,36 +575,11 @@ async def list_documents(
         perm = widen_for_console(perm, runtime.db)
     limit, offset = _page(limit, offset)
     allow_deleted = str(status or "") == "deleted"
-    where = ["1=1"]
-    params: list[Any] = []
-    if kb_id is not None:
-        where.append("d.kb_id = ?")
-        params.append(int(kb_id))
-    if status:
-        where.append("d.status = ?")
-        params.append(str(status))
-    elif include_chunked:
-        # 分块预览：已分块待入库也要能看块（但文档管理默认仍不显示）。
-        where.append("d.status IN ('chunked', 'published', 'offline')")
-    else:
-        # 文档管理默认只展示"完成解析+清洗+分块+向量"的文档；
-        # 未完成的 pending/parsing/review/indexing/failed 只在「清洗解析」页处理。
-        where.append("d.status IN ('published', 'offline')")
-    if level is not None:
-        where.append("d.level = ?")
-        params.append(int(level))
-    if q:
-        where.append("d.title LIKE ?")
-        params.append(f"%{q}%")
-    # SQL 先收窄：密级 + 可见知识库（超管跳过，否则跨部门运维看不到库）
-    if not admin_bypass:
-        where.append("d.level <= ?")
-        params.append(int(perm.clearance))
-        if not perm.visible_kb_ids:
-            return JSONResponse({"items": [], "total": 0, "limit": limit, "offset": offset})
-        placeholders = ",".join("?" for _ in perm.visible_kb_ids)
-        where.append(f"d.kb_id IN ({placeholders})")
-        params.extend(int(k) for k in perm.visible_kb_ids)
+    where, params = _documents_where(
+        kb_id=kb_id, status=status, include_chunked=include_chunked, level=level, q=q
+    )
+    if not _apply_perm_scope(where, params, perm, admin_bypass=admin_bypass):
+        return JSONResponse({"items": [], "total": 0, "limit": limit, "offset": offset})
 
     # 试点规模：先取足够候选再精滤分页（避免 total 与可见行不一致）
     fetch_cap = min(max(offset + limit * 5, 200), 2000)
@@ -517,54 +593,19 @@ async def list_documents(
         f"WHERE {' AND '.join(where)} ORDER BY d.doc_id DESC LIMIT ?"
     )
     with runtime.db.sync_connect() as conn:
-        import json as _json
-
-        from ekbs.permission.acl import DocumentFacts
-
         raw_rows = [dict(r) for r in conn.execute(sql, (*params, fetch_cap)).fetchall()]
-        doc_ids = [int(r["doc_id"]) for r in raw_rows]
-        acl_map = runtime.gate.load_document_acl(doc_ids)
-        visible: list[dict[str, Any]] = []
-        for record in raw_rows:
-            try:
-                record["visible_dept_ids"] = _json.loads(record.get("visible_dept_ids") or "[]")
-            except ValueError:
-                record["visible_dept_ids"] = []
-            facts = DocumentFacts.from_row(record)
-            decision = runtime.gate.can_see_document(
-                perm,
-                facts,
-                acl_map.get(int(record["doc_id"]), []),
-                for_retrieval=False,
-                allow_deleted=allow_deleted,
-                admin_bypass=admin_bypass,
-            )
-            if decision.allowed:
-                visible.append(record)
+        visible = _filter_visible_docs(
+            runtime, perm, raw_rows, allow_deleted=allow_deleted, admin_bypass=admin_bypass
+        )
         total = len(visible)
         from ekbs.personal import attach_personal_owners
 
         attach_personal_owners(conn, visible)
-        # 若触顶仍可能漏计：再做一次全量精滤计数（试点文档量可接受）
         if len(raw_rows) >= fetch_cap:
-            count_sql = (
-                "SELECT d.doc_id, d.kb_id, d.title, d.level, d.status, d.visible_dept_ids, "
-                "d.effective_date, d.expire_date, d.doc_version, "
-                "(SELECT c.shard_id FROM ekbs_chunk c WHERE c.doc_id = d.doc_id LIMIT 1) AS shard_id "
-                f"FROM ekbs_document d WHERE {' AND '.join(where)}"
+            total = _count_visible_docs(
+                runtime, conn, perm, where, params,
+                allow_deleted=allow_deleted, admin_bypass=admin_bypass,
             )
-            all_rows = conn.execute(count_sql, tuple(params)).fetchall()
-            all_ids = [int(r["doc_id"]) for r in all_rows]
-            all_acl = runtime.gate.load_document_acl(all_ids)
-            total = 0
-            for row in all_rows:
-                facts = DocumentFacts.from_row(row)
-                if runtime.gate.can_see_document(
-                    perm, facts, all_acl.get(int(row["doc_id"]), []),
-                    for_retrieval=False, allow_deleted=allow_deleted,
-                    admin_bypass=admin_bypass,
-                ):
-                    total += 1
         page = visible[offset : offset + limit]
     return JSONResponse({"items": page, "total": total, "limit": limit, "offset": offset})
 

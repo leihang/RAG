@@ -449,84 +449,89 @@ def _docx_raster_is_decorative(blob: bytes, *, max_edge: int = _DOCX_DECORATIVE_
     return max(int(width), int(height)) < int(max_edge)
 
 
-def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
-    """`.docx` —— 按文档顺序抽段落、表格与**嵌入图片**（与 pptx 同口径进 ``figures``）。
+@dataclass
+class _DocxState:
+    """`.docx` 解析过程中的可变状态（把巨型函数的状态收拢，便于分阶段抽取）。"""
 
-    页眉/页脚：**文字**抽一次写入文首「文件信息」；**装饰小图**不进 figure，
-    较大的页眉图仍落盘（历史夹具与交接班制度 logo 兜底保留）。
-    """
-    try:
-        import docx  # python-docx
-        from docx.oxml.ns import qn
-        from docx.table import Table
-        from docx.text.paragraph import Paragraph
-    except Exception as exc:  # pragma: no cover
-        raise ParserUnavailable(f"python-docx 不可用：{exc}") from exc
-
-    document = docx.Document(str(path))
-    header_meta, header_page_count = _docx_header_meta(document)
-    lines: list[str] = []
-    if header_meta:
-        # 用 H2：与一级编号章（level=2）同级，后续 ``1. 目的`` 会弹出本节点，
-        # 避免 ``文件信息 > 4.1 …`` 污染 heading_path。
-        lines.append("## 文件信息")
-        lines.extend(header_meta)
-        lines.append("")
-    tables: list[ParsedTable] = []
-    figures: list[ParsedFigure] = []
-    table_seq = 0
-    seen_images: set[str] = set()
-    ocr_budget = [_figure_ocr_budget()]
+    assets_dir: Path | None
+    log_file: str
+    lines: list[str] = field(default_factory=list)
+    tables: list[ParsedTable] = field(default_factory=list)
+    figures: list[ParsedFigure] = field(default_factory=list)
+    seen_images: set[str] = field(default_factory=set)
+    ocr_budget: list[int] = field(default_factory=lambda: [_figure_ocr_budget()])
     #: (figure_index, blob_size, nearby_text) —— 无字图用上文题注，避免只剩「图1」搜不到「二维码」
-    textless: list[tuple[int, int, str]] = []
-    recent_texts: list[str] = []
+    textless: list[tuple[int, int, str]] = field(default_factory=list)
+    recent_texts: list[str] = field(default_factory=list)
+    table_seq: int = 0
 
-    def _nearby_caption() -> str:
-        """优先带「二维码/扫描/下载」的近邻段，再退到 APP/图片，最后取最近正文。"""
-        for keys in (
-            ("二维码", "二维碼", "扫码", "扫描", "下载"),
-            ("图片", "图示", "示意图"),
-            ("APP", "App", "app"),
-        ):
-            for text in reversed(recent_texts):
-                if any(k in text for k in keys):
-                    return text
-        return recent_texts[-1] if recent_texts else ""
 
-    def _ingest_images(element: Any, *, skip_decorative: bool = False) -> None:
-        for blob, ext, caption in _docx_images_in_element(element, document):
-            if skip_decorative and not (caption or "").strip() and _docx_raster_is_decorative(blob):
-                continue
-            added = _register_figure_blob(
-                blob, ext,
-                assets_dir=assets_dir, figures=figures, seen=seen_images,
-                caption=caption, page=None, ocr_budget=ocr_budget,
-                log_file=path.name,
-            )
-            if added and not figures[-1].caption and not figures[-1].ocr_text:
-                textless.append((len(figures) - 1, len(blob), _nearby_caption()))
+def _docx_header_lines(header_meta: list[str]) -> list[str]:
+    """页眉/页脚文字作为「文件信息」写进文首。"""
+    if not header_meta:
+        return []
+    # 用 H2：与一级编号章（level=2）同级，后续 ``1. 目的`` 会弹出本节点，
+    # 避免 ``文件信息 > 4.1 …`` 污染 heading_path。
+    return ["## 文件信息", *header_meta, ""]
 
-    # 按文档顺序交错段落 / 表格 / 图片，避免「全文段落完再甩表/图」打乱阅读位置
+
+def _docx_nearby_caption(recent_texts: list[str]) -> str:
+    """优先带「二维码/扫描/下载」的近邻段，再退到 APP/图片，最后取最近正文。"""
+    for keys in (
+        ("二维码", "二维碼", "扫码", "扫描", "下载"),
+        ("图片", "图示", "示意图"),
+        ("APP", "App", "app"),
+    ):
+        for text in reversed(recent_texts):
+            if any(k in text for k in keys):
+                return text
+    return recent_texts[-1] if recent_texts else ""
+
+
+def _register_docx_figure(state: _DocxState, blob: bytes, ext: str, caption: str) -> None:
+    """落盘一张图；无字图先记账，等全部抽完再统一挂题注。"""
+    added = _register_figure_blob(
+        blob, ext,
+        assets_dir=state.assets_dir, figures=state.figures, seen=state.seen_images,
+        caption=caption, page=None, ocr_budget=state.ocr_budget,
+        log_file=state.log_file,
+    )
+    if added and not state.figures[-1].caption and not state.figures[-1].ocr_text:
+        state.textless.append(
+            (len(state.figures) - 1, len(blob), _docx_nearby_caption(state.recent_texts))
+        )
+
+
+def _ingest_docx_images(element: Any, document: Any, state: _DocxState) -> None:
+    for blob, ext, caption in _docx_images_in_element(element, document):
+        _register_docx_figure(state, blob, ext, caption)
+
+
+def _walk_docx_body(document: Any, state: _DocxState, qn: Any) -> None:
+    """按文档顺序交错段落 / 表格 / 图片，避免「全文段落完再甩表/图」打乱阅读位置。"""
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
     for child in document.element.body.iterchildren():
         if child.tag == qn("w:p"):
             paragraph = Paragraph(child, document)
             text = (paragraph.text or "").strip()
             # 先记上文再落图：空段里的二维码才能挂上「扫描二维码下载」
             if text:
-                recent_texts.append(text)
-                del recent_texts[:-6]
-            _ingest_images(child)
+                state.recent_texts.append(text)
+                del state.recent_texts[:-6]
+            _ingest_docx_images(child, document, state)
             if not text:
                 continue
             style = (paragraph.style.name or "").lower() if paragraph.style else ""
             if style.startswith("heading"):
                 level = "".join(ch for ch in style if ch.isdigit()) or "1"
-                lines.append("#" * min(int(level or 1), 6) + " " + text)
+                state.lines.append("#" * min(int(level or 1), 6) + " " + text)
             else:
-                lines.append(text)
+                state.lines.append(text)
         elif child.tag == qn("w:tbl"):
             table = Table(child, document)
-            _ingest_images(child)
+            _ingest_docx_images(child, document, state)
             rows: list[list[str]] = []
             for row in table.rows:
                 cells = [((cell.text or "").strip().replace("\n", " ")) for cell in row.cells]
@@ -535,27 +540,22 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
             body = _rows_to_pipe_markdown(rows)
             if not body:
                 continue
-            table_seq += 1
-            tables.append(
-                ParsedTable(body=body, caption="", page=None, table_id=str(table_seq))
+            state.table_seq += 1
+            state.tables.append(
+                ParsedTable(body=body, caption="", page=None, table_id=str(state.table_seq))
             )
-            lines.append(f"[表格 {table_seq}]")
+            state.lines.append(f"[表格 {state.table_seq}]")
 
-    # 兜底：正文遍历漏掉的关系图（页眉/页脚/文本框等）仍要落盘，否则等于丢图
+
+def _collect_docx_fallback_images(path: Path, document: Any, state: _DocxState) -> None:
+    """兜底扫图：正文关系、页眉/页脚 part、zip media 三处，漏一处等于丢图。"""
+    # 1) 正文遍历漏掉的关系图（页眉/页脚/文本框等）
     for blob, ext, caption in _docx_images_from_rels(document):
         if not (caption or "").strip() and _docx_raster_is_decorative(blob):
             continue
-        added = _register_figure_blob(
-            blob, ext,
-            assets_dir=assets_dir, figures=figures, seen=seen_images,
-            caption=caption, page=None, ocr_budget=ocr_budget,
-            log_file=path.name,
-        )
-        if added and not figures[-1].caption and not figures[-1].ocr_text:
-            textless.append((len(figures) - 1, len(blob), _nearby_caption()))
-
-    # 再兜底：页眉/页脚的图挂在 **header/footer part** 的关系上，不在 document.part.rels；
-    # 实测交接班制度等 docx 的 logo 只在 word/header1.xml → word/media/，正文 blip=0。
+        _register_docx_figure(state, blob, ext, caption)
+    # 2) 页眉/页脚的图挂在 **header/footer part** 的关系上，不在 document.part.rels；
+    #    实测交接班制度等 docx 的 logo 只在 word/header1.xml → word/media/，正文 blip=0。
     for section in document.sections:
         for part in (
             getattr(section, "header", None),
@@ -573,45 +573,53 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
             for blob, ext, caption in _docx_images_in_element(element, part):
                 if not (caption or "").strip() and _docx_raster_is_decorative(blob):
                     continue
-                added = _register_figure_blob(
-                    blob, ext,
-                    assets_dir=assets_dir, figures=figures, seen=seen_images,
-                    caption=caption, page=None, ocr_budget=ocr_budget,
-                    log_file=path.name,
-                )
-                if added and not figures[-1].caption and not figures[-1].ocr_text:
-                    textless.append((len(figures) - 1, len(blob), _nearby_caption()))
-
-    # zip 级兜底：任何 part 漏扫时仍能从 word/media/ 捞到栅格图（与 xlsx 同口径）
+                _register_docx_figure(state, blob, ext, caption)
+    # 3) zip 级兜底：任何 part 漏扫时仍能从 word/media/ 捞到栅格图（与 xlsx 同口径）
     for blob, ext in _ooxml_media_blobs(path, prefix="word/media/"):
         if _docx_raster_is_decorative(blob):
             continue
-        added = _register_figure_blob(
-            blob, ext,
-            assets_dir=assets_dir, figures=figures, seen=seen_images,
-            caption="", page=None, ocr_budget=ocr_budget,
-            log_file=path.name,
-        )
-        if added and not figures[-1].caption and not figures[-1].ocr_text:
-            textless.append((len(figures) - 1, len(blob), _nearby_caption()))
+        _register_docx_figure(state, blob, ext, "")
 
-    if textless:
-        title = path.stem.strip()
-        # 全部无字图都挂题注（旧逻辑只给最大一张 → 其余被 chunker 当「无文本」丢掉）
-        # OCR 默认关闭时教程截图常两张都无字；优先挂「上文」让「二维码/下载」能被检索到。
-        for rank, (idx, _size, nearby) in enumerate(textless, start=1):
-            if figures[idx].caption or figures[idx].ocr_text:
-                continue
-            nearby_bit = " ".join((nearby or "").split())
-            if len(nearby_bit) > 36:
-                nearby_bit = nearby_bit[:36].rstrip() + "…"
-            parts = [p for p in (title, nearby_bit) if p]
-            if len(textless) > 1:
-                parts.append(f"图{rank}")
-            figures[idx].caption = " · ".join(parts) if parts else f"图{rank}"
 
-    if figures:
-        log.info("docx_figures_extracted", file=path.name, figures=len(figures))
+def _attach_textless_captions(state: _DocxState, title: str) -> None:
+    """全部无字图都挂题注（旧逻辑只给最大一张 → 其余被 chunker 当「无文本」丢掉）。"""
+    if not state.textless:
+        return
+    # OCR 默认关闭时教程截图常两张都无字；优先挂「上文」让「二维码/下载」能被检索到。
+    for rank, (idx, _size, nearby) in enumerate(state.textless, start=1):
+        if state.figures[idx].caption or state.figures[idx].ocr_text:
+            continue
+        nearby_bit = " ".join((nearby or "").split())
+        if len(nearby_bit) > 36:
+            nearby_bit = nearby_bit[:36].rstrip() + "…"
+        parts = [p for p in (title, nearby_bit) if p]
+        if len(state.textless) > 1:
+            parts.append(f"图{rank}")
+        state.figures[idx].caption = " · ".join(parts) if parts else f"图{rank}"
+
+
+def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
+    """`.docx` —— 按文档顺序抽段落、表格与**嵌入图片**（与 pptx 同口径进 ``figures``）。
+
+    页眉/页脚：**文字**抽一次写入文首「文件信息」；**装饰小图**不进 figure，
+    较大的页眉图仍落盘（历史夹具与交接班制度 logo 兜底保留）。
+    """
+    try:
+        import docx  # python-docx
+        from docx.oxml.ns import qn
+    except Exception as exc:  # pragma: no cover
+        raise ParserUnavailable(f"python-docx 不可用：{exc}") from exc
+
+    document = docx.Document(str(path))
+    header_meta, header_page_count = _docx_header_meta(document)
+    state = _DocxState(assets_dir=assets_dir, log_file=path.name)
+    state.lines.extend(_docx_header_lines(header_meta))
+    _walk_docx_body(document, state, qn)
+    _collect_docx_fallback_images(path, document, state)
+    _attach_textless_captions(state, path.stem.strip())
+
+    if state.figures:
+        log.info("docx_figures_extracted", file=path.name, figures=len(state.figures))
     if header_meta:
         log.info(
             "docx_header_meta_extracted",
@@ -619,13 +627,12 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
             lines=len(header_meta),
             page_count=header_page_count,
         )
-
     return ParsedDocument(
-        markdown="\n".join(lines).rstrip() + ("\n" if lines else ""),
+        markdown="\n".join(state.lines).rstrip() + ("\n" if state.lines else ""),
         engine="docx",
         source_path=str(path),
-        tables=tables,
-        figures=figures,
+        tables=state.tables,
+        figures=state.figures,
         page_count=header_page_count,
     )
 
@@ -752,6 +759,192 @@ def _fill_xlsx_merged_header(
                     values[pos] = text
 
 
+@dataclass
+class _XlsxState:
+    """`.xlsx` 解析过程中的可变状态（把巨型函数的状态收拢，便于分阶段抽取）。"""
+
+    assets_dir: Path | None
+    log_file: str
+    lines: list[str] = field(default_factory=list)
+    tables: list[ParsedTable] = field(default_factory=list)
+    figures: list[ParsedFigure] = field(default_factory=list)
+    seen_images: set[str] = field(default_factory=set)
+    ocr_budget: list[int] = field(default_factory=lambda: [_figure_ocr_budget()])
+    table_seq: int = 0
+
+
+def _xlsx_split_blocks(sheet: Any) -> list[list[tuple[int, list[str]]]]:
+    """按空行 / 单格分节标题把 sheet 切成连续数据块（一个 sheet 可能有多张表）。"""
+    blocks: list[list[tuple[int, list[str]]]] = []
+    buf: list[tuple[int, list[str]]] = []
+    for row_number, row in enumerate(sheet.iter_rows(), start=1):
+        values = _convert_date_serials_in_header([_xlsx_cell_text(cell) for cell in row])
+        if not any(v for v in values):
+            if buf:
+                blocks.append(buf)
+                buf = []
+            continue
+        # 单格分节标题：当前块已有内容时，先结束上一张表，标题归到下一段
+        if len(buf) >= 2 and _is_section_title_row(values):
+            blocks.append(buf)
+            buf = []
+        buf.append((row_number, values))
+    if buf:
+        blocks.append(buf)
+    return blocks
+
+
+def _xlsx_merge_single_row_blocks(
+    blocks: list[list[tuple[int, list[str]]]],
+) -> list[list[tuple[int, list[str]]]]:
+    """单行块通常是标题行：并到下一块，避免产出只有标题的「表」。"""
+    merged: list[list[tuple[int, list[str]]]] = []
+    pending: list[tuple[int, list[str]]] = []
+    for block in blocks:
+        if len(block) == 1 and not pending:
+            pending = block
+            continue
+        merged.append([*pending, *block] if pending else block)
+        pending = []
+    if pending:
+        merged.append(pending)
+    return merged
+
+
+def _xlsx_listobject_header_rows(sheet: Any) -> list[int]:
+    """ListObject（Excel 内建表）直接给出的表头行号；没有则空。"""
+    header_rows: list[int] = []
+    try:
+        from openpyxl.utils import range_boundaries
+
+        for tbl in (getattr(sheet, "tables", {}) or {}).values():
+            try:
+                header_rows.append(int(range_boundaries(tbl.ref)[1]))
+            except Exception:
+                continue
+    except Exception:  # pragma: no cover - 无 tables 属性
+        return []
+    return header_rows
+
+
+def _xlsx_image_anchor_rows(sheet: Any) -> list[int]:
+    rows: list[int] = []
+    for image in getattr(sheet, "_images", []) or []:
+        try:
+            rows.append(int(image.anchor._from.row) + 1)
+        except Exception:
+            continue
+    return rows
+
+
+def _xlsx_serialize_blocks(
+    sheet: Any,
+    merged_blocks: list[list[tuple[int, list[str]]]],
+    table_header_rows: list[int],
+    state: _XlsxState,
+    sheet_index: int,
+) -> None:
+    """逐块确定表头（ListObject > 结构启发式）→ 填合并表头 → 按图片锚点拆段 → 出表格。"""
+    from ekbs.ingest.table_serialize import _looks_like_form, _pick_header_index
+
+    anchor_rows = _xlsx_image_anchor_rows(sheet)
+    for block_index, rows_with_nums in enumerate(merged_blocks, start=1):
+        rows = [values for _n, values in rows_with_nums]
+        row_nums = [n for n, _values in rows_with_nums]
+        form_like = _looks_like_form(rows)
+        header_abs: int | None = None
+        if not form_like:
+            in_block = [n for n in table_header_rows if n in row_nums]
+            if in_block:
+                header_abs = in_block[0]
+            else:
+                idx = _pick_header_index(rows)
+                if 0 <= idx < len(row_nums):
+                    header_abs = row_nums[idx]
+        if header_abs is not None:
+            _fill_xlsx_merged_header(sheet, rows_with_nums, header_abs)
+            rows_with_nums = [(n, list(v)) for n, v in rows_with_nums]
+        header_idx = row_nums.index(header_abs) if header_abs in row_nums else 0
+        if not form_like and header_abs is not None:
+            parts = _split_rows_at_image_anchors(rows_with_nums, header_idx, anchor_rows)
+        else:
+            parts = [rows_with_nums]
+        for part_index, part in enumerate(parts, start=1):
+            part_rows = [values for _n, values in part]
+            body = _rows_to_pipe_markdown(part_rows)
+            if not body:
+                continue
+            state.table_seq += 1
+            base_caption = (
+                sheet.title if len(merged_blocks) == 1
+                else f"{sheet.title}（第{block_index}段）"
+            )
+            caption = base_caption if len(parts) == 1 else f"{base_caption}（图片段{part_index}）"
+            state.tables.append(
+                ParsedTable(
+                    body=body,
+                    caption=caption,
+                    page=sheet_index,
+                    table_id=str(state.table_seq),
+                )
+            )
+            state.lines.append(f"[表格 {state.table_seq}] {caption}".rstrip())
+
+
+def _xlsx_collect_sheet_images(sheet: Any, state: _XlsxState, sheet_index: int) -> None:
+    for image in getattr(sheet, "_images", []) or []:
+        try:
+            blob = image._data()  # noqa: SLF001 — openpyxl 无稳定公开 API
+        except Exception as exc:
+            log.warning("xlsx_image_unreadable", sheet=sheet.title, error=str(exc)[:80])
+            continue
+        ext = ""
+        path_hint = getattr(image, "path", None) or ""
+        if path_hint:
+            ext = Path(str(path_hint)).suffix.lstrip(".")
+        # 浮动图可能带旋转（openpyxl Image.rotation，单位度）
+        try:
+            rotate = float(getattr(image, "rotation", 0) or 0)
+        except Exception:
+            rotate = 0.0
+        _register_figure_blob(
+            blob, ext or "png",
+            assets_dir=state.assets_dir, figures=state.figures, seen=state.seen_images,
+            caption=sheet.title, page=sheet_index, ocr_budget=state.ocr_budget,
+            log_file=state.log_file, rotate_degrees=rotate,
+        )
+
+
+def _xlsx_collect_chart_tables(sheet: Any, state: _XlsxState, sheet_index: int) -> None:
+    for chart_rows, caption in _xlsx_sheet_chart_tables(sheet):
+        body = _rows_to_pipe_markdown(chart_rows)
+        if not body:
+            continue
+        state.table_seq += 1
+        state.tables.append(
+            ParsedTable(
+                body=body,
+                caption=caption or sheet.title,
+                page=sheet_index,
+                table_id=str(state.table_seq),
+            )
+        )
+        state.lines.append(
+            f"[表格 {state.table_seq}] {caption or sheet.title}".rstrip()
+        )
+
+
+def _xlsx_collect_zip_media(path: Path, state: _XlsxState) -> None:
+    """``sheet._images`` 可能漏掉部分介质：再扫 zip 内 ``xl/media/``（按内容摘要去重）。"""
+    for blob, ext in _ooxml_media_blobs(path, prefix="xl/media/"):
+        _register_figure_blob(
+            blob, ext,
+            assets_dir=state.assets_dir, figures=state.figures, seen=state.seen_images,
+            caption=path.stem, page=None, ocr_budget=state.ocr_budget,
+            log_file=state.log_file,
+        )
+
+
 def _parse_xlsx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
     """`.xlsx` —— 工作表 → 表格块；嵌入图片（``sheet._images`` / ``xl/media``）→ figure。
 
@@ -763,210 +956,90 @@ def _parse_xlsx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
         raise ParserUnavailable(f"openpyxl 不可用：{exc}") from exc
 
     workbook = openpyxl.load_workbook(str(path), data_only=True)
-    lines: list[str] = []
-    tables: list[ParsedTable] = []
-    figures: list[ParsedFigure] = []
-    table_seq = 0
-    seen_images: set[str] = set()
-    ocr_budget = [_figure_ocr_budget()]
-
+    state = _XlsxState(assets_dir=assets_dir, log_file=path.name)
     for sheet_index, sheet in enumerate(workbook.worksheets, start=1):
-        lines.append(f"## {sheet.title}")
-        # 一个 sheet 可能是"表单 + 多个表段"（商户撤场清算表就是典型）：
-        # 先按空行切连续块，再逐块序列化，不能把整个 sheet 硬当成一张表。
-        blocks: list[list[tuple[int, list[str]]]] = []
-        buf: list[tuple[int, list[str]]] = []
-        for row_number, row in enumerate(sheet.iter_rows(), start=1):
-            values = _convert_date_serials_in_header([_xlsx_cell_text(cell) for cell in row])
-            if not any(v for v in values):
-                if buf:
-                    blocks.append(buf)
-                    buf = []
-                continue
-            # 单格分节标题：当前块已有内容时，先结束上一张表，标题归到下一段
-            if len(buf) >= 2 and _is_section_title_row(values):
-                blocks.append(buf)
-                buf = []
-            buf.append((row_number, values))
-        if buf:
-            blocks.append(buf)
-        # 单行块通常是标题行：并到下一块，避免产出只有标题的“表”
-        merged_blocks: list[list[tuple[int, list[str]]]] = []
-        pending: list[tuple[int, list[str]]] = []
-        for block in blocks:
-            if len(block) == 1 and not pending:
-                pending = block
-                continue
-            merged_blocks.append([*pending, *block] if pending else block)
-            pending = []
-        if pending:
-            merged_blocks.append(pending)
-
-        # ListObject（Excel 内建表）直接给出表头/数据范围；没有时用结构启发式。
-        table_header_rows: list[int] = []
-        try:
-            from openpyxl.utils import range_boundaries
-
-            for tbl in (getattr(sheet, "tables", {}) or {}).values():
-                try:
-                    table_header_rows.append(int(range_boundaries(tbl.ref)[1]))
-                except Exception:
-                    continue
-        except Exception:
-            table_header_rows = []
-
-        from ekbs.ingest.table_serialize import _looks_like_form, _pick_header_index
-
-        for block_index, rows_with_nums in enumerate(merged_blocks, start=1):
-            rows = [values for _n, values in rows_with_nums]
-            row_nums = [n for n, _values in rows_with_nums]
-            form_like = _looks_like_form(rows)
-            header_abs: int | None = None
-            if not form_like:
-                in_block = [n for n in table_header_rows if n in row_nums]
-                if in_block:
-                    header_abs = in_block[0]
-                else:
-                    idx = _pick_header_index(rows)
-                    if 0 <= idx < len(row_nums):
-                        header_abs = row_nums[idx]
-            if header_abs is not None:
-                _fill_xlsx_merged_header(sheet, rows_with_nums, header_abs)
-                rows_with_nums = [(n, list(v)) for n, v in rows_with_nums]
-            anchor_rows: list[int] = []
-            for image in getattr(sheet, "_images", []) or []:
-                try:
-                    anchor_rows.append(int(image.anchor._from.row) + 1)
-                except Exception:
-                    continue
-            header_idx = row_nums.index(header_abs) if header_abs in row_nums else 0
-            if not form_like and header_abs is not None:
-                parts = _split_rows_at_image_anchors(rows_with_nums, header_idx, anchor_rows)
-            else:
-                parts = [rows_with_nums]
-            for part_index, part in enumerate(parts, start=1):
-                part_rows = [values for _n, values in part]
-                body = _rows_to_pipe_markdown(part_rows)
-                if not body:
-                    continue
-                table_seq += 1
-                base_caption = sheet.title if len(merged_blocks) == 1 else f"{sheet.title}（第{block_index}段）"
-                caption = base_caption if len(parts) == 1 else f"{base_caption}（图片段{part_index}）"
-                tables.append(
-                    ParsedTable(
-                        body=body,
-                        caption=caption,
-                        page=sheet_index,
-                        table_id=str(table_seq),
-                    )
-                )
-                lines.append(f"[表格 {table_seq}] {caption}".rstrip())
-
-        for image in getattr(sheet, "_images", []) or []:
-            try:
-                blob = image._data()  # noqa: SLF001 — openpyxl 无稳定公开 API
-            except Exception as exc:
-                log.warning("xlsx_image_unreadable", sheet=sheet.title, error=str(exc)[:80])
-                continue
-            ext = ""
-            path_hint = getattr(image, "path", None) or ""
-            if path_hint:
-                ext = Path(str(path_hint)).suffix.lstrip(".")
-            # 浮动图可能带旋转（openpyxl Image.rotation，单位度）
-            try:
-                rotate = float(getattr(image, "rotation", 0) or 0)
-            except Exception:
-                rotate = 0.0
-            _register_figure_blob(
-                blob, ext or "png",
-                assets_dir=assets_dir, figures=figures, seen=seen_images,
-                caption=sheet.title, page=sheet_index, ocr_budget=ocr_budget,
-                log_file=path.name, rotate_degrees=rotate,
-            )
-
-        for chart_rows, caption in _xlsx_sheet_chart_tables(sheet):
-            body = _rows_to_pipe_markdown(chart_rows)
-            if not body:
-                continue
-            table_seq += 1
-            tables.append(
-                ParsedTable(
-                    body=body,
-                    caption=caption or sheet.title,
-                    page=sheet_index,
-                    table_id=str(table_seq),
-                )
-            )
-            label = caption or sheet.title
-            lines.append(f"[表格 {table_seq}] {label}".rstrip())
-        lines.append("")
-
-    # sheet._images 可能漏掉部分介质：再扫 zip 内 xl/media/（按内容摘要去重）
-    for blob, ext in _ooxml_media_blobs(path, prefix="xl/media/"):
-        _register_figure_blob(
-            blob, ext,
-            assets_dir=assets_dir, figures=figures, seen=seen_images,
-            caption=path.stem, page=None, ocr_budget=ocr_budget,
-            log_file=path.name,
+        state.lines.append(f"## {sheet.title}")
+        merged_blocks = _xlsx_merge_single_row_blocks(_xlsx_split_blocks(sheet))
+        _xlsx_serialize_blocks(
+            sheet, merged_blocks, _xlsx_listobject_header_rows(sheet), state, sheet_index
         )
+        _xlsx_collect_sheet_images(sheet, state, sheet_index)
+        _xlsx_collect_chart_tables(sheet, state, sheet_index)
+        state.lines.append("")
+    _xlsx_collect_zip_media(path, state)
 
-    if figures:
-        log.info("xlsx_figures_extracted", file=path.name, figures=len(figures))
-
+    if state.figures:
+        log.info("xlsx_figures_extracted", file=path.name, figures=len(state.figures))
     return ParsedDocument(
-        markdown="\n".join(lines),
+        markdown="\n".join(state.lines),
         engine="xlsx",
         source_path=str(path),
-        tables=tables,
-        figures=figures,
+        tables=state.tables,
+        figures=state.figures,
     )
+
+
+def _chart_title(chart: Any) -> str:
+    """尽量宽松地取图标题；openpyxl 的 Title 对象/字符串都认。"""
+    title_obj = getattr(chart, "title", None)
+    if title_obj is None:
+        return ""
+    # openpyxl Title.tx.rich 或 title 字符串
+    title = str(getattr(title_obj, "tx", None) or title_obj or "").strip()
+    if "Title()" in title or title.startswith("<"):
+        return ""
+    return title
+
+
+def _chart_series_values(series: Any) -> list[str]:
+    try:
+        val = series.val
+        nums = getattr(val, "numRef", None) or getattr(val, "numLit", None)
+        if nums is not None and getattr(nums, "pt", None):
+            return ["" if pt.v is None else str(pt.v) for pt in nums.pt]
+        if hasattr(series, "values"):
+            return ["" if v is None else str(v) for v in (series.values or [])]
+    except Exception:
+        return []
+    return []
+
+
+def _chart_categories(series: Any) -> list[str]:
+    try:
+        cat_ref = getattr(series, "cat", None)
+        if cat_ref is not None:
+            strref = getattr(cat_ref, "strRef", None) or getattr(cat_ref, "numRef", None)
+            pts = getattr(strref, "pt", None) if strref is not None else None
+            if pts:
+                return ["" if pt.v is None else str(pt.v) for pt in pts]
+    except Exception:
+        pass
+    return []
+
+
+def _chart_series_cols(
+    series_list: list[Any],
+) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """取类别（首条 series 的 x 值）与各系列数值列。"""
+    categories: list[str] = []
+    series_cols: list[tuple[str, list[str]]] = []
+    for index, series in enumerate(series_list, start=1):
+        name = str(getattr(series, "title", None) or f"系列{index}")
+        vals = _chart_series_values(series)
+        if not categories:
+            categories = _chart_categories(series)
+        series_cols.append((name, vals))
+    return categories, series_cols
 
 
 def _xlsx_sheet_chart_tables(sheet: Any) -> Iterator[tuple[list[list[str]], str]]:
     """从工作表上的 chart 尽量还原类别×系列数值表。"""
-    charts = list(getattr(sheet, "_charts", None) or [])
-    for chart in charts:
+    for chart in list(getattr(sheet, "_charts", None) or []):
         try:
-            title = ""
-            title_obj = getattr(chart, "title", None)
-            if title_obj is not None:
-                # openpyxl Title.tx.rich 或 title 字符串，尽量宽松
-                title = str(getattr(title_obj, "tx", None) or title_obj or "").strip()
-                if "Title()" in title or title.startswith("<"):
-                    title = ""
             series_list = list(getattr(chart, "series", None) or [])
             if not series_list:
                 continue
-            # 类别：取第一条 series 的 x 值；数值取 val
-            categories: list[str] = []
-            series_cols: list[tuple[str, list[str]]] = []
-            for index, series in enumerate(series_list, start=1):
-                name = str(getattr(series, "title", None) or f"系列{index}")
-                vals = []
-                try:
-                    val = series.val
-                    nums = getattr(val, "numRef", None) or getattr(val, "numLit", None)
-                    if nums is not None and getattr(nums, "pt", None):
-                        vals = [
-                            "" if pt.v is None else str(pt.v)
-                            for pt in nums.pt
-                        ]
-                    elif hasattr(series, "values"):
-                        vals = ["" if v is None else str(v) for v in (series.values or [])]
-                except Exception:
-                    vals = []
-                try:
-                    cat_ref = series.tx if False else getattr(series, "cat", None)
-                    if cat_ref is not None and not categories:
-                        strref = getattr(cat_ref, "strRef", None) or getattr(cat_ref, "numRef", None)
-                        pts = getattr(strref, "pt", None) if strref is not None else None
-                        if pts:
-                            categories = ["" if pt.v is None else str(pt.v) for pt in pts]
-                except Exception:
-                    pass
-                series_cols.append((name, vals))
-            if not series_cols:
-                continue
+            categories, series_cols = _chart_series_cols(series_list)
             width = max((len(vals) for _, vals in series_cols), default=0)
             if width <= 0:
                 continue
@@ -979,7 +1052,7 @@ def _xlsx_sheet_chart_tables(sheet: Any) -> Iterator[tuple[list[list[str]], str]
                 for _, vals in series_cols:
                     row.append(vals[row_index] if row_index < len(vals) else "")
                 rows.append(row)
-            yield rows, title
+            yield rows, _chart_title(chart)
         except Exception as exc:
             log.warning("xlsx_chart_unreadable", error=str(exc)[:80])
             continue
@@ -1067,6 +1140,113 @@ def _parse_doc(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
     )
 
 
+@dataclass
+class _PptxState:
+    """`.pptx` 解析过程中的可变状态（把巨型函数的状态收拢，便于分阶段抽取）。"""
+
+    assets_dir: Path | None
+    log_file: str
+    figures: list[ParsedFigure] = field(default_factory=list)
+    tables: list[ParsedTable] = field(default_factory=list)
+    ocr_budget: list[int] = field(default_factory=lambda: [_figure_ocr_budget()])
+    seen_images: set[str] = field(default_factory=set)
+    table_seq: int = 0
+    skipped_pictures: int = 0
+
+
+def _pptx_register_picture(shape: Any, state: _PptxState, number: int,
+                           textless: list[tuple[int, int]]) -> None:
+    """抽 shape 的图片；断链的链接图只告警、不崩。"""
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    picture = _pptx_shape_picture(shape)
+    if picture is not None:
+        blob, ext = picture
+        try:
+            rotate = float(getattr(shape, "rotation", 0.0) or 0.0)
+        except Exception:
+            rotate = 0.0
+        added = _register_figure_blob(
+            blob, ext,
+            assets_dir=state.assets_dir, figures=state.figures, seen=state.seen_images,
+            caption=_alt_text(shape), page=number, ocr_budget=state.ocr_budget,
+            log_file=state.log_file, rotate_degrees=rotate,
+        )
+        if added and not state.figures[-1].caption and not state.figures[-1].ocr_text:
+            textless.append((len(state.figures) - 1, len(blob)))
+        return
+    # 明确是图片类形状但读不出字节（断链的链接图等）
+    try:
+        shape_type = shape.shape_type
+    except Exception:
+        shape_type = None
+    if shape_type in {MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.LINKED_PICTURE}:
+        state.skipped_pictures += 1
+        log.warning("pptx_picture_unreadable", slide=number, shape_type=str(shape_type))
+
+
+def _pptx_append_content(shape: Any, state: _PptxState, number: int, lines: list[str]) -> None:
+    """抽 shape 的正文文本、内嵌表格、图表（图表转数值表）。"""
+    if getattr(shape, "has_text_frame", False):
+        text = (shape.text_frame.text or "").strip()
+        if text:
+            lines.append(text)
+    if getattr(shape, "has_table", False):
+        rows: list[list[str]] = []
+        for row in shape.table.rows:
+            cells = [(cell.text or "").strip().replace("\n", " ") for cell in row.cells]
+            if any(cells):
+                rows.append(cells)
+        body = _rows_to_pipe_markdown(rows)
+        if body:
+            state.table_seq += 1
+            state.tables.append(
+                ParsedTable(body=body, caption="", page=number, table_id=str(state.table_seq))
+            )
+            lines.append(f"[表格 {state.table_seq}]")
+    # 图表 → 数值表（放置方式与「图片截图」不同，但问答同样要能引用）
+    chart_rows = _pptx_chart_rows(shape)
+    if chart_rows:
+        body = _rows_to_pipe_markdown(chart_rows)
+        if body:
+            state.table_seq += 1
+            title = _alt_text(shape) or ""
+            state.tables.append(
+                ParsedTable(body=body, caption=title, page=number, table_id=str(state.table_seq))
+            )
+            lines.append(f"[表格 {state.table_seq}]{(' ' + title) if title else ''}".rstrip())
+
+
+def _pptx_ingest_shape(shape: Any, state: _PptxState, number: int,
+                       lines: list[str], textless: list[tuple[int, int]]) -> None:
+    _pptx_register_picture(shape, state, number, textless)
+    _pptx_append_content(shape, state, number, lines)
+
+
+def _pptx_slide_lines(slide: Any, number: int, portrait: bool, state: _PptxState) -> list[str]:
+    """抽一页：页标题 + 形状内容 + 备注 + 无字图题注兜底。"""
+    lines = [f"## 第 {number} 页" + ("（竖向）" if portrait else "")]
+    textless: list[tuple[int, int]] = []
+    for shape in _iter_shapes(slide.shapes):
+        _pptx_ingest_shape(shape, state, number, lines, textless)
+    notes = getattr(slide, "notes_slide", None)
+    if notes is not None:
+        note_text = (notes.notes_text_frame.text or "").strip()
+        if note_text:
+            lines.append(f"（备注）{note_text}")
+    if textless:
+        page_title = next((ln.strip() for ln in lines[1:] if ln.strip()), "")
+        if page_title:
+            biggest = max(textless, key=lambda item: item[1])[0]
+            state.figures[biggest].caption = page_title
+            log.info(
+                "pptx_figure_caption_fallback", slide=number,
+                figure=state.figures[biggest].figure_id, caption=page_title,
+                textless=len(textless),
+            )
+    return lines
+
+
 def _parse_pptx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
     """`.pptx` —— 用 `python-pptx` 按页抽文本、表格**与图片**。
 
@@ -1089,7 +1269,6 @@ def _parse_pptx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
     """
     try:
         from pptx import Presentation
-        from pptx.enum.shapes import MSO_SHAPE_TYPE
     except Exception as exc:  # pragma: no cover
         raise ParserUnavailable(f"python-pptx 不可用：{exc}") from exc
 
@@ -1098,123 +1277,31 @@ def _parse_pptx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
         presentation.slide_height and presentation.slide_width
         and presentation.slide_height > presentation.slide_width
     )
-    pages: list[str] = []
-    figures: list[ParsedFigure] = []
-    tables: list[ParsedTable] = []
-    table_seq = 0
-    ocr_budget = [_figure_ocr_budget()]
-    seen_images: set[str] = set()
-    skipped_pictures = 0
-
-    for number, slide in enumerate(presentation.slides, start=1):
-        heading = f"## 第 {number} 页" + ("（竖向）" if portrait else "")
-        lines: list[str] = [heading]
-        textless: list[tuple[int, int]] = []
-        for shape in _iter_shapes(slide.shapes):
-            # —— 图片：不限 PICTURE，占位符/链接图只要 .image 可读都抽 ——
-            picture = _pptx_shape_picture(shape)
-            if picture is not None:
-                blob, ext = picture
-                try:
-                    rotate = float(getattr(shape, "rotation", 0.0) or 0.0)
-                except Exception:
-                    rotate = 0.0
-                added = _register_figure_blob(
-                    blob, ext,
-                    assets_dir=assets_dir, figures=figures, seen=seen_images,
-                    caption=_alt_text(shape), page=number, ocr_budget=ocr_budget,
-                    log_file=path.name, rotate_degrees=rotate,
-                )
-                if added and not figures[-1].caption and not figures[-1].ocr_text:
-                    textless.append((len(figures) - 1, len(blob)))
-            else:
-                # 明确是图片类形状但读不出字节（断链的链接图等）
-                try:
-                    st = shape.shape_type
-                except Exception:
-                    st = None
-                if st in {
-                    MSO_SHAPE_TYPE.PICTURE,
-                    MSO_SHAPE_TYPE.LINKED_PICTURE,
-                }:
-                    skipped_pictures += 1
-                    log.warning("pptx_picture_unreadable", slide=number, shape_type=str(st))
-
-            if getattr(shape, "has_text_frame", False):
-                text = (shape.text_frame.text or "").strip()
-                if text:
-                    lines.append(text)
-
-            if getattr(shape, "has_table", False):
-                table = shape.table
-                rows: list[list[str]] = []
-                for row in table.rows:
-                    cells = [(cell.text or "").strip().replace("\n", " ") for cell in row.cells]
-                    if any(cells):
-                        rows.append(cells)
-                body = _rows_to_pipe_markdown(rows)
-                if body:
-                    table_seq += 1
-                    tables.append(
-                        ParsedTable(
-                            body=body, caption="", page=number, table_id=str(table_seq),
-                        )
-                    )
-                    lines.append(f"[表格 {table_seq}]")
-
-            # 图表 → 数值表（放置方式与「图片截图」不同，但问答同样要能引用）
-            chart_rows = _pptx_chart_rows(shape)
-            if chart_rows:
-                body = _rows_to_pipe_markdown(chart_rows)
-                if body:
-                    table_seq += 1
-                    title = _alt_text(shape) or ""
-                    tables.append(
-                        ParsedTable(
-                            body=body, caption=title, page=number, table_id=str(table_seq),
-                        )
-                    )
-                    lines.append(f"[表格 {table_seq}]{(' ' + title) if title else ''}".rstrip())
-
-        notes = getattr(slide, "notes_slide", None)
-        if notes is not None:
-            note_text = (notes.notes_text_frame.text or "").strip()
-            if note_text:
-                lines.append(f"（备注）{note_text}")
-
-        if textless:
-            page_title = next((ln.strip() for ln in lines[1:] if ln.strip()), "")
-            if page_title:
-                biggest = max(textless, key=lambda item: item[1])[0]
-                figures[biggest].caption = page_title
-                log.info(
-                    "pptx_figure_caption_fallback", slide=number,
-                    figure=figures[biggest].figure_id, caption=page_title,
-                    textless=len(textless),
-                )
-        pages.append("\n".join(lines))
-
+    state = _PptxState(assets_dir=assets_dir, log_file=path.name)
+    pages = [
+        "\n".join(_pptx_slide_lines(slide, number, portrait, state))
+        for number, slide in enumerate(presentation.slides, start=1)
+    ]
     # zip 兜底：母版/版式/漏扫形状里的 media
     for blob, ext in _ooxml_media_blobs(path, prefix="ppt/media/"):
         _register_figure_blob(
             blob, ext,
-            assets_dir=assets_dir, figures=figures, seen=seen_images,
-            caption=path.stem if portrait else "", page=None, ocr_budget=ocr_budget,
-            log_file=path.name,
+            assets_dir=state.assets_dir, figures=state.figures, seen=state.seen_images,
+            caption=path.stem if portrait else "", page=None, ocr_budget=state.ocr_budget,
+            log_file=state.log_file,
         )
-
-    if figures or skipped_pictures:
+    if state.figures or state.skipped_pictures:
         log.info(
-            "pptx_figures_extracted", file=path.name, figures=len(figures),
-            unreadable=skipped_pictures, portrait=portrait,
+            "pptx_figures_extracted", file=path.name, figures=len(state.figures),
+            unreadable=state.skipped_pictures, portrait=portrait,
             ocr_budget=_figure_ocr_budget(),
         )
     markdown = "\n\n".join(pages)
     return ParsedDocument(
         markdown=markdown, engine="pptx", source_path=str(path),
         page_map=page_map_from_pages(pages), page_count=len(pages),
-        figures=figures,
-        tables=tables,
+        figures=state.figures,
+        tables=state.tables,
     )
 
 
@@ -1300,6 +1387,97 @@ def _fill_xls_merged_header(
                     values[col] = master
 
 
+@dataclass
+class _XlsState:
+    """旧版 `.xls` 解析过程中的可变状态。"""
+
+    assets_dir: Path | None
+    log_file: str
+    lines: list[str] = field(default_factory=list)
+    tables: list[ParsedTable] = field(default_factory=list)
+    figures: list[ParsedFigure] = field(default_factory=list)
+    table_seq: int = 0
+
+
+def _xls_row_values(sheet: Any, book: Any, xlrd: Any, row_index: int) -> list[str]:
+    """xlrd 把所有数字读成 float（整数显示成 "1.0"）——归一化成 "1"；日期按 XL_CELL_DATE 转可读。"""
+    values: list[str] = []
+    for col_index in range(sheet.ncols):
+        cell = sheet.cell(row_index, col_index)
+        if cell.ctype == xlrd.XL_CELL_DATE:
+            try:
+                values.append(
+                    xlrd.xldate_as_datetime(cell.value, book.datemode).strftime("%Y-%m-%d")
+                )
+            except Exception:
+                values.append(_cell_text(cell.value))
+        else:
+            values.append(_cell_text(cell.value))
+    return _convert_date_serials_in_header(values)
+
+
+def _xls_split_blocks(sheet: Any, book: Any, xlrd: Any) -> list[list[tuple[int, list[str]]]]:
+    """与 xlsx 同口径：按空行 / 单格分节标题切连续块。"""
+    blocks: list[list[tuple[int, list[str]]]] = []
+    buf: list[tuple[int, list[str]]] = []
+    for row_index in range(sheet.nrows):
+        values = _xls_row_values(sheet, book, xlrd, row_index)
+        if not any(values):
+            if buf:
+                blocks.append(buf)
+                buf = []
+            continue
+        if len(buf) >= 2 and _is_section_title_row(values):
+            blocks.append(buf)
+            buf = []
+        buf.append((row_index + 1, values))
+    if buf:
+        blocks.append(buf)
+    return blocks
+
+
+def _xls_serialize_blocks(
+    sheet: Any, merged_blocks: list[list[tuple[int, list[str]]]],
+    state: _XlsState, sheet_index: int,
+) -> None:
+    from ekbs.ingest.table_serialize import _looks_like_form, _pick_header_index
+
+    for block_index, rows_with_nums in enumerate(merged_blocks, start=1):
+        rows = [values for _n, values in rows_with_nums]
+        row_nums = [n for n, _values in rows_with_nums]
+        if not _looks_like_form(rows):
+            idx = _pick_header_index(rows)
+            if 0 <= idx < len(row_nums):
+                _fill_xls_merged_header(sheet, rows_with_nums, row_nums[idx])
+                rows = [values for _n, values in rows_with_nums]
+        body = _rows_to_pipe_markdown(rows)
+        if not body:
+            continue
+        state.table_seq += 1
+        caption = sheet.name if len(merged_blocks) == 1 else f"{sheet.name}（第{block_index}段）"
+        state.tables.append(
+            ParsedTable(body=body, caption=caption, page=sheet_index, table_id=str(state.table_seq))
+        )
+        state.lines.append(f"[表格 {state.table_seq}] {caption}".rstrip())
+
+
+def _xls_scan_figures(path: Path, state: _XlsState) -> None:
+    """xlrd 不暴露嵌入图 API：对文件字节做 PNG/JPEG 魔数扫描作兜底（与 ``.doc`` 同口径）。"""
+    if state.assets_dir is None:
+        return
+    seen: set[str] = set()
+    ocr_budget = [_figure_ocr_budget()]
+    for blob, ext in _scan_embedded_raster_blobs(path.read_bytes()):
+        _register_figure_blob(
+            blob, ext,
+            assets_dir=state.assets_dir, figures=state.figures, seen=seen,
+            caption=path.stem, page=None, ocr_budget=ocr_budget,
+            log_file=state.log_file,
+        )
+    if state.figures:
+        log.info("xls_figures_scanned", file=path.name, figures=len(state.figures))
+
+
 def _parse_xls(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
     """旧版 `.xls` —— 用 `xlrd` 按工作表抽成 Markdown 表格（与 xlsx 分支同口径）。
 
@@ -1317,98 +1495,20 @@ def _parse_xls(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
         ) from exc
 
     book = xlrd.open_workbook(str(path))
-    lines: list[str] = []
-    tables: list[ParsedTable] = []
-    figures: list[ParsedFigure] = []
-    table_seq = 0
+    state = _XlsState(assets_dir=assets_dir, log_file=path.name)
     for sheet_index, sheet in enumerate(book.sheets(), start=1):
-        lines.append(f"## {sheet.name}")
-        # 与 xlsx 同口径：按空行切连续块，一个 sheet 可以有多段表/表单。
-        blocks: list[list[tuple[int, list[str]]]] = []
-        buf: list[tuple[int, list[str]]] = []
-        for row_index in range(sheet.nrows):
-            # xlrd 把所有数字读成 float，整数会显示成 "1.0" —— 归一化成 "1"；
-            # 日期格式单元格按 XL_CELL_DATE 转可读日期（与 xlsx 同口径）。
-            values = []
-            for col_index in range(sheet.ncols):
-                cell = sheet.cell(row_index, col_index)
-                if cell.ctype == xlrd.XL_CELL_DATE:
-                    try:
-                        values.append(
-                            xlrd.xldate_as_datetime(cell.value, book.datemode).strftime("%Y-%m-%d")
-                        )
-                    except Exception:
-                        values.append(_cell_text(cell.value))
-                else:
-                    values.append(_cell_text(cell.value))
-            values = _convert_date_serials_in_header(values)
-            if not any(values):
-                if buf:
-                    blocks.append(buf)
-                    buf = []
-                continue
-            if len(buf) >= 2 and _is_section_title_row(values):
-                blocks.append(buf)
-                buf = []
-            buf.append((row_index + 1, values))
-        if buf:
-            blocks.append(buf)
-        merged_blocks: list[list[tuple[int, list[str]]]] = []
-        pending: list[tuple[int, list[str]]] = []
-        for block in blocks:
-            if len(block) == 1 and not pending:
-                pending = block
-                continue
-            merged_blocks.append([*pending, *block] if pending else block)
-            pending = []
-        if pending:
-            merged_blocks.append(pending)
-
-        from ekbs.ingest.table_serialize import _looks_like_form, _pick_header_index
-
-        for block_index, rows_with_nums in enumerate(merged_blocks, start=1):
-            rows = [values for _n, values in rows_with_nums]
-            row_nums = [n for n, _values in rows_with_nums]
-            if not _looks_like_form(rows):
-                idx = _pick_header_index(rows)
-                if 0 <= idx < len(row_nums):
-                    _fill_xls_merged_header(sheet, rows_with_nums, row_nums[idx])
-                    rows = [values for _n, values in rows_with_nums]
-            body = _rows_to_pipe_markdown(rows)
-            if not body:
-                continue
-            table_seq += 1
-            caption = sheet.name if len(merged_blocks) == 1 else f"{sheet.name}（第{block_index}段）"
-            tables.append(
-                ParsedTable(
-                    body=body,
-                    caption=caption,
-                    page=sheet_index,
-                    table_id=str(table_seq),
-                )
-            )
-            lines.append(f"[表格 {table_seq}] {caption}".rstrip())
-        lines.append("")
-
-    if assets_dir is not None:
-        seen: set[str] = set()
-        ocr_budget = [_figure_ocr_budget()]
-        for blob, ext in _scan_embedded_raster_blobs(path.read_bytes()):
-            _register_figure_blob(
-                blob, ext,
-                assets_dir=assets_dir, figures=figures, seen=seen,
-                caption=path.stem, page=None, ocr_budget=ocr_budget,
-                log_file=path.name,
-            )
-        if figures:
-            log.info("xls_figures_scanned", file=path.name, figures=len(figures))
-
+        state.lines.append(f"## {sheet.name}")
+        # 与 xlsx 共用「单行块并到下一块」的规则
+        merged_blocks = _xlsx_merge_single_row_blocks(_xls_split_blocks(sheet, book, xlrd))
+        _xls_serialize_blocks(sheet, merged_blocks, state, sheet_index)
+        state.lines.append("")
+    _xls_scan_figures(path, state)
     return ParsedDocument(
-        markdown="\n".join(lines),
+        markdown="\n".join(state.lines),
         engine="xls",
         source_path=str(path),
-        tables=tables,
-        figures=figures,
+        tables=state.tables,
+        figures=state.figures,
     )
 
 
@@ -1735,6 +1835,38 @@ def _register_figure_blob(
     return True
 
 
+def _docx_related_blob(document: Any, r_id: str) -> tuple[bytes, str] | None:
+    """按关系 id 取图片 part 的 ``(blob, ext)``；非图片/缺失返回 None。"""
+    if not r_id:
+        return None
+    try:
+        part = document.part.related_parts[r_id]
+    except (KeyError, AttributeError):
+        return None
+    blob = getattr(part, "blob", None)
+    if not blob:
+        return None
+    partname = str(getattr(part, "partname", "") or "")
+    ext = Path(partname).suffix.lstrip(".").lower() or "png"
+    if ext not in _IMAGE_EXTS:
+        return None
+    return blob, ext
+
+
+def _blip_caption(blip: Any) -> str:
+    """向上找 8 层父节点，取第一个非空 ``descr/title/name`` 作题注。"""
+    parent = blip.getparent()
+    for _ in range(8):
+        if parent is None:
+            break
+        for attr in ("descr", "title", "name"):
+            value = parent.get(attr)
+            if value and str(value).strip():
+                return str(value).strip()
+        parent = parent.getparent()
+    return ""
+
+
 def _docx_images_in_element(element: Any, document: Any) -> Iterator[tuple[bytes, str, str]]:
     """从一段 / 一表 / 页眉的 OOXML 节点里抽出嵌入图 ``(blob, ext, caption)``。
 
@@ -1747,44 +1879,14 @@ def _docx_images_in_element(element: Any, document: Any) -> Iterator[tuple[bytes
     except Exception:  # pragma: no cover
         return
 
-    def _related_blob(r_id: str) -> tuple[bytes, str] | None:
-        if not r_id:
-            return None
-        try:
-            part = document.part.related_parts[r_id]
-        except (KeyError, AttributeError):
-            return None
-        blob = getattr(part, "blob", None)
-        if not blob:
-            return None
-        partname = str(getattr(part, "partname", "") or "")
-        ext = Path(partname).suffix.lstrip(".").lower() or "png"
-        if ext not in _IMAGE_EXTS:
-            return None
-        return blob, ext
-
     blip_tag = qn("a:blip")
     embed_attr = qn("r:embed")
     for blip in element.iter(blip_tag):
-        r_id = blip.get(embed_attr)
-        got = _related_blob(r_id)
+        got = _docx_related_blob(document, blip.get(embed_attr))
         if not got:
             continue
         blob, ext = got
-        caption = ""
-        parent = blip.getparent()
-        for _ in range(8):
-            if parent is None:
-                break
-            for attr in ("descr", "title", "name"):
-                value = parent.get(attr)
-                if value and str(value).strip():
-                    caption = str(value).strip()
-                    break
-            if caption:
-                break
-            parent = parent.getparent()
-        yield blob, ext, caption
+        yield blob, ext, _blip_caption(blip)
 
     # VML：``{urn:schemas-microsoft-com:vml}imagedata`` + ``r:id``
     vml_imagedata = "{urn:schemas-microsoft-com:vml}imagedata"
@@ -1793,7 +1895,7 @@ def _docx_images_in_element(element: Any, document: Any) -> Iterator[tuple[bytes
         r_id = node.get(r_id_attr) or node.get(
             "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
         )
-        got = _related_blob(r_id or "")
+        got = _docx_related_blob(document, r_id or "")
         if not got:
             continue
         blob, ext = got
@@ -2216,6 +2318,103 @@ def _emit_seal_account(emit, text: str) -> None:
     emit(raw)
 
 
+@dataclass
+class _MineruState:
+    """MinerU 块列表 → Markdown 过程中的可变状态。"""
+
+    path: Path
+    out_root: Path | None
+    assets_dir: Path | None
+    lines: list[str] = field(default_factory=list)
+    page_map: list[tuple[int, int, int]] = field(default_factory=list)
+    seen_pages: set[int] = field(default_factory=set)
+    figures: list[ParsedFigure] = field(default_factory=list)
+    tables: list[ParsedTable] = field(default_factory=list)
+    ocr_budget: int = field(default_factory=_figure_ocr_budget)
+    table_seq: int = 0
+    offset: int = 0
+    max_page: int = 0
+
+
+def _append_table_block(state: _MineruState, block: dict, page: int, emit) -> None:
+    body = str(block.get("table_body") or str(block.get("text") or "").strip()).strip()
+    caption = " ".join(str(c) for c in (block.get("table_caption") or []) if c).strip()
+    if body or caption:
+        state.table_seq += 1
+        state.tables.append(
+            ParsedTable(body=body, caption=caption, page=page, table_id=str(state.table_seq))
+        )
+    # 正文只留一行锚点，避免整表再进 parent/child 双索引
+    emit(f"[表格 {state.table_seq}]{(' ' + caption) if caption else ''}".rstrip())
+
+
+def _append_image_block(state: _MineruState, block: dict, page: int, emit) -> None:
+    from ekbs.ingest.seal_filter import is_seal_image
+
+    img = str(block.get("img_path") or "").strip()
+    caption = " ".join(str(c) for c in (block.get("img_caption") or []) if c).strip()
+    managed = _persist_figure(img, state.out_root, state.assets_dir) if img else None
+    if managed is None:
+        if is_seal_image(None, caption=caption):
+            log.info("seal_figure_dropped", file=state.path.name, img=img, page=page)
+            _emit_seal_account(emit, caption)
+            return
+        # 没给 assets_dir（或找不到源图）→ 只能留链接，且**明确告警**：这种链接会失效
+        if img and state.assets_dir is None:
+            log.warning("figure_not_persisted", file=state.path.name, img=img)
+        emit(f"![{caption or '图片'}]({img})" if img else (caption or "（图片）"))
+        return
+    image_file = state.assets_dir / managed
+    # 先按画面/题注丢掉公章，避免对印章浪费 OCR，也不写进附图
+    if is_seal_image(image_file, caption=caption):
+        log.info("seal_figure_dropped", file=state.path.name, img=managed, page=page)
+        _emit_seal_account(emit, caption)
+        return
+    ocr = ""
+    if state.ocr_budget > 0:
+        outcome = _ocr_figure(image_file)
+        ocr = outcome.text
+        if outcome.attempted:
+            state.ocr_budget -= 1
+        if not outcome.usable:
+            log.warning(
+                "figure_ocr_disabled_for_document", file=state.path.name,
+                skipped_after=len(state.figures),
+                hint="MinerU 不可用，本文件剩余图片不再尝试 OCR（图片本身已落盘）",
+            )
+            state.ocr_budget = 0
+    if is_seal_image(image_file, caption=caption, ocr=ocr):
+        log.info(
+            "seal_figure_dropped", file=state.path.name, img=managed, page=page, via="ocr",
+        )
+        _emit_seal_account(emit, caption or ocr)
+        return
+    state.figures.append(
+        ParsedFigure(
+            name=managed, caption=caption, page=page,
+            ocr_text=ocr, figure_id=Path(managed).stem,
+        )
+    )
+    # 与 pptx 分支一致：**不要**把 `![](images/…)` 写进 markdown。
+    # 图片块只从 ``figures`` 建；链接进正文会被切成 parent/child 并向量化，
+    # 检索污染实测见开班典礼第 1 页（整段只有图片链接却双索引）。
+    # 正文只留短锚点，方便对照页内有图。
+    stem = Path(managed).stem
+    emit(f"[图片 {stem[:12]}]{(' ' + caption) if caption else ''}".rstrip())
+
+
+def _append_text_block(state: _MineruState, block: dict, kind: str, emit) -> None:
+    text = str(block.get("text") or "").strip()
+    if kind == "equation":
+        emit(text if text.startswith("$$") else f"$$ {text} $$")
+        return
+    level = block.get("text_level")
+    if isinstance(level, int) and 1 <= level <= 6 and text:
+        emit("#" * level + " " + text)
+    elif text:
+        emit(text)
+
+
 def _blocks_to_document(
     blocks: Sequence[dict],
     path: Path,
@@ -2229,127 +2428,43 @@ def _blocks_to_document(
     图片块（``type == "image"``）会被**复制到 ``assets_dir``** 并登记成 :class:`ParsedFigure`；
     只给链接不落盘等于没保留（临时目录一删就全丢）。
     """
-    lines: list[str] = []
-    page_map: list[tuple[int, int, int]] = []
-    seen_pages: set[int] = set()
-    figures: list[ParsedFigure] = []
-    tables: list[ParsedTable] = []
-    ocr_budget = _figure_ocr_budget()
-    offset = 0
-    max_page = 0
-    table_seq = 0
+    state = _MineruState(path=path, out_root=out_root, assets_dir=assets_dir)
 
     def emit(text: str) -> None:
-        nonlocal offset
-        lines.append(text)
-        offset += len(text) + 1
+        state.lines.append(text)
+        state.offset += len(text) + 1
 
     for block in blocks:
         page_index = block.get("page_idx")
         page = int(page_index) + 1 if isinstance(page_index, int) else 1
-        max_page = max(max_page, page)
-        if page not in seen_pages:
-            seen_pages.add(page)
-            page_map.append((offset, page, page))
-
+        state.max_page = max(state.max_page, page)
+        if page not in state.seen_pages:
+            state.seen_pages.add(page)
+            state.page_map.append((state.offset, page, page))
         kind = str(block.get("type") or "text")
-        text = str(block.get("text") or "").strip()
         if kind == "table":
-            body = str(block.get("table_body") or text).strip()
-            caption = " ".join(str(c) for c in (block.get("table_caption") or []) if c).strip()
-            if body or caption:
-                table_seq += 1
-                tables.append(
-                    ParsedTable(
-                        body=body,
-                        caption=caption,
-                        page=page,
-                        table_id=str(table_seq),
-                    )
-                )
-            # 正文只留一行锚点，避免整表再进 parent/child 双索引
-            emit(f"[表格 {table_seq}]{(' ' + caption) if caption else ''}".rstrip())
+            _append_table_block(state, block, page, emit)
         elif kind == "image":
-            img = str(block.get("img_path") or "").strip()
-            caption = " ".join(str(c) for c in (block.get("img_caption") or []) if c).strip()
-            managed = _persist_figure(img, out_root, assets_dir) if img else None
-            if managed is None:
-                from ekbs.ingest.seal_filter import is_seal_image
-
-                if is_seal_image(None, caption=caption):
-                    log.info("seal_figure_dropped", file=path.name, img=img, page=page)
-                    _emit_seal_account(emit, caption)
-                    continue
-                # 没给 assets_dir（或找不到源图）→ 只能留链接，且**明确告警**：这种链接会失效
-                if img and assets_dir is None:
-                    log.warning("figure_not_persisted", file=path.name, img=img)
-                emit(f"![{caption or '图片'}]({img})" if img else (caption or "（图片）"))
-            else:
-                from ekbs.ingest.seal_filter import is_seal_image
-
-                image_file = assets_dir / managed
-                # 先按画面/题注丢掉公章，避免对印章浪费 OCR，也不写进附图
-                if is_seal_image(image_file, caption=caption):
-                    log.info("seal_figure_dropped", file=path.name, img=managed, page=page)
-                    _emit_seal_account(emit, caption)
-                    continue
-                ocr = ""
-                if ocr_budget > 0:
-                    outcome = _ocr_figure(image_file)
-                    ocr = outcome.text
-                    if outcome.attempted:
-                        ocr_budget -= 1
-                    if not outcome.usable:
-                        log.warning(
-                            "figure_ocr_disabled_for_document", file=path.name,
-                            skipped_after=len(figures),
-                            hint="MinerU 不可用，本文件剩余图片不再尝试 OCR（图片本身已落盘）",
-                        )
-                        ocr_budget = 0
-                if is_seal_image(image_file, caption=caption, ocr=ocr):
-                    log.info(
-                        "seal_figure_dropped", file=path.name, img=managed,
-                        page=page, via="ocr",
-                    )
-                    _emit_seal_account(emit, caption or ocr)
-                    continue
-                figures.append(
-                    ParsedFigure(
-                        name=managed, caption=caption, page=page,
-                        ocr_text=ocr, figure_id=Path(managed).stem,
-                    )
-                )
-                # 与 pptx 分支一致：**不要**把 `![](images/…)` 写进 markdown。
-                # 图片块只从 ``figures`` 建；链接进正文会被切成 parent/child 并向量化，
-                # 检索污染实测见开班典礼第 1 页（整段只有图片链接却双索引）。
-                # 正文只留短锚点，方便对照页内有图。
-                stem = Path(managed).stem
-                emit(f"[图片 {stem[:12]}]{(' ' + caption) if caption else ''}".rstrip())
-        elif kind == "equation":
-            emit(text if text.startswith("$$") else f"$$ {text} $$")
+            _append_image_block(state, block, page, emit)
         else:
-            level = block.get("text_level")
-            if isinstance(level, int) and 1 <= level <= 6 and text:
-                emit("#" * level + " " + text)
-            elif text:
-                emit(text)
+            _append_text_block(state, block, kind, emit)
 
-    markdown = "\n".join(lines)
+    markdown = "\n".join(state.lines)
     if not markdown.strip() and markdown_file is not None:
         markdown = markdown_file.read_text(encoding="utf-8", errors="replace")
     # 跨页续表合并（清洗步 4）：MinerU 常把一表拆成多块
     from ekbs.ingest.table_merge import merge_continued_tables
 
-    markdown, tables, merge_stats = merge_continued_tables(markdown, tables)
+    markdown, tables, merge_stats = merge_continued_tables(markdown, state.tables)
     if merge_stats:
         log.info("mineru_tables_merged", file=path.name, **merge_stats)
     return ParsedDocument(
         markdown=markdown,
         engine="mineru",
         source_path=str(path),
-        page_map=page_map,
-        page_count=max_page or None,
-        figures=figures,
+        page_map=state.page_map,
+        page_count=state.max_page or None,
+        figures=state.figures,
         tables=tables,
     )
 

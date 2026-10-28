@@ -311,6 +311,97 @@ async def get_parse_result(
     )
 
 
+def _upgrade_review_draft(runtime, row, task_id: int) -> None:
+    """旧草稿只在待复核时升级。已入库的稿子不能再改磁盘。"""
+    seal_stats = upgrade_review_draft_seals(runtime.settings.data_dir, task_id)
+    if seal_stats.get("seal_figures_dropped"):
+        log.info("review_draft_seals_upgraded", task_id=task_id, **seal_stats)
+    upgrade_stats = upgrade_review_draft_tables(runtime.settings.data_dir, task_id)
+    if upgrade_stats.get("tables_merged_pairs") or upgrade_stats.get("tables_repaired"):
+        log.info("review_draft_tables_upgraded", task_id=task_id, **upgrade_stats)
+    tail_stats = upgrade_review_draft_tail(
+        runtime.settings.data_dir, task_id, str(row["source_path"] or "")
+    )
+    if tail_stats:
+        log.info("review_draft_tail_upgraded", task_id=task_id, **tail_stats)
+
+
+def _draft_tables(sidecar) -> list[dict]:
+    tables = []
+    for item in sidecar.tables:
+        body_html = str(item.get("body") or "")
+        tables.append(
+            {
+                "table_id": str(item.get("table_id") or ""),
+                "caption": str(item.get("caption") or ""),
+                "page": item.get("page"),
+                "body_html": body_html,
+                "chars": len(body_html),
+            }
+        )
+    return tables
+
+
+def _resolve_figure_kind(
+    runtime, task_id: int, parse_root, fid: str, rel: str, kind: str,
+) -> tuple[float | None, str]:
+    candidates = []
+    if rel:
+        candidates.append((runtime.settings.data_dir / rel).resolve())
+    if fid:
+        candidates.extend(
+            [
+                parse_root / str(task_id) / "images" / fid,
+                parse_root / str(task_id) / "images" / f"{fid}.jpg",
+                parse_root / str(task_id) / "images" / f"{fid}.png",
+            ]
+        )
+    for cand in candidates:
+        try:
+            cand.relative_to(parse_root)
+        except Exception:
+            continue
+        if cand.is_file():
+            if kind != "handwriting":
+                try:
+                    meta = classify_figure(cand)
+                    return round(meta.ink_frac, 4), meta.kind
+                except Exception:
+                    pass
+            break
+    return None, kind
+
+
+def _draft_figures(runtime, task_id: int, sidecar) -> list[dict]:
+    figures = []
+    parse_root = Path(runtime.settings.data_paths()["parse"]).resolve()
+    for item in sidecar.figures:
+        fid = str(item.get("figure_id") or "")
+        rel = str(item.get("image_path") or "").strip()
+        kind = "handwriting" if fid.startswith("handwrite") else "normal"
+        ink_frac: float | None = None
+        if fid or rel:
+            ink_frac, kind = _resolve_figure_kind(runtime, task_id, parse_root, fid, rel, kind)
+        figures.append(
+            {
+                "figure_id": fid,
+                "caption": str(item.get("caption") or ""),
+                "ocr_text": str(item.get("ocr_text") or ""),
+                "page": item.get("page"),
+                "image_path": rel,
+                "has_image": bool(fid),
+                "kind": kind,
+                "ink_frac": ink_frac,
+                "display_hint": (
+                    "淡色附图，预览已自动增强对比"
+                    if kind in ("faint", "blank")
+                    else ""
+                ),
+            }
+        )
+    return figures
+
+
 @router.get("/parse/tasks/{task_id}/draft")
 async def get_parse_draft(
     task_id: int,
@@ -329,88 +420,15 @@ async def get_parse_draft(
             status_code=409,
             detail=f"仅待复核或已入库文档可看对照（当前 {status}）",
         )
-    # 旧草稿只在待复核时升级。已入库的稿子不能再改磁盘。
     if status == STATUS_REVIEW:
-        seal_stats = upgrade_review_draft_seals(runtime.settings.data_dir, task_id)
-        if seal_stats.get("seal_figures_dropped"):
-            log.info("review_draft_seals_upgraded", task_id=task_id, **seal_stats)
-        upgrade_stats = upgrade_review_draft_tables(runtime.settings.data_dir, task_id)
-        if upgrade_stats.get("tables_merged_pairs") or upgrade_stats.get("tables_repaired"):
-            log.info("review_draft_tables_upgraded", task_id=task_id, **upgrade_stats)
-        tail_stats = upgrade_review_draft_tail(
-            runtime.settings.data_dir,
-            task_id,
-            str(row["source_path"] or ""),
-        )
-        if tail_stats:
-            log.info("review_draft_tail_upgraded", task_id=task_id, **tail_stats)
+        _upgrade_review_draft(runtime, row, task_id)
     try:
         markdown = load_review_markdown(runtime.settings.data_dir, task_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     sidecar = load_review_sidecar(runtime.settings.data_dir, task_id)
-    tables = []
-    for item in sidecar.tables:
-        body_html = str(item.get("body") or "")
-        tables.append(
-            {
-                "table_id": str(item.get("table_id") or ""),
-                "caption": str(item.get("caption") or ""),
-                "page": item.get("page"),
-                "body_html": body_html,
-                "chars": len(body_html),
-            }
-        )
-    figures = []
-    parse_root = Path(runtime.settings.data_paths()["parse"]).resolve()
-    for item in sidecar.figures:
-        fid = str(item.get("figure_id") or "")
-        rel = str(item.get("image_path") or "").strip()
-        kind = "handwriting" if fid.startswith("handwrite") else "normal"
-        ink_frac = None
-        if fid or rel:
-            candidates = []
-            if rel:
-                candidates.append((runtime.settings.data_dir / rel).resolve())
-            if fid:
-                candidates.extend(
-                    [
-                        parse_root / str(task_id) / "images" / fid,
-                        parse_root / str(task_id) / "images" / f"{fid}.jpg",
-                        parse_root / str(task_id) / "images" / f"{fid}.png",
-                    ]
-                )
-            for cand in candidates:
-                try:
-                    cand.relative_to(parse_root)
-                except Exception:
-                    continue
-                if cand.is_file():
-                    if kind != "handwriting":
-                        try:
-                            meta = classify_figure(cand)
-                            kind = meta.kind
-                            ink_frac = round(meta.ink_frac, 4)
-                        except Exception:
-                            pass
-                    break
-        figures.append(
-            {
-                "figure_id": fid,
-                "caption": str(item.get("caption") or ""),
-                "ocr_text": str(item.get("ocr_text") or ""),
-                "page": item.get("page"),
-                "image_path": rel,
-                "has_image": bool(fid),
-                "kind": kind,
-                "ink_frac": ink_frac,
-                "display_hint": (
-                    "淡色附图，预览已自动增强对比"
-                    if kind in ("faint", "blank")
-                    else ""
-                ),
-            }
-        )
+    tables = _draft_tables(sidecar)
+    figures = _draft_figures(runtime, task_id, sidecar)
     return JSONResponse(
         {
             "task_id": task_id,

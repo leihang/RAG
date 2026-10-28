@@ -29,7 +29,7 @@ def num(v: float | None, digits: int = 3) -> str:
     return "-" if v is None else f"{v:.{digits}f}"
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901 - 一次性评测脚本
     print("# 评测指标核对表\n")
 
     rgb = load(EVAL / "rgb" / "retrieval_report.json")

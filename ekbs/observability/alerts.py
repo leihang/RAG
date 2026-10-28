@@ -267,47 +267,72 @@ def in_business_hours(now: datetime | None = None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _evaluate_rate_window(database: Database, rule: AlertRule) -> AlertHit | None:
+    numerator = sum(
+        value
+        for value, _ in load_window(
+            database, rule.numerator, rule.window_seconds, labels=rule.numerator_labels
+        )
+    )
+    denominator = sum(
+        value
+        for value, _ in load_window(
+            database, rule.denominator, rule.window_seconds, labels=rule.denominator_labels
+        )
+    )
+    # 分母为 0 时**不告警**：那是「没有流量」，不是「失败率高」
+    if denominator <= 0:
+        return None
+    value = numerator / denominator
+    if _compare(value, rule.comparison, rule.threshold):
+        return AlertHit(rule, value, 1)
+    return None
+
+
+def _evaluate_growth_window(database: Database, rule: AlertRule) -> AlertHit | None:
+    current = sum(value for value, _ in load_window(database, rule.name, rule.window_seconds))
+    previous = sum(
+        value
+        for value, _ in load_window(
+            database, rule.name, rule.window_seconds, offset_seconds=rule.window_seconds
+        )
+    )
+    if previous <= 0:
+        return None
+    value = current / previous
+    if _compare(value, rule.comparison, rule.threshold):
+        return AlertHit(rule, value, 2)
+    return None
+
+
+def _sample_value(database: Database, rule: AlertRule, metric_name: str, samples: list) -> float:
+    if not samples:
+        return 0.0
+    if rule.per_label_max:
+        # 「单卡片流式更新 > 200 次」要按标签（card_id）分组，取**每组之和的最大值**。
+        # 早先的实现把所有值加在一起，等于把「多个卡片各 50 次」误报成「一张卡片 200 次」。
+        grouped = _sum_per_label(database, metric_name, rule.window_seconds)
+        return max(grouped.values(), default=0.0)
+    if rule.kind == "sum_window":
+        return sum(item[0] for item in samples)
+    # p95/gauge：采集时已算好，取窗口内最近一次
+    return samples[-1][0]
+
+
+def _sustained_ok(rule: AlertRule, samples: list) -> bool:
+    if rule.kind not in {"gauge", "p95_window"} or not rule.sustained:
+        return True
+    return all(_compare(item[0], rule.comparison, rule.threshold) for item in samples)
+
+
 def evaluate_rule(database: Database, rule: AlertRule, *, now: datetime | None = None) -> AlertHit | None:
     if rule.business_hours_only and not in_business_hours(now):
         return None
 
     if rule.kind == "rate_window":
-        numerator = sum(
-            value
-            for value, _ in load_window(
-                database, rule.numerator, rule.window_seconds, labels=rule.numerator_labels
-            )
-        )
-        denominator = sum(
-            value
-            for value, _ in load_window(
-                database, rule.denominator, rule.window_seconds, labels=rule.denominator_labels
-            )
-        )
-        # 分母为 0 时**不告警**：那是「没有流量」，不是「失败率高」
-        if denominator <= 0:
-            return None
-        value = numerator / denominator
-        if _compare(value, rule.comparison, rule.threshold):
-            return AlertHit(rule, value, 1)
-        return None
-
+        return _evaluate_rate_window(database, rule)
     if rule.kind == "growth_window":
-        current = sum(
-            value for value, _ in load_window(database, rule.name, rule.window_seconds)
-        )
-        previous = sum(
-            value
-            for value, _ in load_window(
-                database, rule.name, rule.window_seconds, offset_seconds=rule.window_seconds
-            )
-        )
-        if previous <= 0:
-            return None
-        value = current / previous
-        if _compare(value, rule.comparison, rule.threshold):
-            return AlertHit(rule, value, 2)
-        return None
+        return _evaluate_growth_window(database, rule)
 
     metric_name = f"{rule.name}_p95" if rule.kind == "p95_window" else rule.name
     samples = load_window(database, metric_name, rule.window_seconds)
@@ -316,24 +341,9 @@ def evaluate_rule(database: Database, rule: AlertRule, *, now: datetime | None =
         return None
     # 而 sum_window 没有采样就是**和为零**：对「业务时段 5 分钟内没有收到消息」
     # 这类规则，零正是要告警的条件（早先在这里提前 return，漏报过）。
-
-    if not samples:
-        value = 0.0
-    elif rule.per_label_max:
-        # 「单卡片流式更新 > 200 次」要按标签（card_id）分组，取**每组之和的最大值**。
-        # 早先的实现把所有值加在一起，等于把「多个卡片各 50 次」误报成「一张卡片 200 次」。
-        grouped = _sum_per_label(database, metric_name, rule.window_seconds)
-        value = max(grouped.values(), default=0.0)
-    elif rule.kind == "sum_window":
-        value = sum(item[0] for item in samples)
-    elif rule.kind == "p95_window":
-        value = samples[-1][0]  # 采集时已算好 p95，取窗口内最近一次
-    else:  # gauge
-        value = samples[-1][0]
-
-    if rule.kind in {"gauge", "p95_window"} and rule.sustained:
-        if not all(_compare(item[0], rule.comparison, rule.threshold) for item in samples):
-            return None
+    value = _sample_value(database, rule, metric_name, samples)
+    if not _sustained_ok(rule, samples):
+        return None
     if _compare(value, rule.comparison, rule.threshold):
         return AlertHit(rule, value, len(samples))
     return None

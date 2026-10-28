@@ -171,6 +171,80 @@ class DocumentGate:
             perm, doc, entries, for_retrieval=True, today=today
         )
 
+    def _check_doc_status(
+        self,
+        doc: DocumentFacts | None,
+        *,
+        for_retrieval: bool,
+        allow_deleted: bool,
+        admin_bypass: bool,
+        today: str | None,
+    ) -> AclDecision | None:
+        """① 文档存在性 + 状态/时效（返回 None 表示继续后续判定）。"""
+        if doc is None:
+            return AclDecision(False, "doc_not_found")
+        if admin_bypass and not for_retrieval:
+            if doc.status == "deleted" and not allow_deleted:
+                return AclDecision(False, "deleted")
+            return AclDecision(True, "admin_bypass")
+        if for_retrieval:
+            if doc.status != "published":
+                return AclDecision(False, "status")
+            today = today or _today()
+            if doc.effective_date and str(doc.effective_date) > today:
+                return AclDecision(False, "not_effective")
+            if doc.expire_date and str(doc.expire_date) <= today:
+                return AclDecision(False, "expired")
+        elif doc.status == "deleted" and not allow_deleted:
+            return AclDecision(False, "deleted")
+        return None
+
+    @staticmethod
+    def _check_doc_level_kb(doc: DocumentFacts, perm: PermContext) -> AclDecision | None:
+        """② 密级 + 知识库可见性。"""
+        if doc.level > perm.clearance:
+            return AclDecision(False, "level")
+        # ⚠️ 这里**必须**是严格成员判断，不能写成 `if perm.visible_kb_ids and ...`：
+        #    「可见知识库集合为空」意味着该用户看不到任何知识库，而不是「无限制」。
+        #    （实测踩过：kb 级 deny 收敛掉全部可见 kb 后，空集被当成放行，L1 文档照样被读出。）
+        #    K3 冲突提示：这等于让「kb 级 ACL」压过「L1 全员可见」（00 §3.2 规则 2），
+        #    是有意的取舍 —— 显式 deny 应当生效；如需反过来，请先改 00/03 的口径。
+        if doc.kb_id not in perm.visible_kb_ids:
+            return AclDecision(False, "kb")
+        return None
+
+    def _check_acl_entries(
+        self, entry_list: list[AclEntry], perm: PermContext,
+    ) -> AclDecision | None:
+        """③ 文档级 ACL：deny 优先，其次 allow。"""
+        for entry in entry_list:
+            if entry.effect == "deny" and self._entry_matches(entry, perm):
+                return AclDecision(False, "acl_deny")
+        for entry in entry_list:
+            if entry.effect == "allow" and self._entry_matches(entry, perm):
+                return AclDecision(True, "acl_allow")
+        return None
+
+    @staticmethod
+    def _check_shard_and_dept(doc: DocumentFacts, perm: PermContext) -> AclDecision:
+        """④ shard 级 allow / L4 白名单 / 部门 / 公开。"""
+        # K6 修正：跨部门文档靠 shard 级 allow 授权（06 §2.2）
+        if doc.shard_id and doc.shard_id in perm.acl_allow_shards:
+            return AclDecision(True, "shard_acl_allow")
+        # L4 白名单：没有显式 allow 就拒绝
+        if doc.level == 4:
+            return AclDecision(False, "l4_whitelist")
+        if doc.level == 1:
+            return AclDecision(True, "public")
+        if not doc.visible_dept_ids:
+            return AclDecision(True, "internal_open")
+        if set(doc.visible_dept_ids) & set(perm.dept_chain):
+            return AclDecision(True, "dept")
+        # 兜底：文档可见部门用的是整数 dept_id 写法时也能命中
+        if set(doc.visible_dept_ids) & set(perm.dept_subjects):
+            return AclDecision(True, "dept")
+        return AclDecision(False, "dept")
+
     def can_see_document(
         self,
         perm: PermContext,
@@ -191,59 +265,20 @@ class DocumentGate:
         * ``admin_bypass=True``：仅用于 ``super_admin`` 管理台 —— 跨部门/密级运维，
           仍拒绝 ``deleted``（除非 allow_deleted）。**检索路径禁止传 True**。
         """
-        if doc is None:
-            return AclDecision(False, "doc_not_found")
-        if admin_bypass and not for_retrieval:
-            if doc.status == "deleted" and not allow_deleted:
-                return AclDecision(False, "deleted")
-            return AclDecision(True, "admin_bypass")
-        # 1) 状态与时效
-        if for_retrieval:
-            if doc.status != "published":
-                return AclDecision(False, "status")
-            today = today or _today()
-            if doc.effective_date and str(doc.effective_date) > today:
-                return AclDecision(False, "not_effective")
-            if doc.expire_date and str(doc.expire_date) <= today:
-                return AclDecision(False, "expired")
-        elif doc.status == "deleted" and not allow_deleted:
-            return AclDecision(False, "deleted")
-        # 2) 密级（纵向）
-        if doc.level > perm.clearance:
-            return AclDecision(False, "level")
-        # 3) 知识库可见性。
-        # ⚠️ 这里**必须**是严格成员判断，不能写成 `if perm.visible_kb_ids and ...`：
-        #    「可见知识库集合为空」意味着该用户看不到任何知识库，而不是「无限制」。
-        #    （实测踩过：kb 级 deny 收敛掉全部可见 kb 后，空集被当成放行，L1 文档照样被读出。）
-        #    K3 冲突提示：这等于让「kb 级 ACL」压过「L1 全员可见」（00 §3.2 规则 2），
-        #    是有意的取舍 —— 显式 deny 应当生效；如需反过来，请先改 00/03 的口径。
-        if doc.kb_id not in perm.visible_kb_ids:
-            return AclDecision(False, "kb")
-        # 4) 文档级 ACL：deny 优先
-        entry_list = list(entries or [])
-        for entry in entry_list:
-            if entry.effect == "deny" and self._entry_matches(entry, perm):
-                return AclDecision(False, "acl_deny")
-        for entry in entry_list:
-            if entry.effect == "allow" and self._entry_matches(entry, perm):
-                return AclDecision(True, "acl_allow")
-        # 4.5) K6 修正：跨部门文档靠 shard 级 allow 授权（06 §2.2）
-        if doc.shard_id and doc.shard_id in perm.acl_allow_shards:
-            return AclDecision(True, "shard_acl_allow")
-        # 5) L4 白名单：没有显式 allow 就拒绝
-        if doc.level == 4:
-            return AclDecision(False, "l4_whitelist")
-        # 6) 部门 / 公开
-        if doc.level == 1:
-            return AclDecision(True, "public")
-        if not doc.visible_dept_ids:
-            return AclDecision(True, "internal_open")
-        if set(doc.visible_dept_ids) & set(perm.dept_chain):
-            return AclDecision(True, "dept")
-        # 兜底：文档可见部门用的是整数 dept_id 写法时也能命中
-        if set(doc.visible_dept_ids) & set(perm.dept_subjects):
-            return AclDecision(True, "dept")
-        return AclDecision(False, "dept")
+        decision = self._check_doc_status(
+            doc, for_retrieval=for_retrieval, allow_deleted=allow_deleted,
+            admin_bypass=admin_bypass, today=today,
+        )
+        if decision is not None:
+            return decision
+        assert doc is not None  # _check_doc_status 已拦截 None
+        decision = self._check_doc_level_kb(doc, perm)
+        if decision is not None:
+            return decision
+        decision = self._check_acl_entries(list(entries or []), perm)
+        if decision is not None:
+            return decision
+        return self._check_shard_and_dept(doc, perm)
 
     def filter_chunks(
         self,

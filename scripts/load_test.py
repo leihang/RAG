@@ -130,7 +130,7 @@ class HardwareSampler(threading.Thread):
         self._stop_event.set()
         self.join(timeout=self.interval + 5)
 
-    def _sample(self) -> dict:
+    def _sample(self) -> dict:  # noqa: C901 - 压测采样工具（进程/DB/接口多段采集）
         out: dict = {"t": time.time()}
         # --- 进程级：top 第二帧给 %CPU 与线程数（第一帧 CPU 恒 0，会得出"零占用"假结论）---
         try:

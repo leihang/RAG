@@ -438,6 +438,56 @@ class ChunkingResult:
         return [n for n in self.nodes if n.chunk_type == "table"]
 
 
+def _dotted_level(num: str) -> int:
+    """``1.`` → 2；``4.1`` → 3；``4.1.2`` → 4（与章/节层级对齐，便于同级弹出）。"""
+    parts = [p for p in re.split(r"[.．]", num.rstrip(".．")) if p]
+    return min(1 + max(len(parts), 1), 6)
+
+
+def _parse_heading_line(stripped: str) -> tuple[int, str] | None:
+    """识别一行是不是标题（Markdown ``#`` / 中文条款 / 点分编号），返回 ``(level, title)``。"""
+    match = _HEADING_RE.match(stripped)
+    if match:
+        return len(match.group(1)), match.group(2).strip()
+    clause = _CLAUSE_HEADING_RE.match(stripped)
+    if clause:
+        kind = clause.group(2)
+        title = f"第{clause.group(1)}{kind}"
+        rest = clause.group(3).strip()
+        if rest:
+            title = f"{title} {rest}"
+        return _CLAUSE_LEVEL.get(kind, 3), title
+    dotted = _DOTTED_HEADING_RE.match(stripped)
+    if dotted:
+        num = dotted.group(1).strip()
+        return _dotted_level(num), f"{num} {dotted.group(2).strip()}"
+    return None
+
+
+def _emit_heading_fallbacks(sections: list[Section], heading_log: list, page_map) -> None:
+    """收尾兜底：有些标题（文档末尾的、被同级标题顶掉的）**没有正文**，文字只存在于
+    heading_stack 里 —— 一旦被 pop 就永久消失。这里只补真正没落库的那些：
+    若该标题已经出现在某个块的 heading_path 中（H1 通常如此），就不重复产出，
+    免得制造一堆 5 token 的碎片块。
+    """
+    emitted_paths = [section.heading_path for section in sections]
+    emitted_text = _strip_md_marks("".join(section.text for section in sections))
+    for title, path, source, head_off in heading_log:
+        if not source.strip() or title in " ".join(emitted_paths):
+            continue
+        if _strip_md_marks(source) in emitted_text:
+            continue
+        page_from, page_to = _pages_for(head_off, head_off + len(source), page_map)
+        sections.append(
+            Section(
+                heading_path=path or title,
+                text=source.strip(),
+                page_from=page_from,
+                page_to=page_to,
+            )
+        )
+
+
 def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | None = None) -> list[Section]:
     """按标题层级把 Markdown 拆成小节，并维护 ``heading_path``。
 
@@ -498,57 +548,17 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
         else:
             current_start = offset + line_len + 1
 
-    def _dotted_level(num: str) -> int:
-        """``1.`` → 2；``4.1`` → 3；``4.1.2`` → 4（与章/节层级对齐，便于同级弹出）。"""
-        parts = [p for p in re.split(r"[.．]", num.rstrip(".．")) if p]
-        return min(1 + max(len(parts), 1), 6)
-
     for line in markdown.splitlines():
         stripped = line.strip()
-        match = _HEADING_RE.match(stripped)
-        clause = _CLAUSE_HEADING_RE.match(stripped) if not match else None
-        dotted = _DOTTED_HEADING_RE.match(stripped) if not match and not clause else None
-        if match:
-            level = len(match.group(1))
-            title = match.group(2).strip()
-            push_heading(level, title, len(line), source_line=line)
-        elif clause:
-            kind = clause.group(2)
-            level = _CLAUSE_LEVEL.get(kind, 3)
-            title = f"第{clause.group(1)}{kind}"
-            rest = clause.group(3).strip()
-            if rest:
-                title = f"{title} {rest}"
-            push_heading(level, title, len(line), source_line=line)
-        elif dotted:
-            num = dotted.group(1).strip()
-            title = f"{num} {dotted.group(2).strip()}"
-            push_heading(_dotted_level(num), title, len(line), source_line=line)
-        else:
+        parsed = _parse_heading_line(stripped)
+        if parsed is None:
             buffer.append(line)
+        else:
+            level, title = parsed
+            push_heading(level, title, len(line), source_line=line)
         offset += len(line) + 1
     flush(offset)
-
-    # 收尾兜底：有些标题（文档末尾的、被同级标题顶掉的）**没有正文**，文字只存在于
-    # heading_stack 里 —— 一旦被 pop 就永久消失。这里只补真正没落库的那些：
-    # 若该标题已经出现在某个块的 heading_path 中（H1 通常如此），就不重复产出，
-    # 免得制造一堆 5 token 的碎片块。
-    emitted_paths = [section.heading_path for section in sections]
-    emitted_text = _strip_md_marks("".join(section.text for section in sections))
-    for title, path, source, head_off in heading_log:
-        if not source.strip() or title in " ".join(emitted_paths):
-            continue
-        if _strip_md_marks(source) in emitted_text:
-            continue
-        page_from, page_to = _pages_for(head_off, head_off + len(source), page_map)
-        sections.append(
-            Section(
-                heading_path=path or title,
-                text=source.strip(),
-                page_from=page_from,
-                page_to=page_to,
-            )
-        )
+    _emit_heading_fallbacks(sections, heading_log, page_map)
     return sections
 
 

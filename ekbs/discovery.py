@@ -364,6 +364,102 @@ def _query_title_overlap(query: str, title: str) -> int:
     return score
 
 
+def _add_suggestion(
+    out: list[dict[str, Any]], seen: set[str], question: str, *,
+    source: str, doc_id: int | None = None,
+) -> None:
+    q = question.strip()
+    if not q or q in seen:
+        return
+    seen.add(q)
+    item: dict[str, Any] = {"question": q, "source": source}
+    if doc_id is not None:
+        item["doc_id"] = doc_id
+    out.append(item)
+
+
+def _suggest_by_query_seeds(
+    out: list[dict[str, Any]], seen: set[str], seeds: list[dict[str, Any]],
+    titles: list[str], query_l: str, limit: int,
+) -> None:
+    """0) 与当前问题词面相关的种子优先（仍须标题 ACL）。"""
+    for seed in seeds:
+        if not _seed_matches_titles(seed, titles):
+            continue
+        kws = [str(k).strip().lower() for k in (seed.get("title_keywords") or []) if str(k).strip()]
+        qtext = str(seed.get("question") or "").lower()
+        if any(kw in query_l for kw in kws) or any(
+            tok and tok in query_l for tok in qtext.replace("？", "").split() if len(tok) >= 2
+        ):
+            _add_suggestion(out, seen, str(seed["question"]), source="seed")
+        if len(out) >= limit:
+            return
+
+
+def _suggest_for_refusal(
+    out: list[dict[str, Any]], seen: set[str], runtime: Any,
+    docs: list[dict[str, Any]], query_l: str, limit: int,
+) -> None:
+    """拒答且问题未命中任何种子：只推相关文档派生问，禁止甩默认合同题。"""
+    want_figure = any(k in query_l for k in ("图", "二维码", "二维碼", "照片", "截图", "码"))
+    ranked = sorted(
+        docs,
+        key=lambda d: _query_title_overlap(query_l, str(d.get("title") or "")),
+        reverse=True,
+    )
+    for doc in ranked:
+        if _query_title_overlap(query_l, str(doc.get("title") or "")) <= 0:
+            break
+        title = _short_title(str(doc.get("title") or ""))
+        if want_figure:
+            _add_suggestion(
+                out, seen, f"把「{title}」里的图片发我",
+                source="doc_title_figure", doc_id=int(doc["doc_id"]),
+            )
+        _add_suggestion(
+            out, seen, f"「{title}」主要讲了什么？",
+            source="doc_title", doc_id=int(doc["doc_id"]),
+        )
+        if len(out) >= limit:
+            return
+    # 「二维码」对不上标题时：改推当前可见、且库里真有 figure 块的文档
+    if len(out) < limit and want_figure:
+        for doc in _docs_with_figures(runtime, docs, limit=limit):
+            title = _short_title(str(doc.get("title") or ""))
+            _add_suggestion(
+                out, seen, f"把「{title}」里的图片发我",
+                source="doc_with_figure", doc_id=int(doc["doc_id"]),
+            )
+            if len(out) >= limit:
+                break
+
+
+def _suggest_by_seeds(
+    out: list[dict[str, Any]], seen: set[str], seeds: list[dict[str, Any]],
+    titles: list[str], limit: int,
+) -> None:
+    """1) 其余运营/黄金种子（过标题关键词 ACL）——帮助/导览用。"""
+    for seed in seeds:
+        if _seed_matches_titles(seed, titles):
+            _add_suggestion(out, seen, str(seed["question"]), source="seed")
+        if len(out) >= limit:
+            return
+
+
+def _suggest_by_titles(
+    out: list[dict[str, Any]], seen: set[str], docs: list[dict[str, Any]], limit: int,
+) -> None:
+    """2) 从可见文档标题派生（始终 ACL 安全；展示名去路径前缀）。"""
+    for doc in docs:
+        title = _short_title(str(doc.get("title") or ""))
+        _add_suggestion(
+            out, seen, f"「{title}」主要讲了什么？",
+            source="doc_title", doc_id=int(doc["doc_id"]),
+        )
+        if len(out) >= limit:
+            break
+
+
 def suggested_questions(
     runtime: Any,
     perm: PermContext,
@@ -388,73 +484,19 @@ def suggested_questions(
     query_l = (query or "").strip().lower()
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-
-    def _add(question: str, *, source: str, doc_id: int | None = None) -> None:
-        q = question.strip()
-        if not q or q in seen:
-            return
-        seen.add(q)
-        item: dict[str, Any] = {"question": q, "source": source}
-        if doc_id is not None:
-            item["doc_id"] = doc_id
-        out.append(item)
-
     seeds = load_seed_questions(getattr(getattr(runtime, "settings", None), "repo_root", None))
 
-    # 0) 与当前问题词面相关的种子优先（仍须标题 ACL）
     if query_l:
-        for seed in seeds:
-            if not _seed_matches_titles(seed, titles):
-                continue
-            kws = [str(k).strip().lower() for k in (seed.get("title_keywords") or []) if str(k).strip()]
-            qtext = str(seed.get("question") or "").lower()
-            if any(kw in query_l for kw in kws) or any(
-                tok and tok in query_l for tok in qtext.replace("？", "").split() if len(tok) >= 2
-            ):
-                _add(str(seed["question"]), source="seed")
-            if len(out) >= limit:
-                return out[:limit]
-
-    # 拒答且问题未命中任何种子：只推相关文档派生问，禁止甩默认合同题
-    if for_refusal and query_l:
-        want_figure = any(k in query_l for k in ("图", "二维码", "二维碼", "照片", "截图", "码"))
-        ranked = sorted(
-            docs,
-            key=lambda d: _query_title_overlap(query_l, str(d.get("title") or "")),
-            reverse=True,
-        )
-        for doc in ranked:
-            if _query_title_overlap(query_l, str(doc.get("title") or "")) <= 0:
-                break
-            title = _short_title(str(doc.get("title") or ""))
-            if want_figure:
-                _add(f"把「{title}」里的图片发我", source="doc_title_figure", doc_id=int(doc["doc_id"]))
-            _add(f"「{title}」主要讲了什么？", source="doc_title", doc_id=int(doc["doc_id"]))
-            if len(out) >= limit:
-                return out[:limit]
-        # 「二维码」对不上标题时：改推当前可见、且库里真有 figure 块的文档
-        if len(out) < limit and want_figure:
-            for doc in _docs_with_figures(runtime, docs, limit=limit):
-                title = _short_title(str(doc.get("title") or ""))
-                _add(f"把「{title}」里的图片发我", source="doc_with_figure", doc_id=int(doc["doc_id"]))
-                if len(out) >= limit:
-                    break
-        return out[:limit]
-
-    # 1) 其余运营/黄金种子（过标题关键词 ACL）——帮助/导览用
-    for seed in seeds:
-        if _seed_matches_titles(seed, titles):
-            _add(str(seed["question"]), source="seed")
+        _suggest_by_query_seeds(out, seen, seeds, titles, query_l, limit)
         if len(out) >= limit:
             return out[:limit]
-
-    # 2) 从可见文档标题派生（始终 ACL 安全；展示名去路径前缀）
-    for doc in docs:
-        title = _short_title(str(doc.get("title") or ""))
-        _add(f"「{title}」主要讲了什么？", source="doc_title", doc_id=int(doc["doc_id"]))
-        if len(out) >= limit:
-            break
-
+    if for_refusal and query_l:
+        _suggest_for_refusal(out, seen, runtime, docs, query_l, limit)
+        return out[:limit]
+    _suggest_by_seeds(out, seen, seeds, titles, limit)
+    if len(out) >= limit:
+        return out[:limit]
+    _suggest_by_titles(out, seen, docs, limit)
     return out[:limit]
 
 

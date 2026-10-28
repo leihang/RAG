@@ -66,117 +66,140 @@ class MigrationReport:
         }
 
 
+def _ensure_builtin_roles(conn: Any, report: MigrationReport, dry_run: bool) -> None:
+    """① 内置角色（0 号之前部署的库可能缺）。"""
+    for code, name in BUILTIN_ROLES:
+        row = conn.execute("SELECT role_id FROM ekbs_role WHERE code = ?", (code,)).fetchone()
+        if row is None:
+            report.roles_created.append(code)
+            if not dry_run:
+                conn.execute(
+                    "INSERT INTO ekbs_role(code, name, is_builtin, status, created_at) "
+                    "VALUES (?, ?, 1, 1, datetime('now'))",
+                    (code, name),
+                )
+
+
+def _ensure_permissions(
+    conn: Any, existing: dict[str, int], report: MigrationReport, dry_run: bool,
+) -> None:
+    """② 补权限点。"""
+    for code, name, module in PERMISSIONS:
+        if code in existing:
+            continue
+        report.permissions_added.append(code)
+        if not dry_run:
+            conn.execute(
+                "INSERT INTO ekbs_permission(code, name, module) VALUES (?, ?, ?)",
+                (code, name, module),
+            )
+
+
+def _merge_legacy_permissions(
+    conn: Any, existing: dict[str, int], report: MigrationReport, dry_run: bool,
+) -> None:
+    """③ 合并历史命名：把授权搬到新代码上，再删旧点。"""
+    for legacy, target in LEGACY_PERMISSION_MAP.items():
+        if legacy not in existing:
+            continue
+        if target is None:
+            report.permissions_retired.append(legacy)
+            if not dry_run:
+                conn.execute("DELETE FROM ekbs_permission WHERE code = ?", (legacy,))
+            continue
+        report.permissions_renamed[legacy] = target
+        if not dry_run:
+            conn.execute(
+                "INSERT OR IGNORE INTO ekbs_role_permission(role_id, perm_id) "
+                "SELECT rp.role_id, (SELECT perm_id FROM ekbs_permission WHERE code = ?) "
+                "FROM ekbs_role_permission rp "
+                "JOIN ekbs_permission old ON old.perm_id = rp.perm_id "
+                "WHERE old.code = ? AND (SELECT perm_id FROM ekbs_permission WHERE code = ?) "
+                "IS NOT NULL",
+                (target, legacy, target),
+            )
+            conn.execute("DELETE FROM ekbs_permission WHERE code = ?", (legacy,))
+
+
+def _count_grants_for_dry_run(conn: Any, report: MigrationReport) -> None:
+    """演练：只统计将要新增的授权数，不写库。"""
+    for role_code, codes in ROLE_GRANTS.items():
+        role_row = conn.execute(
+            "SELECT role_id FROM ekbs_role WHERE code = ?", (role_code,)
+        ).fetchone()
+        if role_row is None:
+            continue
+        for code in codes:
+            perm_row = conn.execute(
+                "SELECT perm_id FROM ekbs_permission WHERE code = ?", (code,)
+            ).fetchone()
+            if perm_row is None:
+                continue
+            already = conn.execute(
+                "SELECT 1 FROM ekbs_role_permission WHERE role_id = ? AND perm_id = ?",
+                (int(role_row["role_id"]), int(perm_row["perm_id"])),
+            ).fetchone()
+            if already is None:
+                report.grants_added += 1
+
+
+def _replay_role_grants(conn: Any, report: MigrationReport) -> None:
+    """④ 按 05 §3.4 重放角色授权 + super_admin 全量 + 统计受影响用户。"""
+    for role_code, codes in ROLE_GRANTS.items():
+        role_row = conn.execute(
+            "SELECT role_id FROM ekbs_role WHERE code = ?", (role_code,)
+        ).fetchone()
+        if role_row is None:
+            continue
+        for code in codes:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO ekbs_role_permission(role_id, perm_id) "
+                "SELECT ?, perm_id FROM ekbs_permission WHERE code = ?",
+                (int(role_row["role_id"]), code),
+            )
+            report.grants_added += int(cursor.rowcount or 0)
+    # super_admin 显式授全量（判定处另有通配兜底，但管理台要能展示完整表）
+    conn.execute(
+        "INSERT OR IGNORE INTO ekbs_role_permission(role_id, perm_id) "
+        "SELECT r.role_id, p.perm_id FROM ekbs_role r, ekbs_permission p "
+        "WHERE r.code = 'super_admin'"
+    )
+    report.users_affected = int(
+        conn.execute("SELECT COUNT(*) FROM ekbs_user_role").fetchone()[0]
+    )
+
+
+def _record_migration(conn: Any, report: MigrationReport, operator_id: int | None) -> None:
+    conn.execute(
+        "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
+        "field, old_value, new_value, reason) "
+        "VALUES (?, 'rbac', 'permission_catalog', 'acl_grant', 'catalog', ?, ?, ?)",
+        (
+            operator_id,
+            json.dumps(LEGACY_PERMISSION_MAP, ensure_ascii=False),
+            json.dumps({"added": report.permissions_added, "grants": report.grants_added},
+                       ensure_ascii=False),
+            "权限点对齐 05 §8.2（迁移工具）",
+        ),
+    )
+
+
 def migrate(db: Database, *, dry_run: bool = False, operator_id: int | None = None) -> MigrationReport:
     report = MigrationReport(dry_run=dry_run)
     with db.sync_connect() as conn:
-        # ① 内置角色（0 号之前部署的库可能缺）
-        for code, name in BUILTIN_ROLES:
-            row = conn.execute("SELECT role_id FROM ekbs_role WHERE code = ?", (code,)).fetchone()
-            if row is None:
-                report.roles_created.append(code)
-                if not dry_run:
-                    conn.execute(
-                        "INSERT INTO ekbs_role(code, name, is_builtin, status, created_at) "
-                        "VALUES (?, ?, 1, 1, datetime('now'))",
-                        (code, name),
-                    )
-
-        # ② 补权限点
+        _ensure_builtin_roles(conn, report, dry_run)
         existing = {
             str(r["code"]): int(r["perm_id"])
             for r in conn.execute("SELECT perm_id, code FROM ekbs_permission").fetchall()
         }
-        for code, name, module in PERMISSIONS:
-            if code in existing:
-                continue
-            report.permissions_added.append(code)
-            if not dry_run:
-                conn.execute(
-                    "INSERT INTO ekbs_permission(code, name, module) VALUES (?, ?, ?)",
-                    (code, name, module),
-                )
-
-        # ③ 合并历史命名：把授权搬到新代码上，再删旧点
-        for legacy, target in LEGACY_PERMISSION_MAP.items():
-            if legacy not in existing:
-                continue
-            if target is None:
-                report.permissions_retired.append(legacy)
-                if not dry_run:
-                    conn.execute("DELETE FROM ekbs_permission WHERE code = ?", (legacy,))
-                continue
-            report.permissions_renamed[legacy] = target
-            if not dry_run:
-                conn.execute(
-                    "INSERT OR IGNORE INTO ekbs_role_permission(role_id, perm_id) "
-                    "SELECT rp.role_id, (SELECT perm_id FROM ekbs_permission WHERE code = ?) "
-                    "FROM ekbs_role_permission rp "
-                    "JOIN ekbs_permission old ON old.perm_id = rp.perm_id "
-                    "WHERE old.code = ? AND (SELECT perm_id FROM ekbs_permission WHERE code = ?) "
-                    "IS NOT NULL",
-                    (target, legacy, target),
-                )
-                conn.execute("DELETE FROM ekbs_permission WHERE code = ?", (legacy,))
-
+        _ensure_permissions(conn, existing, report, dry_run)
+        _merge_legacy_permissions(conn, existing, report, dry_run)
         if dry_run:
-            # 演练：只统计将要新增的授权数，不写库
-            for role_code, codes in ROLE_GRANTS.items():
-                role_row = conn.execute(
-                    "SELECT role_id FROM ekbs_role WHERE code = ?", (role_code,)
-                ).fetchone()
-                if role_row is None:
-                    continue
-                for code in codes:
-                    perm_row = conn.execute(
-                        "SELECT perm_id FROM ekbs_permission WHERE code = ?", (code,)
-                    ).fetchone()
-                    if perm_row is None:
-                        continue
-                    already = conn.execute(
-                        "SELECT 1 FROM ekbs_role_permission WHERE role_id = ? AND perm_id = ?",
-                        (int(role_row["role_id"]), int(perm_row["perm_id"])),
-                    ).fetchone()
-                    if already is None:
-                        report.grants_added += 1
+            _count_grants_for_dry_run(conn, report)
             conn.rollback()
             return report
-
-        # ④ 按 05 §3.4 重放角色授权
-        for role_code, codes in ROLE_GRANTS.items():
-            role_row = conn.execute(
-                "SELECT role_id FROM ekbs_role WHERE code = ?", (role_code,)
-            ).fetchone()
-            if role_row is None:
-                continue
-            for code in codes:
-                cursor = conn.execute(
-                    "INSERT OR IGNORE INTO ekbs_role_permission(role_id, perm_id) "
-                    "SELECT ?, perm_id FROM ekbs_permission WHERE code = ?",
-                    (int(role_row["role_id"]), code),
-                )
-                report.grants_added += int(cursor.rowcount or 0)
-        # super_admin 显式授全量（判定处另有通配兜底，但管理台要能展示完整表）
-        conn.execute(
-            "INSERT OR IGNORE INTO ekbs_role_permission(role_id, perm_id) "
-            "SELECT r.role_id, p.perm_id FROM ekbs_role r, ekbs_permission p "
-            "WHERE r.code = 'super_admin'"
-        )
-
-        report.users_affected = int(
-            conn.execute("SELECT COUNT(*) FROM ekbs_user_role").fetchone()[0]
-        )
-        conn.execute(
-            "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
-            "field, old_value, new_value, reason) "
-            "VALUES (?, 'rbac', 'permission_catalog', 'acl_grant', 'catalog', ?, ?, ?)",
-            (
-                operator_id,
-                json.dumps(LEGACY_PERMISSION_MAP, ensure_ascii=False),
-                json.dumps({"added": report.permissions_added, "grants": report.grants_added},
-                           ensure_ascii=False),
-                "权限点对齐 05 §8.2（迁移工具）",
-            ),
-        )
+        _replay_role_grants(conn, report)
+        _record_migration(conn, report, operator_id)
         conn.commit()
     log.info("permission_migration_done", **report.as_dict())
     return report
