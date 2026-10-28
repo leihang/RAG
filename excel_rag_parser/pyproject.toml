@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "excel-rag-parser"
+version = "1.0.0"
+description = "Production-grade Excel/CSV table parser that emits RAG-ready chunks (Markdown / JSON / text)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "EKBS" }]
+keywords = ["excel", "xlsx", "xls", "xlsb", "csv", "rag", "table", "chunking"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Text Processing",
+]
+dependencies = [
+    # xlsx/xlsm 是主格式，openpyxl 为必装
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+xls = ["xlrd>=2.0"]          # 旧版 .xls
+xlsb = ["pyxlsb>=1.0"]       # 二进制 .xlsb
+dev = ["pytest>=8", "pytest-cov>=5"]
+
+[project.scripts]
+excel-rag-parser = "excel_rag_parser.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 本包没有任何异步测试；禁用 pytest-asyncio 插件，避免它在末尾抛
+# `PytestDeprecationWarning: asyncio_default_fixture_loop_scope is unset`
+# （该插件由宿主环境安装，与本站无关）。
+addopts = "-q -p no:asyncio"
