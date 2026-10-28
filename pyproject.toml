@@ -31,9 +31,33 @@ filterwarnings = ["ignore::DeprecationWarning"]
 target-version = "py311"
 line-length = 120
 # 只查 Python；文档里的示例代码块按"示意"处理，不当可运行代码要求
-extend-exclude = ["*.md", "var", "var-cloud"]
+# excel_rag / excel_rag_parser 是独立交付物（原型 / 独立 pip 包，各有自己的测试与配置），
+# 不纳入 EKBS 的 CI 门禁。
+extend-exclude = ["*.md", "var", "var-cloud", "excel_rag", "excel_rag_parser"]
 
 [tool.ruff.lint]
 # 先只开「零争议」规则：语法错误 / 未定义名 / 未使用 import·变量 / 重复定义。
 # E501（行宽）、UP、B、SIM 等存量较多，清理完再逐批放开，避免一次性全仓格式化。
-select = ["E4", "E7", "E9", "F"]
+# C901：圈复杂度棘轮（见 mccabe.max-complexity），只防新增、不追历史债。
+select = ["E4", "E7", "E9", "F", "C901"]
+
+[tool.ruff.lint.mccabe]
+# 圈复杂度棘轮：现卡 15（**目标值已达**）。retrieve/answer/_parse_×4/migrate/
+# can_see_document 等 11 个巨型函数已全部拆到 ≤15；仅 handle(28) 与 eval 一次性脚本
+# 以 `# noqa: C901` 显式留痕（历史债，非隐藏）。
+max-complexity = 15
+
+[tool.mypy]
+# 类型检查棘轮：只检查「已类型化、当前零错误」的模块；历史模块未类型化不在此列。
+# 新增/重构的模块应以零 mypy 错误为目标，并逐步加入 files 白名单。
+python_version = "3.11"
+ignore_missing_imports = true
+follow_imports = "skip"        # 只看显式列出的文件，不追依赖（避免历史模块噪音）
+warn_unused_ignores = false
+files = [
+    "ekbs/config.py",
+    "ekbs/errors.py",
+    "ekbs/db.py",
+    "ekbs/retrieval/intent.py",
+    "ekbs/retrieval/rrf.py",
+]

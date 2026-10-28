@@ -18,6 +18,7 @@ cd "$ROOT"
 
 PY="$ROOT/.venv/bin/python"
 RUFF="$ROOT/.venv/bin/ruff"
+MYPY="$ROOT/.venv/bin/mypy"
 WEB="$ROOT/ekbs-admin-web"
 RUN_FRONTEND=1
 
@@ -38,10 +39,14 @@ bad()  { echo "[FAIL] $*"; FAIL=$((FAIL + 1)); }
 stage "0. 环境"
 if [ -x "$PY" ]; then ok "python: $("$PY" --version 2>&1)"; else bad "缺少 ${PY}（先建 .venv）"; fi
 if [ -x "$RUFF" ]; then ok "ruff: $("$RUFF" --version 2>&1)"; else bad "缺少 ruff（pip install -r requirements-dev.txt）"; fi
+if [ -x "$MYPY" ]; then ok "mypy: $("$MYPY" --version 2>&1)"; else bad "缺少 mypy（pip install -r requirements-dev.txt）"; fi
 
 if [ "$FAIL" -eq 0 ]; then
-  stage "1. 静态检查（ruff）"
+  stage "1. 静态检查（ruff，含 C901 圈复杂度棘轮）"
   if "$RUFF" check .; then ok "ruff check 全绿"; else bad "ruff check 有违规"; fi
+
+  stage "1.5 类型检查（mypy，棘轮白名单见 pyproject [tool.mypy].files）"
+  if "$MYPY"; then ok "mypy 白名单零错误"; else bad "mypy 有错误"; fi
 
   stage "2. 契约测试（pytest，离线）"
   # 注意：不要再传 -q —— pyproject 的 addopts 已有 -q，双 quiet 会吞掉汇总行
