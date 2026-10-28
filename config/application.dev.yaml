@@ -40,6 +40,9 @@ retrieval:
     top_n: 15
     keep: 5
     min_score: 0.30
+    # 多子问（P2）配额：每子问保底块数 / 多子问最终 keep 上限
+    per_question_min: 1
+    keep_cap: 15
   parent_expand: true
   # 与生产一致（README §七：dev 与生产的检索参数逐字一致，只差 provider）。
   # 选 alpha/0.85 的实测依据见 config/application.cloud.yaml 同字段注释（README §四 第 75 条）。
@@ -52,6 +55,11 @@ retrieval:
   dense_multi_query: 1
   # figure 多模态旁路索引（课程 17）：图片向量与文本 embed 维度不同，单独 FAISS + RRF 第三路
   figure_multimodal: true
+  # 多意图拆分（P0）：一次问多个问题时拆成子问，每子问独立召回 + 配额精排
+  intent_split:
+    enabled: true
+    strategy: rules         # rules（确定性）| off；llm 暂按 rules 兜底
+    max_questions: 5
   # 查询改写（00 §2.1 的第一步，多轮对话时启用）；策略：off | heuristic | llm
   # heuristic：含指代 / 追问展开用语（详细、继续…）/ 过短时并入上一轮问题
   query_rewrite:

@@ -294,6 +294,30 @@ async def test_pipeline_multi_turn_records_rewrite_and_context(seeded) -> None:
         # 说明：审计由 API 层写（ekbs/api/qa.py），这里直接调 pipeline 不会落审计 —— 见下一个用例
 
 
+async def test_followup_history_never_enters_generation_prompt(seeded) -> None:
+    """会话历史只用于查询改写，绝不进生成 prompt（方向纠正：用户提示词修改）。
+
+    追问轮里，改写后的查询已把上一轮主题并进去、召回对了块；生成端只吃
+    「系统提示 + 用户原问题」，不带任何历史 user/assistant 消息。
+    """
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    await runtime.pipeline.answer("年假有多少天", alice, conversation_id="conv-g")
+    second = await runtime.pipeline.answer(
+        "那它需要提前几天申请", alice, conversation_id="conv-g"
+    )
+    # 第二轮确实是追问：改写用到了历史，但历史只能进改写，不能进生成
+    assert second.history_used is True
+    assert second.rewritten_query.startswith("年假有多少天")
+
+    last_messages = runtime.pipeline.providers.llm.calls[-1]
+    roles = [m["role"] for m in last_messages]
+    assert roles[0] == "system"
+    assert "assistant" not in roles, "生成 prompt 不得带历史 assistant 消息"
+    user_contents = [m["content"] for m in last_messages if m["role"] == "user"]
+    assert user_contents == ["那它需要提前几天申请"], "生成 prompt 只能有当前问题，不能带历史"
+
+
 async def test_answer_cache_is_partitioned_by_history(seeded) -> None:
     """只有追问（rewrite 用到历史）才分缓存键；自包含问题不带历史、可共享。
 

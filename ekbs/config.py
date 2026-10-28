@@ -120,6 +120,19 @@ class RerankCfg(_Section):
     top_n: int = 15  # 输入候选数
     keep: int = 5  # 输出条数
     min_score: float = 0.30  # 低于此分视为无有效命中 → 拒答
+    #: 多子问时的配额：每个子问保底保留的块数（P2）
+    per_question_min: int = 1
+    #: 多子问时最终 keep 上限（防止块数随子问数无限膨胀）
+    keep_cap: int = 15
+
+
+class IntentSplitCfg(_Section):
+    """多意图拆分（P0）：一次问多个问题时拆成独立子问。"""
+
+    enabled: bool = False
+    #: rules（默认，确定性）| off（关闭）；llm 在 batch 1 暂按 rules 兜底
+    strategy: str = "rules"
+    max_questions: int = 5
 
 
 class RetrievalCacheCfg(_Section):
@@ -135,6 +148,8 @@ class RetrievalCfg(_Section):
     sparse_top_k: int = 30
     rrf_k: int = 60
     rerank: RerankCfg = Field(default_factory=RerankCfg)
+    #: 多意图拆分（P0）：多子问输入时每子问独立召回 + 配额精排
+    intent_split: IntentSplitCfg = Field(default_factory=IntentSplitCfg)
     parent_expand: bool = True
     cache: RetrievalCacheCfg = Field(default_factory=RetrievalCacheCfg)
     #: 融合策略：``rrf``（默认，只用名次）| ``alpha``（α·向量 + (1-α)·稀疏，课程 18）

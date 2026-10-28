@@ -66,6 +66,9 @@ retrieval:
     #   精排第 2）—— 见 README §四 第 74 条。
     #   复现：python -m ekbs.tools.eval_switch_sweep（输出含负例分布）
     min_score: 0.65
+    # 多子问（P2）配额：每子问保底块数 / 多子问最终 keep 上限
+    per_question_min: 1
+    keep_cap: 15
   parent_expand: true
   # 融合：rrf | alpha（α·向量+(1-α)·BM25，课程 18 可调）
   #
@@ -92,6 +95,12 @@ retrieval:
   dense_multi_query: 3
   # figure 多模态旁路（课程 17 / tongyi-embedding-vision-plus）：与文本 embed 分索引
   figure_multimodal: true
+  # 多意图拆分（P0）：一次问多个问题时拆成子问，每子问独立召回 + 配额精排
+  # rules=确定性规则（离线可测）；llm 在 batch 1 暂按 rules 兜底（待接线）
+  intent_split:
+    enabled: true
+    strategy: rules
+    max_questions: 5
   # 查询改写（00 §2.1 的第一步，多轮对话时启用）；策略：off | heuristic | llm
   # heuristic：含指代 / 追问展开用语（详细、继续…）/ 过短时并入上一轮问题
   # llm：用云端模型按模板改写成自包含查询

@@ -60,6 +60,7 @@ from ekbs.retrieval.numeric import (
     verify_copied,
     verify_scope,
 )
+from ekbs.retrieval.intent import IntentSplitter, SubQuestion
 from ekbs.retrieval.rrf import alpha_fuse, rrf_fuse, ranks_of
 
 log = get_logger(component="retrieval")
@@ -143,6 +144,31 @@ class RetrievalResult:
 
 
 @dataclass
+class _RecallLanes:
+    """② 召回阶段的产物：dense/sparse/figure 三路 + 查询变体。"""
+
+    variants: list[str]
+    dense_scored: list[tuple[int, float]]
+    sparse_scored: list[tuple[int, float]]
+    dense_ids: list[int]
+    sparse_ids: list[int]
+    figure_ids: list[int]
+    figure_scored: list[tuple[int, float]]
+    use_figure_mm: bool
+    degraded: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _FusionOutcome:
+    """③ 融合阶段的产物。"""
+
+    fused: list[tuple[int, float]]
+    dense_ranks: dict[int, int]
+    sparse_ranks: dict[int, int]
+    mode: str
+
+
+@dataclass
 class Citation:
     """落库到 ``ekbs_qa_citation`` 的引用（只存 hash 与页码，不存片段全文）。"""
 
@@ -194,6 +220,10 @@ class AnswerResult:
     dropped_chunks: int = 0
     dropped_history: int = 0
     context_truncated: bool = False
+    #: 多意图拆分（P0）：单问时为空；多子问时为 [{index,text,rewritten,source}]
+    sub_questions: list[dict[str, Any]] = field(default_factory=list)
+    #: 子问覆盖情况：{total, covered, uncovered}；单问时为空 dict
+    coverage: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -296,6 +326,8 @@ class RetrievalPipeline:
         self.figure_index = figure_index
         # 生成后置核验（默认关闭；只对边界分调用，见 AnswerVerifyCfg）
         self.answer_verifier = AnswerVerifier(settings.answer_verify)
+        # 多意图拆分（P0）：默认关闭；enabled 时多子问走独立召回 + 配额精排
+        self.intent_splitter = IntentSplitter(settings)
 
     # ------------------------------------------------------------------
     # 查询嵌入（含缓存与「不可用即拒答」）
@@ -574,140 +606,24 @@ class RetrievalPipeline:
 
         embed_done = time.perf_counter()
 
-        # ② 两路召回（FAISS 是同步 C 调用，放线程池；04 §1.5）
-        variants = self._query_variants(query, limit=int(params.get("multi_query") or 1))
-        # 稠密多查询：每个语义变体各嵌一次、各召回一路，再**用 RRF 融合**。
-        # 为什么不平均向量：变体越多平均向量越糊（把多个语义中心折中），实测更差。
-        # 单变体（默认 dense_multi_query=1）时就是 `vector` 那一路，**与旧行为完全一致**。
-        dense_variants = self._dense_query_variants(
-            query, limit=int(params.get("dense_multi_query") or 1)
-        )
-        dense_vectors = [vector]
-        for variant in dense_variants[1:]:
-            extra = await self.query_vector(variant)
-            if extra is None:
-                log.warning("dense_variant_embed_failed", variant_len=len(variant))
-                continue
-            dense_vectors.append(extra)
-        dense_lanes = []
-        for dense_vector in dense_vectors:
-            lane = await asyncio.to_thread(
-                self._dense_recall_scored, dense_vector, perm, params["dense_top_k"]
-            )
-            dense_lanes.append(lane)
-        if len(dense_lanes) > 1:
-            dense_scored = rrf_fuse(
-                [[chunk_id for chunk_id, _ in lane] for lane in dense_lanes],
-                k=params["rrf_k"],
-            )
-        else:
-            dense_scored = dense_lanes[0]
-        sparse_scored = await asyncio.to_thread(
-            self._sparse_recall_scored,
-            query,
-            perm,
-            params["sparse_top_k"],
-            variants=variants,
-        )
-        dense_ids = [chunk_id for chunk_id, _ in dense_scored]
-        sparse_ids = [chunk_id for chunk_id, _ in sparse_scored]
-
-        # ②ʹ figure 多模态第三路（查询文本进同一 MM 模型）
-        figure_ids: list[int] = []
-        figure_scored: list[tuple[int, float]] = []
-        use_figure_mm = (
-            bool(params.get("figure_multimodal"))
-            and self.figure_index is not None
-            and self.providers.multimodal is not None
-        )
-        if use_figure_mm:
-            try:
-                mm_vector = await self._multimodal_query_vector(query)
-                figure_scored = await asyncio.to_thread(
-                    self._figure_recall_scored, mm_vector, perm, params["dense_top_k"]
-                )
-                figure_ids = [chunk_id for chunk_id, _ in figure_scored]
-            except Exception as exc:
-                log.warning("figure_mm_recall_failed", error=str(exc)[:160])
-                result.degraded.append("figure_mm_unavailable")
-
+        # ② 两路召回（FAISS 是同步 C 调用，放线程池；04 §1.5）+ figure 第三路
+        lanes = await self._recall_lanes(query, perm, params, vector)
+        result.degraded.extend(lanes.degraded)
         recall_done = time.perf_counter()
         if collect_debug:
-            import numpy as np  # 本模块按需导入 numpy（不在模块顶层引入）
-
-            result.stage_debug["dense"] = {
-                "requested_top_k": params["dense_top_k"],
-                "per_shard": {
-                    shard_id: [
-                        {"faiss_row": row, "score": round(score, 6)}
-                        for row, score in self.shards.search(
-                            shard_id, np.asarray(vector, dtype="float32"), params["dense_top_k"]
-                        )
-                    ]
-                    for shard_id in perm.visible_shard_ids
-                },
-                "merged_chunk_ids": dense_ids,
-            }
-            sparse_top = sparse_scored[: params["sparse_top_k"]]
-            shard_by_chunk: dict[int, str] = {}
-            if sparse_top:
-                ids = [chunk_id for chunk_id, _score in sparse_top]
-                ph = ",".join("?" for _ in ids)
-                with self.db.sync_connect() as conn:
-                    shard_by_chunk = {
-                        int(row["chunk_id"]): str(row["shard_id"])
-                        for row in conn.execute(
-                            f"SELECT chunk_id, shard_id FROM ekbs_chunk WHERE chunk_id IN ({ph})",
-                            ids,
-                        )
-                    }
-            result.stage_debug["sparse"] = {
-                "requested_top_k": params["sparse_top_k"],
-                "variants": variants,
-                "hits": [
-                    {
-                        "chunk_id": chunk_id,
-                        # 前端列名是 BM25 分数；同时保留 score 兼容旧调试台契约
-                        "bm25": round(score, 6),
-                        "score": round(score, 6),
-                        "shard_id": shard_by_chunk.get(int(chunk_id)),
-                    }
-                    for chunk_id, score in sparse_top
-                ],
-            }
-            result.stage_debug["figure_mm"] = {
-                "enabled": use_figure_mm,
-                "hits": [
-                    {"chunk_id": chunk_id, "score": round(score, 6)}
-                    for chunk_id, score in figure_scored[: params["dense_top_k"]]
-                ],
-            }
+            self._record_recall_debug(result, params, perm, vector, lanes)
 
         # ③ 融合：默认 RRF（含 figure 第三路）；可切 α 加权（课程 18，仍只融 dense+sparse）
-        fusion = str(params.get("fusion") or "rrf")
-        if fusion == "alpha":
-            fused = alpha_fuse(
-                dense_scored,
-                sparse_scored,
-                alpha=float(params.get("hybrid_alpha") if params.get("hybrid_alpha") is not None else 0.5),
-            )
-            if figure_ids:
-                # α 路径再与 figure 做一次 RRF，避免图模态分数与文本量纲混算
-                fused_ids = [cid for cid, _ in fused]
-                fused = rrf_fuse([fused_ids, figure_ids], k=params["rrf_k"])
-        else:
-            lanes = [dense_ids, sparse_ids]
-            if figure_ids:
-                lanes.append(figure_ids)
-            fused = rrf_fuse(lanes, k=params["rrf_k"])
-        dense_ranks = ranks_of(dense_ids)
-        sparse_ranks = ranks_of(sparse_ids)
+        fusion_outcome = self._fuse_lanes(lanes, params)
+        fused = fusion_outcome.fused
+        dense_ranks = fusion_outcome.dense_ranks
+        sparse_ranks = fusion_outcome.sparse_ranks
         if collect_debug:
             result.stage_debug["fusion"] = {
-                "mode": fusion,
+                "mode": fusion_outcome.mode,
                 "hybrid_alpha": params.get("hybrid_alpha"),
-                "multi_query": variants,
-                "figure_lane": bool(figure_ids),
+                "multi_query": lanes.variants,
+                "figure_lane": bool(lanes.figure_ids),
             }
         if not fused:
             result.refused = True
@@ -719,98 +635,10 @@ class RetrievalPipeline:
             )
             return result
 
-        rerank_enabled = bool(params["rerank_enabled"]) and self.providers.rerank is not None
-        shortlist = [chunk_id for chunk_id, _ in fused[: params["rerank_top_n"]]]
-        result.candidate_count = len(shortlist)
-        ranked: list[RetrievedChunk] = []
-        #: D18 粗筛丢弃的候选（rerank 路径填充；关闭路径无出网行为，由 C5 复检兜底）
-        pre_dropped_ids: set[int] = set()
-
-        if rerank_enabled:
-            docs = self.load_chunks(shortlist)
-            # D18 粗筛（00 v4.0 C5 双闸之第一闸）：云端 rerank **之前**先做 doc 级 ACL。
-            # 无权 chunk 不进入 payload、不发出企业边界 —— 分片过滤只能保证「片级有权」，
-            # 片内 deny / ACL 补丁整片加载的无权文档，必须在出网前拦下（rerank 后仍有 C5 复检）。
-            pre_pairs = [(cid, docs[cid].doc_id) for cid in shortlist if cid in docs]
-            _, pre_dropped = await asyncio.to_thread(
-                self.gate.filter_chunks, perm, pre_pairs
-            )
-            pre_dropped_ids = {chunk_id for chunk_id, _ in pre_dropped}
-            result.c5_pre_dropped = len(pre_dropped)
-            if collect_debug:
-                result.stage_debug["c5_pre"] = {
-                    "checked": len(pre_pairs),
-                    "dropped": len(pre_dropped),
-                    "dropped_chunk_ids": [cid for cid, _ in pre_dropped],
-                }
-            payload = [
-                RerankDoc(
-                    chunk_id=chunk_id,
-                    # 与嵌入同口径：带上小节标题，精排才看得见「第二条 住宿标准」这类限定词
-                    text=retrieval_text(docs[chunk_id].heading_path, docs[chunk_id].content),
-                    shard_id=docs[chunk_id].shard_id,
-                    rrf_score=score,
-                    dense_rank=dense_ranks.get(chunk_id),
-                    sparse_rank=sparse_ranks.get(chunk_id),
-                )
-                for chunk_id, score in fused[: params["rerank_top_n"]]
-                if chunk_id in docs and chunk_id not in pre_dropped_ids
-            ]
-            reranked: list = []
-            if payload:
-                try:
-                    reranked = await self.providers.rerank.rerank(
-                        query, payload, params["rerank_top_n"]
-                    )
-                except (RerankUnavailable, ModelUnavailable) as exc:
-                    # 00 §2.3：跳过精排，直接取 RRF Top-5（仍须过 C5）
-                    log.warning("rerank_unavailable_degrade", error=str(exc))
-                    result.degraded.append("rerank_skipped")
-            else:
-                # 候选被 D18 全部丢弃：不向外部发任何请求（顺带省一次 rerank 调用）
-                log.info(
-                    "d18_prefilter_emptied_payload",
-                    user_id=perm.user_id,
-                    dropped=len(pre_dropped),
-                )
-            score_map = {item.chunk_id: item.score for item in reranked}
-            if score_map:
-                for chunk_id, rrf_score in fused[: params["rerank_top_n"]]:
-                    if chunk_id in pre_dropped_ids:
-                        continue  # D18：被粗筛丢弃者不回流 ranked
-                    chunk = docs.get(chunk_id)
-                    if chunk is None:
-                        continue
-                    chunk.rrf_score = rrf_score
-                    chunk.dense_rank = dense_ranks.get(chunk_id)
-                    chunk.sparse_rank = sparse_ranks.get(chunk_id)
-                    chunk.rerank_score = score_map.get(chunk_id)
-                    ranked.append(chunk)
-                ranked.sort(key=lambda c: (-(c.rerank_score or 0.0), c.chunk_id))
-            else:
-                if payload:
-                    result.degraded.append("rerank_fallback_rrf")
-                for chunk_id, rrf_score in fused[: params["rerank_keep"]]:
-                    if chunk_id in pre_dropped_ids:
-                        continue  # D18：降级路径同样不放行
-                    chunk = docs.get(chunk_id)
-                    if chunk is None:
-                        continue
-                    chunk.rrf_score = rrf_score
-                    chunk.dense_rank = dense_ranks.get(chunk_id)
-                    chunk.sparse_rank = sparse_ranks.get(chunk_id)
-                    ranked.append(chunk)
-        else:
-            # rerank 关闭：直接取 RRF Top-keep
-            docs = self.load_chunks(shortlist[: params["rerank_keep"]])
-            for chunk_id, rrf_score in fused[: params["rerank_keep"]]:
-                chunk = docs.get(chunk_id)
-                if chunk is None:
-                    continue
-                chunk.rrf_score = rrf_score
-                chunk.dense_rank = dense_ranks.get(chunk_id)
-                chunk.sparse_rank = sparse_ranks.get(chunk_id)
-                ranked.append(chunk)
+        # ④ 精排（含 D18 粗筛；rerank 不可用/关闭时降级为 RRF Top-keep）
+        rerank_enabled, ranked, pre_dropped_ids = await self._rerank_candidates(
+            query, perm, params, fused, dense_ranks, sparse_ranks, result, collect_debug
+        )
 
         rerank_done = time.perf_counter()
 
@@ -902,6 +730,276 @@ class RetrievalPipeline:
             total=_ms(started, expand_done),
         )
         return result
+
+    async def _recall_lanes(
+        self,
+        query: str,
+        perm: PermContext,
+        params: dict[str, Any],
+        vector: list[float],
+    ) -> _RecallLanes:
+        """② 双路召回（dense 多变体 + sparse）+ figure 第三路。"""
+        variants = self._query_variants(query, limit=int(params.get("multi_query") or 1))
+        # 稠密多查询：每个语义变体各嵌一次、各召回一路，再**用 RRF 融合**。
+        # 为什么不平均向量：变体越多平均向量越糊（把多个语义中心折中），实测更差。
+        # 单变体（默认 dense_multi_query=1）时就是 `vector` 那一路，**与旧行为完全一致**。
+        dense_variants = self._dense_query_variants(
+            query, limit=int(params.get("dense_multi_query") or 1)
+        )
+        dense_vectors = [vector]
+        for variant in dense_variants[1:]:
+            extra = await self.query_vector(variant)
+            if extra is None:
+                log.warning("dense_variant_embed_failed", variant_len=len(variant))
+                continue
+            dense_vectors.append(extra)
+        dense_lanes = []
+        for dense_vector in dense_vectors:
+            lane = await asyncio.to_thread(
+                self._dense_recall_scored, dense_vector, perm, params["dense_top_k"]
+            )
+            dense_lanes.append(lane)
+        if len(dense_lanes) > 1:
+            dense_scored = rrf_fuse(
+                [[chunk_id for chunk_id, _ in lane] for lane in dense_lanes],
+                k=params["rrf_k"],
+            )
+        else:
+            dense_scored = dense_lanes[0]
+        sparse_scored = await asyncio.to_thread(
+            self._sparse_recall_scored,
+            query,
+            perm,
+            params["sparse_top_k"],
+            variants=variants,
+        )
+        figure_ids, figure_scored, use_figure_mm, degraded = await self._recall_figures(
+            query, perm, params
+        )
+        return _RecallLanes(
+            variants=variants,
+            dense_scored=dense_scored,
+            sparse_scored=sparse_scored,
+            dense_ids=[chunk_id for chunk_id, _ in dense_scored],
+            sparse_ids=[chunk_id for chunk_id, _ in sparse_scored],
+            figure_ids=figure_ids,
+            figure_scored=figure_scored,
+            use_figure_mm=use_figure_mm,
+            degraded=degraded,
+        )
+
+    async def _recall_figures(
+        self, query: str, perm: PermContext, params: dict[str, Any]
+    ) -> tuple[list[int], list[tuple[int, float]], bool, list[str]]:
+        """②ʹ figure 多模态第三路；失败降级不拖垮检索。"""
+        use = (
+            bool(params.get("figure_multimodal"))
+            and self.figure_index is not None
+            and self.providers.multimodal is not None
+        )
+        if not use:
+            return [], [], False, []
+        try:
+            mm_vector = await self._multimodal_query_vector(query)
+            scored = await asyncio.to_thread(
+                self._figure_recall_scored, mm_vector, perm, params["dense_top_k"]
+            )
+            return [chunk_id for chunk_id, _ in scored], scored, True, []
+        except Exception as exc:  # noqa: BLE001 - 多模态旁路失败不拖垮检索
+            log.warning("figure_mm_recall_failed", error=str(exc)[:160])
+            return [], [], True, ["figure_mm_unavailable"]
+
+    def _record_recall_debug(
+        self,
+        result: RetrievalResult,
+        params: dict[str, Any],
+        perm: PermContext,
+        vector: list[float],
+        lanes: _RecallLanes,
+    ) -> None:
+        """把召回阶段的分片/BM25/figure 命中写进调试台（仅 collect_debug 时）。"""
+        import numpy as np  # 本模块按需导入 numpy（不在模块顶层引入）
+
+        result.stage_debug["dense"] = {
+            "requested_top_k": params["dense_top_k"],
+            "per_shard": {
+                shard_id: [
+                    {"faiss_row": row, "score": round(score, 6)}
+                    for row, score in self.shards.search(
+                        shard_id, np.asarray(vector, dtype="float32"), params["dense_top_k"]
+                    )
+                ]
+                for shard_id in perm.visible_shard_ids
+            },
+            "merged_chunk_ids": lanes.dense_ids,
+        }
+        sparse_top = lanes.sparse_scored[: params["sparse_top_k"]]
+        shard_by_chunk: dict[int, str] = {}
+        if sparse_top:
+            ids = [chunk_id for chunk_id, _score in sparse_top]
+            ph = ",".join("?" for _ in ids)
+            with self.db.sync_connect() as conn:
+                shard_by_chunk = {
+                    int(row["chunk_id"]): str(row["shard_id"])
+                    for row in conn.execute(
+                        f"SELECT chunk_id, shard_id FROM ekbs_chunk WHERE chunk_id IN ({ph})",
+                        ids,
+                    )
+                }
+        result.stage_debug["sparse"] = {
+            "requested_top_k": params["sparse_top_k"],
+            "variants": lanes.variants,
+            "hits": [
+                {
+                    "chunk_id": chunk_id,
+                    # 前端列名是 BM25 分数；同时保留 score 兼容旧调试台契约
+                    "bm25": round(score, 6),
+                    "score": round(score, 6),
+                    "shard_id": shard_by_chunk.get(int(chunk_id)),
+                }
+                for chunk_id, score in sparse_top
+            ],
+        }
+        result.stage_debug["figure_mm"] = {
+            "enabled": lanes.use_figure_mm,
+            "hits": [
+                {"chunk_id": chunk_id, "score": round(score, 6)}
+                for chunk_id, score in lanes.figure_scored[: params["dense_top_k"]]
+            ],
+        }
+
+    def _fuse_lanes(self, lanes: _RecallLanes, params: dict[str, Any]) -> _FusionOutcome:
+        """③ 融合：RRF（含 figure 第三路）或 α 加权。"""
+        fusion = str(params.get("fusion") or "rrf")
+        if fusion == "alpha":
+            fused = alpha_fuse(
+                lanes.dense_scored,
+                lanes.sparse_scored,
+                alpha=float(
+                    params.get("hybrid_alpha")
+                    if params.get("hybrid_alpha") is not None
+                    else 0.5
+                ),
+            )
+            if lanes.figure_ids:
+                # α 路径再与 figure 做一次 RRF，避免图模态分数与文本量纲混算
+                fused_ids = [cid for cid, _ in fused]
+                fused = rrf_fuse([fused_ids, lanes.figure_ids], k=params["rrf_k"])
+        else:
+            fusion_lanes = [lanes.dense_ids, lanes.sparse_ids]
+            if lanes.figure_ids:
+                fusion_lanes.append(lanes.figure_ids)
+            fused = rrf_fuse(fusion_lanes, k=params["rrf_k"])
+        return _FusionOutcome(
+            fused=fused,
+            dense_ranks=ranks_of(lanes.dense_ids),
+            sparse_ranks=ranks_of(lanes.sparse_ids),
+            mode=fusion,
+        )
+
+    async def _rerank_candidates(
+        self,
+        query: str,
+        perm: PermContext,
+        params: dict[str, Any],
+        fused: list[tuple[int, float]],
+        dense_ranks: dict[int, int],
+        sparse_ranks: dict[int, int],
+        result: RetrievalResult,
+        collect_debug: bool,
+    ) -> tuple[bool, list[RetrievedChunk], set[int]]:
+        """④ 精排：D18 粗筛 → 云端 rerank（不可用降级 RRF）→ ``(enabled, ranked, pre_dropped_ids)``。"""
+        rerank_enabled = bool(params["rerank_enabled"]) and self.providers.rerank is not None
+        shortlist = [chunk_id for chunk_id, _ in fused[: params["rerank_top_n"]]]
+        result.candidate_count = len(shortlist)
+        ranked: list[RetrievedChunk] = []
+        #: D18 粗筛丢弃的候选（rerank 路径填充；关闭路径无出网行为，由 C5 复检兜底）
+        pre_dropped_ids: set[int] = set()
+
+        if not rerank_enabled:
+            # rerank 关闭：直接取 RRF Top-keep
+            docs = self.load_chunks(shortlist[: params["rerank_keep"]])
+            for chunk_id, rrf_score in fused[: params["rerank_keep"]]:
+                chunk = docs.get(chunk_id)
+                if chunk is None:
+                    continue
+                chunk.rrf_score = rrf_score
+                chunk.dense_rank = dense_ranks.get(chunk_id)
+                chunk.sparse_rank = sparse_ranks.get(chunk_id)
+                ranked.append(chunk)
+            return rerank_enabled, ranked, pre_dropped_ids
+
+        docs = self.load_chunks(shortlist)
+        # D18 粗筛（00 v4.0 C5 双闸之第一闸）：云端 rerank **之前**先做 doc 级 ACL。
+        # 无权 chunk 不进入 payload、不发出企业边界 —— 分片过滤只能保证「片级有权」，
+        # 片内 deny / ACL 补丁整片加载的无权文档，必须在出网前拦下（rerank 后仍有 C5 复检）。
+        pre_pairs = [(cid, docs[cid].doc_id) for cid in shortlist if cid in docs]
+        _, pre_dropped = await asyncio.to_thread(self.gate.filter_chunks, perm, pre_pairs)
+        pre_dropped_ids = {chunk_id for chunk_id, _ in pre_dropped}
+        result.c5_pre_dropped = len(pre_dropped)
+        if collect_debug:
+            result.stage_debug["c5_pre"] = {
+                "checked": len(pre_pairs),
+                "dropped": len(pre_dropped),
+                "dropped_chunk_ids": [cid for cid, _ in pre_dropped],
+            }
+        payload = [
+            RerankDoc(
+                chunk_id=chunk_id,
+                # 与嵌入同口径：带上小节标题，精排才看得见「第二条 住宿标准」这类限定词
+                text=retrieval_text(docs[chunk_id].heading_path, docs[chunk_id].content),
+                shard_id=docs[chunk_id].shard_id,
+                rrf_score=score,
+                dense_rank=dense_ranks.get(chunk_id),
+                sparse_rank=sparse_ranks.get(chunk_id),
+            )
+            for chunk_id, score in fused[: params["rerank_top_n"]]
+            if chunk_id in docs and chunk_id not in pre_dropped_ids
+        ]
+        reranked: list = []
+        if payload:
+            try:
+                reranked = await self.providers.rerank.rerank(
+                    query, payload, params["rerank_top_n"]
+                )
+            except (RerankUnavailable, ModelUnavailable) as exc:
+                # 00 §2.3：跳过精排，直接取 RRF Top-5（仍须过 C5）
+                log.warning("rerank_unavailable_degrade", error=str(exc))
+                result.degraded.append("rerank_skipped")
+        else:
+            # 候选被 D18 全部丢弃：不向外部发任何请求（顺带省一次 rerank 调用）
+            log.info(
+                "d18_prefilter_emptied_payload", user_id=perm.user_id, dropped=len(pre_dropped)
+            )
+
+        score_map = {item.chunk_id: item.score for item in reranked}
+        if score_map:
+            for chunk_id, rrf_score in fused[: params["rerank_top_n"]]:
+                if chunk_id in pre_dropped_ids:
+                    continue  # D18：被粗筛丢弃者不回流 ranked
+                chunk = docs.get(chunk_id)
+                if chunk is None:
+                    continue
+                chunk.rrf_score = rrf_score
+                chunk.dense_rank = dense_ranks.get(chunk_id)
+                chunk.sparse_rank = sparse_ranks.get(chunk_id)
+                chunk.rerank_score = score_map.get(chunk_id)
+                ranked.append(chunk)
+            ranked.sort(key=lambda c: (-(c.rerank_score or 0.0), c.chunk_id))
+        else:
+            if payload:
+                result.degraded.append("rerank_fallback_rrf")
+            for chunk_id, rrf_score in fused[: params["rerank_keep"]]:
+                if chunk_id in pre_dropped_ids:
+                    continue  # D18：降级路径同样不放行
+                chunk = docs.get(chunk_id)
+                if chunk is None:
+                    continue
+                chunk.rrf_score = rrf_score
+                chunk.dense_rank = dense_ranks.get(chunk_id)
+                chunk.sparse_rank = sparse_ranks.get(chunk_id)
+                ranked.append(chunk)
+        return rerank_enabled, ranked, pre_dropped_ids
 
     def _expand_parents(
         self, chunks: list[RetrievedChunk], perm: PermContext
@@ -1020,29 +1118,15 @@ class RetrievalPipeline:
             present.add(cid)
         return out
 
-    def _expand_page_figures(
+    def _page_figure_ids(
         self,
-        chunks: list[RetrievedChunk],
-        perm: PermContext,
+        anchors: list[RetrievedChunk],
+        present: set[int],
         *,
-        max_per_anchor: int = 8,
-        max_total: int = 12,
-    ) -> list[RetrievedChunk]:
-        """正文/表格命中后，把**同一文档、页码重叠**的 figure 块并入上下文。
-
-        PPT「计量表更换」正文与电表照片常分属 parent / figure；只靠向量时照片
-        往往排不进 top-k，用户一问「把照片发出来」就会因上下文无图而拒答。
-        """
-        if not chunks:
-            return chunks
-        present = {c.chunk_id for c in chunks}
-        anchors = [
-            c for c in chunks
-            if c.chunk_type != "figure" and c.page_from is not None
-        ]
-        if not anchors:
-            return chunks
-
+        max_per_anchor: int,
+        max_total: int,
+    ) -> list[int]:
+        """按锚点页重叠查同文档 figure 块 id（去重 + 上限）。"""
         figure_ids: list[int] = []
         seen_fig: set[int] = set()
         with self.db.sync_connect() as conn:
@@ -1067,7 +1151,88 @@ class RetrievalPipeline:
                         break
                 if len(figure_ids) >= max_total:
                     break
+        return figure_ids
 
+    @staticmethod
+    def _group_figures_by_page(
+        figure_ids: list[int],
+        allowed: set[int],
+        figures: dict[int, RetrievedChunk],
+    ) -> dict[tuple[int, int, int], list[RetrievedChunk]]:
+        by_doc_page: dict[tuple[int, int, int], list[RetrievedChunk]] = {}
+        for cid in figure_ids:
+            if cid not in allowed:
+                continue
+            fig = figures[cid]
+            lo = int(fig.page_from or 0)
+            hi = int(fig.page_to or lo)
+            by_doc_page.setdefault((int(fig.doc_id), lo, hi), []).append(fig)
+        return by_doc_page
+
+    @staticmethod
+    def _figures_for_chunk(
+        chunk: RetrievedChunk,
+        by_doc_page: dict[tuple[int, int, int], list[RetrievedChunk]],
+    ) -> list[RetrievedChunk]:
+        lo = int(chunk.page_from or 0)
+        hi = int(chunk.page_to or lo)
+        matches: list[RetrievedChunk] = []
+        for (doc_id, flo, fhi), figs in by_doc_page.items():
+            if doc_id != int(chunk.doc_id):
+                continue
+            if fhi < lo or flo > hi:
+                continue
+            matches.extend(figs)
+        return matches
+
+    def _attach_figures_by_page(
+        self,
+        expanded: list[RetrievedChunk],
+        by_doc_page: dict[tuple[int, int, int], list[RetrievedChunk]],
+        present: set[int],
+    ) -> tuple[list[RetrievedChunk], set[int]]:
+        """把插图挂在对应正文锚点后面，方便模型就近引用。"""
+        out: list[RetrievedChunk] = []
+        inserted: set[int] = set()
+        for chunk in expanded:
+            out.append(chunk)
+            if chunk.chunk_type == "figure" or chunk.page_from is None:
+                continue
+            for fig in self._figures_for_chunk(chunk, by_doc_page):
+                if fig.chunk_id in inserted or fig.chunk_id in present:
+                    continue
+                fig.rerank_score = chunk.rerank_score
+                fig.rrf_score = chunk.rrf_score
+                out.append(fig)
+                inserted.add(fig.chunk_id)
+        return out, inserted
+
+    def _expand_page_figures(
+        self,
+        chunks: list[RetrievedChunk],
+        perm: PermContext,
+        *,
+        max_per_anchor: int = 8,
+        max_total: int = 12,
+    ) -> list[RetrievedChunk]:
+        """正文/表格命中后，把**同一文档、页码重叠**的 figure 块并入上下文。
+
+        PPT「计量表更换」正文与电表照片常分属 parent / figure；只靠向量时照片
+        往往排不进 top-k，用户一问「把照片发出来」就会因上下文无图而拒答。
+        """
+        if not chunks:
+            return chunks
+        present = {c.chunk_id for c in chunks}
+        anchors = [
+            c for c in chunks
+            if c.chunk_type != "figure" and c.page_from is not None
+        ]
+        if not anchors:
+            return chunks
+
+        figure_ids = self._page_figure_ids(
+            anchors, present, max_per_anchor=max_per_anchor, max_total=max_total
+        )
         if not figure_ids:
             return chunks
 
@@ -1079,37 +1244,8 @@ class RetrievalPipeline:
         if dropped:
             log.info("c5_denied_figure", count=len(dropped), user_id=perm.user_id)
 
-        expanded = list(chunks)
-        # 把插图挂在对应正文锚点后面，方便模型就近引用
-        by_doc_page: dict[tuple[int, int, int], list[RetrievedChunk]] = {}
-        for cid in figure_ids:
-            if cid not in allowed:
-                continue
-            fig = figures[cid]
-            lo = int(fig.page_from or 0)
-            hi = int(fig.page_to or lo)
-            by_doc_page.setdefault((int(fig.doc_id), lo, hi), []).append(fig)
-
-        out: list[RetrievedChunk] = []
-        inserted: set[int] = set()
-        for chunk in expanded:
-            out.append(chunk)
-            if chunk.chunk_type == "figure" or chunk.page_from is None:
-                continue
-            lo = int(chunk.page_from)
-            hi = int(chunk.page_to or lo)
-            for (doc_id, flo, fhi), figs in list(by_doc_page.items()):
-                if doc_id != int(chunk.doc_id):
-                    continue
-                if fhi < lo or flo > hi:
-                    continue
-                for fig in figs:
-                    if fig.chunk_id in inserted or fig.chunk_id in present:
-                        continue
-                    fig.rerank_score = chunk.rerank_score
-                    fig.rrf_score = chunk.rrf_score
-                    out.append(fig)
-                    inserted.add(fig.chunk_id)
+        by_doc_page = self._group_figures_by_page(figure_ids, allowed, figures)
+        out, inserted = self._attach_figures_by_page(list(chunks), by_doc_page, present)
         # 未挂上的（页码对不上）仍追加在末尾，避免丢掉
         for cid in figure_ids:
             if cid in allowed and cid not in inserted and cid not in present:
@@ -1853,7 +1989,7 @@ class RetrievalPipeline:
 
 
         多轮时：先把会话历史取出来（``ekbs_session_ctx``，键含用户维度）→ **查询改写**
-        → 用改写后的查询检索 → 带历史生成 → 把本轮写回上下文。
+        → 用改写后的查询检索 → 生成（历史只用于改写，不进生成 prompt）→ 把本轮写回上下文。
         每轮都重新加载 ``PermContext`` 由调用方负责（`03` §6.1 V5）。
 
         ``mode``：``auto``（默认，按意图 + ``qa.auto_numeric`` 路由）|
@@ -1877,21 +2013,30 @@ class RetrievalPipeline:
         intent = str(getattr(rewrite, "intent", "factual") or "factual")
         auto_numeric = bool((getattr(self.settings, "qa", None) or {}).get("auto_numeric", True))
         mode_used = resolve_answer_mode(mode, intent, auto_numeric=auto_numeric)
-        # 关键：只有“追问/指代”（rewrite 实际用到历史）才把历史带进生成 prompt。
-        # 自包含问题不带历史 → 钉钉与 UI 用同一份 prompt，答案一致；
-        # 多轮追问仍保留上下文，不被误伤。
-        generation_history = messages if bool(getattr(rewrite, "used_history", False)) else []
-
+        # ②.5 多意图拆分（P0）：一次问多个问题时拆成子问。
+        # 单问（默认）→ sub_questions 只有 1 个，下面走与原实现完全一致的链路。
+        sub_questions: list[SubQuestion] = self.intent_splitter.split(question)
+        multi_intent = len(sub_questions) > 1
+        numeric_overridden = False
+        if multi_intent and mode_used == MODE_NUMERIC:
+            # 多子问合并回答属 prose 语义；取数模式是单问题语义。覆盖必须留痕，便于排障。
+            numeric_overridden = True
+            mode_used = MODE_PROSE
+        sub_key = (
+            "|subq=" + "|".join(sq.text for sq in sub_questions) if multi_intent else ""
+        )
+        # 会话历史**只**服务于查询改写（帮向量/嵌入模型判定意图），绝不进生成 prompt：
+        # 生成只吃「改写后查询召回的 chunks + 用户原问题」，钉钉与 UI 用同一份 prompt。
         cached = None
-        # 答案缓存键必须含**历史指纹**：同一问题在不同上下文下答案不同，
-        # 否则多轮里会把上一轮的答案复用成这一轮的（C2 的同类问题）
-        # 缓存键要含**检索配置版本**：只按 (权限指纹, 问题) 建键时，
-        # 改了 min_score / 换精排模型 / 开关 rerank 之后，旧答案会继续被服务到 TTL 到期。
+        # 答案缓存键以**改写后的查询**分区：历史只影响改写，追问/指代的上下文已经被
+        # 并进 `rewrite.rewritten`，所以不同上下文自然落到不同键（C2 的同类问题）。
+        # 键还要含**检索配置版本**：只按 (权限指纹, 问题) 建键时，改了 min_score /
+        # 换精排模型 / 开关 rerank 之后，旧答案会继续被服务到 TTL 到期。
         # 实测踩到：阈值从 0.30 改到 0.60 后，同一个问题仍在 3ms 内返回旧语义的
         # `refused=false + 5 条引用 + 答案「未找到可靠依据」`。
         cache_key = CacheStore.answer_key(
             perm.fingerprint,
-            f"{rewrite.rewritten}|{_history_digest(generation_history)}|gen={int(allow_generation)}"
+            f"{rewrite.rewritten}{sub_key}|gen={int(allow_generation)}"
             # 模式必须进键：取数模式与业务问答的答案形态完全不同，
             # 用解析后的 mode_used（auto→prose/numeric），避免同意图重复缓存两套键。
             f"|mode={mode_used}|rc={self.retrieval_cache_revision()}|idx={self.index_cache_revision()}",
@@ -1899,48 +2044,124 @@ class RetrievalPipeline:
         if use_cache and not collect_debug:
             cached = await self.cache.get(cache_key)
         if cached:
-            retrieval = RetrievalResult(
-                query=rewrite.rewritten, chunks=[], refused=False,
-                timings_ms={"embed": 0.0, "recall": 0.0, "rerank": 0.0, "expand": 0.0, "total": 0.0},
-            )
-            citations = [Citation(**item) for item in cached.get("citations", [])]
-            result = AnswerResult(
-                answer=str(cached.get("answer", "")),
-                citations=citations,
-                retrieval=retrieval,
-                model=str(cached.get("model", "")),
-                rewritten_query=rewrite.rewritten,
-                history_used=rewrite.used_history,
-                refused=bool(cached.get("refused", False)),
-                refusal_reason=str(cached.get("refusal_reason", "")),
-                numeric=cached.get("numeric"),
-                mode_used=str(cached.get("mode_used") or mode_used),
-                intent=str(cached.get("intent") or intent),
-                figure_attachments=list(cached.get("figure_attachments") or []),
-                degraded=["answer_cache_hit"],
-            )
+            result = self._answer_from_cache(cached, rewrite, mode_used, intent)
             # 命中缓存也要记这一轮上下文：否则多轮追问会丢掉这一轮（实测踩到）
             await self._remember_turn(conversation_id, perm, question, result)
             return result
 
-        retrieval = await self.retrieve(
-            rewrite.rewritten, perm, overrides=overrides, collect_debug=collect_debug
+        retrieval, intent_hits = await self._retrieve_for_answer(
+            rewrite=rewrite,
+            sub_questions=sub_questions,
+            multi_intent=multi_intent,
+            messages=messages,
+            perm=perm,
+            overrides=overrides,
+            collect_debug=collect_debug,
         )
         if allow_generation and mode_used == MODE_NUMERIC:
             result = await self._answer_numeric(question, retrieval, perm)
         elif allow_generation:
-            result = await self.generate(question, retrieval, perm, history=generation_history)
+            result = await self.generate(question, retrieval, perm)
         else:
             result = self._retrieval_only_answer(question, retrieval, perm)
-        result.rewritten_query = rewrite.rewritten
+        self._annotate_result(
+            result,
+            rewrite,
+            sub_questions,
+            multi_intent,
+            intent_hits,
+            retrieval,
+            mode_used=mode_used,
+            intent=intent,
+            numeric_overridden=numeric_overridden,
+        )
+        self._apply_figure_adjustments(result, retrieval, intent=intent, question=question)
+
+        # ③ 写回上下文（群聊按用户隔离，见 session.py 的说明）
+        await self._remember_turn(conversation_id, perm, question, result)
+
+        if use_cache and not collect_debug and result.answer and not result.refused:
+            await self.cache.set(
+                cache_key,
+                self._answer_cache_payload(result, mode_used, intent),
+                ttl=self.settings.retrieval.cache.answer_ttl,
+            )
+        return result
+
+    # ------------------------------------------------------------------
+    # answer() 的后处理（缓存命中 / 结果标注 / 找图修正 / 缓存写回）
+    # ------------------------------------------------------------------
+
+    def _answer_from_cache(
+        self, cached: dict[str, Any], rewrite: Any, mode_used: str, intent: str
+    ) -> AnswerResult:
+        """用答案缓存重建 ``AnswerResult``（缓存命中路径）。"""
+        retrieval = RetrievalResult(
+            query=rewrite.rewritten, chunks=[], refused=False,
+            timings_ms={"embed": 0.0, "recall": 0.0, "rerank": 0.0, "expand": 0.0, "total": 0.0},
+        )
+        citations = [Citation(**item) for item in cached.get("citations", [])]
+        return AnswerResult(
+            answer=str(cached.get("answer", "")),
+            citations=citations,
+            retrieval=retrieval,
+            model=str(cached.get("model", "")),
+            rewritten_query=str(cached.get("rewritten_query") or rewrite.rewritten),
+            history_used=rewrite.used_history,
+            refused=bool(cached.get("refused", False)),
+            refusal_reason=str(cached.get("refusal_reason", "")),
+            numeric=cached.get("numeric"),
+            mode_used=str(cached.get("mode_used") or mode_used),
+            intent=str(cached.get("intent") or intent),
+            figure_attachments=list(cached.get("figure_attachments") or []),
+            sub_questions=list(cached.get("sub_questions") or []),
+            coverage=dict(cached.get("coverage") or {}),
+            degraded=["answer_cache_hit"],
+        )
+
+    def _annotate_result(
+        self,
+        result: AnswerResult,
+        rewrite: Any,
+        sub_questions: Sequence[SubQuestion],
+        multi_intent: bool,
+        intent_hits: dict[int, set[int]],
+        retrieval: RetrievalResult,
+        *,
+        mode_used: str,
+        intent: str,
+        numeric_overridden: bool,
+    ) -> None:
+        """把改写/意图/子问覆盖等元信息写回结果。"""
+        result.rewritten_query = (
+            " ; ".join(sq.rewritten for sq in sub_questions) if multi_intent else rewrite.rewritten
+        )
         result.history_used = rewrite.used_history
         result.mode_used = mode_used
         result.intent = intent
+        result.sub_questions = (
+            [
+                {"index": sq.index, "text": sq.text, "rewritten": sq.rewritten, "source": sq.source}
+                for sq in sub_questions
+            ]
+            if multi_intent
+            else []
+        )
+        result.coverage = (
+            self._coverage(sub_questions, retrieval, intent_hits) if multi_intent else {}
+        )
+        if numeric_overridden:
+            result.degraded.append("multi_intent_numeric_to_prose")
+
+    def _apply_figure_adjustments(
+        self, result: AnswerResult, retrieval: RetrievalResult, *, intent: str, question: str
+    ) -> None:
+        """找图意图的后处理：补/清洗引用，并把「资料区无像素」的口头拒答纠正为已找到原图。"""
         result.figure_attachments = self._collect_figure_attachments(
             retrieval.chunks,
             result.citations,
             intent=intent,
-            query=rewrite.rewritten or question,
+            query=result.rewritten_query or question,
         )
         # 找图意图：引用里的空白垃圾图（空调合同扫描页等）不得留在答案卡片上
         if intent == "figure" and result.figure_attachments:
@@ -2001,26 +2222,23 @@ class RetrievalPipeline:
                     )
                 result.citations = rebuilt
 
-        # ③ 写回上下文（群聊按用户隔离，见 session.py 的说明）
-        await self._remember_turn(conversation_id, perm, question, result)
-
-        if use_cache and not collect_debug and result.answer and not result.refused:
-            await self.cache.set(
-                cache_key,
-                {
-                    "answer": result.answer,
-                    "model": result.model,
-                    "refused": result.refused,
-                    "refusal_reason": result.refusal_reason,
-                    "citations": [c.__dict__ for c in result.citations],
-                    "numeric": result.numeric,
-                    "mode_used": mode_used,
-                    "intent": intent,
-                    "figure_attachments": result.figure_attachments,
-                },
-                ttl=self.settings.retrieval.cache.answer_ttl,
-            )
-        return result
+    @staticmethod
+    def _answer_cache_payload(result: AnswerResult, mode_used: str, intent: str) -> dict[str, Any]:
+        """答案缓存落库载荷（字段变更需同步 ``_answer_from_cache``）。"""
+        return {
+            "answer": result.answer,
+            "model": result.model,
+            "refused": result.refused,
+            "refusal_reason": result.refusal_reason,
+            "citations": [c.__dict__ for c in result.citations],
+            "numeric": result.numeric,
+            "mode_used": mode_used,
+            "intent": intent,
+            "figure_attachments": result.figure_attachments,
+            "rewritten_query": result.rewritten_query,
+            "sub_questions": result.sub_questions,
+            "coverage": result.coverage,
+        }
 
     @staticmethod
     def _figure_is_junk(content: str, heading_path: str = "") -> bool:
@@ -2172,6 +2390,134 @@ class RetrievalPipeline:
             return result
         return await self.rewriter.rewrite(question, messages)
 
+    # ------------------------------------------------------------------
+    # 多意图检索（P0+P1+P2）
+    # ------------------------------------------------------------------
+
+    async def _retrieve_multi_intent(
+        self,
+        sub_questions: Sequence[SubQuestion],
+        messages: Sequence[dict[str, str]],
+        perm: PermContext,
+        *,
+        overrides: RetrievalOverrides | None = None,
+        collect_debug: bool = False,
+    ) -> tuple[RetrievalResult, dict[int, set[int]]]:
+        """多子问：每子问独立改写 + 独立召回，再合并去重 + 配额选择（P1+P2）。
+
+        ``collect_debug`` 只保留给未来调试扩展；子问级召回默认不收集分阶段明细，
+        避免 N 倍调试开销。返回 ``(合并结果, chunk_id → 命中它的子问集合)``。
+        """
+        per_sub: list[tuple[int, RetrievalResult]] = []
+        for sq in sub_questions:
+            sub_rewrite = await self._rewrite(sq.text, messages)
+            sq.rewritten = str(getattr(sub_rewrite, "rewritten", sq.text) or sq.text)
+            result = await self.retrieve(
+                sq.rewritten, perm, overrides=overrides, collect_debug=False
+            )
+            per_sub.append((sq.index, result))
+        merged, hit_by = self._merge_retrievals(per_sub)
+        return merged, hit_by
+
+    async def _retrieve_for_answer(
+        self,
+        *,
+        rewrite: Any,
+        sub_questions: Sequence[SubQuestion],
+        multi_intent: bool,
+        messages: Sequence[dict[str, str]],
+        perm: PermContext,
+        overrides: RetrievalOverrides | None,
+        collect_debug: bool,
+    ) -> tuple[RetrievalResult, dict[int, set[int]]]:
+        """单问走原链路（与改动前逐字节一致）；多子问走独立召回 + 配额合并。"""
+        if not multi_intent:
+            return (
+                await self.retrieve(
+                    rewrite.rewritten, perm, overrides=overrides, collect_debug=collect_debug
+                ),
+                {},
+            )
+        return await self._retrieve_multi_intent(
+            sub_questions, messages, perm, overrides=overrides, collect_debug=collect_debug
+        )
+
+    def _merge_retrievals(
+        self, per_sub: Sequence[tuple[int, RetrievalResult]]
+    ) -> tuple[RetrievalResult, dict[int, set[int]]]:
+        """合并各子问结果：去重取最高分 + 每子问保底配额 + 全局补足 + 上限截断。"""
+        cfg = self.settings.retrieval
+        per_min = max(1, int(getattr(cfg.rerank, "per_question_min", 1) or 1))
+        cap = max(per_min, int(getattr(cfg.rerank, "keep_cap", 15) or 15))
+
+        pool: dict[int, RetrievedChunk] = {}
+        hit_by: dict[int, set[int]] = {}
+        for sub_index, result in per_sub:
+            for chunk in result.chunks:
+                existing = pool.get(chunk.chunk_id)
+                if existing is None or (chunk.rerank_score or 0.0) > (existing.rerank_score or 0.0):
+                    pool[chunk.chunk_id] = chunk
+                hit_by.setdefault(chunk.chunk_id, set()).add(sub_index)
+
+        # 每子问保底：各自 rerank 最高的 per_min 块
+        selected_ids: list[int] = []
+        seen: set[int] = set()
+        for _sub_index, result in per_sub:
+            ranked = sorted(result.chunks, key=lambda c: (c.rerank_score or 0.0), reverse=True)
+            for chunk in ranked[:per_min]:
+                if chunk.chunk_id not in seen:
+                    seen.add(chunk.chunk_id)
+                    selected_ids.append(chunk.chunk_id)
+
+        # 剩余名额按全局 rerank 分补足
+        remaining = sorted(pool.values(), key=lambda c: (c.rerank_score or 0.0), reverse=True)
+        for chunk in remaining:
+            if len(selected_ids) >= cap:
+                break
+            if chunk.chunk_id not in seen:
+                seen.add(chunk.chunk_id)
+                selected_ids.append(chunk.chunk_id)
+
+        selected = [pool[cid] for cid in selected_ids[:cap]]
+        top_score = max(
+            (c.rerank_score for c in selected if c.rerank_score is not None), default=None
+        )
+        merged = RetrievalResult(
+            query=" ; ".join(r.query for _, r in per_sub),
+            chunks=selected,
+            candidate_count=sum(r.candidate_count for _, r in per_sub),
+            c5_dropped=sum(r.c5_dropped for _, r in per_sub),
+            c5_pre_dropped=sum(r.c5_pre_dropped for _, r in per_sub),
+            top_score=top_score,
+            refused=not selected,
+            refusal_reason=(
+                "" if selected
+                else (per_sub[0][1].refusal_reason if per_sub else REFUSE_NO_CANDIDATE)
+            ),
+            degraded=sorted({d for _, r in per_sub for d in r.degraded}),
+            timings_ms={"total": sum(float(r.timings_ms.get("total", 0.0)) for _, r in per_sub)},
+        )
+        return merged, hit_by
+
+    @staticmethod
+    def _coverage(
+        sub_questions: Sequence[SubQuestion],
+        retrieval: RetrievalResult,
+        intent_hits: dict[int, set[int]],
+    ) -> dict[str, Any]:
+        """统计每个子问是否被最终选中的块覆盖（P5 的前置可观测数据）。"""
+        selected_ids = {c.chunk_id for c in retrieval.chunks}
+        covered: list[str] = []
+        uncovered: list[str] = []
+        for sq in sub_questions:
+            hit = any(sq.index in intent_hits.get(cid, set()) for cid in selected_ids)
+            (covered if hit else uncovered).append(sq.text)
+        return {
+            "total": len(sub_questions),
+            "covered": len(covered),
+            "uncovered": uncovered,
+        }
+
     async def _remember_turn(
         self, conversation_id: str | None, perm: PermContext, question: str, result: AnswerResult
     ) -> None:
@@ -2223,25 +2569,19 @@ class RetrievalPipeline:
         parts = [
             f"embed={getattr(embed, 'ident', '')}",
             f"rerank={getattr(rerank, 'ident', '')}:{int(cfg.rerank.enabled)}:{cfg.rerank.top_n}"
-            f":{cfg.rerank.keep}:{cfg.rerank.min_score}",
+            f":{cfg.rerank.keep}:{cfg.rerank.min_score}"
+            f":{getattr(cfg.rerank, 'per_question_min', 1)}:{getattr(cfg.rerank, 'keep_cap', 15)}",
             f"llm={getattr(llm, 'ident', '')}",
             f"k={cfg.dense_top_k}:{cfg.sparse_top_k}:{cfg.rrf_k}:{int(cfg.parent_expand)}",
             f":mq={cfg.multi_query}:{getattr(cfg, 'dense_multi_query', 1)}",
             f"rw={getattr(cfg.query_rewrite, 'strategy', '')}",
+            f"split={int(getattr(cfg.intent_split, 'enabled', False))}"
+            f":{getattr(cfg.intent_split, 'strategy', '')}"
+            f":{getattr(cfg.intent_split, 'max_questions', 0)}",
             f"expand={getattr(getattr(getattr(self.rewriter, 'expand_llm', None), 'ref', None), 'ident', '')}",
             f"prompt={PROMPT_REVISION}",
         ]
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
-
-
-def _history_digest(messages: Sequence[dict[str, str]]) -> str:
-    """历史摘要（进答案缓存键）：同一问题在不同上下文下必须落到不同的键。"""
-    import hashlib
-
-    if not messages:
-        return "-"
-    raw = "\n".join(f"{m.get('role')}:{m.get('content')}" for m in messages)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _ms(start: float, end: float | None = None) -> float:

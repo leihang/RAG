@@ -244,6 +244,9 @@ async def qa_chat(
         "question": safe_question,
         "rewritten_query": answer.rewritten_query,
         "history_used": answer.history_used,
+        # 多意图拆分（P0）：单问时为空列表/空 dict，老客户端不受影响
+        "sub_questions": answer.sub_questions,
+        "coverage": answer.coverage,
         "citations": _citation_payload(answer.citations),
         "refused": answer.refused,
         "refusal_reason": answer.refusal_reason,

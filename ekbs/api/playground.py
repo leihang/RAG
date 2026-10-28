@@ -252,8 +252,8 @@ async def debug_query(
 ) -> JSONResponse:
     """完整链路（改写 → 检索 → 生成），返回各阶段结构化结果。
 
-    传入 ``conversation_id`` 时走正式多轮：读/写 ``ekbs_session_ctx``、查询改写、
-    生成侧带历史。不传则仍是单轮（与改前行为兼容）。
+    传入 ``conversation_id`` 时走正式多轮：读/写 ``ekbs_session_ctx``、查询改写
+    （历史只用于改写，不进生成 prompt）。不传则仍是单轮（与改前行为兼容）。
     """
     user, _ = _principal(
         request, _h(authorization, x_internal_token, x_internal_user_id), "rag:playground:run"

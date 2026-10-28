@@ -57,7 +57,16 @@ retrieval:
     # 故 **0.65**。完整实测与逐阈值对照见 config/application.cloud.yaml 同字段注释
     # 与 python -m ekbs.tools.eval_switch_sweep。
     min_score: 0.65        # 低于此分视为无有效命中 → 拒答
+    # 多子问（P2）配额：每子问保底块数 / 多子问最终 keep 上限
+    per_question_min: 1
+    keep_cap: 15
   parent_expand: true
+  # 多意图拆分（P0）：一次问多个问题时拆成子问，每子问独立召回 + 配额精排
+  # rules=确定性规则（离线可测）；llm 在 batch 1 暂按 rules 兜底（待接线）
+  intent_split:
+    enabled: true
+    strategy: rules
+    max_questions: 5
   # 融合：rrf | alpha（α·向量+(1-α)·BM25）。**原来这里没有这个键**，会落到配置类默认的 rrf，
   # 而 2026-10-02 用 16 份真实语料 + 两套金标题集实测：rrf 在同义改写集上 82.4%/0.657，
   # alpha 0.85 → 88.2%/0.664，纯向量 → 94.1%/0.683（RRF 把很弱的稀疏侧与向量侧同等加权）。
