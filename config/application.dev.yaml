@@ -164,6 +164,9 @@ adapter:
   api_base: "http://127.0.0.1:8000"
   qa_stream_timeout_seconds: 180
   request_timeout_seconds: 30
+  # 首次会话的自我介绍（每个用户只发一次：首次私聊 / 首次在群被 @ 都算）。
+  # dev/mock 默认关闭，避免测试用例被多一条问候干扰；生产在 cloud/deploy 配置里启用。
+  self_intro: ""
 
 session:
   context_max_turns: 10

@@ -376,6 +376,9 @@ class AdapterCfg(_Section):
     api_base: str = "http://127.0.0.1:8000"
     qa_stream_timeout_seconds: int = 180
     request_timeout_seconds: int = 30
+    #: 首次会话的自我介绍：**每个用户只发一次**（首次私聊 / 首次在群被 @ 都算）；
+    #: 空串 = 关闭。用 `\n` 分段。
+    self_intro: str = ""
 
 
 # ---------------------------------------------------------------------------

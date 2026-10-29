@@ -85,6 +85,8 @@ def handler(seeded, cards) -> StreamMessageHandler:
     runtime.settings.dingtalk["card"] = {
         "ai_template_id": "tmpl-ai", "streaming_enabled": True, "stream_key": "content",
     }
+    # 默认关闭自我介绍，避免所有用例都被多一条问候干扰；专门用例里再显式打开
+    runtime.settings.adapter.self_intro = ""
     return StreamMessageHandler(
         db=runtime.db, settings=runtime.settings, secrets=runtime.secrets,
         idempotency=IdempotencyGuard(runtime.db),
@@ -620,3 +622,44 @@ async def test_accessible_doc_list_uses_catalog_not_qa_or_file(handler) -> None:
     assert qa.call_count == 1
     assert catalog.call_count == 3
     assert file_route.call_count == 1
+
+
+INTRO_TEXT = "你好，我是企业知识库助手，可以问我制度/合同/能耗。"
+
+
+@respx.mock
+async def test_first_message_gets_self_intro(handler) -> None:
+    """首次会话（每用户只一次）先发自我介绍，再正常回答——问候不能替掉问题。"""
+    handler.settings.adapter.self_intro = INTRO_TEXT
+    routes = mock_dingtalk()
+    api = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+
+    code, _ = await handler.process({"data": payload(msg_id="intro-first")})
+    assert code == ACK_OK
+    assert api.call_count == 1, "自我介绍之后仍要回答用户的问题"
+    oto = [json.loads(call.request.content) for call in routes["oto"].calls]
+    assert len(oto) == 1
+    assert INTRO_TEXT[:10] in json.dumps(oto[0], ensure_ascii=False)
+
+
+@respx.mock
+async def test_self_intro_only_once_per_user(handler) -> None:
+    """每用户只欢迎一次：同一个人第二条消息不再发自我介绍。"""
+    handler.settings.adapter.self_intro = INTRO_TEXT
+    routes = mock_dingtalk()
+    respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+
+    await handler.process({"data": payload(msg_id="intro-a")})
+    await handler.process({"data": payload(msg_id="intro-b")})
+    assert routes["oto"].call_count == 1, "同一用户第二次会话不得重复欢迎"
+
+
+@respx.mock
+async def test_self_intro_disabled_when_empty(handler) -> None:
+    """``self_intro`` 为空 = 关闭（默认不打扰用户）。"""
+    handler.settings.adapter.self_intro = ""
+    routes = mock_dingtalk()
+    respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+
+    await handler.process({"data": payload(msg_id="intro-off")})
+    assert routes["oto"].call_count == 0

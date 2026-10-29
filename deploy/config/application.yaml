@@ -173,6 +173,10 @@ adapter:
   api_base: "http://127.0.0.1:8000"  # 回环调用 ekbs-api（见 §1.5 跳 (3)）
   qa_stream_timeout_seconds: 180
   request_timeout_seconds: 30
+  # 首次会话的自我介绍（每个用户只发一次：首次私聊 / 首次在群被 @ 都算）；置空 = 关闭
+  self_intro: |
+    你好，我是企业知识库助手。直接问我公司制度、合同、能耗、设备台账等问题即可；
+    回复「帮助」可查看当前可查的文档与示例问法。
 
 # ---------- 多轮会话（04 §5.2；落库表 ekbs_session_ctx，见 01 §5.5）----------
 session:

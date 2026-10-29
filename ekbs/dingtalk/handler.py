@@ -270,6 +270,12 @@ class StreamMessageHandler:
             inc(AUTH_LOGIN, 1, result="success")
             user_id = int(user["user_id"])
 
+            # ③.6 自我介绍：**每用户只发一次**（首次私聊 / 首次在群被 @ 都算）。
+            # 发完继续正常处理，不要 return —— 否则用户第一句问的真问题会被吞。
+            intro = self._first_session_intro(message)
+            if intro:
+                await self._reply_text(message, intro)
+
             if message.download_code:
                 reply = await self._accept_personal_file(message, user_id)
                 await self._reply_text(message, reply)
@@ -459,6 +465,24 @@ class StreamMessageHandler:
                 "WHERE dingtalk_userid = ? AND status = 'active' AND deleted_at IS NULL",
                 (staff_id,),
             ).fetchone()
+
+    def _first_session_intro(self, message: InboundMessage) -> str:
+        """每用户只欢迎一次：该 sender 在钉钉渠道的**第一条**消息才发自我介绍。
+
+        判定依据 ``ekbs_msg_inbox`` —— ``handle()`` 一进来就 ``accept()`` 落库，
+        所以首条消息时该 sender 的行数恰为 1。加群瞬间没有可靠事件可订阅
+        （钉钉未投递「机器人入群」），故以「首次被 @ / 首次私聊」近似。
+        """
+        intro = str(self.settings.adapter.self_intro or "")
+        if not intro:
+            return ""
+        with self.db.sync_connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM ekbs_msg_inbox "
+                "WHERE sender_staff_id = ? AND channel = 'dingtalk_robot'",
+                (message.sender_staff_id,),
+            ).fetchone()
+        return intro if int(row["n"] if row is not None else 0) <= 1 else ""
 
     # ------------------------------------------------------------------
     # 调用问答 API
