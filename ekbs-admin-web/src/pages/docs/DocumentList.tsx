@@ -62,8 +62,8 @@ export default function DocumentList() {
 
   const columns: ProColumns<DocumentItem>[] = [
     { title: 'ID', dataIndex: 'doc_id', width: 64, search: false },
-    // 默认 420，可拖拽调宽（useResizableColumns）；ellipsis 只做兜底，hover 有 tooltip。
-    { title: '文档名', dataIndex: 'title', ellipsis: true,
+    // 默认 420，可拖拽调宽（useResizableColumns）；不截断（长路径换行显示，拖宽可看全）
+    { title: '文档名', dataIndex: 'title',
       render: (_, row) => <Link to={`/docs/${row.doc_id}`}>{row.title}</Link> },
     // §5.1「强制」+ 原则 P4：列表里必须能看到密级
     { title: '密级', dataIndex: 'level', width: 110, valueType: 'select',

@@ -12,15 +12,17 @@ interface ResizeMeta {
 
 type Props = HTMLAttributes<HTMLTableCellElement> & ResizeMeta & { children?: ReactNode }
 
+/** 右边缘命中区（px）：文档名很长时，8px 手柄可能被内容/省略号干扰，整条边都能拖更稳。 */
+const EDGE_HIT_PX = 14
+
 /**
  * antd Table 的可拖拽表头：拖列右边界调整宽度。
  *
- * 为什么要它：文档名是目录导入的全路径（可能上百字符），固定列宽要么截断、
- * 要么把右侧列挤出视口；让使用者自己拖出想要的宽度，比猜一个"万能宽度"靠谱。
- * 宽度记忆由 `useResizableColumns` 负责（localStorage）。
+ * 两道保险：① 表头右边缘固定手柄；② 整个 th 右边界 14px 内也能起拖
+ * （文档名长、内容压住手柄时依然能拉）。宽度记忆由 `useResizableColumns` 负责。
  *
  * ⚠️ 只有 `onResize` 存在的列才画手柄：行选择列、展开列没有 onResize，
- * 画了也无法拖动 —— 之前每个表头都画，用户拖到"假手柄"上会以为功能坏了。
+ * 画了也无法拖动 —— 用户拖到"假手柄"上会以为功能坏了。
  */
 export default function ResizableHeader({ width, onResize, children, style, ...rest }: Props) {
   const [active, setActive] = useState(false)
@@ -28,16 +30,15 @@ export default function ResizableHeader({ width, onResize, children, style, ...r
   const startX = useRef(0)
   const startWidth = useRef(0)
 
-  const onMouseDown = useCallback(
-    (event: ReactMouseEvent) => {
-      event.preventDefault()
-      event.stopPropagation()
-      startX.current = event.clientX
+  const begin = useCallback(
+    (clientX: number) => {
+      if (!onResize) return
+      startX.current = clientX
       startWidth.current = Number(width) || 100
       setActive(true)
       const onMove = (moveEvent: MouseEvent) => {
         const next = Math.max(80, startWidth.current + (moveEvent.clientX - startX.current))
-        onResize?.(null, { size: { width: next } })
+        onResize(null, { size: { width: next } })
       }
       const onUp = () => {
         setActive(false)
@@ -50,13 +51,33 @@ export default function ResizableHeader({ width, onResize, children, style, ...r
     [onResize, width],
   )
 
+  const onThMouseDown = useCallback(
+    (event: ReactMouseEvent<HTMLTableCellElement>) => {
+      if (!onResize) return
+      const rect = event.currentTarget.getBoundingClientRect()
+      if (rect.right - event.clientX > EDGE_HIT_PX) return
+      event.preventDefault()
+      event.stopPropagation()
+      begin(event.clientX)
+    },
+    [begin, onResize],
+  )
+
   return (
-    <th {...rest} style={{ ...style, position: 'relative', userSelect: 'none' }}>
+    <th
+      {...rest}
+      onMouseDown={onThMouseDown}
+      style={{ ...style, position: 'relative', userSelect: 'none' }}
+    >
       {children}
       {onResize ? (
         <span
           aria-hidden
-          onMouseDown={onMouseDown}
+          onMouseDown={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            begin(event.clientX)
+          }}
           onMouseEnter={() => setHover(true)}
           onMouseLeave={() => setHover(false)}
           title="拖动调整列宽"
@@ -65,9 +86,9 @@ export default function ResizableHeader({ width, onResize, children, style, ...r
             top: 0,
             right: 0,
             bottom: 0,
-            width: 8,
+            width: EDGE_HIT_PX,
             cursor: 'col-resize',
-            // 始终可见的细线：完全透明时用户根本发现不了"这里能拖"
+            zIndex: 3,
             borderRight: '1px solid rgba(0, 0, 0, 0.14)',
             background: active
               ? 'rgba(22, 119, 255, 0.35)'

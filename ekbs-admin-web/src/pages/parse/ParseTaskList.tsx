@@ -69,8 +69,7 @@ export default function ParseTaskList() {
     {
       title: '文档名',
       dataIndex: 'title',
-      // 默认 420，可拖拽调宽（useResizableColumns）；ellipsis 只做兜底，hover 有 tooltip。
-      ellipsis: true,
+      // 默认 420，可拖拽调宽（useResizableColumns）；不截断（长路径换行显示，拖宽可看全）
       render: (_, r) => <Link to={`/docs/${parseTaskId(r) ?? ''}`}>{r.title}</Link>,
     },
     {
