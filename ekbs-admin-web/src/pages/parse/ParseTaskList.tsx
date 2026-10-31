@@ -67,7 +67,8 @@ export default function ParseTaskList() {
     {
       title: '文档名',
       dataIndex: 'title',
-      ellipsis: true,
+      // 不截断（原先 ellipsis + 固定总宽 1200，目录导入的全路径名被切掉一半）：
+      // 列宽按内容自适应，表格整体横向滚动，长路径也能看全。
       render: (_, r) => <Link to={`/docs/${parseTaskId(r) ?? ''}`}>{r.title}</Link>,
     },
     {
@@ -353,7 +354,8 @@ export default function ParseTaskList() {
         rowKey={(r) => String(parseTaskId(r) ?? r.title)}
         actionRef={actionRef}
         columns={columns}
-        scroll={{ x: 1200 }}
+        // max-content：列宽跟内容走（长文档名不再被固定总宽挤压），超出视口横向滚动
+        scroll={{ x: 'max-content' }}
         pagination={{ defaultPageSize: 20, showSizeChanger: true }}
         rowSelection={{
           fixed: true,

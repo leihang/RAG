@@ -60,7 +60,9 @@ export default function DocumentList() {
 
   const columns: ProColumns<DocumentItem>[] = [
     { title: 'ID', dataIndex: 'doc_id', width: 64, search: false },
-    { title: '文档名', dataIndex: 'title', ellipsis: true,
+    // 不截断（原先 ellipsis + 固定总宽，目录导入的全路径名被切掉一半）：
+    // 列宽按内容自适应，表格整体横向滚动，长路径也能看全。
+    { title: '文档名', dataIndex: 'title',
       render: (_, row) => <Link to={`/docs/${row.doc_id}`}>{row.title}</Link> },
     // §5.1「强制」+ 原则 P4：列表里必须能看到密级
     { title: '密级', dataIndex: 'level', width: 110, valueType: 'select',
@@ -108,7 +110,8 @@ export default function DocumentList() {
         rowKey="doc_id"
         actionRef={actionRef}
         columns={columns}
-        scroll={{ x: 1240 }}
+        // max-content：列宽跟内容走（长文档名不再被固定总宽挤压），超出视口横向滚动
+        scroll={{ x: 'max-content' }}
         options={{ density: true, fullScreen: true, setting: true, reload: true }}
         pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100] }}
         toolBarRender={() => [
