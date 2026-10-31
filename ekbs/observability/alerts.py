@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Literal
@@ -39,6 +40,9 @@ Kind = Literal["sum_window", "rate_window", "gauge", "p95_window", "growth_windo
 BUSINESS_HOURS = (time(9, 0), time(18, 0))
 BUSINESS_DAYS = (0, 1, 2, 3, 4)  # 周一到周五
 SHANGHAI = timezone(timedelta(hours=8))
+
+#: 依赖语料的质量规则：空库时评估无意义（清库/重导期间会一直误报 P1）
+QUALITY_RULES: frozenset[str] = frozenset({m.QUALITY_DEGRADED, m.QUALITY_REFUSAL_RATE})
 
 
 @dataclass(frozen=True)
@@ -361,19 +365,94 @@ def evaluate_all(
             continue
         if hit is not None:
             hits.append(hit)
-    return hits
+    return _suppress_quality_without_corpus(database, hits)
 
 
-def record_alerts(database: Database, hits: list[AlertHit]) -> int:
-    """命中即写 ``ekbs_security_event``（P1/P2），P3 只记日志（`04` §7.7）。"""
-    written = 0
+def _published_docs(database: Database) -> int:
     with database.sync_connect() as conn:
-        for hit in hits:
-            if hit.severity not in {"P1", "P2"}:
-                log.warning("alert_p3", **hit.as_dict())
-                continue
-            import json
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM ekbs_document WHERE status = 'published'"
+            ).fetchone()["n"]
+        )
 
+
+def _suppress_quality_without_corpus(
+    database: Database, hits: list[AlertHit]
+) -> list[AlertHit]:
+    """空库时抑制依赖语料的质量告警。
+
+    为什么：清库/重导期间 ``quality_degraded`` / ``quality_refusal_rate`` 会因历史 QA
+    样本或哨兵上一次写入的 gauge 一直命中，报 P1 却没有可修的东西 —— 这是"数据缺失"，
+    不是"质量劣化"。等语料重新发布后自然恢复评估。
+    """
+    quality = [hit for hit in hits if hit.rule.name in QUALITY_RULES]
+    if not quality or _published_docs(database) > 0:
+        return hits
+    log.info("alerts_suppressed_no_corpus", rules=[hit.rule.name for hit in quality])
+    return [hit for hit in hits if hit.rule.name not in QUALITY_RULES]
+
+
+@dataclass
+class AlertChange:
+    """一次告警判定带来的状态变化（调度器据此决定推不推送）。"""
+
+    opened: list[AlertHit] = field(default_factory=list)
+    closed: list[str] = field(default_factory=list)
+    active: int = 0
+
+
+def _open_rules(database: Database, *, scan: int = 200) -> set[str]:
+    """从事件流推出**当前未恢复**的规则集合。
+
+    为什么不单独建状态表：``ekbs_security_event`` 就是唯一事实来源，再加一张表反而要
+    保证两者一致（`01 §5` 的表数是硬闸，加表还会触发 schema 自检失败）。
+    状态化之后告警量很小（每天最多几条），扫最近 200 条足够。
+    """
+    with database.sync_connect() as conn:
+        rows = conn.execute(
+            "SELECT detail FROM ekbs_security_event WHERE event_type='metric_alert' "
+            "ORDER BY event_id DESC LIMIT ?",
+            (int(scan),),
+        ).fetchall()
+    seen: set[str] = set()
+    open_rules: set[str] = set()
+    for row in rows:
+        try:
+            detail = json.loads(row["detail"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        rule_name = str(detail.get("metric") or "")
+        if not rule_name or rule_name in seen:
+            continue
+        seen.add(rule_name)
+        if not detail.get("recovered"):
+            open_rules.add(rule_name)
+    return open_rules
+
+
+def record_alerts(
+    database: Database, hits: list[AlertHit], *, now: datetime | None = None
+) -> AlertChange:
+    """按**状态变化**写事件：首次命中写 fired、恢复写 recovered，持续期间不重复写。
+
+    为什么不能"命中一次写一条"：采集作业每 60s 跑一次，任何持续命中的规则一天能写
+    上千条重复事件（实测 ``quality_*`` 两条各 1428 条），把 UI「最近告警」刷屏、
+    真正的告警被淹没。P3 只记日志、不进事件表（`04` §7.7）。
+    """
+    stamp = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M:%S")
+    p1p2 = [hit for hit in hits if hit.severity in {"P1", "P2"}]
+    for hit in hits:
+        if hit.severity not in {"P1", "P2"}:
+            log.warning("alert_p3", **hit.as_dict())
+
+    open_rules = _open_rules(database)
+    current = {hit.rule.name for hit in p1p2}
+    opened = [hit for hit in p1p2 if hit.rule.name not in open_rules]
+    closed = sorted(open_rules - current)
+
+    with database.sync_connect() as conn:
+        for hit in opened:
             conn.execute(
                 "INSERT INTO ekbs_security_event(event_type, user_id, severity, detail) "
                 "VALUES ('metric_alert', NULL, ?, ?)",
@@ -382,8 +461,25 @@ def record_alerts(database: Database, hits: list[AlertHit]) -> int:
                     json.dumps(hit.as_dict(), ensure_ascii=False),
                 ),
             )
-            written += 1
+        for rule_name in closed:
+            conn.execute(
+                "INSERT INTO ekbs_security_event(event_type, user_id, severity, detail) "
+                "VALUES ('metric_alert', NULL, 'low', ?)",
+                (
+                    json.dumps(
+                        {"metric": rule_name, "recovered": True, "at": stamp},
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
         conn.commit()
-    if hits:
-        log.warning("alerts_fired", count=len(hits), p1=sum(1 for h in hits if h.severity == "P1"))
-    return written
+
+    if opened:
+        log.warning(
+            "alerts_fired",
+            count=len(opened),
+            p1=sum(1 for hit in opened if hit.severity == "P1"),
+        )
+    if closed:
+        log.info("alerts_recovered", rules=closed)
+    return AlertChange(opened=opened, closed=closed, active=len(current))

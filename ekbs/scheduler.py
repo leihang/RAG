@@ -91,14 +91,21 @@ def job_metrics_collect(runtime: Runtime) -> None:
 
     # 告警判定（阈值唯一来源：observability/alerts.py 的 ALERT_RULES）
     hits = evaluate_all(runtime.db)
-    if hits:
-        record_alerts(runtime.db, hits)
-        # 推送到告警通道（08 §5.2：钉钉主通道 + 邮件带外；未配置则只记日志）
+    change = record_alerts(runtime.db, hits)
+    if change.opened:
+        # 只在**新开**告警时推送：持续命中不重复打扰，恢复由 change.closed 说明
         try:
-            AlertNotifier(runtime.db, runtime.secrets).notify(hits)
+            AlertNotifier(runtime.db, runtime.secrets).notify(change.opened)
         except Exception as exc:  # noqa: BLE001 - 推送失败绝不影响采集作业
             log.error("alert_notify_failed", error=str(exc)[:200])
-    log.debug("metrics_collected", host=values, in_process=len(in_process), alerts=len(hits))
+    log.debug(
+        "metrics_collected",
+        host=values,
+        in_process=len(in_process),
+        alerts=len(hits),
+        opened=len(change.opened),
+        closed=len(change.closed),
+    )
 
 
 def job_policy_version_mirror(runtime: Runtime) -> None:

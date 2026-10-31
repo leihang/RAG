@@ -185,18 +185,69 @@ def test_business_hours_only_rule(runtime) -> None:
     assert a.evaluate_rule(runtime.db, rule, now=monday_noon) is not None
 
 
+def _alert_events(runtime) -> list[dict]:
+    with runtime.db.sync_connect() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                "SELECT severity, detail FROM ekbs_security_event "
+                "WHERE event_type='metric_alert' ORDER BY event_id"
+            )
+        ]
+
+
 def test_record_alerts_writes_security_events_for_p1_p2_only(runtime) -> None:
+    """P1/P2 首次命中写一条 fired；**持续命中不重复写**（避免每分钟刷屏）。"""
     p1 = next(r for r in a.ALERT_RULES if r.severity == "P1")
     p3 = next(r for r in a.ALERT_RULES if r.severity == "P3")
     hits = [a.AlertHit(p1, 0.0, 3), a.AlertHit(p3, 999.0, 1)]
-    written = a.record_alerts(runtime.db, hits)
-    assert written == 1
-    with runtime.db.sync_connect() as conn:
-        rows = conn.execute(
-            "SELECT severity, detail FROM ekbs_security_event WHERE event_type='metric_alert'"
-        ).fetchall()
+
+    change = a.record_alerts(runtime.db, hits)
+    assert len(change.opened) == 1  # P3 只记日志、不写事件
+    assert change.closed == []
+    rows = _alert_events(runtime)
     assert len(rows) == 1 and rows[0]["severity"] == "high"
     assert p1.name in str(rows[0]["detail"])
+
+    # 同一批命中原样再来一次：状态未变，不应再写事件
+    again = a.record_alerts(runtime.db, hits)
+    assert again.opened == []
+    assert len(_alert_events(runtime)) == 1
+
+
+def test_record_alerts_writes_recovery_event(runtime) -> None:
+    """告警恢复：状态行删除 + 写一条 ``recovered`` 事件（severity=low）。"""
+    p1 = next(r for r in a.ALERT_RULES if r.severity == "P1")
+    a.record_alerts(runtime.db, [a.AlertHit(p1, 1.0, 2)])
+
+    change = a.record_alerts(runtime.db, [])
+
+    assert change.closed == [p1.name]
+    rows = _alert_events(runtime)
+    assert len(rows) == 2
+    assert rows[-1]["severity"] == "low"
+    assert '"recovered": true' in str(rows[-1]["detail"]).lower()
+    assert a._open_rules(runtime.db) == set()
+
+
+def test_quality_alerts_suppressed_without_corpus(runtime) -> None:
+    """空库时质量类告警是"数据缺失"而非"劣化"：不评估，避免清库/重导期误报 P1。"""
+    _write_metric(runtime, m.QUALITY_REFUSAL_RATE, [0.5])
+    _write_metric(runtime, m.QUALITY_DEGRADED, [1.0])
+
+    hits = a.evaluate_all(runtime.db)
+
+    assert not [hit for hit in hits if hit.rule.name in a.QUALITY_RULES]
+
+
+async def test_quality_alerts_resume_when_corpus_returns(seeded) -> None:
+    """有已发布文档时，质量告警恢复评估（回归：别把抑制写成永久关闭）。"""
+    runtime, _summary = seeded
+    _write_metric(runtime, m.QUALITY_REFUSAL_RATE, [0.5])
+
+    hits = a.evaluate_all(runtime.db)
+
+    assert any(hit.rule.name == m.QUALITY_REFUSAL_RATE for hit in hits)
 
 
 def test_scheduler_job_writes_metrics_and_evaluates_alerts(runtime) -> None:
