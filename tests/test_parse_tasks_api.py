@@ -257,3 +257,41 @@ async def test_auditor_can_read_but_not_manage(client, seeded) -> None:
     assert (
         await client.post(f"/api/v1/parse/tasks/{doc_id}/cancel", headers=headers)
     ).status_code == 403
+
+
+async def test_list_tasks_filters_by_title_keyword(client, seeded) -> None:
+    """清洗解析列表的搜索框：``q`` 按文档名/导入路径过滤。
+
+    回归：前端搜索框的 ``title`` 参数没被传下去、后端也没有关键字参数，搜索框形同摆设。
+    """
+    runtime, _ = seeded
+    auditor_id = grant(runtime, "demo_alice", "auditor")
+    make_pending(runtime, title="工程部/02 客户满意度调查表(1)")
+    make_pending(runtime, title="工程部/03 装修申请流程")
+    headers = headers_for(auditor_id)
+
+    hit = (
+        await client.get("/api/v1/parse/tasks", headers=headers, params={"q": "满意度"})
+    ).json()
+    assert [item["title"] for item in hit["items"]] == ["工程部/02 客户满意度调查表(1)"]
+    assert hit["total"] == 1
+
+    miss = (
+        await client.get("/api/v1/parse/tasks", headers=headers, params={"q": "不存在的文档"})
+    ).json()
+    assert miss["items"] == []
+    assert miss["total"] == 0
+
+
+async def test_list_tasks_keyword_escapes_like_wildcards(client, seeded) -> None:
+    """``%`` / ``_`` 按字面匹配，不能变成 SQL 通配符。"""
+    runtime, _ = seeded
+    auditor_id = grant(runtime, "demo_alice", "auditor")
+    make_pending(runtime, title="折扣 9% 说明")
+    make_pending(runtime, title="折扣 90 说明")
+    headers = headers_for(auditor_id)
+
+    hit = (
+        await client.get("/api/v1/parse/tasks", headers=headers, params={"q": "9%"})
+    ).json()
+    assert [item["title"] for item in hit["items"]] == ["折扣 9% 说明"]

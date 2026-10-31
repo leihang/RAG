@@ -404,6 +404,8 @@ export default function ParseTaskList() {
             limit: params.pageSize,
             offset: ((params.current ?? 1) - 1) * (params.pageSize ?? 20),
             status: params.status as string | undefined,
+            // 搜索框（「文档名」列）→ 后端 q；此前参数被丢掉，搜索框形同摆设
+            q: (params as Record<string, unknown>).title as string | undefined,
           })
           setSummary(res)
           setSelectedMap((prev) => {

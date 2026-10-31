@@ -156,6 +156,7 @@ async def list_parse_tasks(
         description="pending|parsing|review|indexing|published|failed|offline",
     ),
     kb_id: int | None = Query(default=None),
+    q: str | None = Query(default=None, description="按文档名/导入路径搜索（LIKE）"),
     limit: int = Query(default=50),
     offset: int = Query(default=0),
     authorization: str | None = Header(default=None),
@@ -181,6 +182,13 @@ async def list_parse_tasks(
     if kb_id is not None:
         where.append("d.kb_id = ?")
         params.append(int(kb_id))
+    if q and q.strip():
+        # 转义 LIKE 通配符：文档名里带 % / _ 时不能变成通配
+        escaped = (
+            q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        where.append("d.title LIKE ? ESCAPE '\\'")
+        params.append(f"%{escaped}%")
     sql = (
         "SELECT d.doc_id AS task_id, d.kb_id, d.title, d.status, d.level, d.page_count, "
         "d.created_at, d.updated_at, d.parse_ms, "

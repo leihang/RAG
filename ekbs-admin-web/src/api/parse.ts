@@ -6,6 +6,8 @@ export interface ParseTaskQuery {
   offset?: number
   status?: string
   kb_id?: number
+  /** 按文档名/导入路径搜索（LIKE） */
+  q?: string
 }
 
 export const listParseTasks = (params: ParseTaskQuery = {}) =>
