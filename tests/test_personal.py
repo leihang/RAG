@@ -266,3 +266,32 @@ def test_personal_storage_cap_blocks_the_next_file_and_frees_on_delete(seeded) -
         user_id=alice, filename="丙.txt", content=b"c" * (1 * 1024 * 1024),
     )
     assert third["created"] is True
+
+
+def test_personal_delete_removes_raw_file_and_empty_folder(seeded) -> None:
+    """删私有库文件要真删干净：原件 + 空文件夹。
+
+    回归：之前只软删 DB 行（status='deleted'），``raw/personal/<uid>/`` 里的原件和
+    空目录会一直留着 —— 用户删完文件后个人文件夹还在。
+    """
+    runtime, _ = seeded
+    alice = user_id_of(runtime.db, "demo_alice")
+    registered = register_personal_upload(
+        runtime.db, runtime.settings, user_id=alice, filename="甲.txt", content=b"x",
+    )
+    raw_dir = runtime.settings.data_paths()["raw"] / "personal" / str(alice)
+    source = raw_dir / "甲.txt"
+    assert source.is_file(), f"前置条件：个人原件应存在（{source}）"
+
+    removed = delete_personal_file(
+        runtime.db, user_id=alice, title="甲", runtime=runtime,
+    )
+
+    assert removed["deleted"] is True
+    assert not source.exists(), "个人原件应被删除"
+    assert not raw_dir.exists(), "空掉的个人文件夹应被清理"
+    with runtime.db.sync_connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM ekbs_document WHERE doc_id = ?",
+            (registered["doc_id"],),
+        ).fetchone()["n"] == 0

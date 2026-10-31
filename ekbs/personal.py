@@ -378,8 +378,15 @@ def format_personal_list(items: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def delete_personal_file(db: Database, *, user_id: int, title: str) -> dict[str, Any]:
-    """按标题删除本人私有库里的文件。对不上或对上多份时不删。"""
+def delete_personal_file(
+    db: Database, *, user_id: int, title: str, runtime: Any | None = None
+) -> dict[str, Any]:
+    """按标题删除本人私有库里的文件。对不上或对上多份时不删。
+
+    给了 ``runtime`` 时走**硬删**（与文档删除同一套：摘索引 + 删 parse/原件 +
+    清理空父目录）。只软删 DB 行的话，``raw/personal/<uid>/`` 里的原件和空目录
+    会一直留着 —— 实测：删完文件后个人文件夹还在。
+    """
     query = str(title or "").strip().lower()
     if not query:
         return {"deleted": False, "message": "请说「删除我的文件 标题」。标题用「我的文件」里看到的名字。"}
@@ -395,14 +402,25 @@ def delete_personal_file(db: Database, *, user_id: int, title: str) -> dict[str,
         shown = "、".join(sorted(titles)[:8])
         return {"deleted": False, "message": f"匹配到多份，请说完整标题：{shown}"}
     chosen = matches[0]
+    doc_id = int(chosen["doc_id"])
+    message = f"已从你的私有库删除「{chosen['title']}」。"
+    if runtime is not None:
+        # 延迟导入：`api.docs` 反向依赖本模块，模块级导入会成环
+        from ekbs.api.docs import _perform_delete
+
+        _perform_delete(
+            runtime, doc_id, user_id=int(user_id),
+            reason="api:personal_delete", hard=True, purge_assets=True,
+        )
+        return {"deleted": True, "doc_id": doc_id, "message": message}
     with db.sync_connect() as conn:
         conn.execute(
             "UPDATE ekbs_document SET status = 'deleted', deleted_at = datetime('now'), "
             "updated_at = datetime('now') WHERE doc_id = ? AND created_by = ?",
-            (int(chosen["doc_id"]), int(user_id)),
+            (doc_id, int(user_id)),
         )
         conn.commit()
-    return {"deleted": True, "doc_id": int(chosen["doc_id"]), "message": f"已从你的私有库删除「{chosen['title']}」。"}
+    return {"deleted": True, "doc_id": doc_id, "message": message}
 
 
 def purge_demo_accounts(db: Database) -> dict[str, Any]:

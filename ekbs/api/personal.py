@@ -106,7 +106,11 @@ async def personal_delete(
         request, authorization, x_internal_token, x_internal_user_id,
         x_internal_dt_userid, x_internal_channel,
     )
+    # 传 runtime：走硬删（摘索引 + 删原件 + 清理空文件夹），否则个人文件夹会残留
     result = delete_personal_file(
-        request.app.state.runtime.db, user_id=user.user_id, title=payload.title
+        request.app.state.runtime.db,
+        user_id=user.user_id,
+        title=payload.title,
+        runtime=request.app.state.runtime,
     )
     return JSONResponse(result)
