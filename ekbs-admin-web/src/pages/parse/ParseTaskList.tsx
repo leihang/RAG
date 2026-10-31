@@ -11,6 +11,8 @@ import Auth from '@/components/Auth'
 import ClearanceTag from '@/components/ClearanceTag'
 import StatusTag from '@/components/StatusTag'
 import EmptyState from '@/components/EmptyState'
+import ResizableHeader from '@/components/ResizableHeader'
+import { useResizableColumns } from '@/components/useResizableColumns'
 import ImpactConfirmModal from '@/pages/docs/ImpactConfirmModal'
 import {
   approveParseTask,
@@ -67,8 +69,8 @@ export default function ParseTaskList() {
     {
       title: '文档名',
       dataIndex: 'title',
-      // 不截断（原先 ellipsis + 固定总宽 1200，目录导入的全路径名被切掉一半）：
-      // 列宽按内容自适应，表格整体横向滚动，长路径也能看全。
+      // 默认 420，可拖拽调宽（useResizableColumns）；ellipsis 只做兜底，hover 有 tooltip。
+      ellipsis: true,
       render: (_, r) => <Link to={`/docs/${parseTaskId(r) ?? ''}`}>{r.title}</Link>,
     },
     {
@@ -311,6 +313,12 @@ export default function ParseTaskList() {
     }
   }
 
+  // 列宽可拖拽调整并记忆：文档名默认 420，拖宽看全、拖窄给别的列让位
+  const resizableColumns = useResizableColumns(columns, {
+    storageKey: 'parse-tasks',
+    defaults: { title: 420 },
+  })
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       <Card>
@@ -353,8 +361,9 @@ export default function ParseTaskList() {
         headerTitle="清洗解析"
         rowKey={(r) => String(parseTaskId(r) ?? r.title)}
         actionRef={actionRef}
-        columns={columns}
-        // max-content：列宽跟内容走（长文档名不再被固定总宽挤压），超出视口横向滚动
+        columns={resizableColumns}
+        // 表头右边界可拖拽调宽（ResizableHeader），宽度记忆在 localStorage
+        components={{ header: { cell: ResizableHeader } }}
         scroll={{ x: 'max-content' }}
         pagination={{ defaultPageSize: 20, showSizeChanger: true }}
         rowSelection={{
