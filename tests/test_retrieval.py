@@ -652,3 +652,25 @@ def test_build_context_marks_figure_chunks() -> None:
     assert "【图片】" in ctx
     assert "[1]" in ctx and "[2]" in ctx
     assert "DT862" in ctx
+
+
+def test_build_context_includes_doc_title_and_heading() -> None:
+    """进 LLM 的资料段要带文档名 —— 同模板块（「1. 目的」）靠文档名区分。"""
+    from ekbs.retrieval.pipeline import RetrievalPipeline, RetrievedChunk
+
+    chunks = [
+        RetrievedChunk(
+            chunk_id=1,
+            doc_id=1,
+            shard_id="kb_97486022_L2",
+            content="满足公共设备管理需要。",
+            heading_path="1. 目的",
+            doc_title="工程部/1、程序文件/XJWY-GC-02设备编号作业指导书",
+        )
+    ]
+
+    text = RetrievalPipeline.build_context(chunks)
+
+    assert "XJWY-GC-02设备编号作业指导书" in text
+    assert "1. 目的" in text
+    assert "满足公共设备管理需要。" in text

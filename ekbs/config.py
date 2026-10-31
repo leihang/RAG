@@ -409,6 +409,10 @@ class Settings(BaseSettings):
     #: 生成后置的"资料充分性"核验（默认关闭，见 AnswerVerifyCfg）
     answer_verify: AnswerVerifyCfg = Field(default_factory=AnswerVerifyCfg)
     parse: ParseCfg = Field(default_factory=ParseCfg)
+    #: 入库增强开关（默认全关）：``contextual_retrieval`` 开启后每块先由 LLM 生成
+    #: 一句「本段在文档中的位置/主题」再入库（Anthropic Contextual Retrieval）。
+    #: 每块一次 LLM 调用、全量语料成本高 —— 按语料批次开，不要默认开。
+    ingest: dict[str, Any] = Field(default_factory=dict)
     upload: UploadCfg = Field(default_factory=UploadCfg)
     permission: PermissionCfg = Field(default_factory=PermissionCfg)
     dingtalk: dict[str, Any] = Field(default_factory=dict)

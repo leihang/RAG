@@ -18,7 +18,7 @@ import asyncio
 
 import hashlib
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 from ekbs.config import Settings
 from ekbs.db import Database
@@ -93,6 +93,25 @@ class IngestResult:
         }
 
 
+#: Contextual Retrieval（可选）：让 LLM 只写「本段在文档中的位置/主题」，不复述原文。
+#: 为什么值得做：同模板段落（「1. 目的」「2. 范围」）去掉文档名后几乎一样，补一句
+#: 「这是《X》第 4 章讲编号规则的段落」后，嵌入与精排都能把它和别的文档区分开。
+_CONTEXT_PROMPT = (
+    "下面是文档《{title}》中的一段（所在章节：{heading}）。"
+    "请用不超过 40 字、一句话说明这段内容在文档中的**位置或主题**，用于改善检索；"
+    "不要复述原文，不要编号，不要加「本文」之类的空话。\n\n"
+    "原文：\n{body}"
+)
+
+
+def _first_line(text: str, *, limit: int = 80) -> str:
+    for line in (text or "").splitlines():
+        cleaned = line.strip().strip("。；;，,")
+        if cleaned:
+            return cleaned[:limit]
+    return ""
+
+
 class IngestPipeline:
     def __init__(
         self,
@@ -109,6 +128,51 @@ class IngestPipeline:
         self.shards = shards
         self.fts = fts or FtsIndex(db)
         self.figure_index = figure_index
+
+    async def _apply_contextual_retrieval(self, title: str, nodes: Sequence[Any]) -> int:
+        """可选的 Contextual Retrieval：给每块补一句上下文再入库（默认关闭）。
+
+        为什么默认关：每块一次 LLM 调用，全量语料（数万块）成本很高，且失败时会拖慢
+        入库；``ingest.contextual_retrieval: true`` 按语料批次开。打开后正文前缀
+        ``【上下文】…``，FTS / 嵌入 / 精排都吃得到同一份文本。
+        """
+        if not bool((self.settings.ingest or {}).get("contextual_retrieval", False)):
+            return 0
+        llm = getattr(self.providers, "llm", None)
+        if llm is None:
+            return 0
+        changed = 0
+        for node in nodes:
+            if node.chunk_type not in {"parent", "child", "table", "figure"}:
+                continue
+            body = (node.content or "").strip()
+            if not body:
+                continue
+            try:
+                generated = await llm.generate(
+                    [
+                        {
+                            "role": "user",
+                            "content": _CONTEXT_PROMPT.format(
+                                title=title,
+                                heading=node.heading_path or "（无小节）",
+                                body=body[:400],
+                            ),
+                        }
+                    ]
+                )
+            except Exception as exc:  # noqa: BLE001 - 增强失败不能拖垮入库
+                log.warning("contextual_retrieval_failed", error=str(exc)[:160])
+                continue
+            context = _first_line(getattr(generated, "text", ""))
+            if not context:
+                continue
+            node.content = f"【上下文】{context}\n{node.content}"
+            node.token_count = count_tokens(node.content)
+            changed += 1
+        if changed:
+            log.info("contextual_retrieval_applied", doc_title=title, nodes=changed)
+        return changed
 
     # ------------------------------------------------------------------
 
@@ -267,6 +331,7 @@ class IngestPipeline:
                     samples=list(lost_lines[:3]),
                     hint="这些行没进任何块（content∪heading_path），检索不到；看 chunker 的标题判据",
                 )
+            await self._apply_contextual_retrieval(title, chunking.nodes)
             self._insert_chunks(doc_id, shard_id, chunking.nodes)
             child_ids = self._child_chunk_ids(doc_id)
             if defer_vector:
