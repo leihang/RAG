@@ -386,7 +386,11 @@ def _logical_row_cells(row: Any) -> list[str]:
             continue
         if key is not None:
             position[key] = len(texts)
-        texts.append((getattr(cell, "text", "") or "").strip().replace("\n", " "))
+        if tc is not None and _is_docx_element(tc):
+            raw_text = _docx_element_text(tc, _docx_qn())
+        else:
+            raw_text = getattr(cell, "text", "") or ""
+        texts.append(raw_text.strip().replace("\n", " "))
         spans.append(1)
 
     cells: list[str] = []
@@ -394,6 +398,64 @@ def _logical_row_cells(row: Any) -> list[str]:
         cells.append(text)
         cells.extend([""] * (span - 1))
     return cells
+
+
+#: Word 符号字体（``w:sym``）里常见的复选框/勾 → Unicode。
+#: 符号存在 ``w:sym``、**不在 ``w:t``**；只读 ``w:t`` 会整段丢失 —— 实测
+#: 《客户满意度调查表》18 个 Wingdings 复选框全部消失，变成
+#: "一至三次三至五次五次以上"（用户反馈"符号被解析掉了"）。
+_DOCX_SYMBOLS: dict[tuple[str, int], str] = {
+    ("wingdings", 0xA8): "□",
+    ("wingdings", 0xA1): "☐",
+    ("wingdings", 0xFE): "☑",
+    ("wingdings", 0xFD): "☒",
+    ("wingdings", 0xFC): "✓",
+    ("symbol", 0xD8): "√",
+}
+
+
+def _docx_symbol_char(sym: Any, qn: Any) -> str:
+    """``w:sym`` → 可读字符；未收录的 PUA 码位返回空串（不伪造字符）。"""
+    font = str(sym.get(qn("w:font")) or "").strip().lower()
+    raw = str(sym.get(qn("w:char")) or "").strip()
+    if not raw:
+        return ""
+    try:
+        code = int(raw, 16)
+    except ValueError:
+        return ""
+    return _DOCX_SYMBOLS.get((font, code)) or _DOCX_SYMBOLS.get((font, code & 0xFF)) or ""
+
+
+def _docx_element_text(element: Any, qn: Any) -> str:
+    """按文档顺序读一段 XML 的文字：``w:t`` 取文本、``w:sym`` 还原符号。
+
+    只读 ``w:t`` 会丢掉符号字体里的复选框/勾/箭头（Word 把它们存成 ``w:sym``）。
+    """
+    parts: list[str] = []
+    for node in element.iter():
+        tag = node.tag
+        if tag == qn("w:t"):
+            parts.append(node.text or "")
+        elif tag == qn("w:sym"):
+            parts.append(_docx_symbol_char(node, qn))
+        elif tag == qn("w:tab"):
+            parts.append(" ")
+        elif tag in (qn("w:br"), qn("w:cr")):
+            parts.append("\n")
+    return "".join(parts)
+
+
+def _docx_qn() -> Any:
+    """python-docx 的 qn（延迟导入，避免模块级依赖）。"""
+    from docx.oxml.ns import qn
+
+    return qn
+
+
+def _is_docx_element(tc: Any) -> bool:
+    tag = str(getattr(tc, "tag", ""))
+    return "wordprocessingml" in tag
 
 
 def _docx_table_html(table: Any) -> str:
@@ -415,7 +477,7 @@ def _docx_table_html(table: Any) -> str:
     for row in table.rows:
         cells: list[dict[str, Any]] = []
         for tc in row._tr.tc_lst:
-            text = "".join(node.text or "" for node in tc.iter(qn("w:t"))).strip().replace("\n", " ")
+            text = _docx_element_text(tc, qn).strip().replace("\n", " ")
             span = 1
             vmerge = ""
             tc_pr = tc.tcPr
@@ -613,7 +675,8 @@ def _walk_docx_body(document: Any, state: _DocxState, qn: Any) -> None:
     for child in document.element.body.iterchildren():
         if child.tag == qn("w:p"):
             paragraph = Paragraph(child, document)
-            text = (paragraph.text or "").strip()
+            # 用 sym-aware 取文（paragraph.text 会丢掉 w:sym 里的符号）
+            text = _docx_element_text(child, qn).strip()
             # 先记上文再落图：空段里的二维码才能挂上「扫描二维码下载」
             if text:
                 state.recent_texts.append(text)

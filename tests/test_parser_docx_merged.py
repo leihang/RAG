@@ -121,3 +121,28 @@ def test_continued_table_merge_skips_word_layout_tables() -> None:
     assert stats.get("tables_merged_pairs", 0) == 0
     assert len(tables) == 2
     assert 'colspan="2"' in tables[0].body
+
+
+def test_word_symbol_checkboxes_are_preserved(tmp_path) -> None:
+    """Word 把复选框存在 ``w:sym``（符号字体）里；只读 ``w:t`` 会整段丢掉。
+
+    回归：《客户满意度调查表》的服务评价区 18 个 Wingdings 复选框全部消失，
+    变成"一至三次三至五次五次以上"。
+    """
+    import docx
+    from docx.oxml.ns import qn
+
+    document = docx.Document()
+    paragraph = document.add_paragraph("选择：")
+    run = paragraph.add_run()
+    sym = run._r.makeelement(
+        qn("w:sym"), {qn("w:font"): "Wingdings", qn("w:char"): "00A8"}
+    )
+    run._r.append(sym)
+    paragraph.add_run("一至三次")
+    path = tmp_path / "sym.docx"
+    document.save(str(path))
+
+    parsed = _parse_docx(path)
+
+    assert "□一至三次" in parsed.markdown, parsed.markdown
