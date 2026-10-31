@@ -138,10 +138,16 @@ export default function ImportDirs() {
   }, [])
 
   const removeFolder = async (rel: string) => {
-    if (!window.confirm(`删除文件夹「${rel}」？里面有文件时会拒绝。`)) return
+    if (
+      !window.confirm(
+        `删除文件夹「${rel}」？\n将同时删除其下所有文件，以及库内该目录下的文档（不可恢复）。`,
+      )
+    )
+      return
     try {
-      await deleteImportDir(rel)
-      message.success('已删除文件夹')
+      const res = await deleteImportDir(rel, true)
+      const extra = res.documents_deleted ? `，连带删除 ${res.documents_deleted} 篇文档` : ''
+      message.success(`已删除文件夹${extra}`)
       await enterDir(cwd)
     } catch (err) {
       message.error(describeImportError(err))

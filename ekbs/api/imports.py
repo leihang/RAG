@@ -246,21 +246,61 @@ async def import_mkdir(
 async def import_rmdir(
     request: Request,
     path: str = Query(min_length=1, description="raw 下要删除的相对路径"),
+    with_documents: bool = Query(
+        default=False,
+        description="true=连同该目录下已入库的文档一起删（硬删）；false=只删空文件夹",
+    ),
     authorization: str | None = Header(default=None),
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """删除空文件夹。目录已经不在磁盘上时也返回成功，方便界面去掉残留名字。"""
-    _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "doc:document:create")
+    """删除文件夹。
+
+    * 默认 ``with_documents=false``：只删**空**文件夹（有内容返回 409）；
+    * ``with_documents=true``：先把该目录下已入库的文档**硬删**（块/向量/parse/原件），
+      再递归删掉目录 —— 解决"UI 删了文件夹、库里文档/目录还在"的问题。
+
+    目录已经不在磁盘上时也返回成功，方便界面去掉残留名字。
+    """
+    principal = _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "doc:document:create"
+    )
     runtime = request.app.state.runtime
+    documents_deleted = 0
+    if with_documents:
+        # 延迟导入：docs 路由与 imports 路由互相引用时不至于在 import 期成环
+        from ekbs.api.docs import _perform_delete
+
+        target = resolve_within_raw(runtime.settings, path)
+        prefix = str(target).rstrip("/") + "/"
+        with runtime.db.sync_connect() as conn:
+            doc_ids = [
+                int(row["doc_id"])
+                for row in conn.execute(
+                    "SELECT doc_id FROM ekbs_document WHERE source_path LIKE ?",
+                    (prefix + "%",),
+                )
+            ]
+        for doc_id in doc_ids:
+            try:
+                _perform_delete(
+                    runtime, doc_id, user_id=principal.user_id,
+                    reason="api:dir_delete", hard=True, purge_assets=True,
+                )
+                documents_deleted += 1
+            except Exception as exc:  # noqa: BLE001 - 单篇失败不拖垮整目录删除
+                log.warning("dir_delete_doc_failed", doc_id=doc_id, error=str(exc)[:160])
     try:
-        rel = remove_import_dir(runtime.settings, path)
+        rel = remove_import_dir(runtime.settings, path, recursive=with_documents)
     except FolderNotEmpty as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ImportPathError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    log.info("import_rmdir", rel_path=rel)
-    return JSONResponse({"rel_path": rel, "deleted": True})
+    log.info("import_rmdir", rel_path=rel, with_documents=with_documents,
+             documents_deleted=documents_deleted)
+    return JSONResponse(
+        {"rel_path": rel, "deleted": True, "documents_deleted": documents_deleted}
+    )
 
 
 @router.get("/import/depts")

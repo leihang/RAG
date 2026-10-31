@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -302,10 +303,13 @@ def save_folder_policy(
     return policy
 
 
-def remove_import_dir(settings: Settings, rel: str) -> str:
-    """删除 raw 下的空文件夹。已经不存在也算删掉，方便界面清掉残留名字。
+def remove_import_dir(settings: Settings, rel: str, *, recursive: bool = False) -> str:
+    """删除 raw 下的文件夹。已经不存在也算删掉，方便界面清掉残留名字。
 
-    只含权限文件或 ``.DS_Store`` 视为空。里面还有文件或子文件夹则拒绝。
+    ``recursive=False``（默认）：只删**空**文件夹（含权限文件/``.DS_Store`` 视为空），
+    里面还有文件或子目录则拒绝 —— 默认路径不会误删文件。
+    ``recursive=True``：连同文件与子目录一起删。调用方应先把库内文档删掉
+    （``DELETE /import/dirs?with_documents=true`` 就是这么做的）。
     """
     cleaned = str(rel or "").strip().replace("\\", "/").strip("/")
     if not cleaned:
@@ -321,6 +325,10 @@ def remove_import_dir(settings: Settings, rel: str) -> str:
         return cleaned
     if not target.is_dir():
         raise ImportPathError(f"不是文件夹：{cleaned}")
+    if recursive:
+        # 目录里可能有隐藏文件/只读文件，shutil.rmtree 统一处理；失败会抛 OSError
+        shutil.rmtree(target)
+        return cleaned
     leftovers: list[str] = []
     for child in target.iterdir():
         if child.name in _IGNORED_NAMES or (child.is_file() and child.name.startswith(".")):

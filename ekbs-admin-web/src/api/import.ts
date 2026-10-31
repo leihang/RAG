@@ -68,11 +68,20 @@ export const createImportDir = (body: {
     folder_policy?: { level: number; visible_dept_ids: string[]; viewer_user_ids: number[] } | null
   }>
 
-/** 删除空文件夹。磁盘上已经没有这个目录时也算成功。 */
-export const deleteImportDir = (path: string) =>
-  http.delete('/import/dirs', { params: { path }, skipErrorToast: true }) as Promise<{
+/**
+ * 删除文件夹。
+ *
+ * `withDocuments=true` 时连着该目录下**已入库的文档**一起硬删（块/向量/parse/原件），
+ * 再递归删磁盘目录 —— 解决「UI 删了文件夹、库里文档和空目录还在」。
+ */
+export const deleteImportDir = (path: string, withDocuments = false) =>
+  http.delete('/import/dirs', {
+    params: { path, with_documents: withDocuments },
+    skipErrorToast: true,
+  }) as Promise<{
     rel_path: string
     deleted: boolean
+    documents_deleted?: number
   }>
 
 /** 预览：这个目录会导入哪些文件、哪些重复、有没有闸门挡着。**不写库**。 */

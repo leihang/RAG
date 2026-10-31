@@ -676,3 +676,55 @@ def test_child_folder_inherits_parent_department_by_default(runtime) -> None:
     bare = root / "wuye" / "未设置目录" / "子目录"
     bare.mkdir(parents=True)
     assert policy_for_upload(runtime.settings, "wuye", "未设置目录/子目录/制度.docx") is None
+
+
+async def test_rmdir_with_documents_deletes_docs_and_folder(client, seeded) -> None:
+    """UI 删文件夹要真删干净：库内文档 + 磁盘文件/子目录一起删。"""
+    runtime, _summary = seeded
+    admin = grant_role(runtime, "demo_alice", "doc_reviewer")
+    kb_id = _first_kb_id(runtime)
+    target = raw_root(runtime.settings) / "kbdemo" / "待删目录"
+    nested = target / "子目录"
+    nested.mkdir(parents=True)
+    source = nested / "a.docx"
+    source.write_bytes(b"x")
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "INSERT INTO ekbs_document(kb_id, title, source_path, level, visible_dept_ids, "
+            "status, checksum, size_bytes, doc_version, created_by) "
+            "VALUES (?, 'a', ?, 2, '[\"102\"]', 'published', 'chk-a', 1, 'v1', ?)",
+            (kb_id, str(source), admin),
+        )
+        conn.commit()
+
+    resp = await client.delete(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        params={"path": "kbdemo/待删目录", "with_documents": "true"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["documents_deleted"] == 1
+    assert not target.exists()
+    with runtime.db.sync_connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM ekbs_document WHERE checksum = 'chk-a'"
+        ).fetchone()["n"] == 0
+
+
+async def test_rmdir_refuses_non_empty_folder_without_with_documents(client, seeded) -> None:
+    """默认只删空文件夹：有内容时 409，避免误删。"""
+    runtime, _summary = seeded
+    admin = grant_role(runtime, "demo_alice", "doc_reviewer")
+    target = raw_root(runtime.settings) / "kbdemo" / "非空目录"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("keep", encoding="utf-8")
+
+    resp = await client.delete(
+        "/api/v1/import/dirs",
+        headers=headers_for(admin),
+        params={"path": "kbdemo/非空目录"},
+    )
+
+    assert resp.status_code == 409
+    assert target.exists()

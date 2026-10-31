@@ -711,7 +711,33 @@ def _purge_document_assets(
         )
         if gone:
             removed.append(gone)
+            removed.extend(_prune_empty_dirs(Path(gone), stop=paths["raw"]))
     return removed
+
+
+def _prune_empty_dirs(path: Path, *, stop: Path) -> list[str]:
+    """删文件后把空掉的父目录一路收掉（不越过 raw 根）。
+
+    为什么要：删文档只删文件、不删目录时，导入页的目录树会一直留着空文件夹，
+    看起来"删了还都在"。只删到第一个非空目录为止。
+    """
+    pruned: list[str] = []
+    stop_resolved = stop.resolve()
+    parent = path.parent
+    while True:
+        try:
+            resolved = parent.resolve()
+        except OSError:
+            break
+        if resolved == stop_resolved or stop_resolved not in resolved.parents:
+            break
+        try:
+            parent.rmdir()  # 目录非空会抛 OSError
+        except OSError:
+            break
+        pruned.append(str(parent))
+        parent = parent.parent
+    return pruned
 
 
 def _drop_document_index(runtime: Any, doc_id: int) -> tuple[list[int], list[str]]:

@@ -449,6 +449,8 @@ async def test_hard_delete_removes_disk_artifacts(client, kb_admin, tmp_path) ->
     assert not parse_dir.exists(), "解析产物目录应被删除"
 
     # 同目录下**别人的**文件不能被牵连（这里放一个同目录的邻居文件）
+    # 删完上一份文档后空目录会被自动清理，所以这里先把目录建回来
+    source.parent.mkdir(parents=True, exist_ok=True)
     sibling = source.parent / "别人的文件.md"
     sibling.write_text("不该被删", encoding="utf-8")
     with runtime.db.sync_connect() as conn:
