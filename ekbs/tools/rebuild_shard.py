@@ -81,7 +81,10 @@ async def rebuild(runtime: Runtime, shard_id: str, *, dry_run: bool = False) -> 
         directory.mkdir(parents=True, exist_ok=True)
         name = f"seg_rebuild_{int(_time.time())}.faiss"
         index = ShardIndex.create(shard_id, directory / name, dim=dim, fingerprint=embed.ref.fingerprint)
-        index.add(np.asarray(vectors, dtype="float32"), chunk_ids)
+        # 空分片（0 块）也要能重建：不判空的话 np.asarray([]) 是形状 (0,)，直接抛
+        # "向量形状 (0,) 与分片维度 1024 不符"。非空才 add，空段落一个 0 向量的 base 段。
+        if vectors:
+            index.add(np.asarray(vectors, dtype="float32"), chunk_ids)
         index.save()
         for old in directory.glob("seg_*.faiss"):
             if old.name != name:
@@ -142,7 +145,12 @@ def main(argv: list[str] | None = None) -> int:
             else [args.shard_id]
         )
         for shard_id in targets:
-            result = asyncio.run(rebuild(runtime, shard_id, dry_run=args.dry_run))
+            # 单个分片失败不拖垮整批（例如某分片登记缺失/段文件损坏）
+            try:
+                result = asyncio.run(rebuild(runtime, shard_id, dry_run=args.dry_run))
+            except Exception as exc:  # noqa: BLE001
+                print({"shard_id": shard_id, "ok": False, "error": str(exc)[:200]})
+                continue
             print(result)
     finally:
         asyncio.run(runtime.aclose())
