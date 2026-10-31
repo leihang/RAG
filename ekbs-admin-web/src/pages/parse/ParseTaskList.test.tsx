@@ -118,13 +118,31 @@ describe('清洗解析列表', () => {
 })
 
 describe('列宽拖拽', () => {
-  it('表头渲染拖拽手柄（ProTable 的 components 已透传）', async () => {
+  it('拖「文档名」列右边界会改变列宽并记忆（ProTable components 全链路）', async () => {
+    window.localStorage.clear()
     render(
       <MemoryRouter>
         <ParseTaskList />
       </MemoryRouter>,
     )
     await screen.findByText('空调保养合同')
-    expect(screen.getAllByTitle('拖动调整列宽').length).toBeGreaterThan(0)
+
+    const before = Array.from(document.querySelectorAll('colgroup col')).map((c) =>
+      c.getAttribute('style'),
+    )
+    const handle = screen
+      .getAllByTitle('拖动调整列宽')
+      .find((node) => node.parentElement?.textContent?.includes('文档名'))
+    expect(handle).toBeTruthy()
+
+    fireEvent.mouseDown(handle as HTMLElement, { clientX: 600 })
+    fireEvent.mouseMove(document, { clientX: 700 })
+    fireEvent.mouseUp(document)
+
+    const after = Array.from(document.querySelectorAll('colgroup col')).map((c) =>
+      c.getAttribute('style'),
+    )
+    expect(after).not.toEqual(before)
+    expect(window.localStorage.getItem('ekbs:col-widths:parse-tasks')).toContain('"title":520')
   })
 })

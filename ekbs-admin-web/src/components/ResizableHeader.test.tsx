@@ -47,3 +47,18 @@ describe('ResizableHeader', () => {
     expect(onResize.mock.calls[onResize.mock.calls.length - 1]?.[1]).toEqual({ size: { width: 80 } })
   })
 })
+
+describe('ResizableHeader 无 onResize', () => {
+  it('不可调整的列（行选择/展开列）不画死手柄', () => {
+    render(
+      <table>
+        <thead>
+          <tr>
+            <ResizableHeader>选择</ResizableHeader>
+          </tr>
+        </thead>
+      </table>,
+    )
+    expect(screen.queryByTitle('拖动调整列宽')).toBeNull()
+  })
+})
