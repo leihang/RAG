@@ -43,13 +43,17 @@ async def rebuild(runtime: Runtime, shard_id: str, *, dry_run: bool = False) -> 
     with runtime.db.sync_connect() as conn:
         # 必须与入库用**同一口径**（叶子块），否则重建一次就悄悄丢掉代码/图片向量
         rows = conn.execute(
-            "SELECT c.chunk_id, c.content, c.heading_path FROM ekbs_chunk c "
+            "SELECT c.chunk_id, c.content, c.heading_path, d.title AS doc_title "
+            "FROM ekbs_chunk c JOIN ekbs_document d ON d.doc_id = c.doc_id "
             f"WHERE c.shard_id = ? AND {RETRIEVABLE_PREDICATE} ORDER BY c.seq",
             (shard_id,),
         ).fetchall()
     chunk_ids = [int(r["chunk_id"]) for r in rows]
-    # 与入库同口径：标题路径 + 正文（chunker.retrieval_text）
-    texts = [retrieval_text(r["heading_path"], str(r["content"])) for r in rows]
+    # 与入库同口径：文档名 + 标题路径 + 正文（chunker.retrieval_text）
+    texts = [
+        retrieval_text(r["heading_path"], str(r["content"]), doc_title=str(r["doc_title"] or ""))
+        for r in rows
+    ]
     if dry_run:
         return {"shard_id": shard_id, "chunks": len(chunk_ids), "dry_run": True}
 

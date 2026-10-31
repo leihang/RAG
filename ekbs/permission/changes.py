@@ -396,8 +396,10 @@ class PermissionChangeService:
             # 必须与入库时「叶子块才是检索单元」的口径完全一致（见 ingest.retrievable）
             rows = conn.execute(
                 "SELECT c.chunk_id, c.chunk_type, c.content, c.heading_path, "
+                "d.title AS doc_title, "
                 f"CASE WHEN {RETRIEVABLE_PREDICATE} THEN 1 ELSE 0 END AS is_retrievable "
-                "FROM ekbs_chunk c WHERE c.doc_id = ? ORDER BY c.seq",
+                "FROM ekbs_chunk c JOIN ekbs_document d ON d.doc_id = c.doc_id "
+                "WHERE c.doc_id = ? ORDER BY c.seq",
                 (doc_id,),
             ).fetchall()
         if not rows:
@@ -410,7 +412,12 @@ class PermissionChangeService:
         )
 
         children = [
-            (int(r["chunk_id"]), retrieval_text(r["heading_path"], str(r["content"])))
+            (
+                int(r["chunk_id"]),
+                retrieval_text(
+                    r["heading_path"], str(r["content"]), doc_title=str(r["doc_title"] or "")
+                ),
+            )
             for r in rows
             if r["is_retrievable"]
         ]

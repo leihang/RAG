@@ -83,7 +83,11 @@ def _chunk_row(runtime: Any, chunk_id: int) -> Any:
 def _chunk_view(row: Any) -> dict[str, Any]:
     item = dict(row)
     item["token_count"] = item.get("token_count") or count_tokens(str(item.get("content") or ""))
-    item["retrieval_text"] = retrieval_text(item.get("heading_path"), str(item.get("content") or ""))
+    item["retrieval_text"] = retrieval_text(
+        item.get("heading_path"),
+        str(item.get("content") or ""),
+        doc_title=str(item.get("doc_title") or ""),
+    )
     return item
 
 
@@ -116,7 +120,9 @@ async def _reembed_async(
 
     with runtime.db.sync_connect() as conn:
         row = conn.execute(
-            "SELECT chunk_id, doc_id, shard_id, chunk_type FROM ekbs_chunk WHERE chunk_id = ?",
+            "SELECT c.chunk_id, c.doc_id, c.shard_id, c.chunk_type, d.title AS doc_title "
+            "FROM ekbs_chunk c JOIN ekbs_document d ON d.doc_id = c.doc_id "
+            "WHERE c.chunk_id = ?",
             (chunk_id,),
         ).fetchone()
         if row is None:
@@ -131,7 +137,7 @@ async def _reembed_async(
         return {"embedded": False, "reason": "container_chunk_not_indexed"}
 
     shard_id = str(row["shard_id"])
-    text = retrieval_text(heading_path, content)
+    text = retrieval_text(heading_path, content, doc_title=str(row["doc_title"] or ""))
     vector = await runtime.providers.embed.embed_one(text)
     # **upsert 而非 append**：编辑/重嵌用的是同一个 chunk_id，
     # 而 FAISS 的 add_with_ids 对重复 id 是累积而不是替换（会召回重复、索引越长越大）

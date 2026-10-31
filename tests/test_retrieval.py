@@ -542,10 +542,14 @@ async def test_heading_only_keyword_is_retrievable(seeded, runtime) -> None:
     )
 
     # 口径唯一性：嵌入/精排用的文本必须包含标题
-    assert retrieval_text("A > 第二条 住宿标准", "一线城市每晚不超过 600 元") == (
+    assert retrieval_text("A > 第二条 住宿标准", "一线城市每晚不超过 600 元", doc_title="") == (
         "A > 第二条 住宿标准\n一线城市每晚不超过 600 元"
     )
-    assert retrieval_text("", "无标题") == "无标题"
+    assert retrieval_text("", "无标题", doc_title="") == "无标题"
+    # 文档名进检索文本：同模板小节（「1. 目的」）靠文档名区分不同文件
+    assert retrieval_text("1. 目的", "更好地服务客户。", doc_title="设备编号作业指导书") == (
+        "设备编号作业指导书\n1. 目的\n更好地服务客户。"
+    )
 
 
 async def test_migration_keeps_heading_in_embedding(seeded) -> None:

@@ -954,8 +954,12 @@ class RetrievalPipeline:
         payload = [
             RerankDoc(
                 chunk_id=chunk_id,
-                # 与嵌入同口径：带上小节标题，精排才看得见「第二条 住宿标准」这类限定词
-                text=retrieval_text(docs[chunk_id].heading_path, docs[chunk_id].content),
+                # 与嵌入同口径：文档名 + 小节标题，精排才看得见「第二条 住宿标准」这类限定词
+                text=retrieval_text(
+                    docs[chunk_id].heading_path,
+                    docs[chunk_id].content,
+                    doc_title=docs[chunk_id].doc_title,
+                ),
                 shard_id=docs[chunk_id].shard_id,
                 rrf_score=score,
                 dense_rank=dense_ranks.get(chunk_id),

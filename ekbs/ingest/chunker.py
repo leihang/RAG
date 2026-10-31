@@ -285,27 +285,39 @@ def count_tokens(text: str) -> int:
         return cjk + max(1, other // 4)
 
 
-def retrieval_text(heading_path: str | None, content: str) -> str:
-    """**检索用文本**：小节标题路径 + 正文（`ekbs_chunk.content` 本身不改）。
+def retrieval_text(heading_path: str | None, content: str, *, doc_title: str) -> str:
+    """**检索用文本**：文档名 + 小节标题路径 + 正文（``ekbs_chunk.content`` 本身不改）。
 
-    为什么必须带上标题：制度文件里关键限定词常常只在小节标题里
-    （「第二条 **住宿标准**」），正文写的是「一线城市每晚不超过 600 元…」。
-    只嵌入正文时，查询「住宿标准」与这段正文**没有任何共享词**，
-    稠密召回直接落空 —— 实测踩到过（差旅费办法导入后查不到）。
+    为什么三样都要：
 
-    ⚠️ **口径必须唯一**：入库（:mod:`ekbs.ingest.pipeline`）、分片迁移
-    （:mod:`ekbs.permission.changes`）、索引重建（:mod:`ekbs.tools.rebuild_shard`）
-    三处都用本函数；任何一处不同，同一个分片里就会混入两套向量语义。
+    * **文档名**：「文件信息 / 1. 目的 / 2. 范围 / 3. 职责」这类模板小节在每篇制度里
+      几乎一样，不带文档名时**两篇不同文件的同模板块向量几乎相同**（实测 3 篇文档
+      共享同一句「重庆卓越城市运营服务有限责任公司熙街管理处」）；查询里带文档名/
+      编号时也无法把同模板块区分开。
+    * **小节路径**：关键限定词常只在小节标题里（「第二条 **住宿标准**」），正文写的是
+      「一线城市每晚不超过 600 元…」，只嵌入正文时查询「住宿标准」与这段正文**没有
+      任何共享词**，稠密召回直接落空 —— 实测踩到过（差旅费办法导入后查不到）。
+
+    ⚠️ **口径必须唯一**：入库 / 分片迁移 / 索引重建 / 编辑重嵌 / 精排 五处都调用本函数。
+    ``doc_title`` 是**必填关键字**：漏传会在调用点直接 ``TypeError``，而不是悄悄混入
+    两套向量语义（这类"同一分片里两套嵌入口径"的排查成本极高）。
     """
+    title = (doc_title or "").strip()
     heading = (heading_path or "").strip()
     body = content or ""
-    if not heading:
-        return body
-    return f"{heading}\n{body}"
+    if title and heading.startswith(title):
+        # 小节路径本身已含文档名（如标题块），不重复拼
+        title = ""
+    prefix = "\n".join(part for part in (title, heading) if part)
+    return f"{prefix}\n{body}" if prefix else body
 
 
 def ensure_heading_path(heading_path: str | None, *, doc_title: str = "") -> str:
-    """``heading_path`` 永不空（`20` §3.3）：缺则用文档标题，再缺用「文档」。"""
+    """``heading_path`` 永不空（`20` §3.3）：缺则用文档标题，再缺用「文档」。
+
+    ⚠️ 这里**只做兜底**，不把文档名拼进小节路径：``heading_path`` 是「文档结构」，
+    文档身份由 :func:`retrieval_text` 在**检索用文本**里补（见那里的说明）。
+    """
     path = (heading_path or "").strip()
     if path:
         return path

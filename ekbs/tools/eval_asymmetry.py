@@ -84,14 +84,19 @@ def corpus_from_db(settings, only_published: bool = True):
     db = Database(settings)
     with db.sync_connect() as conn:
         rows = conn.execute(
-            "SELECT c.chunk_id, c.heading_path, c.content FROM ekbs_chunk c "
-            "JOIN ekbs_document d ON d.doc_id = c.doc_id "
+            "SELECT c.chunk_id, c.heading_path, c.content, d.title AS doc_title "
+            "FROM ekbs_chunk c JOIN ekbs_document d ON d.doc_id = c.doc_id "
             f"WHERE {RETRIEVABLE_PREDICATE} "
             + ("AND d.status = 'published' " if only_published else "")
             + "ORDER BY c.doc_id, c.seq"
         ).fetchall()
     return [
-        (int(r["chunk_id"]), retrieval_text(r["heading_path"], str(r["content"])))
+        (
+            int(r["chunk_id"]),
+            retrieval_text(
+                r["heading_path"], str(r["content"]), doc_title=str(r["doc_title"] or "")
+            ),
+        )
         for r in rows
     ]
 

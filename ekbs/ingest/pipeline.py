@@ -593,12 +593,18 @@ class IngestPipeline:
             return None, {}
         with self.db.sync_connect() as conn:
             rows = conn.execute(
-                "SELECT c.chunk_id, c.content, c.heading_path FROM ekbs_chunk c "
+                "SELECT c.chunk_id, c.content, c.heading_path, d.title AS doc_title "
+                "FROM ekbs_chunk c JOIN ekbs_document d ON d.doc_id = c.doc_id "
                 f"WHERE c.doc_id = ? AND {RETRIEVABLE_PREDICATE} ORDER BY c.seq",
                 (doc_id,),
             ).fetchall()
-        # 嵌入的是「标题路径 + 正文」（口径唯一，见 chunker.retrieval_text）
-        texts = [retrieval_text(r["heading_path"], str(r["content"])) for r in rows]
+        # 嵌入的是「文档名 + 标题路径 + 正文」（口径唯一，见 chunker.retrieval_text）
+        texts = [
+            retrieval_text(
+                r["heading_path"], str(r["content"]), doc_title=str(r["doc_title"] or "")
+            )
+            for r in rows
+        ]
         local_tokens = sum(count_tokens(text) for text in texts)
         pop_usage = getattr(self.providers.embed, "pop_usage", None)
         if callable(pop_usage):  # 清账：别把上一篇/别的用途的用量算到这一篇头上
