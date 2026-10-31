@@ -492,6 +492,9 @@ class TableInput:
     caption: str = ""
     page: int | None = None
     table_id: str = ""
+    #: 表体是**原生 Word 版式**（HTML 带 colspan/rowspan）。表修复/续页合并会按行重拼
+    #: HTML、丢掉跨度 —— 这类表必须跳过重拼，否则合并单元格被拍平。
+    preserve_layout: bool = False
 
 
 @dataclass

@@ -288,6 +288,7 @@ async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:
                 caption=item.caption,
                 page=item.page,
                 table_id=item.table_id,
+                preserve_layout=item.preserve_layout,
             )
             for item in parsed.tables
         ]

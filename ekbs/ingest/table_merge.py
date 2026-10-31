@@ -47,8 +47,15 @@ def repair_table_rows(rows: Sequence[Sequence[str]]) -> list[list[str]]:
     return _repair_water_quality(matrix)
 
 
-def repair_table_html(body: str) -> tuple[str, bool]:
-    """返回 (html, 是否改过)。没改则保留原 HTML。"""
+def repair_table_html(body: str, *, preserve_layout: bool = False) -> tuple[str, bool]:
+    """返回 (html, 是否改过)。没改则保留原 HTML。
+
+    ``preserve_layout=True``（Word 原生表）直接跳过：修复走 ``coerce_rows`` → 行 →
+    重新拼 HTML，跨度（colspan/rowspan）在这一步会丢，修完反而把原表版式拍平。
+    修复针对的是扫描件表格的几种稳定错位（水质指标表、分组表头），没有版式可保。
+    """
+    if preserve_layout:
+        return body, False
     rows = coerce_rows(body)
     if not rows:
         return body, False
@@ -129,6 +136,20 @@ def _repair_quality_label(row: list[str]) -> list[str]:
     return row
 
 
+def _preserves_layout(item: Any) -> bool:
+    """是否是"原生 Word 版式"表（HTML 带合并跨度，不能按行重建）。"""
+    return bool(getattr(item, "preserve_layout", False))
+
+
+def _skip_merge_pair(
+    a_idx: int, b_idx: int, items: Sequence[Any], absorbed: set[int]
+) -> bool:
+    """这一对表要不要跳过合并：已吸收的，或任一方是原生 Word 版式（按行重拼会丢跨度）。"""
+    if a_idx in absorbed or b_idx in absorbed:
+        return True
+    return _preserves_layout(items[a_idx]) or _preserves_layout(items[b_idx])
+
+
 def merge_continued_tables(
     markdown: str,
     tables: Sequence[T],
@@ -158,7 +179,7 @@ def merge_continued_tables(
     while i < len(order) - 1:
         a_idx = order[i]
         b_idx = order[i + 1]
-        if a_idx in absorbed or b_idx in absorbed:
+        if _skip_merge_pair(a_idx, b_idx, items, absorbed):
             i += 1
             continue
         a, b = items[a_idx], items[b_idx]
@@ -454,7 +475,10 @@ def _repair_table_list(items: list[T]) -> tuple[list[T], int]:
     repaired = 0
     out: list[T] = []
     for table in items:
-        new_body, changed = repair_table_html(getattr(table, "body", "") or "")
+        new_body, changed = repair_table_html(
+            getattr(table, "body", "") or "",
+            preserve_layout=_preserves_layout(table),
+        )
         if changed:
             out.append(_replace_table(table, body=new_body))
             repaired += 1

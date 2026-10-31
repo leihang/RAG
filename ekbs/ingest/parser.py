@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -54,6 +55,9 @@ class ParsedTable:
     caption: str = ""
     page: int | None = None
     table_id: str = ""
+    #: 表体是**原生 Word 版式**（HTML 带 colspan/rowspan）。清洗阶段（表修复/续页合并）
+    #: 会按行重拼 HTML、丢掉跨度 —— 这类表必须跳过重拼，否则合并单元格被拍平。
+    preserve_layout: bool = False
 
 
 @dataclass
@@ -392,6 +396,65 @@ def _logical_row_cells(row: Any) -> list[str]:
     return cells
 
 
+def _docx_table_html(table: Any) -> str:
+    """docx 表 → 带 ``colspan``/``rowspan`` 的 HTML —— **所有 Word 表格的统一口径**。
+
+    为什么不再摊平成管道表：Word 里"整行合并"的单元格（合并标题、说明行、评价区）
+    摊平后要么按列重复文本、要么变成"1 格有字 + 3 格空"，复核页看到的版式与原件
+    不一致。直接输出带合并属性的 HTML，复核页 iframe 渲染即还原原表；下游
+    ``parse_table_html`` 只取单元格文本、忽略跨度，检索口径不受影响（每格只出现一次）。
+
+    合并语义（OOXML）：
+    * ``w:gridSpan`` —— 水平合并，跨 N 列；
+    * ``w:vMerge val="restart"`` —— 纵向合并起始格，向下数 ``continue`` 行得到 rowspan；
+    * ``w:vMerge``（无 val 或 ``continue``）—— 纵向合并延续格，内容在起始格，跳过。
+    """
+    from docx.oxml.ns import qn
+
+    grid: list[list[dict[str, Any]]] = []
+    for row in table.rows:
+        cells: list[dict[str, Any]] = []
+        for tc in row._tr.tc_lst:
+            text = "".join(node.text or "" for node in tc.iter(qn("w:t"))).strip().replace("\n", " ")
+            span = 1
+            vmerge = ""
+            tc_pr = tc.tcPr
+            if tc_pr is not None:
+                span_el = tc_pr.find(qn("w:gridSpan"))
+                if span_el is not None:
+                    span = max(1, int(span_el.get(qn("w:val")) or 1))
+                vmerge_el = tc_pr.find(qn("w:vMerge"))
+                if vmerge_el is not None:
+                    vmerge = str(vmerge_el.get(qn("w:val")) or "continue")
+            cells.append({"text": text, "span": span, "vmerge": vmerge})
+        grid.append(cells)
+
+    rows_html: list[str] = []
+    for row_index, cells in enumerate(grid):
+        parts: list[str] = []
+        for cell_index, cell in enumerate(cells):
+            if cell["vmerge"] == "continue":
+                continue  # 被上方 restart 的 rowspan 覆盖
+            rowspan = 1
+            if cell["vmerge"] == "restart":
+                for below in range(row_index + 1, len(grid)):
+                    row = grid[below]
+                    same = row[cell_index] if cell_index < len(row) else None
+                    if same is None or same["vmerge"] != "continue":
+                        break
+                    rowspan += 1
+            attrs = ""
+            if cell["span"] > 1:
+                attrs += f' colspan="{cell["span"]}"'
+            if rowspan > 1:
+                attrs += f' rowspan="{rowspan}"'
+            tag = "th" if row_index == 0 else "td"
+            parts.append(f"<{tag}{attrs}>{html.escape(str(cell['text']))}</{tag}>")
+        if parts:
+            rows_html.append("<tr>" + "".join(parts) + "</tr>")
+    return ("<table>" + "".join(rows_html) + "</table>") if rows_html else ""
+
+
 def _format_docx_header_row(cells: Sequence[str]) -> str | None:
     """把一行页眉表格式化成可检索的键值串。
 
@@ -567,17 +630,16 @@ def _walk_docx_body(document: Any, state: _DocxState, qn: Any) -> None:
         elif child.tag == qn("w:tbl"):
             table = Table(child, document)
             _ingest_docx_images(child, document, state)
-            rows: list[list[str]] = []
-            for row in table.rows:
-                cells = _logical_row_cells(row)
-                if any(cells):
-                    rows.append(cells)
-            body = _rows_to_pipe_markdown(rows)
+            # 统一口径：带 colspan/rowspan 的 HTML（保留 Word 原表版式）
+            body = _docx_table_html(table)
             if not body:
                 continue
             state.table_seq += 1
             state.tables.append(
-                ParsedTable(body=body, caption="", page=None, table_id=str(state.table_seq))
+                ParsedTable(
+                    body=body, caption="", page=None, table_id=str(state.table_seq),
+                    preserve_layout=True,
+                )
             )
             state.lines.append(f"[表格 {state.table_seq}]")
 

@@ -154,7 +154,9 @@ def save_review_asset_edits(
     """
     sidecar = load_review_sidecar(data_dir, doc_id)
     next_tables = (
-        list(sidecar.tables) if tables is None else _tables_from_edits(tables)
+        list(sidecar.tables)
+        if tables is None
+        else _tables_from_edits(tables, sidecar.tables)
     )
     next_figures = (
         list(sidecar.figures) if figures is None else _figures_from_edits(sidecar.figures, figures)
@@ -181,6 +183,7 @@ def save_review_asset_edits(
                 caption=str(item.get("caption") or ""),
                 page=item.get("page"),
                 table_id=str(item.get("table_id") or ""),
+                preserve_layout=bool(item.get("preserve_layout")),
             )
             for item in next_tables
         ],
@@ -188,19 +191,29 @@ def save_review_asset_edits(
     )
 
 
-def _tables_from_edits(edits: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+def _tables_from_edits(
+    edits: Sequence[dict[str, Any]],
+    existing: Sequence[dict[str, Any]] = (),
+) -> list[dict[str, Any]]:
+    # UI 回存时可能不带 preserve_layout；按 table_id 从旧稿继承，避免编辑一次就丢版式
+    preserve_by_id = {
+        str(item.get("table_id") or ""): bool(item.get("preserve_layout")) for item in existing
+    }
     out: list[dict[str, Any]] = []
     for item in edits:
         body = str(item.get("body_html") if item.get("body_html") is not None else item.get("body") or "")
         if len(body) > _TABLE_BODY_LIMIT:
             raise ValueError(f"表格 HTML 过长（>{_TABLE_BODY_LIMIT} 字符）")
         page = item.get("page")
+        table_id = str(item.get("table_id") or "")
         out.append(
             {
-                "table_id": str(item.get("table_id") or ""),
+                "table_id": table_id,
                 "caption": str(item.get("caption") or "")[:_CAPTION_LIMIT],
                 "page": page if isinstance(page, int) else None,
                 "body": body,
+                "preserve_layout": bool(item.get("preserve_layout"))
+                or preserve_by_id.get(table_id, False),
             }
         )
     return out
@@ -264,6 +277,7 @@ def tables_from_sidecar(sidecar: ReviewSidecar) -> list[TableInput]:
                 caption=str(item.get("caption") or ""),
                 page=item.get("page"),
                 table_id=str(item.get("table_id") or ""),
+                preserve_layout=bool(item.get("preserve_layout")),
             )
         )
     return out

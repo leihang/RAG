@@ -63,7 +63,10 @@ async def _run(apply: bool, doc_ids: list[int] | None) -> int:
                     for f in parsed.figures
                 ]
                 tables = [
-                    TableInput(body=t.body, caption=t.caption, page=t.page, table_id=t.table_id)
+                    TableInput(
+                        body=t.body, caption=t.caption, page=t.page, table_id=t.table_id,
+                        preserve_layout=t.preserve_layout,
+                    )
                     for t in parsed.tables
                 ]
                 visible = json.loads(r["visible_dept_ids"] or "[]")

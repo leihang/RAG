@@ -84,6 +84,9 @@ class DraftTableEdit(BaseModel):
     caption: str = ""
     body_html: str = ""
     page: int | None = None
+    #: 原生 Word 版式（带 colspan/rowspan）标记：清洗阶段跳过按行重拼。
+    #: UI 不带时后端按 table_id 从旧稿继承（见 scan_review._tables_from_edits）。
+    preserve_layout: bool = False
 
 
 class DraftFigureEdit(BaseModel):
@@ -337,6 +340,7 @@ def _draft_tables(sidecar) -> list[dict]:
                 "page": item.get("page"),
                 "body_html": body_html,
                 "chars": len(body_html),
+                "preserve_layout": bool(item.get("preserve_layout")),
             }
         )
     return tables
