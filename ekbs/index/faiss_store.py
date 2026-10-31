@@ -864,28 +864,50 @@ class ShardIndexManager:
     # 自检
     # ------------------------------------------------------------------
 
+    def _measure(self, row: ShardRow) -> tuple[int, int]:
+        """读实际索引，返回 ``(向量数, dim)``；**兼容单文件与分段两种布局**。
+
+        分段布局下登记的 ``faiss_path`` 是 ``shards/<id>/manifest.json``（JSON 文件）。
+        若仍按单文件 ``faiss.read_index`` 去读，会报
+        ``Index type 0x20200a7b not recognized``（``0x20200a7b`` 正是 JSON 开头的 ``{``），
+        看起来像"分片损坏"，其实是自检自己读错了文件 —— 2026-10-31 实测踩到，
+        表现为管理台分片页全红、``reconcile`` 每分钟报 mismatch、导入验收失败。
+        """
+        manifest = load_manifest(self.segmented_dir(row.shard_id))
+        if manifest is not None:
+            if row.dim and int(manifest.dim) != int(row.dim):
+                raise SchemaError(f"manifest dim {manifest.dim} ≠ 登记 {row.dim}")
+            if row.embedding_fingerprint and manifest.embedding_fingerprint != row.embedding_fingerprint:
+                raise SchemaError("manifest 嵌入指纹与登记不一致（C3：需重建该分片）")
+            total = sum(int(seg.count) for seg in manifest.segments)
+            if manifest.active is not None:
+                total += int(manifest.active.count)
+            return total, int(manifest.dim)
+        index = ShardIndex.load(
+            row.shard_id, Path(row.faiss_path), expected_dim=row.dim,
+            expected_fingerprint=row.embedding_fingerprint,
+        )
+        return index.vector_count, index.dim
+
     def self_check(self) -> list[ShardCheck]:
-        """与 ``smoke.sh`` 同一口径：读文件比对 ``dim`` / ``ntotal`` / 指纹。"""
+        """与 ``smoke.sh`` 同一口径：读文件比对 ``dim`` / ``ntotal`` / 指纹（兼容两种布局）。"""
         checks: list[ShardCheck] = []
         for row in self.registry():
             try:
-                index = ShardIndex.load(
-                    row.shard_id, Path(row.faiss_path), expected_dim=row.dim,
-                    expected_fingerprint=row.embedding_fingerprint,
-                )
+                vectors, dim = self._measure(row)
             except Exception as exc:
                 checks.append(ShardCheck(row.shard_id, False, f"读取失败：{exc}"))
                 continue
-            if index.vector_count != row.vector_count:
+            if vectors != row.vector_count:
                 checks.append(
                     ShardCheck(
                         row.shard_id, False,
-                        f"ntotal {index.vector_count} ≠ 登记 {row.vector_count}",
+                        f"ntotal {vectors} ≠ 登记 {row.vector_count}",
                     )
                 )
-            elif index.dim != row.dim:
+            elif dim != row.dim:
                 checks.append(
-                    ShardCheck(row.shard_id, False, f"dim {index.dim} ≠ 登记 {row.dim}")
+                    ShardCheck(row.shard_id, False, f"dim {dim} ≠ 登记 {row.dim}")
                 )
             elif not row.embedding_fingerprint:
                 checks.append(ShardCheck(row.shard_id, False, "登记缺少 embedding_fingerprint"))
@@ -898,7 +920,7 @@ class ShardIndexManager:
                 )
             else:
                 checks.append(
-                    ShardCheck(row.shard_id, True, f"{index.vector_count} 向量，dim={index.dim}")
+                    ShardCheck(row.shard_id, True, f"{vectors} 向量，dim={dim}")
                 )
         return checks
 
