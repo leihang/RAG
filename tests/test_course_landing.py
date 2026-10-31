@@ -126,6 +126,19 @@ async def test_retrieve_with_alpha_fusion_still_hits_policy(seeded) -> None:
     assert any(chunk.doc_title == "年假管理制度" for chunk in result.chunks)
 
 
+async def test_retrieve_with_wrrf_fusion_still_hits_policy(seeded) -> None:
+    """加权 RRF 路径与 α 路径行为一致：同样能命中金标文档。"""
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    result = await runtime.pipeline.retrieve(
+        "年假有多少天",
+        alice,
+        overrides=RetrievalOverrides(fusion="wrrf", hybrid_alpha=0.75, multi_query=3),
+    )
+    assert result.refused is False, result.refusal_reason
+    assert any(chunk.doc_title == "年假管理制度" for chunk in result.chunks)
+
+
 async def test_ingest_writes_doc2query_fts_rows(seeded) -> None:
     """入库后同一 chunk 在 FTS 里应有多行（原文 + 假设问句）。"""
     runtime, _ = seeded

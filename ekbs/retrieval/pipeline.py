@@ -61,7 +61,7 @@ from ekbs.retrieval.numeric import (
     verify_scope,
 )
 from ekbs.retrieval.intent import IntentSplitter, SubQuestion
-from ekbs.retrieval.rrf import alpha_fuse, rrf_fuse, ranks_of
+from ekbs.retrieval.rrf import alpha_fuse, ranks_of, rrf_fuse, wrrf_fuse
 
 log = get_logger(component="retrieval")
 
@@ -869,20 +869,28 @@ class RetrievalPipeline:
         }
 
     def _fuse_lanes(self, lanes: _RecallLanes, params: dict[str, Any]) -> _FusionOutcome:
-        """③ 融合：RRF（含 figure 第三路）或 α 加权。"""
-        fusion = str(params.get("fusion") or "rrf")
+        """③ 融合：RRF / 加权 RRF（wrrf）/ α 加权（含 figure 第三路）。"""
+        fusion = str(params.get("fusion") or "rrf").lower()
+        alpha = float(
+            params.get("hybrid_alpha")
+            if params.get("hybrid_alpha") is not None
+            else 0.5
+        )
+        alpha = max(0.0, min(1.0, alpha))
         if fusion == "alpha":
-            fused = alpha_fuse(
-                lanes.dense_scored,
-                lanes.sparse_scored,
-                alpha=float(
-                    params.get("hybrid_alpha")
-                    if params.get("hybrid_alpha") is not None
-                    else 0.5
-                ),
-            )
+            fused = alpha_fuse(lanes.dense_scored, lanes.sparse_scored, alpha=alpha)
             if lanes.figure_ids:
                 # α 路径再与 figure 做一次 RRF，避免图模态分数与文本量纲混算
+                fused_ids = [cid for cid, _ in fused]
+                fused = rrf_fuse([fused_ids, lanes.figure_ids], k=params["rrf_k"])
+        elif fusion == "wrrf":
+            # 加权 RRF：只用名次，权重只调稠密/稀疏贡献比（不做分数归一化）
+            fused = wrrf_fuse(
+                [lanes.dense_ids, lanes.sparse_ids],
+                [alpha, 1.0 - alpha],
+                k=params["rrf_k"],
+            )
+            if lanes.figure_ids:
                 fused_ids = [cid for cid, _ in fused]
                 fused = rrf_fuse([fused_ids, lanes.figure_ids], k=params["rrf_k"])
         else:
@@ -2574,6 +2582,7 @@ class RetrievalPipeline:
             f"llm={getattr(llm, 'ident', '')}",
             f"k={cfg.dense_top_k}:{cfg.sparse_top_k}:{cfg.rrf_k}:{int(cfg.parent_expand)}",
             f":mq={cfg.multi_query}:{getattr(cfg, 'dense_multi_query', 1)}",
+            f"fusion={cfg.fusion}:{getattr(cfg, 'hybrid_alpha', 0.5)}",
             f"rw={getattr(cfg.query_rewrite, 'strategy', '')}",
             f"split={int(getattr(cfg.intent_split, 'enabled', False))}"
             f":{getattr(cfg.intent_split, 'strategy', '')}"

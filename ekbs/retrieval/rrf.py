@@ -60,6 +60,27 @@ def alpha_fuse(
     return sorted(fused.items(), key=lambda pair: (-pair[1], str(pair[0])))
 
 
+def wrrf_fuse(
+    rankings: Sequence[Sequence[T]],
+    weights: Sequence[float],
+    k: int = DEFAULT_RRF_K,
+) -> list[tuple[T, float]]:
+    """加权 RRF：``Σ w_l / (k + rank_l)``。
+
+    与 :func:`alpha_fuse` 的区别：**仍然只看名次、不做分数归一化**；``weights`` 只调
+    各路贡献比（例如稠密 0.75 / 稀疏 0.25）。这样既保留「稠密为主」的偏好，又避免
+    分数校准曲线需要长期维护（换模型/换语料都要重标）。
+    """
+    if len(weights) != len(rankings):
+        raise ValueError("weights 与 rankings 路数不一致")
+    scores: dict[T, float] = {}
+    for ranking, weight in zip(rankings, weights, strict=True):
+        w = max(0.0, float(weight))
+        for position, item in enumerate(ranking, start=1):
+            scores[item] = scores.get(item, 0.0) + w / (k + position)
+    return sorted(scores.items(), key=lambda pair: (-pair[1], str(pair[0])))
+
+
 def _minmax_norm(scored: Sequence[tuple[T, float]]) -> dict[T, float]:
     if not scored:
         return {}
