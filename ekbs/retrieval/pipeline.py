@@ -220,6 +220,9 @@ class AnswerResult:
     dropped_chunks: int = 0
     dropped_history: int = 0
     context_truncated: bool = False
+    #: **输出**被截断（模型 finish_reason=length，撞到 max_tokens 上限）。
+    #: 与 context_truncated（输入侧裁剪）不是一回事：它意味着答案本身不完整。
+    truncated: bool = False
     #: 多意图拆分（P0）：单问时为空；多子问时为 [{index,text,rewritten,source}]
     sub_questions: list[dict[str, Any]] = field(default_factory=list)
     #: 子问覆盖情况：{total, covered, uncovered}；单问时为空 dict
@@ -287,13 +290,20 @@ SYSTEM_PROMPT = (
     "引用资料时必须在句末标注编号，格式如 [1]、[2]。\n"
     "资料里以【图片】开头的条目是可展示的原图：用户索要照片/图片/截图时，"
     "必须引用这些编号（界面会展示图片），不要因为无法在文字里嵌入图片就回复「未找到可靠依据」。\n"
+    # 输出长度是硬约束（max_tokens=2048 ≈ 2000 字）：不加限制提示时，模型会试图复述
+    # 整份合同/全文，结果被静默截断，用户看到半截还以为答完了。
+    "回答要简洁，只答被问到的内容；如果用户要求返回整份文档/全文（例如整份合同），"
+    "不要复述全文，只给出要点摘要，并明确说明「篇幅有限，完整内容请查看引用原文或使用文件下发」。\n"
     "若资料完全不足以回答，才直接回复「未找到可靠依据」。\n\n"
     "资料：\n{context}"
 )
 
+#: 输出被截断时追加给用户的提示（不把半截答案伪装成完整答案）
+TRUNCATION_NOTICE = "（提示：回答已达长度上限被截断，未显示的部分请缩小问题范围或查看引用原文。）"
+
 #: 提示词版本（进答案缓存键）：**改动 SYSTEM_PROMPT 必须同步 +1**，
 #: 否则旧提示词生成的答案会继续从缓存里被服务。
-PROMPT_REVISION = "v4"
+PROMPT_REVISION = "v5"
 
 
 class RetrievalPipeline:
@@ -1515,6 +1525,7 @@ class RetrievalPipeline:
                 refusal_reason="llm_unavailable",
             )
         llm_done = time.perf_counter()
+        finish_reason = str(getattr(llm_result, "finish_reason", "") or "")
 
         answer_text, hallucinated = self._drop_hallucinated(llm_result.text, len(chunks))
         # L4 输出侧检测：答案里不得出现当前用户看不到的文档名（04 §6.4）
@@ -1651,6 +1662,17 @@ class RetrievalPipeline:
                 )
 
         citations = self._post_check_citations(answer_text, chunks, perm)
+        # 输出截断：撞到 max_tokens 上限时答案本身不完整，必须明确告诉用户，
+        # 不能把半截答案伪装成完整答案（评测与用户都会被骗）。
+        truncated = finish_reason == "length"
+        if truncated:
+            answer_text = f"{answer_text}\n\n{TRUNCATION_NOTICE}"
+            degraded.append("output_truncated")
+            log.warning(
+                "answer_truncated",
+                model=llm_result.model,
+                completion_tokens=llm_result.completion_tokens,
+            )
         return AnswerResult(
             answer=answer_text,
             citations=citations,
@@ -1663,6 +1685,7 @@ class RetrievalPipeline:
             dropped_chunks=int(budget["dropped_chunks"]),
             dropped_history=int(budget["dropped_history"]),
             context_truncated=bool(budget["truncated"]),
+            truncated=truncated,
             **timing_kw,
         )
 
@@ -2061,7 +2084,7 @@ class RetrievalPipeline:
             await self._remember_turn(conversation_id, perm, question, result)
             return result
 
-        retrieval, intent_hits = await self._retrieve_for_answer(
+        retrieval, intent_hits, per_sub = await self._retrieve_for_answer(
             rewrite=rewrite,
             sub_questions=sub_questions,
             multi_intent=multi_intent,
@@ -2072,6 +2095,9 @@ class RetrievalPipeline:
         )
         if allow_generation and mode_used == MODE_NUMERIC:
             result = await self._answer_numeric(question, retrieval, perm)
+        elif allow_generation and multi_intent and per_sub:
+            # 多问题：逐子问生成再拼接（共享 2048 输出上限会让后面的问题被略过）
+            result = await self._answer_multi_intent(sub_questions, per_sub, retrieval, perm)
         elif allow_generation:
             result = await self.generate(question, retrieval, perm)
         else:
@@ -2414,11 +2440,12 @@ class RetrievalPipeline:
         *,
         overrides: RetrievalOverrides | None = None,
         collect_debug: bool = False,
-    ) -> tuple[RetrievalResult, dict[int, set[int]]]:
+    ) -> tuple[RetrievalResult, dict[int, set[int]], list[tuple[int, RetrievalResult]]]:
         """多子问：每子问独立改写 + 独立召回，再合并去重 + 配额选择（P1+P2）。
 
         ``collect_debug`` 只保留给未来调试扩展；子问级召回默认不收集分阶段明细，
-        避免 N 倍调试开销。返回 ``(合并结果, chunk_id → 命中它的子问集合)``。
+        避免 N 倍调试开销。返回 ``(合并结果, chunk_id → 命中它的子问集合, 各子问结果)``
+        —— 各子问结果供"逐子问生成"使用（见 :meth:`_answer_multi_intent`）。
         """
         per_sub: list[tuple[int, RetrievalResult]] = []
         for sq in sub_questions:
@@ -2429,7 +2456,7 @@ class RetrievalPipeline:
             )
             per_sub.append((sq.index, result))
         merged, hit_by = self._merge_retrievals(per_sub)
-        return merged, hit_by
+        return merged, hit_by, per_sub
 
     async def _retrieve_for_answer(
         self,
@@ -2441,7 +2468,7 @@ class RetrievalPipeline:
         perm: PermContext,
         overrides: RetrievalOverrides | None,
         collect_debug: bool,
-    ) -> tuple[RetrievalResult, dict[int, set[int]]]:
+    ) -> tuple[RetrievalResult, dict[int, set[int]], list[tuple[int, RetrievalResult]]]:
         """单问走原链路（与改动前逐字节一致）；多子问走独立召回 + 配额合并。"""
         if not multi_intent:
             return (
@@ -2449,9 +2476,86 @@ class RetrievalPipeline:
                     rewrite.rewritten, perm, overrides=overrides, collect_debug=collect_debug
                 ),
                 {},
+                [],
             )
         return await self._retrieve_multi_intent(
             sub_questions, messages, perm, overrides=overrides, collect_debug=collect_debug
+        )
+
+    async def _answer_multi_intent(
+        self,
+        sub_questions: Sequence[SubQuestion],
+        per_sub: Sequence[tuple[int, RetrievalResult]],
+        merged: RetrievalResult,
+        perm: PermContext,
+    ) -> AnswerResult:
+        """多子问：**逐子问生成**再拼接。
+
+        为什么不是"一次生成答所有子问"：输出上限 ``models.llm.max_tokens``（2048）是所有
+        子问**共享**的 —— 问题一多，后面的子问会被模型略过或压缩，用户看到的是只答了
+        前一半。逐子问生成让每个子问独占一次输出预算，证据也更聚焦。
+
+        引用重编号：子问内部 ``[n]`` 对应它自己的块列表；拼成一份答案前必须映射成
+        全局编号，否则每个子问都从 ``[1]`` 开始、引用列表对不上。
+        """
+        by_index = {index: result for index, result in per_sub}
+        sections: list[str] = []
+        global_index: dict[int, int] = {}
+        citations: list[Citation] = []
+        degraded: set[str] = set()
+        refused_all = True
+        truncated = False
+        model = ""
+        prompt_tokens = completion_tokens = total_ms = 0
+
+        for order, sq in enumerate(sub_questions, start=1):
+            result = by_index.get(sq.index)
+            if result is None or not result.chunks:
+                sections.append(f"{order}. {sq.text}\n未找到可靠依据。")
+                continue
+            part = await self.generate(sq.text, result, perm)
+            model = model or part.model
+            prompt_tokens += part.prompt_tokens
+            completion_tokens += part.completion_tokens
+            total_ms += part.total_ms
+            truncated = truncated or part.truncated
+            degraded.update(part.degraded)
+            if not part.refused:
+                refused_all = False
+
+            local_chunks = {i + 1: chunk.chunk_id for i, chunk in enumerate(result.chunks)}
+
+            def _renumber(match: re.Match[str], _map: dict[int, int] = local_chunks) -> str:
+                chunk_id = _map.get(int(match.group(1)))
+                if chunk_id is None:
+                    return match.group(0)
+                if chunk_id not in global_index:
+                    global_index[chunk_id] = len(global_index) + 1
+                return f"[{global_index[chunk_id]}]"
+
+            text = _CITATION_RE.sub(_renumber, part.answer)
+            sections.append(f"{order}. {sq.text}\n{text}")
+            for cite in part.citations:
+                mapped = global_index.get(cite.chunk_id)
+                if mapped is not None:
+                    citations.append(replace(cite, cite_index=mapped))
+
+        citations.sort(key=lambda cite: cite.cite_index)
+        answer = "\n\n".join(sections).strip() or "未找到可靠依据。"
+        return AnswerResult(
+            answer=answer,
+            citations=citations,
+            retrieval=merged,
+            model=model,
+            refused=refused_all,
+            refusal_reason=(
+                "" if not refused_all else (merged.refusal_reason or REFUSE_NO_BASIS)
+            ),
+            degraded=sorted(degraded),
+            truncated=truncated,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_ms=total_ms,
         )
 
     def _merge_retrievals(

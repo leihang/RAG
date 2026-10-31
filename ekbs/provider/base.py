@@ -106,6 +106,9 @@ class LLMResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     fallback_used: bool = False
+    #: 模型侧的结束原因：``stop``（正常）/ ``length``（撞到输出上限被截断）。
+    #: 不检查它的话，被截断的答案和完整答案看起来**一模一样**（用户/评测都会被骗）。
+    finish_reason: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
 

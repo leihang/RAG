@@ -249,6 +249,8 @@ async def qa_chat(
         "coverage": answer.coverage,
         "citations": _citation_payload(answer.citations),
         "refused": answer.refused,
+        # 输出被截断（撞 max_tokens 上限）：答案不完整，前端要显式提示
+        "truncated": answer.truncated,
         "refusal_reason": answer.refusal_reason,
         "suggested_questions": [s["question"] for s in suggested],
         "model": answer.model,

@@ -467,14 +467,17 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         payload = response.json()
         choices = payload.get("choices") or []
         text = ""
+        finish_reason = ""
         if choices:
             text = _message_text((choices[0].get("message") or {}).get("content"))
+            finish_reason = str(choices[0].get("finish_reason") or "")
         usage = payload.get("usage") or {}
         return LLMResult(
             text=text,
             model=str(payload.get("model") or model),
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),
+            finish_reason=finish_reason,
             raw={"id": payload.get("id", ""), "provider": provider},
         )
 
