@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import shutil
@@ -1456,3 +1457,37 @@ async def rebuild_index(
         except Exception as exc:
             results.append({"shard_id": shard_id, "ok": False, "error": str(exc)})
     return JSONResponse({"results": results, "dry_run": payload.dry_run})
+
+
+# ---------------------------------------------------------------------------
+# 清空语料库（"清空重来"：块 / 权限 / 缓存 / 旧索引 / 分片计数）
+# ---------------------------------------------------------------------------
+
+
+class ResetCorpusRequest(BaseModel):
+    dry_run: bool = True
+    #: 非演练时必须显式传 ``CLEAR``，防止误点
+    confirm: str = Field(default="", description="真清时必须等于 CLEAR")
+
+
+@router.post("/system/corpus/reset")
+async def reset_corpus_endpoint(
+    payload: ResetCorpusRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """清空语料库，供「重导前重置」用。**保留分片注册行与知识库/用户**。"""
+    _principal(
+        request, _headers(authorization, x_internal_token, x_internal_user_id),
+        "sys:index:rebuild",
+    )
+    if not payload.dry_run and payload.confirm.strip().upper() != "CLEAR":
+        raise HTTPException(status_code=400, detail="真清需要 confirm=CLEAR")
+    from ekbs.tools.reset_corpus import reset_corpus
+
+    report = await asyncio.to_thread(
+        reset_corpus, _runtime(request), dry_run=payload.dry_run
+    )
+    return JSONResponse(report.as_dict())
