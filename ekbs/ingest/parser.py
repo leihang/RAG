@@ -357,6 +357,41 @@ def _collapse_docx_row_cells(cells: Sequence[str]) -> list[str]:
     return out
 
 
+def _logical_row_cells(row: Any) -> list[str]:
+    """读一行的**逻辑**单元格：水平合并（gridSpan）的重复网格只算一个。
+
+    ⚠️ 不能直接 ``[cell.text for cell in row.cells]``：python-docx 对合并单元格会按
+    **网格列**重复返回同一个 ``_Cell``。实测《客户满意度调查表》里 4 列合并的
+    「申请装修内容…」「服务评价…」被复制成 4 份 —— 表格重度重复且无从去重
+    （真实语料里相邻两列恰好同值的情况也存在，比如并排的 ☑/□，不能按文本去重）。
+
+    做法：用底层 ``<w:tc>`` 元素身份去重。同一个 tc 的多个网格位只取一次；
+    不同 tc 即使文本相同也照常保留。docx / pptx 的合并表结构一致，两处共用。
+
+    去重后**按网格宽度补空**（合并文本占第一格、其余补 ``""``）：这样一行仍覆盖原来的
+    列数，序列化时能识别「整行合并 = 标题行」，也不会让后面的行错列。
+    """
+    texts: list[str] = []
+    spans: list[int] = []
+    position: dict[int, int] = {}
+    for cell in row.cells:
+        tc = getattr(cell, "_tc", None)
+        key = id(tc) if tc is not None else None
+        if key is not None and key in position:
+            spans[position[key]] += 1
+            continue
+        if key is not None:
+            position[key] = len(texts)
+        texts.append((getattr(cell, "text", "") or "").strip().replace("\n", " "))
+        spans.append(1)
+
+    cells: list[str] = []
+    for text, span in zip(texts, spans):
+        cells.append(text)
+        cells.extend([""] * (span - 1))
+    return cells
+
+
 def _format_docx_header_row(cells: Sequence[str]) -> str | None:
     """把一行页眉表格式化成可检索的键值串。
 
@@ -410,7 +445,7 @@ def _docx_header_meta(document: Any) -> tuple[list[str], int | None]:
         for table in getattr(part, "tables", ()) or ():
             for row in table.rows:
                 try:
-                    cells = [((cell.text or "").strip()) for cell in row.cells]
+                    cells = _logical_row_cells(row)
                 except Exception:  # noqa: BLE001 — 坏表行跳过
                     continue
                 line = _format_docx_header_row(cells)
@@ -534,7 +569,7 @@ def _walk_docx_body(document: Any, state: _DocxState, qn: Any) -> None:
             _ingest_docx_images(child, document, state)
             rows: list[list[str]] = []
             for row in table.rows:
-                cells = [((cell.text or "").strip().replace("\n", " ")) for cell in row.cells]
+                cells = _logical_row_cells(row)
                 if any(cells):
                     rows.append(cells)
             body = _rows_to_pipe_markdown(rows)
@@ -1194,7 +1229,7 @@ def _pptx_append_content(shape: Any, state: _PptxState, number: int, lines: list
     if getattr(shape, "has_table", False):
         rows: list[list[str]] = []
         for row in shape.table.rows:
-            cells = [(cell.text or "").strip().replace("\n", " ") for cell in row.cells]
+            cells = _logical_row_cells(row)
             if any(cells):
                 rows.append(cells)
         body = _rows_to_pipe_markdown(rows)
