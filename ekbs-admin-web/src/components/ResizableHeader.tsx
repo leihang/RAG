@@ -21,6 +21,7 @@ type Props = HTMLAttributes<HTMLTableCellElement> & ResizeMeta & { children?: Re
  */
 export default function ResizableHeader({ width, onResize, children, style, ...rest }: Props) {
   const [active, setActive] = useState(false)
+  const [hover, setHover] = useState(false)
   const startX = useRef(0)
   const startWidth = useRef(0)
 
@@ -52,6 +53,8 @@ export default function ResizableHeader({ width, onResize, children, style, ...r
       <span
         aria-hidden
         onMouseDown={onMouseDown}
+        onMouseEnter={() => setHover(true)}
+        onMouseLeave={() => setHover(false)}
         title="拖动调整列宽"
         style={{
           position: 'absolute',
@@ -60,7 +63,13 @@ export default function ResizableHeader({ width, onResize, children, style, ...r
           bottom: 0,
           width: 8,
           cursor: 'col-resize',
-          background: active ? 'rgba(22, 119, 255, 0.35)' : 'transparent',
+          // 始终可见的细线：完全透明时用户根本发现不了"这里能拖"
+          borderRight: '1px solid rgba(0, 0, 0, 0.14)',
+          background: active
+            ? 'rgba(22, 119, 255, 0.35)'
+            : hover
+              ? 'rgba(22, 119, 255, 0.18)'
+              : 'transparent',
         }}
       />
     </th>

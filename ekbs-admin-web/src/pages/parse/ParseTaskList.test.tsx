@@ -116,3 +116,15 @@ describe('清洗解析列表', () => {
     expect(title.closest('a')).toHaveAttribute('href', '/docs/1')
   })
 })
+
+describe('列宽拖拽', () => {
+  it('表头渲染拖拽手柄（ProTable 的 components 已透传）', async () => {
+    render(
+      <MemoryRouter>
+        <ParseTaskList />
+      </MemoryRouter>,
+    )
+    await screen.findByText('空调保养合同')
+    expect(screen.getAllByTitle('拖动调整列宽').length).toBeGreaterThan(0)
+  })
+})
