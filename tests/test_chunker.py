@@ -8,6 +8,7 @@ from ekbs.ingest.chunker import (
     OVERLAP_MIN_RATIO,
     PARENT_MAX_TOKENS,
     PARENT_MIN_TOKENS,
+    TableInput,
     chunk_markdown,
     content_coverage,
     count_tokens,
@@ -384,3 +385,48 @@ def test_bodyless_headings_still_land_somewhere() -> None:
     assert all(
         node.content.strip() != "# 员工手册" for node in long_doc.nodes
     ), "H1 已被后续 heading_path 覆盖，不该再单独成块（避免碎片块）"
+
+
+def test_placeholder_only_sections_merge_into_next() -> None:
+    """``[表格 1]`` 这类空壳节不单独成块（跨文档重复、命中后没有任何信息）。"""
+    md = (
+        "# 制度\n\n"
+        "## 6．质量记录\n\n[表格 1]\n\n"
+        "## 7．附则\n\n" + "本制度自发布之日起执行。" * 10 + "\n\n"
+    )
+    result = chunk_markdown(md, doc_title="设备编号作业指导书")
+
+    assert result.parents
+    paths = [node.heading_path for node in result.parents]
+    assert not any("[表格 1]" in path for path in paths)
+    # 占位符并进正文，原文一行不丢
+    joined = "\n".join(node.content for node in result.parents)
+    assert "[表格 1]" in joined and "6．质量记录" in joined
+
+
+def test_clause_sections_stay_independent_even_if_short() -> None:
+    """条款不因"短"被合并 —— 否则不同规定混进同一块，检索精度变差。"""
+    md = (
+        "# 交接班\n\n"
+        "4.2 接班人员未能到岗，值班人员必须坚持岗位。\n"
+        "4.3 接班人员酗酒时交班人员应拒绝交班。\n"
+        "4.4 设备交班人向接班人介绍各系统运行状态。\n"
+    )
+    result = chunk_markdown(md, doc_title="交接班管理制度")
+
+    paths = [node.heading_path for node in result.parents]
+    assert any("4.2" in path for path in paths)
+    assert any("4.4" in path for path in paths)
+
+
+def test_table_heading_carries_doc_title() -> None:
+    """表名块要带文档名 —— 「表 1」这种名字跨文档完全一样，靠文档名区分。"""
+    result = chunk_markdown(
+        "# 制度\n\n正文说明。\n",
+        doc_title="月度履约评估表",
+        tables=[TableInput(body="| 部门 | 得分 |\n| --- | --- |\n| 工程部 | 90 |", table_id="1")],
+    )
+    table_nodes = [node for node in result.nodes if node.chunk_type == "table"]
+
+    assert table_nodes
+    assert all("月度履约评估表" in node.heading_path for node in table_nodes)

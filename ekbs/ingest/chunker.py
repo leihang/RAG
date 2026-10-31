@@ -37,6 +37,8 @@ CHILD_MIN_TOKENS = 256
 CHILD_MAX_TOKENS = 384
 OVERLAP_MIN_RATIO = 0.12
 OVERLAP_MAX_RATIO = 0.15
+#: 只有标题/占位符、没有正文的节（如 ``[表格 1]``、``[图片]``）
+_PLACEHOLDER_ONLY_RE = re.compile(r"^\[(?:表格|图片)\s*\d*\]$")
 TABLE_SPLIT_TOKENS = 2048
 FALLBACK_WINDOW_CHARS = 100
 
@@ -401,6 +403,71 @@ def merge_short_sections(sections: Sequence[Section], **_kwargs: object) -> list
     return pack_major_sections(sections)
 
 
+def _section_with_heading(section: Section) -> str:
+    """短节并入时保留它的小节标题（否则「1. 目的」这层限定词会丢）。"""
+    text = (section.text or "").strip()
+    heading = (section.heading_path or "").strip()
+    if text:
+        return f"{heading}\n{text}".strip() if heading else text
+    return heading
+
+
+def _join_trailing(last: Section, trailing: Sequence[Section]) -> Section:
+    starts = [s.page_from for s in (last, *trailing) if s.page_from is not None]
+    ends = [s.page_to for s in (last, *trailing) if s.page_to is not None]
+    return Section(
+        heading_path=last.heading_path,
+        text="\n\n".join(
+            [part for part in [last.text, *(_section_with_heading(s) for s in trailing)] if part]
+        ).strip(),
+        page_from=min(starts) if starts else None,
+        page_to=max(ends) if ends else None,
+    )
+
+
+def _is_placeholder_only(section: Section) -> bool:
+    """空壳节：正文为空，或只有一个 ``[表格 N]`` / ``[图片]`` 占位。"""
+    text = (section.text or "").strip()
+    if not text:
+        return True
+    return bool(_PLACEHOLDER_ONLY_RE.match(text))
+
+
+def merge_short_sections_into_next(sections: Sequence[Section]) -> list[Section]:
+    """把**空壳节**（无正文 / 只有占位符）并入下一节（行尾连续的并入上一节）。
+
+    为什么只并空壳、不做"短节按长度合并"：条款（``第X条`` / ``4.1``）和编号小节各自
+    独立成块是既有契约（`test_pack_major_dotted_sections` /
+    `test_chapter_and_fullwidth_dotted_headings`），按长度合并会把不同规定混进同一个块，
+    检索精度反而变差。这里只清掉**没有正文可检索**的碎片块（实测 ``[表格 1]``、
+    ``6．质量记录`` 这类块会跨文档重复出现，命中后什么信息也没有）。
+    """
+    merged: list[Section] = []
+    buffered: list[Section] = []
+    for section in sections:
+        if _is_placeholder_only(section):
+            buffered.append(section)
+            continue
+        starts = [s.page_from for s in (*buffered, section) if s.page_from is not None]
+        ends = [s.page_to for s in (*buffered, section) if s.page_to is not None]
+        pieces = [_section_with_heading(item) for item in buffered]
+        pieces.append((section.text or "").strip())
+        merged.append(
+            Section(
+                heading_path=section.heading_path,
+                text="\n\n".join(part for part in pieces if part).strip(),
+                page_from=min(starts) if starts else None,
+                page_to=max(ends) if ends else None,
+            )
+        )
+        buffered = []
+    if buffered:
+        if not merged:
+            return list(sections)
+        merged[-1] = _join_trailing(merged[-1], buffered)
+    return merged
+
+
 @dataclass
 class FigureInput:
     """文档里抽出的图片（**已落盘**），供分块器生成可检索的 figure 块。
@@ -641,6 +708,7 @@ def chunk_markdown(
     seq = 0
     root = ensure_heading_path("", doc_title=doc_title)
     sections = pack_major_sections(split_sections(markdown, page_map=page_map))
+    sections = merge_short_sections_into_next(sections)
     for section in sections:
         heading = ensure_heading_path(section.heading_path, doc_title=doc_title)
         # 小节完全无标题路径时，用文档根；已有条款路径则保留
@@ -710,8 +778,13 @@ def chunk_markdown(
             table_id=table.table_id,
             row_chunks=table_row_chunks,
         )
+        # 表名单独成块时没有文档上下文（「表 1」这种名字跨文档完全一样），
+        # 把文档名并进 heading：UI 里一眼看得出是哪篇的表，精排文本也自带身份。
+        table_name = (table.caption or "").strip() or (
+            f"表 {table.table_id}" if table.table_id else ""
+        )
         table_heading = ensure_heading_path(
-            table.caption or (f"表 {table.table_id}" if table.table_id else ""),
+            f"{doc_title} · {table_name}" if doc_title and table_name else table_name,
             doc_title=doc_title,
         )
         for block in blocks:
