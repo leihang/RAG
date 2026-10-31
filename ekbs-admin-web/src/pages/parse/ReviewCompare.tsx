@@ -306,6 +306,7 @@ export default function ReviewCompare() {
           caption: item.caption ?? '',
           body_html: item.body_html,
           page: item.page ?? null,
+          preserve_layout: item.preserve_layout ?? false,
         })),
         figures: nextFigures.map((item) => ({
           figure_id: item.figure_id,

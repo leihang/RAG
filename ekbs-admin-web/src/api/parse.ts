@@ -43,6 +43,8 @@ export interface ParseDraftTable {
   page?: number | null
   body_html: string
   chars?: number
+  /** 原生 Word 版式（colspan/rowspan）：回存时带回去，避免编辑一次就丢合并结构 */
+  preserve_layout?: boolean
 }
 
 export interface ParseDraftFigure {
