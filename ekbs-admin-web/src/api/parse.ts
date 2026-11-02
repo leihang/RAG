@@ -148,6 +148,23 @@ export const vectorizeParseTask = (taskId: number) =>
 export const rejectParseTask = (taskId: number) =>
   http.post(`/parse/tasks/${taskId}/reject`) as Promise<unknown>
 
+/** 生成/确认文档「代表问句」（推荐问答 tier-3）：缺省 LLM 生成，带 question 则人工确认 */
+export const generateDocRecommend = (taskId: number, question?: string) =>
+  http.post(
+    `/parse/tasks/${taskId}/recommend`,
+    question == null ? {} : { question },
+  ) as Promise<{ doc_id: number; question: string; status: string }>
+
+/** rerank 验证代表问句能否命中本文档（需已向量入库） */
+export const verifyDocRecommend = (taskId: number) =>
+  http.post(`/parse/tasks/${taskId}/recommend/verify`) as Promise<{
+    doc_id: number
+    question: string
+    rerank_score: number | null
+    verified: boolean
+    status: string
+  }>
+
 export const getParseConfig = () =>
   http.get('/parse/config') as Promise<Record<string, unknown>>
 

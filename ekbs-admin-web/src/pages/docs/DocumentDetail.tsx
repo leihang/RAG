@@ -14,6 +14,7 @@ import {
   updateDocument,
   type DocumentDetail as DocDetail,
 } from '@/api/doc'
+import { verifyDocRecommend } from '@/api/parse'
 import { formatBytes, formatTime } from '@/utils/format'
 import { personalOwnerText } from '@/utils/personalKb'
 
@@ -24,6 +25,8 @@ export default function DocumentDetail() {
   const [detail, setDetail] = useState<DocDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [acting, setActing] = useState(false)
+  const [verifying, setVerifying] = useState(false)
+  const [verifyMsg, setVerifyMsg] = useState<string | null>(null)
 
   const load = async () => {
     setLoading(true)
@@ -66,6 +69,25 @@ export default function DocumentDetail() {
       await load()
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const verifyRecommend = async () => {
+    setVerifying(true)
+    setVerifyMsg(null)
+    try {
+      const res = await verifyDocRecommend(id)
+      if (res.verified) {
+        message.success(`代表问句验证通过（rerank ${(res.rerank_score ?? 0).toFixed(2)}）`)
+        setVerifyMsg(`已命中：${res.question}`)
+      } else {
+        message.warning('代表问句未通过命中验证（rerank 低于阈值），将不进入推荐')
+        setVerifyMsg(`未通过：${res.question}`)
+      }
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setVerifying(false)
     }
   }
 
@@ -144,6 +166,13 @@ export default function DocumentDetail() {
               {isReview ? '查看清洗稿（双栏对照）' : '原件对照'}
             </Button>
           ) : null}
+          {doc.status === 'published' ? (
+            <Auth code="parse:task:manage">
+              <Button size="small" loading={verifying} onClick={() => void verifyRecommend()}>
+                验证代表问句
+              </Button>
+            </Auth>
+          ) : null}
           <Auth code="doc:document:update">
             <Button size="small" loading={acting} onClick={() => void editMeta()}>
               编辑元数据
@@ -175,6 +204,11 @@ export default function DocumentDetail() {
         {isReview ? (
           <Typography.Paragraph type="warning" style={{ marginTop: 12, marginBottom: 0 }}>
             当前为待复核：请打开「查看清洗稿（双栏对照）」，对照原件修订后再确认通过。
+          </Typography.Paragraph>
+        ) : null}
+        {verifyMsg ? (
+          <Typography.Paragraph style={{ marginTop: 12, marginBottom: 0 }}>
+            代表问句：{verifyMsg}
           </Typography.Paragraph>
         ) : null}
       </Card>

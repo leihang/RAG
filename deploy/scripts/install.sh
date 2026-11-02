@@ -39,7 +39,7 @@ SECRETS="$SECRETS_DIR/secrets.env"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"          # deploy/
 SQL_SRC="$ROOT/sql/001_init.sql"
-EXPECTED_TABLES=29                                 # 01 §5：29 张表（含 ekbs_chunk_fts 虚拟表）
+EXPECTED_TABLES=33                                 # 01 §5：33 张表（含 ekbs_chunk_fts 虚拟表）
 
 SKIP_DEPS=0; NO_LOAD=0
 usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }

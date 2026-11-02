@@ -45,6 +45,7 @@ from ekbs.api.qa import _authenticate
 from ekbs.errors import PermissionDenied
 from ekbs.ingest.pipeline import IngestPipeline
 from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
+from ekbs.recommend import generate_doc_question, upsert_doc_recommend, verify_doc_question
 from ekbs.ingest.figure_enhance import classify_figure, enhance_figure_file
 from ekbs.ingest.scan_review import (
     STATUS_REVIEW,
@@ -107,6 +108,10 @@ class DraftBody(BaseModel):
 
 class ApproveBody(BaseModel):
     markdown: str | None = Field(default=None, description="可选：通过前覆盖草稿")
+
+
+class RecommendBody(BaseModel):
+    question: str | None = Field(default=None, description="可选：人工确认/编辑后的代表问句；缺省则 LLM 生成")
 
 
 def _principal(request: Request, headers: dict[str, str | None], code: str) -> Any:
@@ -784,6 +789,102 @@ async def vectorize_parse_task(
             "parent_count": result.parent_count,
             "child_count": result.child_count,
             "vector_count": result.vector_count,
+        }
+    )
+
+
+def _doc_summary(runtime: Any, doc_id: int, title: str, *, max_chars: int = 600) -> str:
+    """文档摘要：优先复核稿正文，否则回退首个子块内容（供代表问句生成用）。"""
+    try:
+        markdown = load_review_markdown(runtime.settings.data_dir, doc_id)
+    except FileNotFoundError:
+        markdown = ""
+    if markdown and markdown.strip():
+        return markdown.strip()[:max_chars]
+    with runtime.db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT substr(content, 1, ?) AS s FROM ekbs_chunk "
+            "WHERE doc_id = ? AND chunk_type = 'child' ORDER BY seq LIMIT 1",
+            (max_chars, doc_id),
+        ).fetchone()
+    return (str(row["s"]).strip() if row else title) or title
+
+
+@router.post("/parse/tasks/{task_id}/recommend")
+async def generate_doc_recommend(
+    task_id: int,
+    request: Request,
+    body: RecommendBody | None = None,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """生成并保存文档「代表问句」（推荐问答 tier-3，入库向量前人工确认）。
+
+    缺省用 LLM 按标题+摘要生成；带 ``body.question`` 则以人工确认/编辑为准。
+    落库 ``status='pending'``；「能否命中」的 rerank 验证见 ``/recommend/verify``（需已向量入库）。
+    """
+    principal = _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "parse:task:manage"
+    )
+    runtime = request.app.state.runtime
+    row = _task_row(runtime, task_id)
+    title = str(row["title"] or "")
+    question = (body.question.strip() if body and body.question else "").strip()
+    if not question:
+        question = await generate_doc_question(
+            runtime, title=title, summary=_doc_summary(runtime, task_id, title)
+        )
+    if not question:
+        raise HTTPException(status_code=502, detail="代表问句生成失败（LLM 不可用）")
+    upsert_doc_recommend(
+        runtime, doc_id=task_id, question=question, status="pending",
+        operator_id=principal.user_id,
+    )
+    log.info("doc_recommend_generated", task_id=task_id, operator=principal.user_id)
+    return JSONResponse({"doc_id": task_id, "question": question, "status": "pending"})
+
+
+@router.post("/parse/tasks/{task_id}/recommend/verify")
+async def verify_doc_recommend(
+    task_id: int,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> JSONResponse:
+    """rerank 验证代表问句能否命中本文档（需已向量入库，否则无法检索到本文档）。"""
+    principal = _principal(
+        request, _h(authorization, x_internal_token, x_internal_user_id), "parse:task:manage"
+    )
+    runtime = request.app.state.runtime
+    row = _task_row(runtime, task_id)
+    if str(row["status"]) != "published":
+        raise HTTPException(
+            status_code=409, detail="仅已发布（向量入库）的文档可验证代表问句"
+        )
+    with runtime.db.sync_connect() as conn:
+        rec = conn.execute(
+            "SELECT question FROM ekbs_doc_recommend WHERE doc_id = ?", (task_id,)
+        ).fetchone()
+    if rec is None:
+        raise HTTPException(status_code=404, detail="该文档尚无代表问句，请先 POST /recommend 生成")
+    question = str(rec["question"])
+    perm = await runtime.perm_context(principal.user_id)
+    score = await verify_doc_question(runtime, perm, question=question, doc_id=task_id)
+    status = "verified" if score is not None else "rejected"
+    upsert_doc_recommend(
+        runtime, doc_id=task_id, question=question, rerank_score=score, status=status,
+        operator_id=principal.user_id,
+    )
+    log.info("doc_recommend_verified", task_id=task_id, score=score, operator=principal.user_id)
+    return JSONResponse(
+        {
+            "doc_id": task_id,
+            "question": question,
+            "rerank_score": score,
+            "verified": score is not None,
+            "status": status,
         }
     )
 

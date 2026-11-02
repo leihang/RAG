@@ -229,10 +229,11 @@ async def qa_chat(
     answer_text = answer.answer
     suggested: list[dict[str, Any]] = []
     if answer.refused:
-        # D22-P0：拒答时附 2～3 条相关示例问（过 ACL）
-        from ekbs.discovery import format_refusal_hints, suggested_questions
+        # D22-P0：拒答时附 2～3 条推荐问（三档：代表问句 > 热门 > 原逻辑；过 ACL）
+        from ekbs.discovery import format_refusal_hints
+        from ekbs.recommend import recommend_questions
 
-        suggested = suggested_questions(
+        suggested = recommend_questions(
             runtime, perm, limit=3, query=safe_question, for_refusal=True
         )
         hint = format_refusal_hints(suggested)

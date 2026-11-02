@@ -12,6 +12,7 @@ import { formatDurationMs } from '@/utils/format'
 import {
   approveParseTask,
   fetchParseDraftFigure,
+  generateDocRecommend,
   getParseDraft,
   rejectParseTask,
   saveParseDraft,
@@ -203,6 +204,8 @@ export default function ReviewCompare() {
   const [acting, setActing] = useState(false)
   const [tableEdit, setTableEdit] = useState<ParseDraftTable | null>(null)
   const [figureEdit, setFigureEdit] = useState<ParseDraftFigure | null>(null)
+  const [recommendQuestion, setRecommendQuestion] = useState('')
+  const [recommending, setRecommending] = useState(false)
 
   const frameRef = useRef<HTMLIFrameElement>(null)
   const pendingDraft = useRef('')
@@ -356,6 +359,36 @@ export default function ReviewCompare() {
     }
   }
 
+  const generateRecommend = async () => {
+    setRecommending(true)
+    try {
+      const res = await generateDocRecommend(docId)
+      setRecommendQuestion(res.question)
+      message.success('已生成代表问句，可编辑后确认')
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRecommending(false)
+    }
+  }
+
+  const confirmRecommend = async () => {
+    const q = recommendQuestion.trim()
+    if (!q) {
+      message.warning('代表问句不能为空')
+      return
+    }
+    setRecommending(true)
+    try {
+      await generateDocRecommend(docId, q)
+      message.success('代表问句已确认（待向量入库后验证命中）')
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRecommending(false)
+    }
+  }
+
   const kind = kindOf(sourceName, mime)
   const editable = docStatus === 'review'
 
@@ -414,6 +447,34 @@ export default function ReviewCompare() {
           <code>[表格 N]</code>、<code>[图片 编号]</code> 只是占位，完整内容在下方面板，编号与正文一致
           {editable ? '，可以修改或删除' : ''}。
         </Typography.Paragraph>
+        {editable ? (
+          <Space wrap style={{ marginTop: 8 }}>
+            <Auth code="parse:task:manage">
+              <Button loading={recommending} onClick={() => void generateRecommend()}>
+                生成代表问句
+              </Button>
+            </Auth>
+            {recommendQuestion ? (
+              <>
+                <Input
+                  value={recommendQuestion}
+                  onChange={(e) => setRecommendQuestion(e.target.value)}
+                  placeholder="代表问句（可编辑）"
+                  style={{ width: 360 }}
+                />
+                <Auth code="parse:task:manage">
+                  <Button
+                    type="primary"
+                    loading={recommending}
+                    onClick={() => void confirmRecommend()}
+                  >
+                    确认代表问句
+                  </Button>
+                </Auth>
+              </>
+            ) : null}
+          </Space>
+        ) : null}
       </Card>
 
       {loading ? (

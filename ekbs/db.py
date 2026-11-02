@@ -27,7 +27,7 @@ from ekbs.config import Settings
 from ekbs.errors import SchemaError
 
 #: `01` §5 的权威表数（含 FTS5 虚拟表 ``ekbs_chunk_fts``，不含 5 张 FTS5 影子表）
-EXPECTED_TABLES = 32
+EXPECTED_TABLES = 33
 
 #: `01` §5.6 的审计触发器数（5 张表 × UPDATE+DELETE + ``ekbs_qa_session`` 的 UPDATE 守卫 = 12）
 EXPECTED_TRIGGERS = 12
@@ -162,6 +162,22 @@ class Database:
             for name, ddl in additions:
                 if name not in policy_cols:
                     conn.execute(f"ALTER TABLE ekbs_policy_version ADD COLUMN {name} {ddl}")
+            # 推荐问答 tier-3：文档级「代表问句」表（新库由 001_init.sql 建，存量库在此补建）。
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS ekbs_doc_recommend ("
+                " doc_id INTEGER PRIMARY KEY REFERENCES ekbs_document(doc_id),"
+                " question TEXT NOT NULL,"
+                " rerank_score REAL,"
+                " status TEXT NOT NULL DEFAULT 'verified',"
+                " created_by INTEGER,"
+                " created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+                " updated_at TEXT NOT NULL DEFAULT (datetime('now'))"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_doc_recommend_status "
+                "ON ekbs_doc_recommend(status)"
+            )
             conn.commit()
 
     def verify_schema(self) -> SchemaReport:
