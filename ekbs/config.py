@@ -113,9 +113,9 @@ class DatabaseCfg(_Section):
 class RerankCfg(_Section):
     enabled: bool = True
     provider: str = "dashscope"
-    model: str = "gte-rerank-v2"
+    model: str = "qwen3.7-text-rerank"
     #: 共享域名；需工作空间专属域名时覆盖为 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com
-    #: ⚠️ gte-rerank-v2 官方公告 2026-05-30 下线，换 qwen3-rerank 时改 model 即可（端点相同）
+    #: 2026-09-27 由 gte-rerank-v2 换成 qwen3.7-text-rerank（前者 2026-05-30 下线；端点相同）
     base_url: str = "https://dashscope.aliyuncs.com"
     top_n: int = 15  # 输入候选数
     keep: int = 5  # 输出条数
@@ -174,7 +174,7 @@ class RetrievalCfg(_Section):
 
 class EmbedCfg(_Section):
     provider: str = "dashscope"
-    model: str = "text-embedding-v4"
+    model: str = "qwen3.7-text-embedding-flash"
     base_url: str = "https://dashscope.aliyuncs.com"
     dim: int = 1024
     #: 00 §3.1 的模型标识是 ``<provider>/<model>@<version>#<dim>``，但配置文件里没有 version 键。

@@ -167,11 +167,11 @@ async def can_read_document(perm, doc) -> bool:          # 来源：03 §6.3
 
 | 环节 | 精确参数与行为 | 来源 |
 |---|---|---|
-| 查询嵌入 | `dashscope/text-embedding-v4@v4#1024`，dim=1024；先查 `ekbs:cache:embed:<sha256(query)>`（TTL 86400，全局共享） | 00 §3.1、03 §4.4 |
+| 查询嵌入 | 以 `models.embed.model` 配置为准（当前 `qwen3.7-text-embedding-flash`，dim=1024）；先查 `ekbs:cache:embed:<sha256(query)>`（TTL 86400，全局共享） | 00 §3.1、03 §4.4 |
 | FAISS 召回 | `IndexFlatIP`，写入前 `faiss.normalize_L2`；**每分片** `idx.search(qvec, min(30, idx.ntotal))`；`search` 是同步 C 调用，必须包在 `asyncio.to_thread` 中；分片缺失见 §11 K17 | 06 §2.3、03 §5.2.1 |
 | FTS5 召回 | jieba **预分词**写入 `content_tok`/`heading_path_tok`，`tokenize='unicode61'`；`bm25(ekbs_chunk_fts)` **越小越相关**；`top_k=30`；权限条件必须 SQL 下推（见下） | 01 §5.2、03 §5.3 |
 | RRF 融合 | `rrf(c) = Σ_{l∈{dense,sparse}} 1/(k + rank_l(c))`，**k=60**；只用名次，不做分数校准、不归一化 BM25；两路各自 topK=30 | 05 §1647、00 §2.1、06 §3.6 |
-| rerank | `gte-rerank-v2`；输入候选 15、输出 `keep=5`、`min_score=0.30`；返回条数不足即视为失败并走降级，**禁止补 0 分、禁止硬编码假分数** | 00 §2.1、01 §7、06 §3.6 |
+| rerank | 以 `retrieval.rerank.model` 配置为准（当前 `qwen3.7-text-rerank`）；输入候选 15、输出 `keep=5`、`min_score` 以配置为准（生产 0.65 / dev mock 0.30）；返回条数不足即视为失败并走降级，**禁止补 0 分、禁止硬编码假分数** | 00 §2.1、01 §7、06 §3.6 |
 | 拒答 | rerank 最高分 < 阈值 或 上下文无有效内容 → 拒答；`ekbs_qa_message.refused=1` 是一等公民 | 00 §2.1、06 §4.6 |
 | 父块扩展 | 命中子块 → 取 `parent_id` 指向的 L1 父块全文（1024~1536 token）；`rerank keep=5` ⇒ 最多回填 5 个父块；扩展后的父块仍须过 C5 | 06 §3.2、06 §3.4、00 §2.1 |
 | 引用后置校验 | 见下方三条 | 00 §2.2、03 §5.5、06 §4.7/§4.11.3 |

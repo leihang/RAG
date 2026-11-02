@@ -35,7 +35,7 @@ retrieval:
   rrf_k: 60
   rerank:
     enabled: true
-    provider: mock         # 开发（生产 dashscope / gte-rerank-v2）
+    provider: mock         # 开发（生产 dashscope / qwen3.7-text-rerank）
     model: mock-rerank-v1
     top_n: 15
     keep: 5
@@ -74,7 +74,7 @@ retrieval:
 # ---------- 云端模型 ----------
 models:
   embed:
-    provider: mock         # 开发（生产 dashscope / text-embedding-v4）
+    provider: mock         # 开发（生产 dashscope / qwen3.7-text-embedding-flash）
     model: mock-embed-v1
     dim: 1024
     # ⚠️ 10 而非 01 §7 写的 20：text-embedding-v4 单请求上限就是 10 条，

@@ -5,7 +5,8 @@
 > **每条结论后括注依据 URL**；文档未说明的一律写「**未核实到**」，不猜。
 > 待确认项集中在 §8（**8 条**）；与本项目现状的冲突集中在 §7（**13 条**）。
 >
-> 涉及模型：嵌入 `text-embedding-v4`（dim=1024）、重排 `gte-rerank-v2`、生成 `qwen-max`。
+> 涉及模型：**以配置为准**（嵌入 `models.embed.model`、重排 `retrieval.rerank.model`、生成 `models.llm.model`）；
+> 当前 cloud/deploy 实际 = `qwen3.7-text-embedding-flash`（dim=1024）/ `qwen3.7-text-rerank` / `qwen-max`。
 
 ---
 
