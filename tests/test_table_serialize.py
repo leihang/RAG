@@ -274,3 +274,90 @@ def test_general_format_date_serials_in_date_header(tmp_path) -> None:
     doc = parse_file(path)
     body = doc.tables[0].body
     assert "46295" not in body and "2026-09-30" in body
+
+
+# --- Word/PowerPoint 合并单元格（colspan / rowspan）的网格还原 -------------------
+# 事故（doc_id=196 XJWY-GC-12 能耗管理作业指导书）：
+#   表 1 两行表头 `<th rowspan="2">级别</th><th colspan="3">分级内容</th>` 被展平成
+#   "级别/能耗检查 | 分级内容/能耗运行管控 | 节能改造 | 列4"，A/B/C 三行的值整体错绑一格；
+#   表 6 `<td rowspan="7">照明</td>` 的 12 行延续行因少一格整体左移，13 块"管理内容"为空。
+# 根因：`parse_table_html` 只补 colspan 的空格，**完全不处理 rowspan**，延续行少一格。
+
+def test_rowspan_two_row_header_aligns_columns() -> None:
+    html = (
+        "<table>"
+        '<tr><th rowspan="2">级别</th><th colspan="3">分级内容</th></tr>'
+        "<tr><td>能耗检查</td><td>能耗运行管控</td><td>节能改造</td></tr>"
+        "<tr><td>A级</td><td>能耗普查</td><td>空调锅炉运行能耗管控</td>"
+        "<td>年度成本降低10万元以上</td></tr>"
+        "</table>"
+    )
+    blocks = serialize_table_body(caption="能耗管理分级", body=html, table_id="1")
+    text = blocks[0]
+    assert (
+        "相关表头: 级别 | 分级内容/能耗检查 | 分级内容/能耗运行管控 | 分级内容/节能改造"
+        in text
+    ), text
+    assert "级别=A级; 分级内容/能耗检查=能耗普查" in text, text
+    assert "分级内容/能耗运行管控=空调锅炉运行能耗管控" in text, text
+    assert "分级内容/节能改造=年度成本降低10万元以上" in text, text
+    assert "列4" not in text, text
+
+
+def test_rowspan_data_rows_repeat_group_label() -> None:
+    html = (
+        "<table>"
+        "<tr><th>类别</th><th>项目</th><th>管理内容</th></tr>"
+        '<tr><td rowspan="2">照明</td><td>大堂照明</td><td>8:00-22:00</td></tr>'
+        "<tr><td>车库照明</td><td>双亮度感应</td></tr>"
+        "<tr><td>设备</td><td>设备房电器</td><td>人走灯熄</td></tr>"
+        "</table>"
+    )
+    text = serialize_table_body(caption="开关机时间表", body=html, table_id="6")[0]
+    assert "类别=照明; 项目=大堂照明; 管理内容=8:00-22:00" in text, text
+    assert "类别=照明; 项目=车库照明; 管理内容=双亮度感应" in text, text
+    assert "类别=设备; 项目=设备房电器; 管理内容=人走灯熄" in text, text
+
+
+def test_colspan_note_row_is_not_labelled_as_first_column() -> None:
+    html = (
+        "<table>"
+        "<tr><th>类别</th><th>项目</th><th>管理内容</th></tr>"
+        "<tr><td>照明</td><td>车库</td><td>感应灯</td></tr>"
+        '<tr><td colspan="3">设备控制开关显眼位置应张贴对应的控制时间表</td></tr>'
+        "</table>"
+    )
+    text = serialize_table_body(caption="开关机时间表", body=html, table_id="6")[0]
+    assert "备注=设备控制开关显眼位置应张贴对应的控制时间表" in text, text
+    assert "类别=设备控制开关显眼位置" not in text, text
+
+
+def test_information_block_html_roundtrip_keeps_note_row() -> None:
+    from ekbs.ingest.table_serialize import information_block_to_html
+
+    html = (
+        "<table>"
+        "<tr><th>类别</th><th>项目</th><th>管理内容</th></tr>"
+        "<tr><td>照明</td><td>车库</td><td>感应灯</td></tr>"
+        '<tr><td colspan="3">控制时间表应张贴在显眼位置</td></tr>'
+        "</table>"
+    )
+    text = serialize_table_body(caption="开关机时间表", body=html, table_id="6")[0]
+    rebuilt = information_block_to_html(text)
+    assert rebuilt is not None
+    assert "控制时间表应张贴在显眼位置" in rebuilt
+
+
+def test_rowspan_grid_width_stays_rectangular() -> None:
+    """rowspan 跨列组合也不能让后续行错列。"""
+    from ekbs.ingest.table_serialize import parse_table_html
+
+    rows = parse_table_html(
+        "<table>"
+        '<tr><td rowspan="2" colspan="2">A</td><td>B</td></tr>'
+        "<tr><td>C</td></tr>"
+        "<tr><td>D</td><td>E</td><td>F</td></tr>"
+        "</table>"
+    )
+    assert len({len(r) for r in rows}) == 1, rows
+    assert rows[2] == ["D", "E", "F"], rows

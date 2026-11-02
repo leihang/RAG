@@ -291,22 +291,25 @@ def _clause_keys(text: str) -> set[tuple[str, int]]:
 
 
 def clause_mismatches(answer: str, chunks: Sequence[object]) -> list[str]:
-    """答案里写出的「第X章/节/条/款/项」若不在所引用块的标题路径里，列出来。
+    """答案里写出的「第X章/节/条/款/项」若不在所引用块的**证据**里，列出来。
 
-    没写条款号则通过。写了就必须能在被 ``[n]`` 点到的 ``heading_path`` 里找到
-    同一个序号（``第五条`` 与 ``第5条`` 视为同一条）。
+    没写条款号则通过。写了就必须能在被 ``[n]`` 点到的块里找到同一个序号
+    （``第五条`` 与 ``第5条`` 视为同一条）。
+
+    证据 = ``heading_path`` **+ 正文**：分块按 token 聚合后，一个块可能覆盖多条条款
+    （标题行补在正文里），此时条号只出现在正文、不在块标题路径里 —— 只查标题会把
+    正确的条款引用误判成幻觉。反过来，正文里没有的条号仍然照拒。
     """
     mentions = _clause_keys(strip_citations(answer))
     if not mentions:
         return []
     indices = cited_indices(answer)
-    headings: list[str] = []
+    allowed: set[tuple[str, int]] = set()
     for index in indices:
         if not 1 <= index <= len(chunks):
             continue
-        headings.append(str(getattr(chunks[index - 1], "heading_path", "") or ""))
-    allowed: set[tuple[str, int]] = set()
-    for heading in headings:
-        allowed |= _clause_keys(heading)
+        chunk = chunks[index - 1]
+        allowed |= _clause_keys(str(getattr(chunk, "heading_path", "") or ""))
+        allowed |= _clause_keys(str(getattr(chunk, "content", "") or ""))
     bad = sorted(mentions - allowed)
     return [f"第{number}{kind}" for kind, number in bad]

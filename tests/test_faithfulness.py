@@ -244,3 +244,20 @@ def test_clause_number_must_match_cited_heading() -> None:
     assert clause_mismatches("依据第3条，须提前申请 [1]。", chunks) == []
     assert clause_mismatches("依据第五条，须提前申请 [1]。", chunks) == ["第5条"]
     assert clause_mismatches("年假为 5 天 [1]。", chunks) == []
+
+
+def test_clause_number_in_aggregated_chunk_content_is_allowed() -> None:
+    """分块按 token 聚合后，一个块可覆盖多条条款：条号在**正文**里也算有效证据。
+
+    只查 heading_path 的话，聚合块的标题只有起始那条（如「第一条」），
+    答案引用块内「第二条」会被判成幻觉、整答拒掉。
+    """
+    chunks = [
+        _chunk(
+            "第一条 年假天数\n满一年五天。\n\n第二条 申请流程\n提前三个工作日。",
+            heading="年假制度 > 第一条 年假天数",
+        ),
+    ]
+    assert clause_mismatches("依据第二条，须提前申请 [1]。", chunks) == []
+    # 证据里根本没有的条号仍然要拒
+    assert clause_mismatches("依据第五条，须提前申请 [1]。", chunks) == ["第5条"]

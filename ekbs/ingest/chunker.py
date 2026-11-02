@@ -404,9 +404,14 @@ def merge_short_sections(sections: Sequence[Section], **_kwargs: object) -> list
 
 
 def _section_with_heading(section: Section) -> str:
-    """短节并入时保留它的小节标题（否则「1. 目的」这层限定词会丢）。"""
+    """短节并入时保留它的小节标题（否则「1. 目的」这层限定词会丢）。
+
+    只取**最后一级**标题，不拼整条 ``heading_path``：实测空壳节（正文只有
+    ``[表格 5]``）并入下一节时，把整条面包屑 ``4. 岗位职责 > 5.3 能耗分析管理 > 5.3.2 …``
+    当正文写进 chunk —— 既是重复信息，又让读者误以为这一节属于 5.3.2。
+    """
     text = (section.text or "").strip()
-    heading = (section.heading_path or "").strip()
+    heading = (section.heading_path or "").strip().rsplit(" > ", 1)[-1]
     if text:
         return f"{heading}\n{text}".strip() if heading else text
     return heading
@@ -431,6 +436,296 @@ def _is_placeholder_only(section: Section) -> bool:
     if not text:
         return True
     return bool(_PLACEHOLDER_ONLY_RE.match(text))
+
+
+#: 章节容器键：末尾若是条款层（``第X条``/``第X款``/``第X项``），装进上层容器。
+_CLAUSE_LEAF_RE = re.compile(r"^第[一二三四五六七八九十百千零〇两\d]+[条款项]")
+#: 正文里的表格占位符：``[表格 3]`` → 表 id ``3``（用于把表块挂回它所在的章节）。
+_TABLE_PLACEHOLDER_RE = re.compile(r"\[表格\s*(\d+)\]")
+#: 正文里的图片占位符（``[图片 …]``）：抽取「临近表格文字」时当段落边界。
+_FIGURE_PLACEHOLDER_RE = re.compile(r"^\[图片")
+
+
+def container_heading_path(heading_path: str) -> str:
+    """父容器的小节路径：``5. 工作程序和要求 > 5.1 管理内容 > 5.1.1 …`` → ``5. 工作程序和要求``。
+
+    父块只是**上下文容器**（叶子规则下不入向量），检索单元仍是条款子块。把同章条款
+    装进一个父块，父块扩展（``retrieval.parent_expand``）才有内容可用（`20` §3.1）。
+    """
+    parts = _heading_parts(major_heading_path(heading_path))
+    while len(parts) >= 2 and _CLAUSE_LEAF_RE.match(parts[-1]):
+        parts.pop()
+    return " > ".join(parts)
+
+
+def _placeholder_table_ids(text: str) -> tuple[str, ...]:
+    """正文里的 ``[表格 N]`` → 表 id 列表（保序去重）。"""
+    return tuple(dict.fromkeys(_TABLE_PLACEHOLDER_RE.findall(text or "")))
+
+
+def _table_adjacent_prose(
+    sections: Sequence[Section], table_id: str, *, max_chars: int = 240
+) -> tuple[str, str]:
+    """表格占位符前/后紧邻的正文字，作为表父块的「上文 / 下文」。
+
+    「临近」= 同一小节内、占位符行上/下紧邻的正文行；只取最近一段，遇到空行或
+    另一占位符（表格/图片）即停，各截断到 ``max_chars``。段落标题名与表名不在此
+    返回（分别由 ``table_section_path`` 与表格序列化的 preamble 承担）。
+    """
+    marker = f"[表格 {table_id}]"
+    for section in sections:
+        text = section.text or ""
+        if marker not in text:
+            continue
+        lines = text.splitlines()
+
+        def _is_boundary(line: str) -> bool:
+            return bool(
+                _TABLE_PLACEHOLDER_RE.search(line) or _FIGURE_PLACEHOLDER_RE.match(line.strip())
+            )
+
+        idx = next((i for i, line in enumerate(lines) if marker in line), None)
+        if idx is None:
+            return "", ""
+
+        def _collect(indices: range) -> str:
+            parts: list[str] = []
+            for i in indices:
+                line = lines[i].strip()
+                if not line or _is_boundary(line):
+                    break
+                parts.append(line)
+            return " ".join(parts).strip()[:max_chars]
+
+        return _collect(range(idx - 1, -1, -1)), _collect(range(idx + 1, len(lines)))
+    return "", ""
+
+
+def _table_parent_content(
+    *, section_path: str, above: str, full_table: str, below: str
+) -> str:
+    """表块/表父块的上下文：段落标题名 + 上方临近文字 + 表格 + 下方临近文字。
+
+    表名已在表格序列化的 preamble 里（``表名: …``），不重复拼；段落标题名是序列化
+    里没有的限定，必须显式带上。只取**最后一级**标题（``rsplit(" > ", 1)[-1]``），
+    否则整条面包屑写进正文 —— 实测 doc 196 的 ``5.3.2 能耗录入及能耗报告`` 曾因此
+    把 ``5. 工作程序和要求 > 5.3.2 …`` 整段写进块内容（面包屑泄漏）。
+    """
+    heading = (section_path or "").strip().rsplit(" > ", 1)[-1]
+    parts = [p for p in (heading, above) if p]
+    parts.append(full_table)
+    if below:
+        parts.append(below)
+    return "\n\n".join(parts)
+
+
+@dataclass
+class _ChildDraft:
+    """待落库的子块草稿（父块装箱时用）。"""
+
+    content: str  # 带 12%~15% 邻块重叠，进向量/FTS
+    body: str  # 不带重叠，父块内容用它拼（避免父块里重复一遍重叠段）
+    heading_path: str
+    page_from: int | None
+    page_to: int | None
+    table_ids: tuple[str, ...] = ()
+
+
+def _squash(text: str) -> str:
+    """去掉全部空白，用于判断「标题行是否已经在正文里」。"""
+    return re.sub(r"\s+", "", text or "")
+
+
+def _child_body(buf: Sequence[Section]) -> str:
+    """把若干小节拼成一个子块正文；跨节时补回**标题骨架**。
+
+    两个理由（都实测过）：
+
+    * 第X条类文档的小节正文不含条号（条号只在 heading_path 里），聚合后若不留标题行，
+      块内容里就找不到「第二条」——答案引用条号时 ``clause_mismatches`` 会判成幻觉；
+    * 聚合会跨章，若只留第一小节的 heading_path，中间的父级标题（``4． 方法和过程控制``）
+      会**彻底消失**（覆盖率掉到 91%）——补回「相对上一小节新增的标题层级」即可。
+    """
+    parts: list[str] = []
+    prev_parts: list[str] = []
+    for index, section in enumerate(buf):
+        path = _heading_parts(section.heading_path)
+        body = (section.text or "").strip()
+        if len(buf) > 1:
+            if index == 0:
+                new_headings = path[-1:]
+            else:
+                common = 0
+                while (
+                    common < min(len(path), len(prev_parts))
+                    and path[common] == prev_parts[common]
+                ):
+                    common += 1
+                new_headings = path[common:]
+            for heading in new_headings:
+                if not heading or _squash(heading) in _squash(body):
+                    continue
+                if any(_squash(heading) == _squash(part) for part in parts[-2:]):
+                    continue
+                parts.append(heading)
+        if body:
+            parts.append(body)
+        prev_parts = path
+    return "\n\n".join(parts)
+
+
+def _build_child_drafts(
+    sections: Sequence[Section], *, child_min: int, child_max: int
+) -> list[_ChildDraft]:
+    """按 token 目标把小节**跨标题**聚合成子块（`20` §3.2 规则 3/4）。
+
+    为什么不再"一个标题一个子块"：制度/作业指导书每个标题下往往只有一两行，按标题切
+    出来的块只有 10~60 token，父子块全部退化成碎片（实测 doc 196 的 33 节 → 33 个
+    6~120 token 的块，父子关系名存实亡）。聚合到 ``child_min`` 才收口；收口点落在
+    标题边界上（小节是切分的最小单位，不会把一行拆两半）。
+    """
+    drafts: list[_ChildDraft] = []
+    buf: list[Section] = []
+    buf_tokens = 0
+
+    def flush() -> None:
+        nonlocal buf, buf_tokens
+        body = _child_body(buf)
+        if body:
+            starts = [s.page_from for s in buf if s.page_from is not None]
+            ends = [s.page_to for s in buf if s.page_to is not None]
+            drafts.append(
+                _ChildDraft(
+                    content=body,
+                    body=body,
+                    heading_path=buf[0].heading_path,
+                    page_from=min(starts) if starts else None,
+                    page_to=max(ends) if ends else None,
+                    table_ids=tuple(
+                        table_id
+                        for section in buf
+                        for table_id in _placeholder_table_ids(section.text)
+                    ),
+                )
+            )
+        buf = []
+        buf_tokens = 0
+
+    for section in sections:
+        text = (section.text or "").strip()
+        if not text:
+            continue
+        section_tokens = count_tokens(text)
+        if section_tokens > child_max:
+            flush()
+            for piece in _pack(text, child_min, child_max):
+                drafts.append(
+                    _ChildDraft(
+                        content=piece,
+                        body=piece,
+                        heading_path=section.heading_path,
+                        page_from=section.page_from,
+                        page_to=section.page_to,
+                        table_ids=_placeholder_table_ids(section.text),
+                    )
+                )
+            continue
+        if buf and buf_tokens + section_tokens > child_max:
+            flush()
+        buf.append(section)
+        buf_tokens += section_tokens
+        if buf_tokens >= child_min:
+            flush()
+    flush()
+    return drafts
+
+
+def _merge_small_tail_child(drafts: list[_ChildDraft], *, child_min: int, child_max: int) -> None:
+    """收尾的碎块（< child_min/2）并入前一块 —— 尾部余量不该单独成块。
+
+    尾部是否成块取决于总长能否整除目标，无法从算法上避免；但 10~60 token 的孤立尾块
+    会污染 rerank（同一篇里块大小差一个量级），所以超小尾块并回前一块（不超 child_max 时）。
+    """
+    if len(drafts) < 2:
+        return
+    last, prev = drafts[-1], drafts[-2]
+    last_tokens = count_tokens(last.content)
+    if last_tokens >= child_min // 2:
+        return
+    if count_tokens(prev.content) + last_tokens > child_max:
+        return
+    merged = _ChildDraft(
+        content=f"{prev.content}\n\n{last.body}",
+        body=f"{prev.body}\n\n{last.body}",
+        heading_path=prev.heading_path,
+        page_from=min(p for p in (prev.page_from, last.page_from) if p is not None)
+        if (prev.page_from is not None or last.page_from is not None)
+        else None,
+        page_to=max(p for p in (prev.page_to, last.page_to) if p is not None)
+        if (prev.page_to is not None or last.page_to is not None)
+        else None,
+        table_ids=tuple(dict.fromkeys((*prev.table_ids, *last.table_ids))),
+    )
+    drafts[-2] = merged
+    drafts.pop()
+
+
+def _apply_draft_overlap(drafts: list[_ChildDraft], *, overlap_tokens: int) -> None:
+    """相邻子块注入 12%~15% 尾部重叠（`20` §3.1 / TC-INDEX-003）。"""
+    if overlap_tokens <= 0:
+        return
+    for index in range(1, len(drafts)):
+        tail = _tail_by_tokens(drafts[index - 1].content, overlap_tokens)
+        if not tail:
+            continue
+        current = drafts[index].content
+        if current.startswith(tail) or tail in current[: min(len(current), len(tail) + 32)]:
+            continue
+        drafts[index].content = f"{tail}\n{current}"
+
+
+def _parent_heading(drafts: Sequence[_ChildDraft], *, root: str) -> str:
+    """父块标题：组内子块**同章**时用章名；跨章时退回文档根（父块只是上下文容器）。"""
+    keys = {container_heading_path(draft.heading_path) for draft in drafts}
+    keys.discard("")
+    if len(keys) == 1:
+        return keys.pop()
+    return root
+
+
+def _pack_parent_drafts(
+    drafts: Sequence[_ChildDraft], *, parent_min: int, parent_max: int
+) -> list[list[_ChildDraft]]:
+    """把子块按 ``parent_min``~``parent_max`` 装箱成父块（可跨章跨节，`20` §3.1）。
+
+    父子关系要有意义，父块就必须比子块大一个量级：按标题/章分组时，2 页文档的「章」
+    只有几十到几百 token，父块约等于子块 → 父块扩展等于没扩展（用户实测反馈）。
+    """
+    groups: list[list[_ChildDraft]] = []
+    current: list[_ChildDraft] = []
+    tokens = 0
+    for draft in drafts:
+        # 按 **body** 计：父块内容就是 body（不含子块的重叠前缀），按 content 算会
+        # 系统性低估 12% 左右 → 父块实际只有 900 token 上下，够不到 parent_min。
+        draft_tokens = count_tokens(draft.body)
+        if current and tokens + draft_tokens > parent_max:
+            groups.append(current)
+            current, tokens = [], 0
+        current.append(draft)
+        tokens += draft_tokens
+        if tokens >= parent_min:
+            groups.append(current)
+            current, tokens = [], 0
+    if current:
+        groups.append(current)
+    # 尾部小组（不够 parent_min）能装进前一组就并进去，避免出现 10 token 的父块
+    if len(groups) >= 2:
+        tail_tokens = sum(count_tokens(draft.body) for draft in groups[-1])
+        prev_tokens = sum(count_tokens(draft.body) for draft in groups[-2])
+        if tail_tokens < parent_min and prev_tokens + tail_tokens <= parent_max:
+            groups[-2] = [*groups[-2], *groups[-1]]
+            groups.pop()
+    return groups
 
 
 def merge_short_sections_into_next(sections: Sequence[Section]) -> list[Section]:
@@ -702,55 +997,68 @@ def chunk_markdown(
 
     ``doc_title``：小节无标题时注入 ``heading_path`` 根，避免检索用文本丢限定词。
 
-    短节若只能切出与父块正文相同的一块 child，则**跳过 child**：父块作为叶子入向量
-    （见 :mod:`ekbs.ingest.retrievable`），避免同文双索引。
+    结构（`20` §3.1/§3.2）：**按 token 目标切，不按标题切**。
+    制度/作业指导书每个标题下常常只有一两行，按标题切出来的块只有 10~60 token ——
+    父块和子块同时退化成碎片，父子关系名存实亡（用户实测反馈）。
+
+    * **子块**（检索单元）：把连续小节聚合到 ``child_min``~``child_max``（收口点落在
+      标题边界，不拆行），相邻子块注入 12%~15% 尾部重叠；
+    * **父块**（上下文容器）：再把子块按 ``parent_min``~``parent_max`` 装箱，可跨章；
+    * 同一段文字不会双索引：父块被子块覆盖后按「叶子块才是检索单元」规则不入向量
+      （见 :mod:`ekbs.ingest.retrievable`）。
     """
     from ekbs.ingest.table_serialize import serialize_table_body
 
     result = ChunkingResult()
     seq = 0
     root = ensure_heading_path("", doc_title=doc_title)
-    sections = pack_major_sections(split_sections(markdown, page_map=page_map))
-    sections = merge_short_sections_into_next(sections)
-    for section in sections:
-        heading = ensure_heading_path(section.heading_path, doc_title=doc_title)
-        # 小节完全无标题路径时，用文档根；已有条款路径则保留
-        if not section.heading_path.strip():
-            heading = root
-        for parent_text in _pack(section.text, parent_min, parent_max):
-            seq += 1
-            parent = ChunkNode(
+    raw_sections = pack_major_sections(split_sections(markdown, page_map=page_map))
+    # 表块要挂回它**所在小节**的路径：必须在空壳节合并前取。合并后 heading 变成下一节的，
+    # 5.3.2 的表会被记成 5.3.3（实测 doc 196 的表 5）。
+    table_section_path: dict[str, str] = {}
+    for section in raw_sections:
+        for table_id in _placeholder_table_ids(section.text):
+            table_section_path.setdefault(table_id, section.heading_path)
+    sections = merge_short_sections_into_next(raw_sections)
+    drafts = _build_child_drafts(sections, child_min=child_min, child_max=child_max)
+    _merge_small_tail_child(drafts, child_min=child_min, child_max=child_max)
+    _apply_draft_overlap(drafts, overlap_tokens=int(child_max * OVERLAP_MIN_RATIO))
+    table_container: dict[str, int] = {}
+    for group in _pack_parent_drafts(drafts, parent_min=parent_min, parent_max=parent_max):
+        parent_text = "\n\n".join(draft.body for draft in group)
+        if not parent_text:
+            continue
+        starts = [draft.page_from for draft in group if draft.page_from is not None]
+        ends = [draft.page_to for draft in group if draft.page_to is not None]
+        seq += 1
+        result.nodes.append(
+            ChunkNode(
                 chunk_type="parent",
                 seq=seq,
                 content=parent_text,
-                heading_path=heading,
-                page_from=section.page_from,
-                page_to=section.page_to,
+                heading_path=ensure_heading_path(
+                    _parent_heading(group, root=root), doc_title=doc_title
+                ),
+                page_from=min(starts) if starts else None,
+                page_to=max(ends) if ends else None,
             )
-            result.nodes.append(parent)
-            parent_index = len(result.nodes) - 1
-
-            # 短节：子块只能切出 1 块且与父块正文相同 → 不建 child。
-            # 父块本身就是叶子，按 retrievable 叶子规则入向量，避免同文双索引。
-            # PPT/幻灯片页常见「整节短于 child_min」，_pack 会原样回传 → 必须跳过。
-            overlap = int(child_max * OVERLAP_MIN_RATIO)
-            child_texts = _pack(parent_text, child_min, child_max, overlap=overlap)
-            parent_norm = " ".join(parent_text.split())
-            if len(child_texts) == 1 and " ".join(child_texts[0].split()) == parent_norm:
-                continue
-            for child_text in child_texts:
-                seq += 1
-                result.nodes.append(
-                    ChunkNode(
-                        chunk_type="child",
-                        seq=seq,
-                        content=child_text,
-                        heading_path=heading,
-                        page_from=section.page_from,
-                        page_to=section.page_to,
-                        parent_index=parent_index,
-                    )
+        )
+        parent_index = len(result.nodes) - 1
+        for draft in group:
+            for table_id in draft.table_ids:
+                table_container.setdefault(table_id, parent_index)
+            seq += 1
+            result.nodes.append(
+                ChunkNode(
+                    chunk_type="child",
+                    seq=seq,
+                    content=draft.content,
+                    heading_path=ensure_heading_path(draft.heading_path, doc_title=doc_title),
+                    page_from=draft.page_from,
+                    page_to=draft.page_to,
+                    parent_index=parent_index,
                 )
+            )
 
     for fig_index, figure in enumerate(figures, start=1):
         content = _figure_search_text(
@@ -775,28 +1083,46 @@ def chunk_markdown(
         )
 
     for table in tables:
-        blocks = serialize_table_body(
+        # 整表先序列化一次（不拆）：拿「表格本身」全文给父块用。
+        full_blocks = serialize_table_body(
             caption=table.caption,
             body=table.body,
             table_id=table.table_id,
-            row_chunks=table_row_chunks,
         )
+        if not full_blocks:
+            continue
         # 表名单独成块时没有文档上下文（「表 1」这种名字跨文档完全一样），
         # 把文档名并进 heading：UI 里一眼看得出是哪篇的表，精排文本也自带身份。
         table_name = (table.caption or "").strip() or (
             f"表 {table.table_id}" if table.table_id else ""
         )
-        table_heading = ensure_heading_path(
-            f"{doc_title} · {table_name}" if doc_title and table_name else table_name,
-            doc_title=doc_title,
-        )
-        for block in blocks:
+        section_path = (table_section_path.get(str(table.table_id)) or "").strip()
+        if section_path:
+            base = f"{doc_title} > {section_path}" if doc_title else section_path
+            table_heading = ensure_heading_path(
+                f"{base} · {table_name}" if table_name else base, doc_title=doc_title
+            )
+        else:
+            table_heading = ensure_heading_path(
+                f"{doc_title} · {table_name}" if doc_title and table_name else table_name,
+                doc_title=doc_title,
+            )
+        above, below = _table_adjacent_prose(raw_sections, str(table.table_id))
+        prose_parent = table_container.get(str(table.table_id))
+
+        if len(full_blocks) == 1:
+            # 小表（整表一块）：上下文直接折进叶子，不另设父容器（多一层只会重复）。
             seq += 1
             result.nodes.append(
                 ChunkNode(
                     chunk_type="table",
                     seq=seq,
-                    content=block,
+                    content=_table_parent_content(
+                        section_path=section_path,
+                        above=above,
+                        full_table=full_blocks[0],
+                        below=below,
+                    ),
                     heading_path=table_heading,
                     page_from=table.page,
                     page_to=table.page,
@@ -806,6 +1132,54 @@ def chunk_markdown(
                     # （实测 164 个表格块全中）。表格的标识在正文里（`表名: …`），
                     # 若要单独追踪，应另开 `table_id` 字段而不是借 figure_id。
                     figure_id=None,
+                    parent_index=prose_parent,
+                )
+            )
+            continue
+
+        # 大表：出「父容器（上文 + 整表 + 下文）+ 行/组叶子」。父容器被子块覆盖后按
+        # 叶子规则不入向量（retrievable.py）；叶子命中后经 `parent_expand` 扩成整表父块。
+        if table_row_chunks:
+            leaf_blocks = serialize_table_body(
+                caption=table.caption,
+                body=table.body,
+                table_id=table.table_id,
+                row_chunks=True,
+            )
+        else:
+            leaf_blocks = full_blocks
+
+        seq += 1
+        container_index = len(result.nodes)
+        result.nodes.append(
+            ChunkNode(
+                chunk_type="table",
+                seq=seq,
+                content=_table_parent_content(
+                    section_path=section_path,
+                    above=above,
+                    full_table="\n\n".join(full_blocks),
+                    below=below,
+                ),
+                heading_path=table_heading,
+                page_from=table.page,
+                page_to=table.page,
+                figure_id=None,
+                parent_index=prose_parent,
+            )
+        )
+        for block in leaf_blocks:
+            seq += 1
+            result.nodes.append(
+                ChunkNode(
+                    chunk_type="table",
+                    seq=seq,
+                    content=block,
+                    heading_path=table_heading,
+                    page_from=table.page,
+                    page_to=table.page,
+                    figure_id=None,
+                    parent_index=container_index,
                 )
             )
     return result

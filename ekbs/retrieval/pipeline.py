@@ -86,6 +86,23 @@ REFUSE_ANSWER_VERIFY_UNAVAILABLE = "answer_verify_unavailable"
 #: 否则正文里正常引用这句话的答案会被误判成拒答。
 NO_BASIS_MARKER = "未找到可靠依据"
 
+
+def refusal_answer_text(reason: str) -> str:
+    """检索侧拒答的**对外文案**，按 ``refusal_reason`` 区分。
+
+    机器可读原因仍走 ``refusal_reason`` 字段（审计/评测用）；这里只决定用户看到什么。
+    ⚠️ 区分「无权限」与「未找到」会在文案层暴露权限边界（侧信道），是产品明确要求的取舍。
+
+    * ``no_visible_shard``：无可见分片 → 引导联系管理员授权；
+    * ``no_candidate`` / ``below_threshold`` / ``all_denied_by_c5``：有权限但没命中/被拦 → 引导「帮助」查目录；
+    * 其余（嵌入/LLM 不可用等）：维持原口径「未找到可靠依据。」。
+    """
+    if reason == REFUSE_NO_SHARD:
+        return "对不起，你无权查阅资料，如需授权请联系管理员。"
+    if reason in (REFUSE_NO_CANDIDATE, REFUSE_BELOW_THRESHOLD, REFUSE_ALL_DENIED):
+        return "对不起，未找到相关信息。你可以输入帮助，来确认你可以查阅的资料目录清单。"
+    return f"{NO_BASIS_MARKER}。"
+
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 
 
@@ -1026,11 +1043,16 @@ class RetrievalPipeline:
     def _expand_parents(
         self, chunks: list[RetrievedChunk], perm: PermContext
     ) -> list[RetrievedChunk]:
-        """子块命中 → 用父块全文进上下文；父块仍需过 C5。"""
+        """子块/表行组命中 → 用父块全文进上下文；父块仍需过 C5。
+
+        表父块（``chunk_type == 'table'`` 且是容器）只在**行组叶子命中**时展开；
+        小表（整表一块、``parent_id`` 指向正文父块）**不展开** —— 它的正文里已折进
+        上下文，展开反而会把它换成不含表格的正文父块。
+        """
         parent_ids = [
             c.parent_chunk_id
             for c in chunks
-            if c.chunk_type == "child" and c.parent_chunk_id
+            if c.parent_chunk_id and c.chunk_type in ("child", "table")
         ]
         if not parent_ids:
             return chunks
@@ -1044,12 +1066,22 @@ class RetrievalPipeline:
         expanded: list[RetrievedChunk] = []
         for chunk in chunks:
             parent = parents.get(int(chunk.parent_chunk_id)) if chunk.parent_chunk_id else None
-            if parent is not None and parent.chunk_id in allowed:
-                parent.rerank_score = chunk.rerank_score
-                parent.rrf_score = chunk.rrf_score
-                parent.dense_rank = chunk.dense_rank
-                parent.sparse_rank = chunk.sparse_rank
-                expanded.append(parent)
+            should_expand = chunk.chunk_type == "child" or (
+                chunk.chunk_type == "table"
+                and parent is not None
+                and parent.chunk_type == "table"
+            )
+            if parent is not None and parent.chunk_id in allowed and should_expand:
+                # 父块只提供**上下文内容**；``heading_path`` 保留命中子块的条款层。
+                # 为什么不能整块换成父块：父块是章节容器，标题只剩「5. 工作程序和要求」，
+                # 答案里写「第X条」时 clause_mismatches 在引用块标题里找不到条号 →
+                # 正确的条款引用被判幻觉、整答拒掉（faithfulness.clause_mismatches）。
+                hit = replace(parent, heading_path=chunk.heading_path or parent.heading_path)
+                hit.rerank_score = chunk.rerank_score
+                hit.rrf_score = chunk.rrf_score
+                hit.dense_rank = chunk.dense_rank
+                hit.sparse_rank = chunk.sparse_rank
+                expanded.append(hit)
             else:
                 expanded.append(chunk)
         return expanded
@@ -1491,13 +1523,14 @@ class RetrievalPipeline:
         started = time.perf_counter()
         chunks = retrieval.chunks
         if not chunks:
+            reason = retrieval.refusal_reason or REFUSE_EMPTY_ANSWER
             return AnswerResult(
-                answer="未找到可靠依据。",
+                answer=refusal_answer_text(reason),
                 citations=[],
                 retrieval=retrieval,
                 model=self.providers.llm.ref.ident,
                 refused=True,
-                refusal_reason=retrieval.refusal_reason or REFUSE_EMPTY_ANSWER,
+                refusal_reason=reason,
             )
 
         # **上下文预算**：资料 + 记忆 + 问题一起裁（保证至少 1 块 + 最近 1 轮）

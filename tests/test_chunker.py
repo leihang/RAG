@@ -14,7 +14,6 @@ from ekbs.ingest.chunker import (
     count_tokens,
     ensure_heading_path,
     major_heading_path,
-    pack_major_sections,
     split_sections,
 )
 
@@ -74,7 +73,11 @@ def test_clause_lines_become_heading_path() -> None:
     assert any("第二条" in p for p in paths)
     result = chunk_markdown(CLAUSE_PLAIN, doc_title="年假管理制度")
     assert all(n.heading_path.strip() for n in result.nodes)
-    assert any("第一条" in n.heading_path for n in result.parents)
+    # 检索单元是 child；聚合后块标题是**块起始**那条条款，其余条款标题保留在正文里
+    assert result.children
+    assert any("第一条" in n.content for n in result.children)
+    assert any("第二条" in n.content for n in result.children)
+
 
 
 def test_heading_path_never_empty_with_doc_title() -> None:
@@ -84,8 +87,12 @@ def test_heading_path_never_empty_with_doc_title() -> None:
     assert ensure_heading_path("", doc_title="") == "文档"
 
 
-def test_short_slide_page_skips_identical_child() -> None:
-    """PPT 短页（远小于 child_min）不得 parent+child 同文双索引。"""
+def test_short_slide_page_child_does_not_duplicate_index() -> None:
+    """PPT 短页（远小于 child_min）：一个父亲容器 + 一个条款子块。
+
+    双索引由「叶子块才是检索单元」（`ekbs/ingest/retrievable.py`）保证：
+    父块被 child 覆盖 → 父块不进向量/FTS。所以这里不再靠「跳过 child」防重复。
+    """
     md = (
         "# 第 4 页\n\n"
         "1.能耗管理1-7用电量（工程部）\n"
@@ -93,18 +100,30 @@ def test_short_slide_page_skips_identical_child() -> None:
     )
     result = chunk_markdown(md, doc_title="工程汇报")
     assert result.parents
-    assert not result.children
-    # 父块是叶子：没有 child 指向它
-    assert all(n.parent_index is None for n in result.nodes)
+    parents = [n for n in result.nodes if n.chunk_type == "parent"]
+    children = result.children
+    assert len(parents) == 1 and len(children) == 1
+    assert children[0].parent_index == 0
+    # 父容器覆盖子块（spec §3.1），但父块本身不是检索单元
+    assert children[0].content.strip() in parents[0].content
 
 
-def test_short_document_leaves_parent_as_leaf() -> None:
-    """短节只能切出与父块相同的一块时：不建 child，父块本身作叶子入向量。"""
+def test_short_document_children_are_size_based() -> None:
+    """短文档：小条款**按 token 聚合**成一个 child，父块一个覆盖它。
+
+    以前按标题切 → 每条条款一个 10~30 token 的块，父块约等于子块、父子关系失效；
+    现在子块聚合到 ``child_min`` 才收口，父块再按 ``parent_min`` 装箱。
+    """
     result = chunk_markdown(SHORT_DOC)
-    assert result.parents, "至少一个父块"
-    assert not result.children, "短节不应再造一份等同正文的 child"
-    for parent in result.parents:
-        assert parent.parent_index is None
+    parents = [n for n in result.nodes if n.chunk_type == "parent"]
+    children = result.children
+    assert len(parents) == 1 and len(children) == 1
+    assert parents[0].parent_index is None
+    assert children[0].parent_index == 0
+    assert "第一条" in children[0].content and "第二条" in children[0].content
+    assert children[0].content.strip() in parents[0].content
+    assert parents[0].token_count >= children[0].token_count
+
 
 
 def test_long_parent_still_splits_into_children() -> None:
@@ -160,18 +179,26 @@ def test_adjacent_children_share_overlap() -> None:
     ), f"相邻子块未见 overlap：prev_tail={tail[:40]!r} cur_head={cur.content[:80]!r}"
 
 
-def test_small_section_becomes_a_small_parent() -> None:
-    """小节本身不足 1024 token 时**不跨中文条款/Markdown 标题合并**。
+def test_small_sections_are_aggregated_not_heading_fragments() -> None:
+    """小节短于 ``child_min`` 时**跨标题聚合**，不再"一个标题一个碎块"。
 
-    此时父块就是该小节全文（小于 ``PARENT_MIN_TOKENS``），这是有意的取舍：
-    检索精度与引用可溯源优先于「父块必须够大」。
-    点分嵌套小节（``4.1``）另见 ``test_pack_major_dotted_sections``。
+    实测（doc 196）：按标题切出 33 个 6~120 token 的块，父块 11~648、子块 6~101，
+    父子块尺寸同一量级 → 父块扩展等于没扩展。
     """
-    result = chunk_markdown(SHORT_DOC)
-    assert result.parents
-    assert all(node.token_count < PARENT_MIN_TOKENS for node in result.parents)
-    # 「第一条 / 第二条」不得被大节优先误合并
-    assert len(result.parents) >= 2
+    md = (
+        "# 手册\n\n"
+        "## 4. 制度\n\n"
+        "4.1 值班人员应提前十五分钟到岗并完成交接检查。\n"
+        "4.2 接班人员未按时到岗时，值班人员必须坚持岗位并上报。\n"
+        "4.3 接班记录应在当班结束后立即填写并签字确认。\n"
+    )
+    result = chunk_markdown(md)
+    parents = [n for n in result.nodes if n.chunk_type == "parent"]
+    assert len(parents) == 1
+    children = result.children
+    assert len(children) == 1, "三条短条款应聚合成一个子块"
+    assert all(k in children[0].content for k in ("4.1", "4.2", "4.3"))
+
 
 
 def test_major_heading_path_strips_nested_dotted() -> None:
@@ -181,9 +208,9 @@ def test_major_heading_path_strips_nested_dotted() -> None:
     assert major_heading_path("4.1 孤儿条款") == "4．"
 
 
-def test_pack_major_dotted_sections() -> None:
-    """4.1 / 4.2 各自成块，不按长度并进「4． 制度」。"""
-    long_41 = "4.1 " + ("接班人应提前到岗并完成检查。" * 8)
+def test_long_clause_splits_but_short_ones_aggregate() -> None:
+    """长条款在条内切开，短条款聚合成块 —— 切点仍落在条款边界，不拆行。"""
+    long_41 = "4.1 " + ("接班人应提前到岗并完成检查。" * 30)
     md = f"""# 交接班
 
 4． 制度
@@ -192,16 +219,15 @@ def test_pack_major_dotted_sections() -> None:
 4.3 接班人员酗酒时交班人员应拒绝交班。
 4.4 设备交班人向接班人介绍各系统运行状态。
 """
-    sections = pack_major_sections(split_sections(md))
-    rule = [s for s in sections if "4." in s.heading_path or "4．" in s.heading_path]
-    assert len(rule) >= 4, [s.heading_path for s in rule]
     result = chunk_markdown(md, doc_title="交接班管理制度")
-    leaves = [n for n in result.nodes if n.chunk_type in {"parent", "child"}]
-    assert any("4.1" in n.heading_path for n in leaves)
-    assert any("4.4" in n.heading_path for n in leaves)
-    for node in leaves:
-        text = node.content
-        assert not ("接班人应提前到岗" in text and "介绍各系统运行状态" in text)
+    children = result.children
+    assert len(children) >= 2, "长条款应切块、短条款聚合"
+    joined = "\n".join(child.content for child in children)
+    assert "介绍各系统运行状态" in joined, "短条款不得因聚合而丢字"
+    ceiling = CHILD_MAX_TOKENS + int(CHILD_MAX_TOKENS * OVERLAP_MIN_RATIO) + 32
+    assert all(child.token_count <= ceiling for child in children)
+    assert all(child.heading_path for child in children)
+
 
 
 def test_children_are_smaller_than_or_equal_to_parents() -> None:
@@ -241,28 +267,32 @@ def test_pages_for_uses_last_marker_not_in_range() -> None:
 
 
 def test_chunk_markdown_does_not_collapse_later_pages_to_page_one() -> None:
-    """回归开班典礼：后页小节不得因页标不在区间内而被标成 page_from=1。"""
-    # 模拟三页：每页一段短正文 + 标题
+    """回归开班典礼：后页内容不得被标成 page_from=1。"""
+    # 每页正文都超过 child_min，保证按页形成独立子块
     md = (
-        "# 开班典礼\n\n封面标题\n\n"
-        "# 导师介绍\n\n前知乎教育业务负责人\n\n"
-        "# 几种典型企业类别\n\n创业型公司与一人公司\n"
+        "# 开班典礼\n\n封面标题：开班典礼\n\n" + "封面介绍内容。" * 60 + "\n\n"
+        "# 导师介绍\n\n导师背景正文\n\n" + "导师背景说明。" * 60 + "\n\n"
+        "# 几种典型企业类别\n\n企业类别正文\n\n" + "企业类别说明。" * 60 + "\n"
     )
-    # 页界刻意落在标题行之后，复现「小节 current_start > 页标 offset」
     page_map = [
         (0, 1, 1),
         (md.index("# 导师介绍"), 2, 2),
         (md.index("# 几种典型企业类别"), 3, 3),
     ]
     result = chunk_markdown(md, page_map=page_map, doc_title="开班典礼")
-    by_heading = {n.heading_path: n for n in result.parents}
-    assert by_heading["开班典礼"].page_from == 1
-    assert by_heading["导师介绍"].page_from == 2
-    assert by_heading["几种典型企业类别"].page_from == 3
-    assert all(n.page_from != 1 or "开班典礼" in n.heading_path for n in result.parents)
 
+    def page_of(marker: str) -> int | None:
+        node = next(n for n in result.children if marker in n.content)
+        return node.page_from
 
-# ---------------------------------------------------------------- 零丢失（2026-10-02 实测事故）
+    assert page_of("封面介绍内容") == 1
+    assert page_of("导师背景说明") == 2
+    assert page_of("企业类别说明") == 3
+    assert all(
+        n.page_from != 1 or "封面" in n.content or "开班典礼" in n.heading_path
+        for n in result.children
+    )
+
 
 
 def test_single_line_clauses_are_not_swallowed() -> None:
@@ -324,14 +354,13 @@ def test_chapter_and_fullwidth_dotted_headings() -> None:
     assert ratio == 1.0 and not lost, f"覆盖率 {ratio:.0%}，丢失 {lost[:3]}"
     paths = [node.heading_path for node in result.nodes]
     assert any(p == "文件信息" or p.endswith("文件信息") for p in paths)
-    assert any(p == "1. 目的" for p in paths)
-    assert any(p == "2． 范围" for p in paths)
-    # 4.1 / 4.3 各自留在标题路径里，不并进上一节
-    assert any("4.1" in p for p in paths)
-    assert any("4.3" in p for p in paths)
+    # 聚合块里保留标题骨架：每个标题行都还能在正文里看到（否则引用不了）
     joined = "\n".join(f"{n.heading_path}\n{n.content}" for n in result.nodes)
-    assert "4.1" in joined and "4.3" in joined
+    for heading in ("1. 目的", "2． 范围", "4． 方法和过程控制", "4.1", "4.3"):
+        assert heading in joined, f"{heading} 在聚合块里丢了"
+    # 「文件信息」不得污染其它章的小节标题（章节路径不许跨章拼接）
     assert not any(p.startswith("文件信息 >") for p in paths if "4." in p or "目的" in p)
+
 
 
 def test_short_clause_title_keeps_behaviour_without_duplication() -> None:
@@ -404,8 +433,8 @@ def test_placeholder_only_sections_merge_into_next() -> None:
     assert "[表格 1]" in joined and "6．质量记录" in joined
 
 
-def test_clause_sections_stay_independent_even_if_short() -> None:
-    """条款不因"短"被合并 —— 否则不同规定混进同一块，检索精度变差。"""
+def test_short_clauses_are_aggregated_with_heading_skeleton() -> None:
+    """短条款聚合成块，但**每条条款的标题行仍保留在块内容里**（引用可溯源）。"""
     md = (
         "# 交接班\n\n"
         "4.2 接班人员未能到岗，值班人员必须坚持岗位。\n"
@@ -413,10 +442,11 @@ def test_clause_sections_stay_independent_even_if_short() -> None:
         "4.4 设备交班人向接班人介绍各系统运行状态。\n"
     )
     result = chunk_markdown(md, doc_title="交接班管理制度")
+    children = result.children
+    assert len(children) == 1, "三条短条款应聚合"
+    for clause in ("4.2", "4.3", "4.4"):
+        assert clause in children[0].content, f"{clause} 的标题行丢了"
 
-    paths = [node.heading_path for node in result.parents]
-    assert any("4.2" in path for path in paths)
-    assert any("4.4" in path for path in paths)
 
 
 def test_table_heading_carries_doc_title() -> None:
@@ -430,3 +460,161 @@ def test_table_heading_carries_doc_title() -> None:
 
     assert table_nodes
     assert all("月度履约评估表" in node.heading_path for node in table_nodes)
+
+
+# --- 父容器 / 子块结构（2026-11 修「0 child + 父块碎片化」）---------------------
+
+def test_parents_are_packed_by_token_target() -> None:
+    """父块按 token 目标装箱（可跨章）：父子块尺寸必须拉开量级。"""
+    body = "公司制度条款内容说明。" * 60  # 每节 ≈ 360 token
+    md = "# 员工手册\n\n" + "".join(
+        f"## 第 {i} 章 规定事项\n\n{body}\n\n" for i in range(1, 6)
+    )
+    result = chunk_markdown(md)
+    parents = [n for n in result.nodes if n.chunk_type == "parent"]
+    children = result.children
+    assert parents and children
+    assert all(p.token_count <= PARENT_MAX_TOKENS for p in parents)
+    assert any(p.token_count >= PARENT_MIN_TOKENS for p in parents), "父块要装到 parent_min"
+    for child in children:
+        assert child.parent_index is not None
+        owner = result.nodes[child.parent_index]
+        assert owner.chunk_type == "parent"
+        assert child.token_count <= owner.token_count
+    # 子块不再是 10~60 token 的标题碎片
+    assert all(c.token_count >= CHILD_MIN_TOKENS // 2 for c in children)
+
+
+
+def test_table_chunk_carries_section_heading_and_parent() -> None:
+    """表块必须带所在章节的 heading_path，并挂到同一章的父容器上（spec §3.4）。"""
+    md = (
+        "# 能耗管理作业指导书\n\n"
+        "## 5.2 能耗计划管理\n\n"
+        "每年 12 月 30 日前提报年度计划。\n"
+        "[表格 3]\n\n"
+        "## 5.3 能耗分析管理\n\n"
+        "每月 8 日前完成分析。\n"
+    )
+    result = chunk_markdown(
+        md,
+        doc_title="能耗管理作业指导书.docx",
+        tables=[
+            TableInput(
+                body="| 级别 | 工作内容 |\n| --- | --- |\n| A | 能耗普查 |",
+                table_id="3",
+            )
+        ],
+    )
+    tables = [n for n in result.nodes if n.chunk_type == "table"]
+    assert len(tables) == 1
+    table = tables[0]
+    assert "5.2 能耗计划管理" in table.heading_path, table.heading_path
+    assert "能耗管理作业指导书.docx" in table.heading_path
+    assert table.parent_index is not None, "表块必须挂到父容器（parent_id 不能是 NULL）"
+    assert result.nodes[table.parent_index].chunk_type == "parent"
+
+
+def test_table_row_chunks_only_when_table_exceeds_budget() -> None:
+    """`table_row_chunks` 只对超预算的大表生效；小表整表一块（spec §3.4）。"""
+    small = "| 项目 | 值 |\n| --- | --- |\n| a | 1 |\n| b | 2 |"
+    small_result = chunk_markdown(
+        "# 制度\n\n正文。\n",
+        doc_title="小表",
+        tables=[TableInput(body=small, table_id="1")],
+        table_row_chunks=True,
+    )
+    small_tables = [n for n in small_result.nodes if n.chunk_type == "table"]
+    assert len(small_tables) == 1, "小表不该逐行切块（三行样板会占掉 40% token）"
+    assert "表名: 表 1" in small_tables[0].content
+
+    rows = "\n".join(f"| 项目{i} | 数值{i} |" for i in range(300))
+    big = f"| 项目 | 值 |\n| --- | --- |\n{rows}"
+    big_result = chunk_markdown(
+        "# 制度\n\n正文。\n",
+        doc_title="大表",
+        tables=[TableInput(body=big, table_id="2")],
+        table_row_chunks=True,
+    )
+    big_tables = [n for n in big_result.nodes if n.chunk_type == "table"]
+    assert len(big_tables) > 1, "超预算的大表才按行出块"
+    assert all(node.content.startswith("表名:") for node in big_tables)
+
+
+def test_placeholder_merge_uses_leaf_heading_not_breadcrumb() -> None:
+    """空壳节并入下一节时只带**最后一级标题**，不把整条 heading_path 写进正文。"""
+    md = (
+        "# 制度\n\n"
+        "## 5. 工作程序和要求\n\n"
+        "### 5.3.2 能耗录入及能耗报告\n\n"
+        "[表格 5]\n\n"
+        "### 5.3.3 能耗分析\n\n"
+        "每月 8 日前完成分析。\n"
+    )
+    result = chunk_markdown(
+        md,
+        doc_title="能耗管理",
+        tables=[TableInput(body="| 项目 | 值 |\n| --- | --- |\n| a | 1 |", table_id="5")],
+    )
+    joined = "\n".join(node.content for node in result.nodes)
+    assert "5. 工作程序和要求 > 5.3.2 能耗录入及能耗报告" not in joined, "整条面包屑不得进正文"
+    assert "5.3.2 能耗录入及能耗报告" in joined, "最后一级标题仍要保留（限定词不能丢）"
+
+
+def test_small_table_folds_surrounding_prose_into_leaf() -> None:
+    """小表：上下文（段落标题名 + 上方临近文字 + 下方结论）折进叶子，不再裸表一块。"""
+    md = (
+        "# 能耗管理作业指导书\n\n"
+        "## 5.2 能耗计划管理\n\n"
+        "每年 12 月 30 日前提报年度计划。\n"
+        "[表格 3]\n"
+        "注：节假日执行时间另行通知。\n\n"
+        "## 5.3 能耗分析管理\n\n"
+        "每月 8 日前完成分析。\n"
+    )
+    result = chunk_markdown(
+        md,
+        doc_title="能耗管理作业指导书.docx",
+        tables=[TableInput(body="| 级别 | 工作内容 |\n| --- | --- |\n| A | 能耗普查 |", table_id="3")],
+    )
+    tables = [n for n in result.nodes if n.chunk_type == "table"]
+    assert len(tables) == 1, "小表应整表一块（不另设父容器）"
+    table = tables[0]
+    assert "每年 12 月 30 日前提报年度计划" in table.content, "上方临近文字应折进叶子"
+    assert "注：节假日执行时间另行通知" in table.content, "下方结论应折进叶子"
+    assert "5.2 能耗计划管理" in table.content, "段落标题名应折进叶子（限定词不能丢）"
+    # 只取最后一级标题，不把整条面包屑写进正文（面包屑泄漏回归）
+    assert "能耗管理作业指导书 > 5.2" not in table.content
+
+
+def test_large_table_gets_container_parent_and_row_leaves() -> None:
+    """大表：父容器（上文 + 整表 + 下文）+ 行/组叶子，叶子 parent_index 指向容器。"""
+    rows = "\n".join(f"| 项目{i} | 数值{i} |" for i in range(300))
+    big = f"| 项目 | 值 |\n| --- | --- |\n{rows}"
+    md = (
+        "# 制度\n\n"
+        "## 6．质量记录\n\n"
+        "下表列出全部质量记录。\n"
+        "[表格 2]\n"
+        "以上记录保存三年。\n"
+    )
+    result = chunk_markdown(
+        md,
+        doc_title="设备编号作业指导书",
+        tables=[TableInput(body=big, table_id="2")],
+        table_row_chunks=True,
+    )
+    tables = [n for n in result.nodes if n.chunk_type == "table"]
+    container_idx = {
+        n.parent_index
+        for n in tables
+        if n.parent_index is not None and result.nodes[n.parent_index].chunk_type == "table"
+    }
+    assert len(container_idx) == 1, "应恰有一个表父容器"
+    container = result.nodes[next(iter(container_idx))]
+    assert "下表列出全部质量记录" in container.content, "上方临近文字进父容器"
+    assert "以上记录保存三年" in container.content, "下方结论进父容器"
+    assert "6．质量记录" in container.content, "段落标题名进父容器"
+    leaves = [n for n in tables if n.parent_index in container_idx]
+    assert len(leaves) > 1, "大表应按行出叶子"
+    assert all(n.content.startswith("表名:") for n in leaves)

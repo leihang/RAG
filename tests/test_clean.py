@@ -205,3 +205,172 @@ async def test_ingest_stores_cleaned_text(seeded) -> None:
 def test_comparison_macros_become_symbols(raw: str, want: str) -> None:
     """比较符宏 → 符号（合同门槛是最常被取数的数字之一，不能留在 LaTeX 里）。"""
     assert normalize_math_in_text(raw)[0] == want
+
+
+@pytest.mark.parametrize(
+    ("raw", "kept"),
+    [
+        # 全库 38 份解析稿里 13 份命中过：正文里的「字母+汉字」被当签署栏乱码删掉
+        ("3.4 按ABC分级分类", "按ABC分级分类"),
+        ("A级为重要，能耗占比最高收益影响大。", "A级为重要"),
+        ("A栋电梯每周检查一次。", "A栋电梯"),
+        ("GB标准执行", "GB标准"),
+        ("MALL营业时间调整", "MALL营业"),
+        ("POP展架摆放规范", "POP展架"),
+        ("POS机刷卡", "POS机"),
+        ("ZR阻燃电缆", "ZR阻燃"),
+        ("BIM手册", "BIM手册"),
+    ],
+)
+def test_latin_cjk_mix_in_body_is_not_signature_noise(raw: str, kept: str) -> None:
+    """正文不是签署栏：字母+汉字是正常混排，不得被 `_SIGN_LATIN_JUNK` 删掉。"""
+    result = clean_markdown(raw)
+    assert kept in result.text, f"正文被误删：{raw!r} -> {result.text!r}"
+    assert result.stats.get("sign_latin_removed", 0) == 0
+
+
+def test_signature_line_latin_junk_still_stripped() -> None:
+    """签署行上的乱码仍要剥；关键词集合不能照抄 `_SIGN_LINE`（它只认「盖章）」等后缀）。"""
+    party = clean_markdown(
+        "甲方：ein高g重庆卓越城市运营服务有限责任公司经办人：日期：24年2月"
+    )
+    assert "ein高g" not in party.text
+    assert "重庆卓越城市运营服务有限责任公司" in party.text
+    assert party.stats.get("sign_latin_removed", 0) >= 1
+
+    broken = clean_markdown("乙方：E動责任公司经办人：日期：2026年1月1日")
+    assert "E動" not in broken.text
+
+    sign = clean_markdown("授权代表签字：高信5001 01080423901 署日期：2026年4月2日")
+    assert "高信" not in sign.text
+    assert "01080423901" not in sign.text
+    assert "[手写签字]" in sign.text
+    assert "签署日期" in sign.text
+
+
+def test_signature_cleaning_is_idempotent() -> None:
+    """同一份混合文本跑两次 clean_markdown，第二次不再变化（重复入库不抖动）。"""
+    raw = (
+        "3.4 按ABC分级分类\n"
+        "A级为重要，能耗占比最高收益影响大。\n"
+        "甲方：ein高g重庆卓越城市运营服务有限责任公司经办人：日期：24年2月\n"
+        "乙方：重庆美日宝金制冷设备有限公司\n"
+    )
+    once = clean_markdown(raw)
+    twice = clean_markdown(once.text)
+    assert once.text.count("ABC") == 1 and "A级为重要" in once.text
+    assert "ein高g" not in once.text
+    assert twice.text == once.text
+    assert twice.stats.get("sign_latin_removed", 0) == 0
+
+
+# --- 规则按来源分域：scan（扫描件） vs office（Word/Excel/PPT 原生文本） --------
+# 事故（doc 196 / doc 175 等 13 份）：OCR 清洗规则对 Word 也全量跑，把正文的
+# 「按ABC分级分类」删成「按分类」、「MALL营业」删成「营业」——Word 里那是原文，
+# 不是盖章压字，清洗层不能臆改。
+
+def test_office_profile_does_not_apply_ocr_repairs() -> None:
+    from ekbs.ingest.clean import OFFICE_PROFILE, SCAN_PROFILE, clean_markdown
+
+    raw = (
+        "由有限责仕公司按ABC分级分类管理。\n"
+        "安全培训覆盖率 $1 0 0 \\%$ 。\n"
+        "食务有限章）\n"
+    )
+    office = clean_markdown(raw, profile=OFFICE_PROFILE)
+    scan = clean_markdown(raw, profile=SCAN_PROFILE)
+
+    # office：原文一字不改（只做空白归一）
+    assert "有限责仕公司" in office.text
+    assert "按ABC分级分类" in office.text
+    assert "食务有限章" in office.text
+    assert office.profile == OFFICE_PROFILE
+
+    # scan：错字/公式/印章碎片都被修（这是扫描件该有的行为）
+    assert "有限责任公司" in scan.text
+    assert "100%" in scan.text and "\\%" not in scan.text
+    assert "食务有限章" not in scan.text
+
+
+def test_office_profile_normalizes_whitespace_only() -> None:
+    from ekbs.ingest.clean import OFFICE_PROFILE, clean_markdown
+
+    raw = "标题\u3000\u3000栏目\t\t值  \n\n\n\n正文\r\n"
+    result = clean_markdown(raw, profile=OFFICE_PROFILE)
+    assert result.text.rstrip("\n") == "标题 栏目 值\n\n正文"
+    assert result.stats["tabs_normalized"] == 2
+    assert result.stats["space_normalized"] >= 2
+    assert result.stats["blank_lines_collapsed"] == 1
+
+
+def test_scan_profile_is_default_for_backcompat() -> None:
+    from ekbs.ingest.clean import SCAN_PROFILE, clean_markdown
+
+    raw = "安全培训覆盖率 $1 0 0 \\%$ ，有限责仕公司。"
+    default = clean_markdown(raw)
+    explicit = clean_markdown(raw, profile=SCAN_PROFILE)
+    assert default.text == explicit.text
+    assert default.profile == SCAN_PROFILE
+
+
+def test_unknown_clean_profile_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        clean_markdown("正文", profile="ocr")
+
+
+@pytest.mark.parametrize(
+    ("path", "want"),
+    [
+        ("制度.docx", "office"),
+        ("旧格式.doc", "office"),
+        ("台账.xlsx", "office"),
+        ("旧表.xls", "office"),
+        ("汇报.pptx", "office"),
+        ("扫描件.pdf", "scan"),
+        ("合同.md", "scan"),
+        ("正文.txt", "scan"),
+        ("", "scan"),
+    ],
+)
+def test_clean_profile_for_path_follows_suffix(path: str, want: str) -> None:
+    from ekbs.ingest.clean import clean_profile_for_path
+
+    assert clean_profile_for_path(path) == want
+
+
+async def test_ingest_office_source_skips_ocr_cleaning(seeded) -> None:
+    """接线断言：.docx 来源入库**不跑** OCR 错字替换（.md 来源仍会跑）。"""
+    from ekbs.ingest.pipeline import IngestPipeline
+
+    runtime, summary = seeded
+    pipeline = IngestPipeline(
+        db=runtime.db,
+        settings=runtime.settings,
+        providers=runtime.providers,
+        shards=runtime.shards,
+        fts=runtime.fts,
+        figure_index=runtime.figure_index,
+    )
+
+    async def _ingest(source_path: str) -> str:
+        result = await pipeline.ingest_markdown(
+            title=f"来源自检{source_path}",
+            markdown="# 制度\n\n由有限责仕公司按ABC分级分类管理，覆盖率 100%。\n",
+            kb_id=int(summary["kb_id"]),
+            level=1,
+            visible_dept_ids=[],
+            source_path=source_path,
+            real_corpus=False,
+        )
+        with runtime.db.sync_connect() as conn:
+            rows = conn.execute(
+                "SELECT content FROM ekbs_chunk WHERE doc_id = ?", (result.doc_id,)
+            ).fetchall()
+        return "\n".join(str(r["content"]) for r in rows)
+
+    office_text = await _ingest("制度.docx")
+    assert "有限责仕公司" in office_text, "Word 原生文本里的错字是原文，不该被清洗层替换"
+    assert "按ABC分级分类" in office_text
+
+    scan_text = await _ingest("制度.md")
+    assert "有限责任公司" in scan_text, "非 Office 来源仍按扫描件规则修错字"

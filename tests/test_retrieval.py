@@ -9,9 +9,13 @@ from __future__ import annotations
 import pytest
 
 from ekbs.retrieval.pipeline import (
+    REFUSE_ALL_DENIED,
     REFUSE_BELOW_THRESHOLD,
+    REFUSE_NO_CANDIDATE,
+    RetrievedChunk,
     REFUSE_EMBED_UNAVAILABLE,
     REFUSE_NO_SHARD,
+    refusal_answer_text,
 )
 from ekbs.retrieval.rrf import rrf_fuse
 from tests.conftest import user_id_of
@@ -250,6 +254,102 @@ async def test_parent_expansion_returns_parent_chunk(seeded) -> None:
     assert any(chunk.chunk_type == "parent" for chunk in result.chunks)
 
 
+async def test_parent_expansion_keeps_clause_heading(seeded) -> None:
+    """父块扩展只换**内容**，标题路径保留命中子块的条款层。
+
+    父块现在是章节容器（「同章小节的上下文」）。若整块替换，引用块的 heading_path
+    只剩章名，答案里写「第X条」时 ``clause_mismatches`` 在标题里找不到条号 →
+    正确的条款引用会被判幻觉、整答拒掉。
+    """
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    with runtime.db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT c.chunk_id, c.parent_id, c.heading_path, c.doc_id, c.shard_id "
+            "FROM ekbs_chunk c WHERE c.chunk_type = 'child' AND c.parent_id IS NOT NULL "
+            "ORDER BY c.chunk_id LIMIT 1"
+        ).fetchone()
+    assert row is not None, "种子语料应产出 child（父容器 + 条款子块）"
+    child = RetrievedChunk(
+        chunk_id=int(row["chunk_id"]),
+        doc_id=int(row["doc_id"]),
+        shard_id=str(row["shard_id"]),
+        content="占位正文",
+        heading_path=str(row["heading_path"]),
+        chunk_type="child",
+        parent_chunk_id=int(row["parent_id"]),
+    )
+    expanded = runtime.pipeline._expand_parents([child], alice)
+    assert expanded, "命中子块应扩展成父块上下文"
+    assert expanded[0].chunk_type == "parent"
+    assert expanded[0].heading_path == str(row["heading_path"]), "条款层标题必须保留"
+
+
+def test_table_row_group_expands_into_table_parent() -> None:
+    """大表行组命中 → 扩成表父块（上文 + 整表 + 下文），标题保留命中的表名路径。
+
+    小表（整表一块、``parent_id`` 指向正文父块）不展开：展开会把它换成不含表格的正文。
+    """
+    from ekbs.retrieval.pipeline import RetrievalPipeline
+
+    container = RetrievedChunk(
+        chunk_id=10,
+        doc_id=1,
+        shard_id="s1",
+        content="6．质量记录\n\n下表列出全部质量记录。\n\n表名: 表 2\n…\n以上记录保存三年。",
+        heading_path="制度 > 6．质量记录 · 表 2",
+        chunk_type="table",
+    )
+    row_group = RetrievedChunk(
+        chunk_id=11,
+        doc_id=1,
+        shard_id="s1",
+        content="表名: 表 2\n项目1=数值1",
+        heading_path="制度 > 6．质量记录 · 表 2",
+        chunk_type="table",
+        parent_chunk_id=10,
+    )
+    prose_parent = RetrievedChunk(
+        chunk_id=12,
+        doc_id=1,
+        shard_id="s1",
+        content="正文父块内容（不含表格）",
+        heading_path="制度 > 6．质量记录",
+        chunk_type="parent",
+    )
+
+    class _Gate:
+        def filter_chunks(self, perm, chunks):
+            return [(cid, did) for cid, did in chunks], []
+
+    class _Perm:
+        user_id = "u1"
+
+    pipeline = object.__new__(RetrievalPipeline)
+    pipeline.load_chunks = lambda ids: {
+        c.chunk_id: c for c in (container, prose_parent) if c.chunk_id in ids
+    }
+    pipeline.gate = _Gate()
+
+    expanded = pipeline._expand_parents([row_group], _Perm())
+    assert expanded and expanded[0].chunk_id == 10, "行组叶子应扩成表父块"
+    assert expanded[0].chunk_type == "table"
+    assert "以上记录保存三年" in expanded[0].content, "下文结论应进上下文"
+    assert expanded[0].heading_path == row_group.heading_path, "表名路径标题必须保留"
+
+    small = RetrievedChunk(
+        chunk_id=13,
+        doc_id=1,
+        shard_id="s1",
+        content="表名: 表 4\n…",
+        heading_path="制度 · 表 4",
+        chunk_type="table",
+        parent_chunk_id=12,
+    )
+    expanded2 = pipeline._expand_parents([small], _Perm())
+    assert expanded2[0].content == small.content, "小表不得展开（parent 是正文父块）"
+
+
 async def test_irrelevant_query_is_refused(seeded) -> None:
     runtime, _ = seeded
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
@@ -280,6 +380,18 @@ async def test_embedding_unavailable_refuses_instead_of_fts_only(seeded) -> None
         runtime.pipeline.providers.embed = original  # type: ignore[assignment]
     assert result.refused is True
     assert result.refusal_reason in {REFUSE_EMBED_UNAVAILABLE, REFUSE_BELOW_THRESHOLD}
+
+
+def test_refusal_answer_text_distinguishes_permission_vs_miss() -> None:
+    """拒答文案按 refusal_reason 区分：无权限引导授权，未命中引导「帮助」查目录。"""
+    assert refusal_answer_text(REFUSE_NO_SHARD) == "对不起，你无权查阅资料，如需授权请联系管理员。"
+    for reason in (REFUSE_NO_CANDIDATE, REFUSE_BELOW_THRESHOLD, REFUSE_ALL_DENIED):
+        assert refusal_answer_text(reason) == (
+            "对不起，未找到相关信息。你可以输入帮助，来确认你可以查阅的资料目录清单。"
+        ), reason
+    # 其余原因（嵌入不可用等）维持原口径
+    assert refusal_answer_text(REFUSE_EMBED_UNAVAILABLE) == "未找到可靠依据。"
+    assert refusal_answer_text("") == "未找到可靠依据。"
 
 
 async def test_no_visible_shard_refuses_cleanly(seeded) -> None:

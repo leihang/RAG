@@ -387,7 +387,7 @@ def _logical_row_cells(row: Any) -> list[str]:
         if key is not None:
             position[key] = len(texts)
         if tc is not None and _is_docx_element(tc):
-            raw_text = _docx_element_text(tc, _docx_qn())
+            raw_text = _docx_cell_text(tc, _docx_qn())
         else:
             raw_text = getattr(cell, "text", "") or ""
         texts.append(raw_text.strip().replace("\n", " "))
@@ -458,6 +458,217 @@ def _is_docx_element(tc: Any) -> bool:
     return "wordprocessingml" in tag
 
 
+def _docx_cell_text(cell: Any, qn: Any) -> str:
+    """单元格文本：**逐段**取文、段间以「；」分隔。
+
+    为什么不能整格拼所有 ``w:t``：Word 一个单元格里常放多个编号段
+    （实测「…现场使用情况检查」+「2、总水表…」），拼成「…检查2、总水表…」
+    后编号与上一条粘连，下游按行切表时无处可切。段内仍走
+    :func:`_docx_element_text`（保留 ``w:sym`` / ``w:tab`` / ``w:br`` 语义）。
+    """
+    parts: list[str] = []
+    for child in cell.iterchildren():
+        text = _docx_element_text(child, qn).strip()
+        if text:
+            parts.append(text)
+    return "；".join(parts)
+
+
+#: OOXML ``w:`` 命名空间的 Clark 记法前缀。用字符串常量而不是 python-docx 的
+#: ``qn``：numbering.xml 直接从 zip 读（``xml.etree``），不必先 import docx。
+_DOCX_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+class _DocxNumberingLevel(NamedTuple):
+    """``word/numbering.xml`` 里一层的编号定义。"""
+
+    start: int
+    num_fmt: str
+    lvl_text: str
+    suffix: str
+
+
+@dataclass
+class _DocxNumberingList:
+    """一个 ``numId`` 的编号定义。
+
+    不同 ``numId`` 即使共用同一个 abstractNum 也**独立计数**（Word 里就是不同列表，
+    实测本文件表 3 单元格里 numId=2/3/4 各从 1 起）。
+    """
+
+    levels: dict[int, _DocxNumberingLevel]
+    start_overrides: dict[int, int] = field(default_factory=dict)
+
+
+def _docx_val(parent: Any, tag: str, default: str = "") -> str:
+    """读 ``<w:tag w:val="…"/>`` 子元素的值（numbering.xml 的通用形状）。"""
+    node = parent.find(_DOCX_W + tag)
+    if node is None:
+        return default
+    return str(node.get(_DOCX_W + "val") or default)
+
+
+def _docx_int(raw: str | None) -> int | None:
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_docx_numbering(path: Path) -> dict[str, _DocxNumberingList]:
+    """读 docx 的 ``word/numbering.xml``：``numId`` → 各层 (start, numFmt, lvlText, suff)。
+
+    为什么从 zip 直接读：``document.part.numbering_part`` 在不同 python-docx 版本
+    行为不一，且无编号表时会抛异常；zip 里缺失/坏掉只该是"没有编号"，不能让解析
+    失败 —— ``log.debug`` 后返回 ``{}``，正文原样保留。
+    """
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            raw = archive.read("word/numbering.xml")
+    except (KeyError, OSError, zipfile.BadZipFile) as exc:
+        log.debug("docx_numbering_unavailable", file=path.name, error=str(exc))
+        return {}
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        log.debug("docx_numbering_unparsable", file=path.name, error=str(exc))
+        return {}
+
+    abstracts: dict[str, dict[int, _DocxNumberingLevel]] = {}
+    for abstract in root.findall(_DOCX_W + "abstractNum"):
+        abstract_id = str(abstract.get(_DOCX_W + "abstractNumId") or "")
+        if not abstract_id:
+            continue
+        levels: dict[int, _DocxNumberingLevel] = {}
+        for lvl in abstract.findall(_DOCX_W + "lvl"):
+            ilvl = _docx_int(lvl.get(_DOCX_W + "ilvl"))
+            if ilvl is None:
+                continue
+            levels[ilvl] = _DocxNumberingLevel(
+                start=_docx_int(_docx_val(lvl, "start", "1")) or 1,
+                num_fmt=_docx_val(lvl, "numFmt", "decimal").lower(),
+                lvl_text=_docx_val(lvl, "lvlText"),
+                suffix=_docx_val(lvl, "suff", "tab").lower(),
+            )
+        abstracts[abstract_id] = levels
+
+    numbering: dict[str, _DocxNumberingList] = {}
+    for num in root.findall(_DOCX_W + "num"):
+        num_id = str(num.get(_DOCX_W + "numId") or "")
+        levels = abstracts.get(_docx_val(num, "abstractNumId"))
+        if not num_id or not levels:
+            continue
+        overrides: dict[int, int] = {}
+        for override in num.findall(_DOCX_W + "lvlOverride"):
+            ilvl = _docx_int(override.get(_DOCX_W + "ilvl"))
+            start = _docx_int(_docx_val(override, "startOverride"))
+            if ilvl is not None and start is not None:
+                overrides[ilvl] = start
+        numbering[num_id] = _DocxNumberingList(levels=levels, start_overrides=overrides)
+    return numbering
+
+
+def _format_docx_number(value: int, num_fmt: str) -> str:
+    """计数器 → 编号文字；未支持的 numFmt 退回十进制（丢编号比格式不对更糟）。"""
+    if num_fmt == "decimalzero":
+        return f"{value:02d}"
+    return str(value)
+
+
+def _docx_number_label(
+    definition: _DocxNumberingList, counters: dict[int, int], ilvl: int
+) -> str:
+    """按 Word 语义推进计数并渲染编号；返回 ``""`` 表示该层没有可见编号。"""
+    level = definition.levels.get(ilvl)
+    if level is None or level.num_fmt in {"bullet", "none"} or not level.lvl_text:
+        return ""
+    start = definition.start_overrides.get(ilvl, level.start)
+    current = counters.get(ilvl)
+    counters[ilvl] = start if current is None else current + 1
+    # 较浅层级递增时，更深层级的编号从头开始（Word 的列表语义）
+    for deeper in [key for key in counters if key > ilvl]:
+        del counters[deeper]
+
+    def counter_at(index: int) -> int:
+        if index not in counters:
+            nested = definition.levels.get(index)
+            counters[index] = definition.start_overrides.get(
+                index, nested.start if nested is not None else 1
+            )
+        return counters[index]
+
+    label = level.lvl_text
+    for index in range(9):
+        placeholder = f"%{index + 1}"
+        if placeholder not in label:
+            continue
+        nested = definition.levels.get(index)
+        num_fmt = nested.num_fmt if nested is not None else "decimal"
+        label = label.replace(placeholder, _format_docx_number(counter_at(index), num_fmt))
+    return label
+
+
+def _insert_docx_numbering_run(paragraph: Any, label: str, separator: str, qn: Any) -> None:
+    """在段首（``w:pPr`` 之后）插入编号 run —— 与 Word 把编号显示在正文前一致。"""
+    run = paragraph.makeelement(qn("w:r"), {})
+    node = run.makeelement(qn("w:t"), {})
+    node.text = label + separator
+    # 尾随空格不能被 XML 处理吃掉（"5. " 靠它和正文分开）
+    node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    run.append(node)
+    p_pr = paragraph.find(qn("w:pPr"))
+    if p_pr is None:
+        paragraph.insert(0, run)
+    else:
+        paragraph.insert(list(paragraph).index(p_pr) + 1, run)
+
+
+def _expand_docx_numbering(
+    document: Any, qn: Any, numbering: dict[str, _DocxNumberingList]
+) -> int:
+    """把 ``w:numPr`` 的自动编号展开成段首文字（返回展开的段落数）。
+
+    Word 把列表编号存在 numbering.xml + 段落的 ``w:numPr`` 里，正文 ``w:t`` 中
+    **没有编号** —— 不展开就等于丢编号。实测《XJWY-GC-12》的「工作程序和要求」
+    实为第 5 章（abstractNum start=5），解析稿没有「5.」，整章下沉到第 4 章下。
+
+    计数按 ``numId`` 隔离；原文手打同样编号的段落（如字面「3、」）跳过不重复前置。
+    """
+    if not numbering:
+        return 0
+    counters: dict[str, dict[int, int]] = {}
+    expanded = 0
+    for paragraph in document.element.body.iter(qn("w:p")):
+        p_pr = paragraph.find(qn("w:pPr"))
+        num_pr = p_pr.find(qn("w:numPr")) if p_pr is not None else None
+        if num_pr is None:
+            continue
+        num_id_el = num_pr.find(qn("w:numId"))
+        num_id = num_id_el.get(qn("w:val")) if num_id_el is not None else ""
+        ilvl_el = num_pr.find(qn("w:ilvl"))
+        ilvl = _docx_int(ilvl_el.get(qn("w:val")) if ilvl_el is not None else None)
+        num_id = str(num_id or "").strip()
+        definition = numbering.get(num_id)
+        # numId=0 是 OOXML 里「本段取消编号」的写法
+        if not num_id or num_id == "0" or ilvl is None or definition is None:
+            continue
+        existing = _docx_element_text(paragraph, qn).strip()
+        label = _docx_number_label(definition, counters.setdefault(num_id, {}), ilvl)
+        if not label:
+            continue
+        if not existing:
+            continue  # 空段只推进计数，不往正文塞一个孤零零的编号
+        if existing.startswith(label):
+            continue  # 原文已手打同样编号，不重复前置
+        separator = "" if definition.levels[ilvl].suffix == "nothing" else " "
+        _insert_docx_numbering_run(paragraph, label, separator, qn)
+        expanded += 1
+    return expanded
+
+
 def _docx_table_html(table: Any) -> str:
     """docx 表 → 带 ``colspan``/``rowspan`` 的 HTML —— **所有 Word 表格的统一口径**。
 
@@ -477,7 +688,7 @@ def _docx_table_html(table: Any) -> str:
     for row in table.rows:
         cells: list[dict[str, Any]] = []
         for tc in row._tr.tc_lst:
-            text = _docx_element_text(tc, qn).strip().replace("\n", " ")
+            text = _docx_cell_text(tc, qn).strip().replace("\n", " ")
             span = 1
             vmerge = ""
             tc_pr = tc.tcPr
@@ -667,11 +878,20 @@ def _ingest_docx_images(element: Any, document: Any, state: _DocxState) -> None:
         _register_docx_figure(state, blob, ext, caption)
 
 
+#: 表题注段：「表1-年度能耗管理计划编制及实施要求」这类紧邻表格的**普通正文段**。
+#: Word 里题注不一定是 caption 样式，只靠样式识别会丢；不识别则表块名与原文表题错位。
+_DOCX_TABLE_CAPTION = re.compile(r"^表\s*\d+")
+#: 题注段长度上限：超过这个长度的「表…」段落大概率是正文（说明/引用），不该当表名。
+_DOCX_TABLE_CAPTION_MAX_LEN = 60
+
+
 def _walk_docx_body(document: Any, state: _DocxState, qn: Any) -> None:
     """按文档顺序交错段落 / 表格 / 图片，避免「全文段落完再甩表/图」打乱阅读位置。"""
     from docx.table import Table
     from docx.text.paragraph import Paragraph
 
+    # 表格前最近的非空正文段（题注候选）；被别的表格或正文段打断就清空
+    pending_caption = ""
     for child in document.element.body.iterchildren():
         if child.tag == qn("w:p"):
             paragraph = Paragraph(child, document)
@@ -684,6 +904,10 @@ def _walk_docx_body(document: Any, state: _DocxState, qn: Any) -> None:
             _ingest_docx_images(child, document, state)
             if not text:
                 continue
+            if _DOCX_TABLE_CAPTION.match(text) and len(text) <= _DOCX_TABLE_CAPTION_MAX_LEN:
+                pending_caption = text
+            else:
+                pending_caption = ""
             style = (paragraph.style.name or "").lower() if paragraph.style else ""
             if style.startswith("heading"):
                 level = "".join(ch for ch in style if ch.isdigit()) or "1"
@@ -695,12 +919,14 @@ def _walk_docx_body(document: Any, state: _DocxState, qn: Any) -> None:
             _ingest_docx_images(child, document, state)
             # 统一口径：带 colspan/rowspan 的 HTML（保留 Word 原表版式）
             body = _docx_table_html(table)
+            # 题注只给紧邻的第一张表；空表也消费掉，避免跨表错挂
+            caption, pending_caption = pending_caption, ""
             if not body:
                 continue
             state.table_seq += 1
             state.tables.append(
                 ParsedTable(
-                    body=body, caption="", page=None, table_id=str(state.table_seq),
+                    body=body, caption=caption, page=None, table_id=str(state.table_seq),
                     preserve_layout=True,
                 )
             )
@@ -771,6 +997,8 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
         raise ParserUnavailable(f"python-docx 不可用：{exc}") from exc
 
     document = docx.Document(str(path))
+    # 自动编号住在 numbering.xml + 段落的 w:numPr 里，正文 w:t 中看不到；先展开再遍历
+    numbering_expanded = _expand_docx_numbering(document, qn, _read_docx_numbering(path))
     header_meta, header_page_count = _docx_header_meta(document)
     state = _DocxState(assets_dir=assets_dir, log_file=path.name)
     state.lines.extend(_docx_header_lines(header_meta))
@@ -778,6 +1006,8 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
     _collect_docx_fallback_images(path, document, state)
     _attach_textless_captions(state, path.stem.strip())
 
+    if numbering_expanded:
+        log.info("docx_numbering_expanded", file=path.name, paragraphs=numbering_expanded)
     if state.figures:
         log.info("docx_figures_extracted", file=path.name, figures=len(state.figures))
     if header_meta:

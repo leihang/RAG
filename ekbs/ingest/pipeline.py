@@ -30,7 +30,7 @@ from ekbs.index.shard import parse_shard_id, resolve_shard_for_document
 from ekbs.ingest.code_chunker import chunk_code, display_source_path, is_code_source
 from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE, retrievable_chunk_ids
 from ekbs.ingest import token_calib
-from ekbs.ingest.clean import clean_figure_text, clean_markdown
+from ekbs.ingest.clean import clean_figure_text, clean_markdown, clean_profile_for_path
 from ekbs.ingest.seal_filter import partition_seal_figures, strip_figure_anchors
 from ekbs.ingest.table_merge import merge_continued_tables
 from ekbs.ingest.chunker import (
@@ -237,9 +237,13 @@ class IngestPipeline:
         # 代码不走这步：扫描件清洗会把连续空格压成一个，Python 缩进一丢，
         # AST 就切不出类里的方法。
         if not is_code_source(source_path):
-            cleaned = clean_markdown(markdown)
-            if cleaned.stats:
-                log.info("markdown_cleaned", title=title, **cleaned.stats)
+            # profile 按来源分域：Word/Excel/PPT 是原生文本，只做空白归一；
+            # OCR 规则（公式残留/断字/错字/印章）只对扫描件成立，套到 Office 上
+            # 会静默改字（实测把「按ABC分级分类」删成「按分类」）。
+            profile = clean_profile_for_path(source_path)
+            cleaned = clean_markdown(markdown, profile=profile)
+            if cleaned.stats or profile != "scan":
+                log.info("markdown_cleaned", title=title, profile=profile, **cleaned.stats)
             markdown = cleaned.text
         # 跨页续表合并（清洗步 4）；过长则保持拆开，由 table_serialize 按行批拆
         markdown, tables_list, merge_stats = merge_continued_tables(markdown, list(tables))

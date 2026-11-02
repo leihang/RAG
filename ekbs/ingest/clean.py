@@ -12,9 +12,20 @@
 1. **公式/单位残留规整**：MinerU 数学模式把 `100%` 拆成 `$1 0 0 \\%$` → 还原成人话。
 2. **扫描件印章/签字噪声**（`20` §2 步 2「水印与印章不进正文」）：
    公章 OCR 碎片、统一社会信用代码尾号、视觉模型「盖有红色印章…」描述、
-   签署栏拉丁乱码（``ein高g`` / ``01g80423001``）从正文与图注里剔除。
+   签署栏拉丁乱码（``ein高g`` / ``01g80423001``）从签署行与图注里剔除
+   （只在「标签+冒号」的签署字段行上剥，正文的字母+汉字混排不动）。
 3. **中文断字合回**：扫描 OCR 常见 ``项目名 称`` / ``离心 机`` → ``项目名称`` / ``离心机``。
 4. **高发 OCR 错字**：如 ``有限责仕公司`` → ``有限责任公司``（盖章压字后误识）。
+
+## 规则按来源分域（2026-11）
+
+上面 1~4 条都是**扫描件/OCR**才成立的问题。Word/Excel/PPT 是原生文本，套用这些规则会
+**静默改字**（实测把「按ABC分级分类」删成「按分类」、「MALL营业」删成「营业」）。所以
+清洗入口按来源分 ``profile``：
+
+* ``scan``（默认）：PDF/扫描图片/未知来源，跑全部规则；
+* ``office``：docx/doc/xlsx/xls/pptx，**只做空白与控制字符归一** —— 错字、印章、LaTeX
+  残留在 Word 里就是原文，要改改源文件，不能由清洗层臆改。
 
 ## 规矩
 
@@ -25,6 +36,7 @@
 
 from __future__ import annotations
 
+import pathlib
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,6 +44,22 @@ from typing import Any
 from ekbs.logging import get_logger
 
 log = get_logger(component="ingest.clean")
+
+#: 清洗 profile：扫描件（OCR/版面）与 Office 原生文档用**不同规则集**。
+#: 见模块头「规则按来源分域」。
+SCAN_PROFILE = "scan"
+OFFICE_PROFILE = "office"
+_PROFILES = (SCAN_PROFILE, OFFICE_PROFILE)
+
+#: 这些后缀由 Office 解析器产出**原生文本**（`python-docx` / `openpyxl` / `python-pptx`），
+#: 没有 OCR 噪声，清洗层只做空白归一。
+OFFICE_SUFFIXES = frozenset({".docx", ".doc", ".xlsx", ".xls", ".pptx"})
+
+#: Office 文档只需要这几条：多空格/全角空格压一个、行尾空格、3+ 空行、零宽/控制字符。
+_OFFICE_HSPACE = re.compile(r"[ \t\u3000]{2,}")
+_OFFICE_TRAILING = re.compile(r"(?m)[ \t\u3000]+$")
+_OFFICE_BLANK_LINES = re.compile(r"\n{3,}")
+_ZERO_WIDTH = re.compile(r"[\u200b-\u200f\u2028\u2029\ufeff]")
 
 #: 行内/行间公式（非贪婪，`$$` 优先匹配，避免把 `$a$ $b$` 连成一段）
 _MATH_SPAN = re.compile(r"\$\$(?P<body>.+?)\$\$|\$(?P<body2>.+?)\$", re.DOTALL)
@@ -102,6 +130,16 @@ _SEAL_CODE_FRAG = re.compile(
     r"|(?<![元￥$])\d{13,18}(?![.\d])"  # 信用代码长度；排除带小数金额
     r")"
     r"(?!\d)"
+)
+#: `_SIGN_LATIN_JUNK` 的作用域门：只剥**签署字段**行（标签紧跟冒号，如
+#: ``甲方：`` / ``授权代表签字：`` / ``甲方（盖章）：``）。
+#: 不能只认关键词：租赁合同条款正文里「乙方确认…」「…的乙方」几乎每行都有，
+#: 会把正文的 ``POS机`` / ``POP规格`` / ``熙熙MALL`` 当乱码删掉（doc 175 实测）。
+#: 也不能复用 `_SIGN_LINE` —— 它要求行内出现「盖章）」这类后缀，没有后缀的
+#: ``授权代表签字：…`` 会漏剥。
+_SIGN_LINE_FOR_LATIN = re.compile(
+    r"(?:甲方|乙方|代表人|授权代表|经办人|签字|签署(?:日期)?|盖章)"
+    r"\s*(?:[（(][^）)\n]{0,10}[）)])?\s*[：:]"
 )
 _SIGN_LINE = re.compile(
     r"(?m)^.*(甲方|乙方|代表人|授权代表|经办人|签字|签署日期|盖章）).*$"
@@ -236,6 +274,24 @@ def _mask_handwritten_names(text: str) -> tuple[str, int]:
     return _HANDWRITE_NAME.sub(_sub, text), n
 
 
+def _strip_sign_latin_junk(text: str) -> tuple[str, int]:
+    """只在签署行上剥拉丁乱码。返回 (文本, 删除次数)。
+
+    正文里「按ABC分级分类」「GB标准执行」「MALL营业」是正常字母+汉字混排，
+    全文替换会把它删成「按分类」「执行」（全库 38 份解析稿里 13 份命中）。
+    """
+    removed = 0
+    lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        if not _SIGN_LINE_FOR_LATIN.search(line):
+            lines.append(line)
+            continue
+        cleaned_line, n = _SIGN_LATIN_JUNK.subn("", line)
+        removed += n
+        lines.append(cleaned_line)
+    return "".join(lines), removed
+
+
 def strip_seal_and_signature_noise(text: str) -> tuple[str, dict[str, int]]:
     """去掉扫描件印章/签署栏 OCR 噪声（`20` §2 步 2）。
 
@@ -273,7 +329,11 @@ def strip_seal_and_signature_noise(text: str) -> tuple[str, dict[str, int]]:
     if inline_removed:
         stats["seal_code_removed"] += inline_removed
         out = "".join(kept_lines)
-    _count_sub(_SIGN_LATIN_JUNK, "sign_latin_removed")
+    # 拉丁乱码只在签署行上剥：正文里的「按ABC分级分类」「GB标准执行」是正常
+    # 字母+汉字混排，全文替换会把「ABC」删成「按分类」。
+    out, latin_removed = _strip_sign_latin_junk(out)
+    if latin_removed:
+        stats["sign_latin_removed"] += latin_removed
     _count_sub(_SEAL_GARBLED, "seal_desc_removed")
 
     # 仅在签署行剥信用代码碎片。带账号/开户/银行的行是尾部账户信息，数字留下。
@@ -312,6 +372,46 @@ def strip_seal_and_signature_noise(text: str) -> tuple[str, dict[str, int]]:
     out = re.sub(r"(?<![签日])署日期", "签署日期", out)
     out = re.sub(r"授权代表\s*授权代表", "授权代表", out)
     return out, {k: v for k, v in stats.items() if v}
+
+
+def normalize_office_text(text: str) -> tuple[str, dict[str, int]]:
+    """Office 原生文本的归一：**只动空白/控制字符，不猜内容**。
+
+    为什么 Office 不走 OCR 规则：Word 里「有限责仕公司」就是作者写错了，不是盖章压字；
+    静默替换成「有限责任公司」等于改了原文（检索、引用、审计对不上）。同理 Word 的
+    ``$`` 是货币符号，不是 MinerU 的数学模式。
+    """
+    if not text:
+        return text, {}
+    stats: dict[str, int] = {}
+    out = text.replace("\r\n", "\n").replace("\r", "\n")
+    if "\t" in out:
+        n = out.count("\t")
+        out = out.replace("\t", " ")
+        stats["tabs_normalized"] = n
+    found = _ZERO_WIDTH.findall(out)
+    if found:
+        stats["zero_width_removed"] = len(found)
+        out = _ZERO_WIDTH.sub("", out)
+    found = _OFFICE_HSPACE.findall(out)
+    if found:
+        stats["space_normalized"] = len(found)
+        out = _OFFICE_HSPACE.sub(" ", out)
+    found = _OFFICE_TRAILING.findall(out)
+    if found:
+        stats["trailing_space_removed"] = len(found)
+        out = _OFFICE_TRAILING.sub("", out)
+    found = _OFFICE_BLANK_LINES.findall(out)
+    if found:
+        stats["blank_lines_collapsed"] = len(found)
+        out = _OFFICE_BLANK_LINES.sub("\n\n", out)
+    return out, stats
+
+
+def clean_profile_for_path(source_path: str) -> str:
+    """按源文件后缀选清洗 profile；未知后缀按**扫描件**处理（保持旧行为）。"""
+    suffix = pathlib.Path(str(source_path or "")).suffix.lower()
+    return OFFICE_PROFILE if suffix in OFFICE_SUFFIXES else SCAN_PROFILE
 
 
 def clean_figure_text(text: str) -> str:
@@ -353,12 +453,24 @@ class CleanResult:
 
     text: str
     stats: dict[str, Any] = field(default_factory=dict)
+    #: 本次用的规则集（``scan`` / ``office``），写日志与质量报告用
+    profile: str = SCAN_PROFILE
 
 
-def clean_markdown(markdown: str) -> CleanResult:
-    """入库前的清洗（公式规整 + 扫描件印章/签字噪声 + 中文断字）。"""
+def clean_markdown(markdown: str, *, profile: str = SCAN_PROFILE) -> CleanResult:
+    """入库前的清洗。``profile`` 决定规则集：``scan``（默认）或 ``office``。
+
+    ``office`` 只做空白/控制字符归一（见 :func:`normalize_office_text`）：
+    OCR 修复规则（公式残留/断字/错字/印章）对 Word/Excel/PPT 是**改原文**，不能跑。
+    """
+    if profile not in _PROFILES:
+        raise ValueError(f"未知清洗 profile：{profile!r}（可选 {', '.join(_PROFILES)}）")
     text = markdown or ""
     stats: dict[str, Any] = {}
+
+    if profile == OFFICE_PROFILE:
+        text, stats = normalize_office_text(text)
+        return CleanResult(text=text, stats=stats, profile=profile)
 
     text, used, kept = normalize_math_in_text(text)
     if used or kept:
@@ -378,4 +490,4 @@ def clean_markdown(markdown: str) -> CleanResult:
     text, seal_stats = strip_seal_and_signature_noise(text)
     stats.update(seal_stats)
 
-    return CleanResult(text=text, stats=stats)
+    return CleanResult(text=text, stats=stats, profile=profile)

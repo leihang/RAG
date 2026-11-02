@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from html.parser import HTMLParser
-from typing import Sequence
+from typing import Any, Sequence
 
 from ekbs.ingest.clean import normalize_math_in_text
 from ekbs.ingest.chunker import count_tokens
@@ -18,41 +18,55 @@ TABLE_MAX_TOKENS = 2048
 
 
 class _TableHTMLParser(HTMLParser):
-    """极简 HTML 表解析：抽出 ``<tr><th>/<td>`` 二维字符矩阵。"""
+    """抽出 ``<tr><th>/<td>`` 的单元格**几何**：文字 + ``colspan`` + ``rowspan``。
+
+    只留文字不够：``rowspan`` 的延续行在 HTML 里根本没有格（``<td rowspan="7">照明</td>``
+    只出现在首行），按文字逐行对齐会把延续行整体左移一列 —— 实测 Word「设施设备开关机
+    控制时间表」18 行里 12 行错列、13 块"管理内容"为空。
+    """
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.rows: list[list[str]] = []
-        self._row: list[str] | None = None
+        self.raw_rows: list[list[dict[str, Any]]] = []
+        self._row: list[dict[str, Any]] | None = None
         self._cell: list[str] | None = None
         self._in_cell = False
         self._colspan = 1
+        self._rowspan = 1
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         name = tag.lower()
         if name == "tr":
             self._row = []
-        elif name in {"td", "th"} and self._row is not None:
+            return
+        if name in {"td", "th"} and self._row is not None:
             self._cell = []
             self._in_cell = True
             self._colspan = 1
+            self._rowspan = 1
             for key, value in attrs:
-                if key.lower() == "colspan" and value and value.strip().isdigit():
-                    self._colspan = max(1, min(int(value.strip()), 32))
+                if key.lower() == "colspan":
+                    self._colspan = _span_attr(value)
+                elif key.lower() == "rowspan":
+                    self._rowspan = _span_attr(value)
 
     def handle_endtag(self, tag: str) -> None:
         name = tag.lower()
         if name in {"td", "th"} and self._row is not None and self._cell is not None:
-            text = "".join(self._cell).strip()
-            self._row.append(text)
-            for _ in range(self._colspan - 1):
-                self._row.append("")
+            self._row.append(
+                {
+                    "text": "".join(self._cell).strip(),
+                    "colspan": self._colspan,
+                    "rowspan": self._rowspan,
+                }
+            )
             self._cell = None
             self._in_cell = False
             self._colspan = 1
+            self._rowspan = 1
         elif name == "tr" and self._row is not None:
             if self._row:
-                self.rows.append(self._row)
+                self.raw_rows.append(self._row)
             self._row = None
 
     def handle_data(self, data: str) -> None:
@@ -60,8 +74,59 @@ class _TableHTMLParser(HTMLParser):
             self._cell.append(data)
 
 
+def _span_attr(value: str | None) -> int:
+    """``colspan="3"`` / ``rowspan="2"`` → 3 / 2；非法值按 1（不伪造合并）。"""
+    raw = (value or "").strip()
+    return max(1, min(int(raw), 32)) if raw.isdigit() else 1
+
+
+def _expand_spans(raw_rows: Sequence[Sequence[dict[str, Any]]]) -> list[list[str]]:
+    """把带 ``rowspan``/``colspan`` 的稀疏行还原成**等宽网格**。
+
+    * ``colspan`` 覆盖列填 ``""`` —— 保持"一格文字只出现一次"的既有口径；
+    * ``rowspan`` 延续行**重复起始格文字** —— 每行都要能独立回答
+      "类别=照明; 项目=车库照明"，留空会让分组标签彻底消失。
+
+    ``rowspan`` 与 ``colspan`` 同时出现时，起始格文字只放首列，覆盖到的其它列留空。
+    """
+    grid: list[list[str]] = []
+    #: 列号 → (文字, 还需覆盖几行)
+    pending: dict[int, tuple[str, int]] = {}
+    for raw in raw_rows:
+        cells: dict[int, str] = {}
+        column = 0
+
+        def consume_pending() -> None:
+            nonlocal column
+            while column in pending and pending[column][1] > 0:
+                text, remain = pending[column]
+                cells[column] = text
+                pending[column] = (text, remain - 1)
+                column += 1
+
+        for cell in raw:
+            consume_pending()
+            span = max(1, int(cell.get("colspan") or 1))
+            rowspan = max(1, int(cell.get("rowspan") or 1))
+            text = str(cell.get("text") or "")
+            cells[column] = text
+            for offset in range(1, span):
+                cells[column + offset] = ""
+            if rowspan > 1:
+                for offset in range(span):
+                    pending[column + offset] = (text if offset == 0 else "", rowspan - 1)
+            column += span
+        consume_pending()
+        width = max(cells) + 1 if cells else 0
+        grid.append([cells.get(index, "") for index in range(width)])
+    width = max((len(row) for row in grid), default=0)
+    for row in grid:
+        row.extend([""] * (width - len(row)))
+    return grid
+
+
 def parse_table_html(html: str) -> list[list[str]]:
-    """HTML → 二维单元格；解析失败返回空表。"""
+    """HTML → 二维单元格（``colspan``/``rowspan`` 已展开成等宽网格）；失败返回空表。"""
     if not (html or "").strip():
         return []
     parser = _TableHTMLParser()
@@ -70,7 +135,7 @@ def parse_table_html(html: str) -> list[list[str]]:
         parser.close()
     except Exception:
         return []
-    return parser.rows
+    return _expand_spans(parser.raw_rows)
 
 
 def parse_table_markdown(text: str) -> list[list[str]]:
@@ -216,11 +281,18 @@ def _split_header_rows(
     if not top or not any(not top[i] and sub[i] for i in filled):
         return [h or f"列{i+1}" for i, h in enumerate(top)], list(rows[1:])
     headers: list[str] = []
+    #: 上一列的主表头。横向合并（colspan）的从格在矩阵里是空串，若不继承，
+    #: `<th rowspan=2>级别</th><th colspan=3>分级内容</th>` 配子表头时会整体错位一格：
+    #: 变成 "级别/能耗检查 | 分级内容/能耗运行管控 | 节能改造"，A/B/C 三行的值全绑错字段。
+    parent = ""
     for i in range(width):
-        if top[i] and sub[i] and top[i] != sub[i]:
-            headers.append(f"{top[i]}/{sub[i]}")
+        if top[i]:
+            parent = top[i]
+        parent_label = top[i] or (parent if sub[i] else "")
+        if parent_label and sub[i] and parent_label != sub[i]:
+            headers.append(f"{parent_label}/{sub[i]}")
         else:
-            headers.append(top[i] or sub[i] or f"列{i+1}")
+            headers.append(parent_label or sub[i] or f"列{i+1}")
     return headers, list(rows[2:])
 
 
@@ -257,11 +329,14 @@ def _build_preamble(caption: str, table_id: str, headers: list[str], form_like: 
 
 
 def _format_row(cells: Sequence[str], headers: Sequence[str]) -> str:
-    parts: list[str] = []
-    for i, header in enumerate(headers):
-        value = str(cells[i]).strip() if i < len(cells) else ""
-        parts.append(f"{header}={value}")
-    return "; ".join(parts)
+    values = [str(cells[i]).strip() if i < len(cells) else "" for i in range(len(headers))]
+    # 整行横向合并的**说明行**（如 Word 表尾 `colspan=3` 的备注）不是任何一列的值：
+    # 挂到"类别"会造出 `类别=设备控制开关显眼位置应张贴…` 这种错语义检索块。
+    # 只认"仅首格有字且是一句说明"的行，避免把稀疏数据行误标成备注。
+    nonempty = [value for value in values if value]
+    if len(headers) >= 3 and nonempty == [values[0]] and len(values[0]) >= 12:
+        return f"备注={values[0]}"
+    return "; ".join(f"{header}={values[i]}" for i, header in enumerate(headers))
 
 
 def _chunk_by_budget(
@@ -324,6 +399,26 @@ def serialize_table_body(
     )
 
 
+def _note_row_cell(line: str, headers: Sequence[str]) -> str | None:
+    """``备注=整行合并的说明`` → 说明文字；不是备注行返回 None。"""
+    if not headers or not line.startswith("备注=") or ";" in line:
+        return None
+    note = line.split("=", 1)[1].strip()
+    return note or None
+
+
+def _row_cells_map(line: str) -> dict[str, str]:
+    """``键=值; 键=值`` → ``{键: 值}``（保持出现顺序）。"""
+    cells: dict[str, str] = {}
+    for part in line.split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        key, _, value = part.partition("=")
+        cells[key.strip()] = value.strip()
+    return cells
+
+
 def information_block_to_html(text: str) -> str | None:
     """把入库的 ``information_block`` 还原成 HTML 表，供生成侧组装上下文。
 
@@ -345,20 +440,16 @@ def information_block_to_html(text: str) -> str | None:
         if line.startswith("相关表头:"):
             headers = [h.strip() for h in line.split(":", 1)[1].split("|") if h.strip()]
             continue
+        note = _note_row_cell(line, headers)
+        if note is not None:
+            # 整行合并的说明行：还原成"首格有字、其余留空"的一行，别在 HTML 里丢掉
+            rows.append([note, *([""] * (len(headers) - 1))])
+            continue
         if "=" in line and ";" in line:
-            cells_map = {}
-            for part in line.split(";"):
-                part = part.strip()
-                if "=" not in part:
-                    continue
-                key, _, value = part.partition("=")
-                cells_map[key.strip()] = value.strip()
-            if headers:
-                rows.append([cells_map.get(h, "") for h in headers])
-            elif cells_map:
-                if not headers:
-                    headers = list(cells_map.keys())
-                rows.append([cells_map.get(h, "") for h in headers])
+            cells_map = _row_cells_map(line)
+            if not headers:
+                headers = list(cells_map.keys())
+            rows.append([cells_map.get(h, "") for h in headers])
     if not headers or not rows:
         return None
     parts = ['<table border="1" cellpadding="4" cellspacing="0">']
