@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -92,14 +93,30 @@ def tokenize(text: str) -> list[str]:
     return [token.strip().lower() for token in jieba.lcut(text or "") if token.strip()]
 
 
+#: 编号/表号/日期类整词：字母数字串 + 至少一个 `-` 或 `/` 分段（`XJWY-GC-01-01`、`XJ-01-11-1F02`、`2026-11-03`）。
+#: 为什么单独抽：jieba 会把这类串切成 7 个碎片（`xj / - / 01 / …`），碎片进倒排等于精确匹配失效。
+#: 与本函数**双端一致**地抽取，等于一个零维护的「自动词典」，不需要 `userdict.txt`。
+_CJK_CODE_RE = re.compile(r"[A-Za-z0-9]{2,}(?:[-/][A-Za-z0-9]+){1,}")
+
+
+def _analyze(text: str) -> list[str]:
+    """写入与查询**共用**的分词口径：jieba 词 + 编号/日期类整词（双端一致，防切碎）。"""
+    tokens = tokenize(text)
+    for code in _CJK_CODE_RE.findall(text or ""):
+        whole = code.lower()
+        if whole not in tokens:
+            tokens.append(whole)
+    return tokens
+
+
 def tokenize_for_fts(text: str) -> str:
-    """写入 FTS5 的 ``content_tok``：空格连接的 jieba 词串。"""
-    return " ".join(tokenize(text))
+    """写入 FTS5 的 ``content_tok``：空格连接的 jieba 词串 + 编号/日期整词。"""
+    return " ".join(_analyze(text))
 
 
 def to_match_query(text: str) -> str:
     """构造 FTS5 MATCH 查询串：每个词加双引号（防语法注入），词间 OR。"""
-    tokens = tokenize(text)
+    tokens = _analyze(text)
     if not tokens:
         return ""
     return " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens)
