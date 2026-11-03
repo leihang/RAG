@@ -822,21 +822,29 @@ def _dotted_level(num: str) -> int:
 
 
 def _parse_heading_line(stripped: str) -> tuple[int, str] | None:
-    """识别一行是不是标题（Markdown ``#`` / 中文条款 / 点分编号），返回 ``(level, title)``。"""
+    """识别一行是不是标题（Markdown ``#`` / 中文条款 / 点分编号），返回 ``(level, title)``。
+
+    「编号 + 正文同行」的行（如 ``5.4 主管人员作业前需…``）整行本身就是正文：
+    此时标题**只保留编号**（``5.4``），整行原文由 ``push_heading`` 收进本节正文。
+    否则 ``heading_path`` 会变成一整段话（实测 GC-13 的 ``5.4`` 让检索标题不可读）。
+    """
     match = _HEADING_RE.match(stripped)
     if match:
         return len(match.group(1)), match.group(2).strip()
+    body_like = _looks_like_content(stripped)
     clause = _CLAUSE_HEADING_RE.match(stripped)
     if clause:
         kind = clause.group(2)
         title = f"第{clause.group(1)}{kind}"
         rest = clause.group(3).strip()
-        if rest:
+        if rest and not body_like:
             title = f"{title} {rest}"
         return _CLAUSE_LEVEL.get(kind, 3), title
     dotted = _DOTTED_HEADING_RE.match(stripped)
     if dotted:
         num = dotted.group(1).strip()
+        if body_like:
+            return _dotted_level(num), num
         return _dotted_level(num), f"{num} {dotted.group(2).strip()}"
     return None
 

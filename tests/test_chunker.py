@@ -79,6 +79,26 @@ def test_clause_lines_become_heading_path() -> None:
     assert any("第二条" in n.content for n in result.children)
 
 
+def test_numbered_clause_with_inline_body_keeps_heading_short() -> None:
+    """「编号 + 正文同行」的条款（如 ``5.4 主管人员作业前需…``）标题只保留编号。
+
+    实测 GC-13：5.1~5.8 全是「编号+正文写在同一行」，旧实现把整行当标题，
+    ``heading_path`` 变成一整段话，检索标题不可读；正文本身必须完整保留。
+    """
+    long_body = (
+        "主管人员作业前需充分识别现场环境，对危险源进行提前排除并进行作业场地的围护标识，"
+        "并向现场作业人员进行安全强调、作业环境、作业范围说明。"
+    )
+    doc = f"5． 方法和过程\n5.4 {long_body}\n5.5 器械要求:拆除施工严禁使用风镐。\n"
+    sections = split_sections(doc)
+    paths = [s.heading_path for s in sections]
+    assert any(path.endswith("> 5.4") for path in paths), paths
+    assert any(path.endswith("> 5.5") for path in paths), paths
+    assert all(len(path) < 60 for path in paths), paths
+    # 整行正文仍在（编号+正文同行时不能只留编号）
+    assert any(long_body in s.text for s in sections)
+
+
 
 def test_heading_path_never_empty_with_doc_title() -> None:
     result = chunk_markdown("没有任何标题的一段正文。", doc_title="差旅费管理办法")
