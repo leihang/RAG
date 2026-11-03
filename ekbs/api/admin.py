@@ -111,24 +111,29 @@ async def list_qa_sessions(
     # 拒答按**答案内容**判定，不直接数 `refused=1`：历史记录里有一批旧版
     # `missing_citation` 硬拒留下的误判（refused=1 但答案正常），照搬标记会把
     # 正常回答算成拒答（实测「部分拒答 1/13」里那 1 轮其实是正常回答）。
-    refusal_like = (
-        "ltrim(TRIM(m.answer), '*#>-—・ 「『') LIKE "
+    refusal_like = "ltrim(TRIM(m.answer), '*#>-—・ 「『') LIKE "
+    refusal_cond = (
+        "m.answer IS NULL OR TRIM(m.answer) = '' "
+        f"OR {refusal_like}'未找到可靠依据%' "
+        f"OR {refusal_like}'对不起%' "
+        f"OR {refusal_like}'没有找到%'"
     )
     sql = (
         "SELECT s.session_id, s.user_id, s.dt_userid, u.nick AS user_nick, u.auth_source, "
         "s.channel, s.conversation_id, "
         "s.perm_fingerprint, s.clearance_at, s.started_at, s.ended_at, s.message_count, "
         "(SELECT COUNT(*) FROM ekbs_qa_message m WHERE m.session_id = s.session_id "
-        " AND m.role = 'assistant' AND ("
-        "m.answer IS NULL OR TRIM(m.answer) = '' "
-        f"OR {refusal_like}'未找到可靠依据%' "
-        f"OR {refusal_like}'对不起%' "
-        f"OR {refusal_like}'没有找到%'"
-        ")) AS refused_count, "
+        f" AND m.role = 'assistant' AND ({refusal_cond})) AS refused_count, "
         "(SELECT COUNT(*) FROM ekbs_qa_message m WHERE m.session_id = s.session_id "
         " AND m.role = 'assistant') AS turn_count, "
         "(SELECT m.question FROM ekbs_qa_message m WHERE m.session_id = s.session_id "
-        " AND m.role = 'assistant' ORDER BY m.message_id DESC LIMIT 1) AS last_question "
+        " AND m.role = 'assistant' ORDER BY m.message_id DESC LIMIT 1) AS last_question, "
+        # 最新一轮是否拒答：行上展示的是「最新问题」，拒答状态也必须取**最新一轮**——
+        # 否则 22 轮里第 9 轮因问题太模糊被拒，最新一问回答正常，整行仍显示「部分拒答 1/22」。
+        "(SELECT CASE WHEN "
+        f"({refusal_cond}) THEN 1 ELSE 0 END "
+        "FROM ekbs_qa_message m WHERE m.session_id = s.session_id "
+        " AND m.role = 'assistant' ORDER BY m.message_id DESC LIMIT 1) AS last_refused "
         "FROM ekbs_qa_session s LEFT JOIN ekbs_user u ON u.user_id = s.user_id "
         f"WHERE {' AND '.join(where)} "
         "ORDER BY COALESCE(s.ended_at, s.started_at) DESC LIMIT ? OFFSET ?"

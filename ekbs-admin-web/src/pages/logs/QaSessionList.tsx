@@ -32,6 +32,7 @@ import {
   REFUSED_META,
   matchQaKeyword,
   questionTextOf,
+  refusedHintOf,
   refusedLabelOf,
   refusedStateOf,
   textOrDash,
@@ -91,13 +92,13 @@ const columns: ProColumns<QaSessionRow>[] = [
   },
   {
     // 方案 §3.2：拒答率是核心指标 —— 真能判定时用醒目色呈现。
-    // 列表接口已从 ekbs_qa_message 汇总 refused_count / turn_count（旧后端才回退 unknown）。
-    // 三态：全部拒答 / 部分拒答 N/M / 已作答 —— 不能把"18 轮里 3 轮拒答"标成整会话拒答。
+    // 列与「最新问题」是同一轮语义：优先取 `last_refused`（最新一轮是否拒答）；
+    // 旧后端才退回会话累计口径（全部拒答 / 部分拒答 N/M / 已作答）。
     title: '是否拒答',
     dataIndex: 'refused',
     width: 150,
     valueEnum: {
-      yes: { text: '全部拒答' },
+      yes: { text: '拒答' },
       partial: { text: '部分拒答' },
       no: { text: '已作答' },
       unknown: { text: '接口未提供' },
@@ -114,7 +115,11 @@ const columns: ProColumns<QaSessionRow>[] = [
       }
       const color =
         meta.tone === 'error' ? 'red' : meta.tone === 'warning' ? 'orange' : 'green'
-      return <Tag color={color}>{refusedLabelOf(row)}</Tag>
+      return (
+        <Tooltip title={refusedHintOf(row)}>
+          <Tag color={color}>{refusedLabelOf(row)}</Tag>
+        </Tooltip>
+      )
     },
   },
   {

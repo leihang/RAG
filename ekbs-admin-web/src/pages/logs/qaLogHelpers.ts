@@ -34,6 +34,8 @@ export interface QaSessionRow {
   turn_count?: number
   /** 最新一轮的问题原文 */
   last_question?: string | null
+  /** 最新一轮是否拒答（1/0，按答案内容判定）；旧后端无此字段 */
+  last_refused?: number
   /**
    * 兼容字段：问题/答案逐轮存在 `ekbs_qa_message`，列表接口汇总的是
    * `last_question`；这两个字段留给本地关键字过滤在后端补齐后自动生效。
@@ -172,18 +174,23 @@ export function toBool(value: unknown): boolean {
 export type RefusedState = 'yes' | 'partial' | 'no' | 'unknown'
 
 /**
- * 会话拒答状态。
+ * 会话行上的拒答状态。
  *
- * `ekbs_qa_session` 本身没有拒答列，列表接口从 `ekbs_qa_message` 汇总了
- * `refused_count`（拒答轮数）与 `turn_count`（总轮数）。**不能**按「有过拒答 = 整会话拒答」
- * 展示 —— 实测一个 18 轮的会话里 3 轮拒答、其余全是正常回答，列表却标「拒答」，
- * 用户会以为"正常回答被标成拒答"。所以拆成三态：
+ * 列表一行的「最新问题」与「是否拒答」是**同一轮**的语义，所以优先用列表接口给的
+ * `last_refused`（最新一轮是否拒答）。实测：22 轮里第 9 轮因问题太模糊（「定义是什么」）
+ * 被拒，最新一问「工程经理职责是什么」回答完全正常，整行却显示「部分拒答 1/22」，
+ * 用户以为最新回答被拒。
+ *
+ * 旧后端没有 `last_refused` 时退回会话累计口径（`refused_count` / `turn_count`）：
  *
  * * `no`      —— 一轮都没拒答；
- * * `partial` —— 部分轮次拒答（其余正常，界面显示 `部分拒答 3/18`）；
+ * * `partial` —— 部分轮次拒答（界面显示 `部分拒答 3/18`）；
  * * `yes`     —— 全部轮次都拒答。
  */
 export function refusedStateOf(row: QaSessionRow): RefusedState {
+  if (typeof row.last_refused === 'number' && Number.isFinite(row.last_refused)) {
+    return row.last_refused > 0 ? 'yes' : 'no'
+  }
   const refused = row.refused_count
   if (typeof refused !== 'number' || !Number.isFinite(refused)) {
     return 'unknown'
@@ -204,13 +211,27 @@ export const REFUSED_META: Record<
   unknown: { text: '接口未提供', tone: 'default' },
 }
 
-/** 拒答列文案：部分拒答附比例（`部分拒答 3/18`），其余用固定文案。 */
+/** 拒答列文案：最新一轮口径只答「拒答/已作答」；旧后端累计口径下部分拒答附比例。 */
 export function refusedLabelOf(row: QaSessionRow): string {
+  if (typeof row.last_refused === 'number' && Number.isFinite(row.last_refused)) {
+    return row.last_refused > 0 ? '拒答' : '已作答'
+  }
   const state = refusedStateOf(row)
   if (state === 'partial') {
     return `部分拒答 ${row.refused_count ?? 0}/${row.turn_count ?? 0}`
   }
   return REFUSED_META[state].text
+}
+
+/** 拒答列 tooltip：说明本会话累计情况（最新一轮之外的历史拒答也能看到）。 */
+export function refusedHintOf(row: QaSessionRow): string {
+  const turns = typeof row.turn_count === 'number' && Number.isFinite(row.turn_count) ? row.turn_count : null
+  const refused = typeof row.refused_count === 'number' && Number.isFinite(row.refused_count) ? row.refused_count : null
+  if (turns == null || refused == null) {
+    return '后端未返回会话轮次/拒答统计'
+  }
+  const latest = typeof row.last_refused === 'number' ? (row.last_refused > 0 ? '拒答' : '已作答') : ''
+  return `最新一轮：${latest || '未知'}；本会话共 ${turns} 轮，累计拒答 ${refused} 轮`
 }
 
 /** 会话问题列：列表接口汇总的是**最新一轮**的问题原文（`last_question`）。 */

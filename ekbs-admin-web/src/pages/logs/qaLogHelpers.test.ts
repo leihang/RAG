@@ -17,6 +17,7 @@ import {
   matchSecurityEvent,
   parseDetail,
   questionTextOf,
+  refusedHintOf,
   refusedLabelOf,
   refusedStateOf,
   sessionDetailErrorText,
@@ -64,6 +65,19 @@ describe('问答会话列表的缺字段处理', () => {
     expect(refusedStateOf({ session_id: 's1', refused_count: 0, turn_count: 18 })).toBe('no')
     // 旧后端没这些字段 → 明确显示「接口未提供」，不能编造
     expect(refusedStateOf({ session_id: 's1' })).toBe('unknown')
+  })
+
+  it('最新一轮口径：历史有拒答、最新回答正常 → 显示「已作答」', () => {
+    // 实测：22 轮里第 9 轮「定义是什么」因问题太模糊被拒，
+    // 最新一问「工程经理职责是什么」回答完全正常 —— 整行不能标「部分拒答 1/22」
+    const row = { session_id: 's1', refused_count: 1, turn_count: 22, last_refused: 0 }
+    expect(refusedStateOf(row)).toBe('no')
+    expect(refusedLabelOf(row)).toBe('已作答')
+    expect(refusedHintOf(row)).toContain('累计拒答 1 轮')
+    // 最新一轮真的被拒
+    const refusedRow = { session_id: 's1', refused_count: 2, turn_count: 22, last_refused: 1 }
+    expect(refusedStateOf(refusedRow)).toBe('yes')
+    expect(refusedLabelOf(refusedRow)).toBe('拒答')
   })
 
   it('问题列：展示最新一轮问题（last_question），缺失才回退占位', () => {
