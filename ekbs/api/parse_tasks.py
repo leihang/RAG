@@ -663,6 +663,7 @@ async def approve_parse_task(
             source_path=str(row["source_path"] or ""),
             doc_version=str(row["doc_version"] or "1"),
             page_map=page_map_from_sidecar(sidecar),
+            page_count=sidecar.page_count,
             figures=[
                 fig for fig in figures_from_sidecar(sidecar)
                 if not str(fig.figure_id or "").startswith("handwrite")

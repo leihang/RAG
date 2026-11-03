@@ -88,6 +88,9 @@ class ReviewSidecar:
     figures: list[dict[str, Any]] = field(default_factory=list)
     tables: list[dict[str, Any]] = field(default_factory=list)
     clean_stats: dict[str, Any] = field(default_factory=dict)
+    #: 文档总页数。docx 无真实分页时由解析器从页眉「页数：1/2」抽取；
+    #: 不存的话入库阶段只能靠 page_map 推算，而 docx 的 page_map 为空 → page_count 永远 NULL。
+    page_count: int | None = None
 
 
 def save_review_draft(
@@ -100,6 +103,7 @@ def save_review_draft(
     figures: Sequence[FigureInput] | None = None,
     tables: Sequence[TableInput] | None = None,
     clean_stats: dict[str, Any] | None = None,
+    page_count: int | None = None,
 ) -> str:
     """写入清洗后正文与 sidecar；返回相对 ``data_dir`` 的 parse_path（目录）。"""
     out = draft_dir(data_dir, doc_id)
@@ -112,6 +116,7 @@ def save_review_draft(
         figures=[asdict(f) for f in (figures or [])],
         tables=[asdict(t) for t in (tables or [])],
         clean_stats=dict(clean_stats or {}),
+        page_count=int(page_count) if page_count else None,
     )
     (out / DRAFT_SIDECAR_NAME).write_text(
         json.dumps(asdict(sidecar), ensure_ascii=False, indent=2),
@@ -167,6 +172,7 @@ def save_review_asset_edits(
         markdown=markdown,
         engine=sidecar.engine,
         page_map=[(int(row[0]), int(row[1]), int(row[2])) for row in sidecar.page_map if len(row) >= 3],
+        page_count=sidecar.page_count,
         figures=[
             FigureInput(
                 image_path=str(item.get("image_path") or ""),
@@ -249,6 +255,7 @@ def load_review_sidecar(data_dir: Path, doc_id: int) -> ReviewSidecar:
         figures=list(raw.get("figures") or []),
         tables=list(raw.get("tables") or []),
         clean_stats=dict(raw.get("clean_stats") or {}),
+        page_count=int(raw["page_count"]) if raw.get("page_count") else None,
     )
 
 
@@ -301,6 +308,7 @@ def prepare_scan_draft(
     figures: Sequence[FigureInput],
     tables: Sequence[TableInput],
     source_path: str | None = None,
+    page_count: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """清洗正文与图注，落盘，返回 (parse_path 相对路径, clean_stats)。"""
     cleaned = clean_markdown(raw_markdown)
@@ -357,6 +365,7 @@ def prepare_scan_draft(
         figures=cleaned_figures,
         tables=merged_tables,
         clean_stats=stats,
+        page_count=page_count,
     )
     return rel, stats
 

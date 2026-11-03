@@ -62,6 +62,25 @@ def test_prepare_scan_draft_writes_files(tmp_path: Path) -> None:
     assert stats.get("sign_latin_removed", 0) >= 1 or "盖章" in md
 
 
+def test_prepare_scan_draft_persists_page_count(tmp_path: Path) -> None:
+    """docx 没有 page_map 时，解析器从页眉抽到的 page_count 必须落进 sidecar。
+
+    否则入库阶段只能用 ``_page_count(page_map)`` 推算，而 Word 的 page_map 为空，
+    文档总页数永远是 NULL（实测 doc 200 就是「页数：1/2 已抽到却没存」）。
+    """
+    prepare_scan_draft(
+        data_dir=tmp_path,
+        doc_id=7,
+        raw_markdown="# 文件信息\n页数：1 / 2\n正文。",
+        engine="docx",
+        page_map=[],
+        figures=[],
+        tables=[],
+        page_count=2,
+    )
+    assert load_review_sidecar(tmp_path, 7).page_count == 2
+
+
 def test_prepare_and_upgrade_merge_continued_tables(tmp_path: Path) -> None:
     def html(city: str) -> str:
         return (

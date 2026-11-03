@@ -365,6 +365,7 @@ async def _import_one(
         visible_dept_ids=dept_ids,
         source_path=str(path),
         page_map=list(parsed.page_map),
+        page_count=parsed.page_count,
         figures=figures,
         tables=tables,
         real_corpus=not synthetic,

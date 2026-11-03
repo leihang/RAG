@@ -304,6 +304,7 @@ async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:
                 figures=figures,
                 tables=tables,
                 source_path=str(doc.get("source_path") or ""),
+                page_count=parsed.page_count,
             )
         else:
             # Word / Excel / PPT / Markdown 同样先复核。不走扫描件清洗，避免误改正文。
@@ -317,6 +318,7 @@ async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:
                 page_map=list(parsed.page_map),
                 figures=figures,
                 tables=tables,
+                page_count=parsed.page_count,
             )
             clean_stats = {}
         if is_personal_scope(doc.get("visible_dept_ids")):
@@ -332,6 +334,7 @@ async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:
                 source_path=str(doc.get("source_path") or ""),
                 doc_version=str(doc.get("doc_version") or "v1"),
                 page_map=page_map_from_sidecar(sidecar),
+                page_count=sidecar.page_count,
                 figures=figures_from_sidecar(sidecar),
                 tables=tables_from_sidecar(sidecar),
                 existing_doc_id=doc_id,

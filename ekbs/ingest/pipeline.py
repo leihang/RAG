@@ -187,6 +187,7 @@ class IngestPipeline:
         source_path: str = "",
         doc_version: str = "v1",
         page_map: Sequence[tuple[int, int, int]] | None = None,
+        page_count: int | None = None,
         real_corpus: bool = False,
         checksum: str | None = None,
         existing_doc_id: int | None = None,
@@ -343,7 +344,7 @@ class IngestPipeline:
                 # 等清洗解析页的"向量入库"再对已（可能被编辑过的）块做 embedding。
                 self._publish(
                     doc_id,
-                    page_count=_page_count(page_map),
+                    page_count=page_count or _page_count(page_map),
                     status="chunked",
                 )
                 result = IngestResult(
@@ -375,7 +376,7 @@ class IngestPipeline:
             self._grant_extra_depts(doc_id, placement.extra_grants, level)
             self._publish(
                 doc_id,
-                page_count=_page_count(page_map),
+                page_count=page_count or _page_count(page_map),
                 status="published",
             )
         except Exception as exc:  # 失败必须落状态，不能静默停在中途态
