@@ -80,6 +80,39 @@ describe('分块预览的向量标签', () => {
     expect(screen.queryByText('上下文块')).toBeNull()
   })
 
+  it('父块下的子块会显示在右栏（子块 N + 子块内容）', async () => {
+    api.getChunkTree.mockResolvedValue({
+      document: { doc_id: 1, title: '电力增容作业指导书', status: 'chunked', level: 1 },
+      parents: 1,
+      children: 2,
+      tree: [
+        {
+          chunk_id: 10, doc_id: 1, chunk_type: 'parent', seq: 1, content: '父块全文',
+          heading_path: 'XJWY-GC-14', token_count: 861, page_from: null, page_to: null,
+          faiss_row: null,
+          children: [
+            {
+              chunk_id: 11, doc_id: 1, chunk_type: 'child', seq: 2, content: '子块A内容',
+              heading_path: '文件信息', token_count: 408, page_from: null, page_to: null,
+              faiss_row: null,
+            },
+            {
+              chunk_id: 12, doc_id: 1, chunk_type: 'child', seq: 3, content: '子块B内容',
+              heading_path: '5.2 流程提报', token_count: 345, page_from: null, page_to: null,
+              faiss_row: null,
+            },
+          ],
+        },
+      ],
+      orphan_children: [],
+    })
+
+    mount()
+    await waitFor(() => expect(screen.getByText('子块（2）')).toBeInTheDocument())
+    expect(screen.getByText('子块A内容')).toBeInTheDocument()
+    expect(screen.getByText('子块B内容')).toBeInTheDocument()
+  })
+
   it('figure 块展示「多模态已索引」标识', async () => {
     api.getChunkTree.mockResolvedValue({
       document: { doc_id: 1, title: '图册', status: 'published', level: 1 },

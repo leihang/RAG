@@ -464,34 +464,42 @@ export default function DocumentUpload() {
     const destFolders = foldersByKb[values.kb_id] ?? []
     const dest = personal ? '' : String(values.dest_folder ?? '').replace(/^\/+|\/+$/g, '')
     const folder = destFolders.find((row) => row.path === dest)
-    const hasOwnDept = (folder?.visible_dept_ids.length ?? 0) > 0
-    if (!personal && !hasOwnDept) {
-      message.error(dest
-        ? '这个文件夹和它的上级都没有部门设置。点「修改权限」写好后再上传。'
-        : '请先新建文件夹，在弹窗里写上密级和部门，再选中它上传。')
-      return
-    }
+    // 用「文件夹是否有有效密级」判断是否沿用文件夹策略，而不是「有没有部门」——
+    // L1（公开）文件夹本来就没部门，用部门判断会把它的 L1 误当成「无策略」，
+    // 进而回退到表单 level（上传页没有 level 字段）→ 发送 null → 后端 422
+    // 「level：Input should be a valid integer」。
+    const folderLevel = folder ? Number(folder.level) : NaN
+    const hasFolderPolicy =
+      Number.isInteger(folderLevel) && folderLevel >= 1 && folderLevel <= 4
     const ownerId = personalOwnerId(target) ?? 0
     const rawDepts = personal
       ? [`user:${ownerId}`]
-      : (hasOwnDept ? folder?.visible_dept_ids : values.dept_ids)
+      : (hasFolderPolicy ? (folder?.visible_dept_ids ?? []) : (values.dept_ids ?? []))
     const deptIds = (Array.isArray(rawDepts) ? rawDepts : String(rawDepts ?? '').split(/[,，\s]+/))
       .map((s) => String(s).trim())
       .filter(Boolean)
-    const level = personal ? 2 : (hasOwnDept ? Number(folder?.level) : Number(values.level))
-    // L2/L3 必须给可见部门（方案 00 §3.2）：后端也会在 init 阶段拒，
-    // 但在这里先拦能省一次往返，也不会留下"上传成功但解析失败"的困惑
+    // level 必须落成 1..4 的整数：后端 UploadInit.level 是 int，null/NaN 会直接 422。
+    // 取不到时回退到知识库默认密级，再回退 L2。
+    const fallbackLevel = initialLevelForKb(kbs, values.kb_id) ?? 2
+    const rawLevel = personal ? 2 : (hasFolderPolicy ? folderLevel : Number(values.level))
+    const level =
+      Number.isInteger(rawLevel) && rawLevel >= 1 && rawLevel <= 4 ? rawLevel : fallbackLevel
+    // 仅 L2+ 必须有可见部门；L1（公开）不要求部门（00 §3.2）。后端也会在 init 阶段拒。
     if (personal && !(ownerId > 0)) {
       message.error('这个个人库没有归属用户，不能投喂')
       return
     }
     if (!personal && level >= 2 && deptIds.length === 0) {
-      message.error(`密级 L${level} 必须选择可见部门；L2/L3 不能不给部门。若要全公司可见请选 L1`)
+      message.error(
+        dest
+          ? `这个文件夹和它的上级都没有部门设置，而当前密级是 L${level}。请点「修改权限」设置部门，或把密级改成 L1（全公司可见）。`
+          : `密级 L${level} 必须选择可见部门；若整个公司可见请把密级改成 L1。`,
+      )
       return
     }
     const viewerIds = personal
       ? []
-      : (hasOwnDept ? (folder?.viewer_user_ids ?? []) : (values.viewer_user_ids ?? []))
+      : (hasFolderPolicy ? (folder?.viewer_user_ids ?? []) : (values.viewer_user_ids ?? []))
         .map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
     setRunning(true)
     // **并发池**：同时最多跑 `concurrency` 个文件（方案 §6.5 默认 3）。
