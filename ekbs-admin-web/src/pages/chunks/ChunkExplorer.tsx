@@ -155,8 +155,9 @@ export default function ChunkExplorer() {
       </Card>
 
       {tree.tree?.length ? (
-        <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
-          <Card title={`分块树（${tree.tree.length}）`} style={{ width: 400, flex: 'none' }} styles={{ body: { padding: 0 } }}>
+        // 窄屏时上下堆叠：右栏（子块）是检索单元，不能因为窗口窄被挤成 0 宽度而"看不见"
+        <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+          <Card title={`父块（${tree.tree.length}）`} style={{ width: 400, flex: 'none' }} styles={{ body: { padding: 0 } }}>
             <List
               size="small"
               dataSource={tree.tree}
@@ -208,7 +209,7 @@ export default function ChunkExplorer() {
 
           <Card
             title={isLeafParent(activeParent) ? '检索单元（短节无子块）' : `子块（${children.length}）`}
-            style={{ flex: 1, minWidth: 0 }}
+            style={{ flex: '1 1 360px', minWidth: 360 }}
             extra={
               activeChunk?.chunk_type === 'child' ? (
                 <Space>
