@@ -107,12 +107,24 @@ async def list_qa_sessions(
     # "刚问完、但会话开得早"的记录压到列表底部，用户会以为"最新的问答没进日志"。
     # 同时把逐轮问题/拒答从 ekbs_qa_message 汇总上来（会话表本身没有这两列），
     # 并 JOIN 用户表带出昵称 —— 只给数字 user_id 时运维分不清是钉钉用户还是管理台本地账号。
+    #
+    # 拒答按**答案内容**判定，不直接数 `refused=1`：历史记录里有一批旧版
+    # `missing_citation` 硬拒留下的误判（refused=1 但答案正常），照搬标记会把
+    # 正常回答算成拒答（实测「部分拒答 1/13」里那 1 轮其实是正常回答）。
+    refusal_like = (
+        "ltrim(TRIM(m.answer), '*#>-—・ 「『') LIKE "
+    )
     sql = (
         "SELECT s.session_id, s.user_id, s.dt_userid, u.nick AS user_nick, u.auth_source, "
         "s.channel, s.conversation_id, "
         "s.perm_fingerprint, s.clearance_at, s.started_at, s.ended_at, s.message_count, "
         "(SELECT COUNT(*) FROM ekbs_qa_message m WHERE m.session_id = s.session_id "
-        " AND m.role = 'assistant' AND m.refused = 1) AS refused_count, "
+        " AND m.role = 'assistant' AND ("
+        "m.answer IS NULL OR TRIM(m.answer) = '' "
+        f"OR {refusal_like}'未找到可靠依据%' "
+        f"OR {refusal_like}'对不起%' "
+        f"OR {refusal_like}'没有找到%'"
+        ")) AS refused_count, "
         "(SELECT COUNT(*) FROM ekbs_qa_message m WHERE m.session_id = s.session_id "
         " AND m.role = 'assistant') AS turn_count, "
         "(SELECT m.question FROM ekbs_qa_message m WHERE m.session_id = s.session_id "

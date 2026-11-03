@@ -38,9 +38,23 @@ export function formatDurationMs(ms?: number | null): string {
   return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分`
 }
 
+/**
+ * 解析后端时间串。
+ *
+ * 后端 SQLite 用 ``datetime('now')`` 写入的是 **UTC**，接口返回 ``YYYY-MM-DD HH:mm:ss``
+ * （不带时区）。dayjs 默认把无时区串当**本地时间**解析 —— 直接格式化会整体慢 8 小时
+ * （实测问答日志"最新一轮"显示成 8 小时前）。这里统一按 UTC 解析再转本地时区。
+ */
+export function parseServerTime(value: string): dayjs.Dayjs {
+  const text = value.trim()
+  // 已带时区（Z / +08:00）的串直接交给 dayjs
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(text)) return dayjs(text)
+  return dayjs(text.includes('T') ? `${text}Z` : `${text.replace(' ', 'T')}Z`)
+}
+
 export function formatTime(value?: string | null): string {
   if (!value) return '-'
-  const d = dayjs(value)
+  const d = parseServerTime(value)
   return d.isValid() ? d.format('YYYY-MM-DD HH:mm:ss') : String(value)
 }
 

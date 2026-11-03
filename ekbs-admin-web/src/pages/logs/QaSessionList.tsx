@@ -125,11 +125,13 @@ const columns: ProColumns<QaSessionRow>[] = [
     render: (_, row) => formatNumber(row.message_count),
   },
   {
-    title: '时间',
-    dataIndex: 'started_at',
+    // 列表按「最后活动时间」排序，这里也展示 ended_at（最新一轮时间），
+    // 展示 started_at 会让人误以为"最新问答是几小时前"。
+    title: '最后问答',
+    dataIndex: 'ended_at',
     width: 180,
     hideInSearch: true,
-    render: (_, row) => formatTime(row.started_at),
+    render: (_, row) => formatTime(row.ended_at ?? row.started_at),
   },
   {
     title: '渠道',

@@ -38,6 +38,7 @@ import {
   sessionDetailErrorText,
   sessionMetaOf,
   textOrDash,
+  turnRefusedOf,
   type QaSessionRaw,
 } from './qaLogHelpers'
 
@@ -58,8 +59,17 @@ export default function QaSessionDetail() {
     () => buildQaTurns(raw?.messages, raw?.citations),
     [raw?.messages, raw?.citations],
   )
+  // 详情按**倒序**展示：最新一轮放最前面（运维看日志通常先看最近发生了什么）
+  const orderedTurns = useMemo(
+    () =>
+      [...turns].sort(
+        (a, b) => (b.turn ?? 0) - (a.turn ?? 0) || (b.messageId ?? 0) - (a.messageId ?? 0),
+      ),
+    [turns],
+  )
 
-  const refusedTurns = turns.filter((t) => t.refused).length
+  // 拒答轮数按**答案内容**统计，不盲信历史 refused 标记（旧版 missing_citation 误判）
+  const refusedTurns = turns.filter((t) => turnRefusedOf(t)).length
   const citationCount = turns.reduce((sum, t) => sum + t.citations.length, 0)
 
   const backButton = (
@@ -158,7 +168,7 @@ export default function QaSessionDetail() {
 
       {turns.length ? (
         <Space direction="vertical" size={0} style={{ width: '100%' }}>
-          {turns.map((turn) => (
+          {orderedTurns.map((turn) => (
             <QaTurnItem key={`${turn.messageId ?? turn.turn}`} turn={turn} />
           ))}
         </Space>
