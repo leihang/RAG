@@ -95,24 +95,36 @@ async def list_qa_sessions(
     where = ["1=1"]
     params: list[Any] = []
     if user_id is not None:
-        where.append("user_id = ?")
+        where.append("s.user_id = ?")
         params.append(int(user_id))
     if channel:
-        where.append("channel = ?")
+        where.append("s.channel = ?")
         params.append(str(channel))
     if since:
-        where.append("started_at >= ?")
+        where.append("s.started_at >= ?")
         params.append(f"{since} 00:00:00")
+    # 按**最后活动时间**排序：同一会话可以持续很久（多轮追问），按 started_at 排会把
+    # "刚问完、但会话开得早"的记录压到列表底部，用户会以为"最新的问答没进日志"。
+    # 同时把逐轮问题/拒答从 ekbs_qa_message 汇总上来（会话表本身没有这两列）。
     sql = (
-        "SELECT session_id, user_id, dt_userid, channel, conversation_id, perm_fingerprint, "
-        "clearance_at, started_at, ended_at, message_count FROM ekbs_qa_session "
-        f"WHERE {' AND '.join(where)} ORDER BY started_at DESC LIMIT ? OFFSET ?"
+        "SELECT s.session_id, s.user_id, s.dt_userid, s.channel, s.conversation_id, "
+        "s.perm_fingerprint, s.clearance_at, s.started_at, s.ended_at, s.message_count, "
+        "(SELECT COUNT(*) FROM ekbs_qa_message m WHERE m.session_id = s.session_id "
+        " AND m.role = 'assistant' AND m.refused = 1) AS refused_count, "
+        "(SELECT COUNT(*) FROM ekbs_qa_message m WHERE m.session_id = s.session_id "
+        " AND m.role = 'assistant') AS turn_count, "
+        "(SELECT m.question FROM ekbs_qa_message m WHERE m.session_id = s.session_id "
+        " AND m.role = 'assistant' ORDER BY m.message_id DESC LIMIT 1) AS last_question "
+        "FROM ekbs_qa_session s "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY COALESCE(s.ended_at, s.started_at) DESC LIMIT ? OFFSET ?"
     )
     with runtime.db.sync_connect() as conn:
         rows = [dict(r) for r in conn.execute(sql, (*params, limit, offset)).fetchall()]
         total = int(
             conn.execute(
-                f"SELECT COUNT(*) FROM ekbs_qa_session WHERE {' AND '.join(where)}", tuple(params)
+                f"SELECT COUNT(*) FROM ekbs_qa_session s WHERE {' AND '.join(where)}",
+                tuple(params),
             ).fetchone()[0]
         )
     # 指纹只回前 12 位：它是缓存分区键，完整值对审计无用但可用于关联

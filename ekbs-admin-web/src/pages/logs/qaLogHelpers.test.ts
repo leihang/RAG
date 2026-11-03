@@ -15,7 +15,7 @@ import {
   matchQaKeyword,
   matchSecurityEvent,
   parseDetail,
-  questionStateOf,
+  questionTextOf,
   refusedStateOf,
   sessionDetailErrorText,
   sessionMetaOf,
@@ -48,20 +48,27 @@ describe('toBool', () => {
 })
 
 describe('问答会话列表的缺字段处理', () => {
-  it('拒答列在列表接口下必须是「无法判定」，不能编造', () => {
-    // ekbs_qa_session 没有 refused 列，GET /logs/qa/sessions 也不返回消息
+  it('拒答列：列表接口汇总 refused_count 后按 >0 判定', () => {
+    expect(refusedStateOf({ session_id: 's1', refused_count: 2 })).toBe('yes')
+    expect(refusedStateOf({ session_id: 's1', refused_count: 0 })).toBe('no')
+    // 旧后端没这个字段 → 明确显示「接口未提供」，不能编造
     expect(refusedStateOf({ session_id: 's1' })).toBe('unknown')
   })
 
-  it('问题列同样标注为接口未提供', () => {
-    expect(questionStateOf({ session_id: 's1' })).toBe('unknown')
+  it('问题列：展示最新一轮问题（last_question），缺失才回退占位', () => {
+    expect(questionTextOf({ session_id: 's1', last_question: '拆除作业指导书的编号？' })).toBe(
+      '拆除作业指导书的编号？',
+    )
+    expect(questionTextOf({ session_id: 's1' })).toBe('')
   })
 
-  it('关键字过滤：后端不返回 question/answer，故与任何关键字都不匹配', () => {
+  it('关键字过滤：命中最新问题或答案（大小写不敏感）', () => {
     const row = { session_id: 's1' }
     expect(matchQaKeyword(row, '报销')).toBe(false)
     // 空关键字不过滤
     expect(matchQaKeyword(row, '   ')).toBe(true)
+    const withQuestion = { session_id: 's1', last_question: 'VPN 怎么申请' }
+    expect(matchQaKeyword(withQuestion, 'vpn')).toBe(true)
   })
 
   it('关键字过滤：后端补齐 question/answer 后即可命中（大小写不敏感）', () => {

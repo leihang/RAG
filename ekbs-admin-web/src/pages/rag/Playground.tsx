@@ -65,11 +65,32 @@ function loadOrCreateConversationId(): string {
   return id
 }
 
+/** 最近一次问答结果：持久化到 sessionStorage，刷新页面不丢（否则用户以为"历史没了"）。 */
+const RESULT_KEY = 'ekbs:playground:last_result'
+
+function loadLastResult(): DebugQueryResp | null {
+  try {
+    const raw = sessionStorage.getItem(RESULT_KEY)
+    return raw ? (JSON.parse(raw) as DebugQueryResp) : null
+  } catch {
+    return null
+  }
+}
+
+function saveLastResult(result: DebugQueryResp | null): void {
+  try {
+    if (result) sessionStorage.setItem(RESULT_KEY, JSON.stringify(result))
+    else sessionStorage.removeItem(RESULT_KEY)
+  } catch {
+    /* private mode */
+  }
+}
+
 export default function Playground() {
   const [form] = Form.useForm()
   const [simForm] = Form.useForm()
   const [docSearchForm] = Form.useForm()
-  const [result, setResult] = useState<DebugQueryResp | null>(null)
+  const [result, setResult] = useState<DebugQueryResp | null>(loadLastResult)
   const [shards, setShards] = useState<ShardInfo | null>(null)
   const [loading, setLoading] = useState(false)
   const [conversationId, setConversationId] = useState(loadOrCreateConversationId)
@@ -112,6 +133,7 @@ export default function Playground() {
     }
     setConversationId(id)
     setResult(null)
+    saveLastResult(null)
     message.success('已开启新会话（上一轮上下文不再带入）')
   }
 
@@ -125,7 +147,7 @@ export default function Playground() {
     const v = form.getFieldsValue()
     setLoading(true)
     try {
-      setResult(await debugQuery({
+      const next = await debugQuery({
         query: q,
         mode: v.mode ?? 'prose',
         conversation_id: conversationId,
@@ -133,7 +155,10 @@ export default function Playground() {
         dense_top_k: v.top_k ?? undefined,
         rerank_keep: v.keep ?? undefined,
         rerank_min_score: v.min_score ?? undefined,
-      }))
+      })
+      setResult(next)
+      // 刷新后还能看到刚才这轮（sessionStorage 与 conversation_id 同生命周期）
+      saveLastResult(next)
     } catch (err) { message.error(err instanceof Error ? err.message : String(err)) }
     finally { setLoading(false) }
   }

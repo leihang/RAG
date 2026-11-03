@@ -7,7 +7,7 @@
  * 这些类型只在本模块内使用，待 `src/api/types.ts` 按实测校正后即可合并回去。
  */
 
-/** `GET /logs/qa/sessions` 的**实际**行字段（admin.py:99-103 的 SELECT，逐字对应）。 */
+/** `GET /logs/qa/sessions` 的**实际**行字段（admin.py 的 SELECT，逐字对应）。 */
 export interface QaSessionRow {
   session_id: string
   /** 后端是 NOT NULL，但前端仍按「可能缺失」处理，避免缺字段时页面炸掉 */
@@ -17,16 +17,22 @@ export interface QaSessionRow {
   /** dingtalk_robot | dingtalk_h5 | web | api */
   channel?: string
   conversation_id?: string | null
-  /** 只回前 12 位（admin.py:111-113 截断） */
+  /** 只回前 12 位（admin.py 截断） */
   perm_fingerprint?: string
   /** 会话建立时的密级快照 */
   clearance_at?: number
   started_at?: string
   ended_at?: string | null
   message_count?: number
+  /** 本会话里拒答的轮数（admin.py 从 ekbs_qa_message 汇总） */
+  refused_count?: number
+  /** 本会话的 assistant 轮数 */
+  turn_count?: number
+  /** 最新一轮的问题原文 */
+  last_question?: string | null
   /**
-   * ⚠️ 以下两列**后端不返回**（问题/答案在 `ekbs_qa_message` 上）。
-   * 保留声明只为让「关键字」本地过滤在后端补齐字段后自动生效，不是让页面造假数据。
+   * 兼容字段：问题/答案逐轮存在 `ekbs_qa_message`，列表接口汇总的是
+   * `last_question`；这两个字段留给本地关键字过滤在后端补齐后自动生效。
    */
   question?: string
   answer?: string
@@ -164,11 +170,15 @@ export type RefusedState = 'yes' | 'no' | 'unknown'
 /**
  * 会话是否拒答。
  *
- * ⚠️ 后端的 `ekbs_qa_session` **没有**拒答列（`refused` 在 `ekbs_qa_message` 上，每轮一条），
- * 而 `GET /logs/qa/sessions` 不返回消息，所以**列表接口无法判定拒答**。
- * 直接返回 `unknown`，由页面显式标注「列表接口无此字段」，而不是编一个值出来。
+ * `ekbs_qa_session` 本身没有拒答列，但列表接口现在从 `ekbs_qa_message`
+ * 汇总了 `refused_count`（本会话拒答轮数）；有值就按「>0 = 拒答过」判定，
+ * 缺字段才回退 `unknown`（旧后端）。
  */
-export function refusedStateOf(_row: QaSessionRow): RefusedState {
+export function refusedStateOf(row: QaSessionRow): RefusedState {
+  const count = row.refused_count
+  if (typeof count === 'number' && Number.isFinite(count)) {
+    return count > 0 ? 'yes' : 'no'
+  }
   return 'unknown'
 }
 
@@ -178,28 +188,29 @@ export const REFUSED_META: Record<RefusedState, { text: string; tone: 'error' | 
   unknown: { text: '接口未提供', tone: 'default' },
 }
 
-/** 会话**没有**问题字段（问题在 `ekbs_qa_message.question`），只能显示占位。 */
-export function questionStateOf(_row: QaSessionRow): 'unknown' {
-  return 'unknown'
+/** 会话问题列：列表接口汇总的是**最新一轮**的问题原文（`last_question`）。 */
+export function questionTextOf(row: QaSessionRow): string {
+  const text = String(row.last_question ?? row.question ?? '').trim()
+  return text
 }
 
 export const QUESTION_UNKNOWN_TEXT = '列表接口未返回，见对话详情'
 
-/** 关键字在问题与答案两侧做大小写不敏感的包含匹配。 */
+/** 关键字在最新问题与答案两侧做大小写不敏感的包含匹配。 */
 export function matchQaKeyword(row: QaSessionRow, keyword: string): boolean {
   const q = keyword.trim().toLowerCase()
   if (!q) return true
-  const haystack = [row.question, row.answer].map((v) => String(v ?? '').toLowerCase())
+  const haystack = [row.last_question, row.question, row.answer].map((v) =>
+    String(v ?? '').toLowerCase(),
+  )
   return haystack.some((t) => t.includes(q))
 }
 
 /** 关键字过滤是在**本页返回的行**上做的：接口不支持 q，回看上面注释。 */
 export const QA_KEYWORD_UNSUPPORTED_NOTE =
-  '「关键字」与「是否拒答」两个筛选项后端接口不支持：GET /logs/qa/sessions 只接受 user_id、channel、since 三个过滤参数，' +
-  '且不返回问题与拒答字段。此处仅对**当前页已返回的行**做本地过滤（页面问题/答案字段本就为空，故通常无匹配），' +
-  '不影响 total。请用「用户 ID」「渠道」「起始日期」做精确定位。'
-
-/** QaSessionRow 的问题/答案字段后端暂缺，见上面类型里的说明。 */
+  '「是否拒答」筛选项后端接口不支持（列表只接受 user_id、channel、since 三个过滤参数），' +
+  '但「问题」列已展示最新一轮问题、「是否拒答」列已按本会话拒答轮数汇总，可直接肉眼判断。' +
+  '此处仅对**当前页已返回的行**做关键字本地过滤，不影响 total。'
 
 // ---------------------------------------------------------------------------
 // 安全事件

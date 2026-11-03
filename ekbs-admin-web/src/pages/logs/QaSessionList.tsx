@@ -3,16 +3,17 @@
  *
  * **只读**：审计员是纯只读角色（方案 §1.2），本页没有任何写操作按钮。
  *
- * 两处与设计稿不符、按后端实测处理（不造假数据）：
+ * 数据口径（与后端实测对齐）：
  *
- * 1. 列「拒答」**无数据源** —— `ekbs_qa_session` 没有拒答列，`refused` 在
- *    `ekbs_qa_message` 上（每轮一条），而 `GET /logs/qa/sessions` 不返回消息。
- *    故该列显示「接口未提供」并附原因；拒答率看 `/dashboard` 的 `refusal_rate`，
- *    逐轮拒答看会话详情。
- * 2. 「问题」列同样无数据源（问题在 `ekbs_qa_message.question`），显示占位并指向详情页。
+ * 1. 「是否拒答」：`ekbs_qa_session` 没有拒答列，但列表接口已从 `ekbs_qa_message`
+ *    汇总 `refused_count`（本会话拒答轮数），>0 显示「拒答」；旧后端缺字段时才回退
+ *    「接口未提供」。
+ * 2. 「最新问题」：列表接口汇总 `last_question`（最新一轮问题原文）。
+ * 3. 排序按 `COALESCE(ended_at, started_at)` —— 同一会话可多轮追问，按会话开始时间
+ *    排会把"刚问完但开得早"的记录压到底部。
  *
- * 筛选项「是否拒答」「关键字」后端也不支持（接口只有 user_id / channel / since），
- * 页面照留控件但只做当前页本地过滤，并在页面上**明示**这一点，另补上后端真正支持的筛选项。
+ * 筛选项「关键字」后端不支持服务端过滤（接口只有 user_id / channel / since），
+ * 页面只做当前页本地过滤，并在页面上**明示**这一点。
  */
 import { useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
@@ -30,6 +31,7 @@ import {
   QUESTION_UNKNOWN_TEXT,
   REFUSED_META,
   matchQaKeyword,
+  questionTextOf,
   refusedStateOf,
   textOrDash,
   type QaSessionRow,
@@ -63,19 +65,26 @@ const columns: ProColumns<QaSessionRow>[] = [
     render: (_, row) => textOrDash(row.user_id),
   },
   {
-    title: '问题',
-    dataIndex: 'question',
+    title: '最新问题',
+    dataIndex: 'last_question',
     width: 240,
     ellipsis: true,
     hideInSearch: true,
-    render: () => (
-      <Tooltip title="列表接口未返回问题文本（问题存在 ekbs_qa_message 表上），请进入对话详情查看">
-        <Typography.Text type="secondary">{QUESTION_UNKNOWN_TEXT}</Typography.Text>
-      </Tooltip>
-    ),
+    render: (_, row) => {
+      const text = questionTextOf(row)
+      if (!text) {
+        return <Typography.Text type="secondary">{QUESTION_UNKNOWN_TEXT}</Typography.Text>
+      }
+      return (
+        <Tooltip title={text}>
+          <Typography.Text>{text}</Typography.Text>
+        </Tooltip>
+      )
+    },
   },
   {
     // 方案 §3.2：拒答率是核心指标 —— 真能判定时用 error 色醒目呈现。
+    // 列表接口已从 ekbs_qa_message 汇总 refused_count（旧后端才回退 unknown）。
     title: '是否拒答',
     dataIndex: 'refused',
     width: 130,
@@ -88,7 +97,7 @@ const columns: ProColumns<QaSessionRow>[] = [
       const meta = REFUSED_META[refusedStateOf(row)]
       if (meta.tone === 'default') {
         return (
-          <Tooltip title="ekbs_qa_session 无拒答列，列表接口也不返回消息，无法判定本会话是否拒答；拒答率请见概览看板">
+          <Tooltip title="后端列表接口尚未汇总 refused_count（旧版本），无法判定本会话是否拒答；升级后端后自动生效">
             <Tag icon={<WarningOutlined />}>{meta.text}</Tag>
           </Tooltip>
         )
