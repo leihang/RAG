@@ -80,6 +80,25 @@ def test_catalog_query_and_file_hint() -> None:
     assert "原文件" in format_help_text([{"title": "年假管理制度"}], [])
 
 
+def test_file_request_hint_accepts_send_geiwo_phrasings() -> None:
+    """用户实测：「发送XX原文件给我」「给我发原文件」「发一下原文件」都不能漏。
+
+    handler 只有 ``file_request_hint`` 命中才走 ``/discovery/file``；旧实现只认
+    「发给我」连写，上面这些常见说法会被当成普通提问丢进 RAG（用户反馈「没理解」）。
+    """
+    assert (
+        file_request_hint("把XJWY-GC-14电力增容作业指导书的原文件发给我")
+        == "XJWY-GC-14电力增容作业指导书"
+    )
+    assert file_request_hint("发送XJWY-GC-14原文件给我") == "XJWY-GC-14"
+    assert file_request_hint("把装饰拆除作业指导书的原件传给我") == "装饰拆除作业指导书"
+    assert file_request_hint("发一下XJWY-GC-14的原文件") == "XJWY-GC-14"
+    assert file_request_hint("给我发XJWY-GC-14的原始文件") == "XJWY-GC-14"
+    # 反例：问「怎么发送文件」「文件发给谁」仍是提问，不该抢问答
+    assert file_request_hint("如何发送文件给客户？") is None
+    assert file_request_hint("这个文件发送给谁？") is None
+
+
 def test_list_accessible_files_is_catalog_not_send_or_qa() -> None:
     """用户原话：两句「列出…清单」必须和「我可以查询哪些文件」一样走可见清单。"""
     assert is_catalog_query("列出我可以查询文件的目录清单")
