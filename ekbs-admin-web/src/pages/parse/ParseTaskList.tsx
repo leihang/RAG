@@ -25,6 +25,7 @@ import {
   retryParseTask,
   vectorizeParseTask,
 } from '@/api/parse'
+import { deleteDocument } from '@/api/doc'
 import type { ParseTask, ParseTaskList as ParseTaskListResp } from '@/api/types'
 import { canReviewTask, parseTaskId } from './parseModel'
 import { formatBytes, formatDurationMs, formatPercent, formatTime } from '@/utils/format'
@@ -40,7 +41,7 @@ export default function ParseTaskList() {
   const [indexLayout, setIndexLayout] = useState<string>('single')
   const [batchRunning, setBatchRunning] = useState(false)
   const [pending, setPending] = useState<{
-    kind: 'retry' | 'cancel' | 'reject'
+    kind: 'retry' | 'cancel' | 'reject' | 'delete'
     docId: number | null
     title: string
   } | null>(null)
@@ -192,6 +193,14 @@ export default function ParseTaskList() {
           <Auth key="cancel" code="parse:task:manage">
             <a onClick={() => setPending({ kind: 'cancel', docId: id, title: r.title })}>取消</a>
           </Auth>,
+          <Auth key="delete" code="doc:document:delete">
+            <a
+              style={{ color: '#ff4d4f' }}
+              onClick={() => setPending({ kind: 'delete', docId: id, title: r.title })}
+            >
+              删除
+            </a>
+          </Auth>,
         )
         return items
       },
@@ -301,9 +310,17 @@ export default function ParseTaskList() {
     try {
       if (pending.kind === 'retry') await retryParseTask(pending.docId)
       else if (pending.kind === 'cancel') await cancelParseTask(pending.docId)
+      else if (pending.kind === 'delete')
+        await deleteDocument(pending.docId, { hard: true, purge_assets: true, reason: 'parse_task:delete' })
       else await rejectParseTask(pending.docId)
       message.success(
-        pending.kind === 'retry' ? '已重跑' : pending.kind === 'cancel' ? '已取消' : '已驳回',
+        pending.kind === 'retry'
+          ? '已重跑'
+          : pending.kind === 'cancel'
+            ? '已取消'
+            : pending.kind === 'delete'
+              ? '已彻底删除'
+              : '已驳回',
       )
       setPending(null)
       actionRef.current?.reload()
@@ -444,15 +461,23 @@ export default function ParseTaskList() {
               ? '重跑解析'
               : pending.kind === 'cancel'
                 ? '取消解析'
-                : '驳回复核'
+                : pending.kind === 'delete'
+                  ? '彻底删除文档'
+                  : '驳回复核'
             : ''
         }
         consequence={
           pending ? (
-            <Typography.Text>
-              确认对「{pending.title}」执行
-              {pending.kind === 'retry' ? '重跑' : pending.kind === 'cancel' ? '取消' : '驳回'}？
-            </Typography.Text>
+            pending.kind === 'delete' ? (
+              <Typography.Text>
+                确认对「{pending.title}」执行<b>彻底删除</b>？将同时删除原件与解析产物，<b>不可恢复</b>。
+              </Typography.Text>
+            ) : (
+              <Typography.Text>
+                确认对「{pending.title}」执行
+                {pending.kind === 'retry' ? '重跑' : pending.kind === 'cancel' ? '取消' : '驳回'}？
+              </Typography.Text>
+            )
           ) : null
         }
         onCancel={() => setPending(null)}
