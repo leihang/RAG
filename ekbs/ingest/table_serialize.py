@@ -341,6 +341,7 @@ def _format_row(cells: Sequence[str], headers: Sequence[str]) -> str:
 
 def _chunk_by_budget(
     preamble: list[str], data_rows: list[list[str]], headers: list[str],
+    *, max_tokens: int = TABLE_MAX_TOKENS,
 ) -> list[str]:
     """按 token 预算把数据行分批，每批重复 preamble。"""
     blocks: list[str] = []
@@ -348,7 +349,7 @@ def _chunk_by_budget(
     for cells in data_rows:
         line = _format_row(cells, headers)
         candidate = "\n".join([*current_lines, line])
-        if current_lines is not preamble and count_tokens(candidate) > TABLE_MAX_TOKENS:
+        if current_lines is not preamble and count_tokens(candidate) > max_tokens:
             blocks.append("\n".join(current_lines))
             current_lines = [*preamble, line]
         else:
@@ -366,8 +367,13 @@ def serialize_information_blocks(
     rows: Sequence[Sequence[str]] = (),
     table_id: str = "",
     row_chunks: bool = False,
+    max_tokens: int = TABLE_MAX_TOKENS,
 ) -> list[str]:
-    """把二维表打成一段或多段自解释文本（超长按行批拆）。"""
+    """把二维表打成一段或多段自解释文本（超长按行批拆）。
+
+    ``max_tokens``：每段预算。默认 2048（整表父容器用）；行组叶子传更小的值
+    （见 ``chunker.TABLE_LEAF_TOKENS=384``），避免十几行挤进同一个向量被稀释。
+    """
     matrix = _normalize_matrix(rows)
     if not matrix:
         return []
@@ -387,15 +393,24 @@ def serialize_information_blocks(
         if not data_rows:
             return ["\n".join(preamble)]
         return ["\n".join([*preamble, _format_row(cells, headers)]) for cells in data_rows]
-    return _chunk_by_budget(preamble, data_rows, headers)
+    return _chunk_by_budget(preamble, data_rows, headers, max_tokens=max_tokens)
 
 
 def serialize_table_body(
-    *, caption: str = "", body: str = "", table_id: str = "", row_chunks: bool = False
+    *,
+    caption: str = "",
+    body: str = "",
+    table_id: str = "",
+    row_chunks: bool = False,
+    max_tokens: int = TABLE_MAX_TOKENS,
 ) -> list[str]:
     """从 MinerU ``table_body`` / 题注直接序列化。"""
     return serialize_information_blocks(
-        caption=caption, rows=coerce_rows(body), table_id=table_id, row_chunks=row_chunks
+        caption=caption,
+        rows=coerce_rows(body),
+        table_id=table_id,
+        row_chunks=row_chunks,
+        max_tokens=max_tokens,
     )
 
 

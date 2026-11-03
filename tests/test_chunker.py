@@ -8,6 +8,7 @@ from ekbs.ingest.chunker import (
     OVERLAP_MIN_RATIO,
     PARENT_MAX_TOKENS,
     PARENT_MIN_TOKENS,
+    TABLE_LEAF_TOKENS,
     TableInput,
     chunk_markdown,
     content_coverage,
@@ -638,3 +639,40 @@ def test_large_table_gets_container_parent_and_row_leaves() -> None:
     leaves = [n for n in tables if n.parent_index in container_idx]
     assert len(leaves) > 1, "大表应按行出叶子"
     assert all(n.content.startswith("表名:") for n in leaves)
+
+
+def test_medium_table_splits_into_row_group_leaves_at_384_tokens() -> None:
+    """整表超过 ``TABLE_LEAF_TOKENS``(384) 就拆「表格父容器 + 行组叶子」。
+
+    实测 GC-12「表1-年度能耗管理计划编制及实施要求」（920 token / 十几行）整表一个
+    向量时，查「A级能耗普查」检索不中 —— 内容被其他行稀释。这条钉住：
+    * 出了表格父容器（整表 + 上下文，不嵌入）；
+    * 叶子按行组拆、每叶 ≤384 + 单行余量，且每叶重复表头（自解释）。
+    """
+    rows = "\n".join(
+        f"| 级别{chr(65 + i % 6)} | 工作内容{i}与年度能耗管理计划相关的说明文字 | 时间节点{i} | 责任人{i} |"
+        for i in range(20)
+    )
+    medium = f"| 级别 | 工作内容 | 时间节点 | 责任人 |\n| --- | --- | --- | --- |\n{rows}"
+    result = chunk_markdown(
+        "# 制度\n\n## 5. 工作程序和要求\n\n表1-年度能耗管理计划\n[表格 1]\n\n",
+        doc_title="能耗管理作业指导书",
+        tables=[TableInput(body=medium, table_id="1", caption="表1-年度能耗管理计划")],
+    )
+    tables = [node for node in result.nodes if node.chunk_type == "table"]
+    container_idx = {
+        node.parent_index
+        for node in tables
+        if node.parent_index is not None
+        and result.nodes[node.parent_index].chunk_type == "table"
+    }
+    assert len(container_idx) == 1, ">384 token 的表应出且只出一个表格父容器"
+    leaves = [node for node in tables if node.parent_index in container_idx]
+    assert len(leaves) > 1, "应拆成多个行组叶子（否则整表一个向量会被稀释）"
+    assert all(node.content.startswith("表名:") for node in leaves), "每叶必须重复表头"
+    # 每叶 ≤ 384（首行可能超一点，允许 CHILD_MAX 余量）
+    assert all(count_tokens(node.content) <= TABLE_LEAF_TOKENS + CHILD_MAX_TOKENS for node in leaves)
+    # 容器在子块覆盖后按叶子规则不嵌入（retrievable.py），这里只校验它含整表
+    container = result.nodes[next(iter(container_idx))]
+    assert "表1-年度能耗管理计划" in container.content
+    assert "级别=级别A" in container.content

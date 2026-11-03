@@ -40,6 +40,10 @@ OVERLAP_MAX_RATIO = 0.15
 #: 只有标题/占位符、没有正文的节（如 ``[表格 1]``、``[图片]``）
 _PLACEHOLDER_ONLY_RE = re.compile(r"^\[(?:表格|图片)\s*\d*\]$")
 TABLE_SPLIT_TOKENS = 2048
+#: 表格**叶子**预算（与正文 child 上限 384 对齐）：整表超过这个就拆「行组叶子」，
+#: 每叶重复表头、逐块嵌入。整表一个向量时十几行数据会互相稀释（实测 920 token 的
+#: 「表1-年度能耗管理计划编制及实施要求」查「A级能耗普查」检索不中）。
+TABLE_LEAF_TOKENS = 384
 FALLBACK_WINDOW_CHARS = 100
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
@@ -517,6 +521,29 @@ def _table_parent_content(
     if below:
         parts.append(below)
     return "\n\n".join(parts)
+
+
+def _table_leaf_blocks(
+    table: TableInput, full_blocks: Sequence[str], *, row_chunks: bool
+) -> Sequence[str]:
+    """表格叶子块：≤``TABLE_LEAF_TOKENS`` 用整表一块；超过就按行组拆（每叶重复表头）。
+
+    整表一个向量时十几行数据会互相稀释（实测 920 token 的「表1-年度能耗管理计划编制
+    及实施要求」查「A级能耗普查」检索不中）。``row_chunks=True`` 时退化为一行一块
+    （配置项 ``ingest.table_row_chunks``，默认关）。
+    """
+    # 延迟导入：table_serialize 反向依赖本模块的 count_tokens，模块级导入会成环
+    from ekbs.ingest.table_serialize import serialize_table_body
+
+    if sum(count_tokens(block) for block in full_blocks) <= TABLE_LEAF_TOKENS:
+        return full_blocks
+    return serialize_table_body(
+        caption=table.caption,
+        body=table.body,
+        table_id=table.table_id,
+        row_chunks=row_chunks,
+        max_tokens=TABLE_LEAF_TOKENS,
+    )
 
 
 @dataclass
@@ -1118,8 +1145,14 @@ def chunk_markdown(
         above, below = _table_adjacent_prose(raw_sections, str(table.table_id))
         prose_parent = table_container.get(str(table.table_id))
 
-        if len(full_blocks) == 1:
-            # 小表（整表一块）：上下文直接折进叶子，不另设父容器（多一层只会重复）。
+        # 叶子预算：整表超过 384 token 就拆「行组叶子」。
+        # 920 token 的表（十几行数据）塞进同一个向量会被互相稀释 —— 查某一行
+        # 的语义（如「A级能耗普查」）时整表向量对不上，检索直接落空。
+        leaf_blocks = _table_leaf_blocks(table, full_blocks, row_chunks=table_row_chunks)
+
+        if len(full_blocks) == 1 and len(leaf_blocks) <= 1:
+            # 小表（整表一块；或单行就超预算、拆不出第二块）：上下文折进叶子，
+            # 不另设父容器（多一层只会重复）。
             seq += 1
             result.nodes.append(
                 ChunkNode(
@@ -1147,16 +1180,6 @@ def chunk_markdown(
 
         # 大表：出「父容器（上文 + 整表 + 下文）+ 行/组叶子」。父容器被子块覆盖后按
         # 叶子规则不入向量（retrievable.py）；叶子命中后经 `parent_expand` 扩成整表父块。
-        if table_row_chunks:
-            leaf_blocks = serialize_table_body(
-                caption=table.caption,
-                body=table.body,
-                table_id=table.table_id,
-                row_chunks=True,
-            )
-        else:
-            leaf_blocks = full_blocks
-
         seq += 1
         container_index = len(result.nodes)
         result.nodes.append(
