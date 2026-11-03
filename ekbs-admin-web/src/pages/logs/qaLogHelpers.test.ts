@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest'
 import {
   accessResultOfDoc,
   actionLabel,
+  answerLooksRefused,
   buildQaTurns,
   citationOfDoc,
   eventTypeLabel,
@@ -16,12 +17,14 @@ import {
   matchSecurityEvent,
   parseDetail,
   questionTextOf,
+  refusedLabelOf,
   refusedStateOf,
   sessionDetailErrorText,
   sessionMetaOf,
   severityOfDoc,
   textOrDash,
   toBool,
+  turnRefusedOf,
   userLabelOf,
 } from './qaLogHelpers'
 
@@ -49,10 +52,17 @@ describe('toBool', () => {
 })
 
 describe('问答会话列表的缺字段处理', () => {
-  it('拒答列：列表接口汇总 refused_count 后按 >0 判定', () => {
-    expect(refusedStateOf({ session_id: 's1', refused_count: 2 })).toBe('yes')
-    expect(refusedStateOf({ session_id: 's1', refused_count: 0 })).toBe('no')
-    // 旧后端没这个字段 → 明确显示「接口未提供」，不能编造
+  it('拒答列：区分「全部拒答 / 部分拒答 / 已作答」，不把个别拒答标成整会话拒答', () => {
+    // 实测：18 轮里 3 轮拒答、其余正常回答 —— 列表不能显示成"拒答"
+    expect(refusedStateOf({ session_id: 's1', refused_count: 3, turn_count: 18 })).toBe('partial')
+    expect(refusedLabelOf({ session_id: 's1', refused_count: 3, turn_count: 18 })).toBe(
+      '部分拒答 3/18',
+    )
+    // 全部轮次都拒答
+    expect(refusedStateOf({ session_id: 's1', refused_count: 2, turn_count: 2 })).toBe('yes')
+    // 一轮没拒
+    expect(refusedStateOf({ session_id: 's1', refused_count: 0, turn_count: 18 })).toBe('no')
+    // 旧后端没这些字段 → 明确显示「接口未提供」，不能编造
     expect(refusedStateOf({ session_id: 's1' })).toBe('unknown')
   })
 
@@ -85,6 +95,27 @@ describe('问答会话列表的缺字段处理', () => {
     expect(matchQaKeyword(row, 'vpn')).toBe(true)
     expect(matchQaKeyword(row, 'it 手册')).toBe(true)
     expect(matchQaKeyword(row, '无关词')).toBe(false)
+  })
+})
+
+describe('轮次拒答判定（以答案内容为准，不盲信 refused 标记）', () => {
+  it('拒答话术识别', () => {
+    expect(answerLooksRefused('未找到可靠依据。')).toBe(true)
+    expect(answerLooksRefused('对不起，你无权查阅资料，如需授权请联系管理员。')).toBe(true)
+    expect(answerLooksRefused('对不起，未找到相关信息。你可以输入帮助…')).toBe(true)
+    expect(answerLooksRefused('文件编号是 XJWY-GC-13。')).toBe(false)
+    expect(answerLooksRefused('')).toBe(true)
+  })
+
+  it('历史误判：refused=1 但答案正常 → 显示「已作答」', () => {
+    // 实测 msg 105：旧版 missing_citation 硬拒，但答案是正常回答
+    expect(
+      turnRefusedOf({ refused: true, answer: '装饰拆除作业指导书的文件编号是XJWY-GC-13。' }),
+    ).toBe(false)
+    // 真正拒答
+    expect(turnRefusedOf({ refused: true, answer: '未找到可靠依据。' })).toBe(true)
+    // 未标记且答案正常
+    expect(turnRefusedOf({ refused: false, answer: '适用范围是熙街管理处。' })).toBe(false)
   })
 })
 

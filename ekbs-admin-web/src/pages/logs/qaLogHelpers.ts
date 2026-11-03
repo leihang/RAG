@@ -169,27 +169,48 @@ export function toBool(value: unknown): boolean {
 // 问答会话列表
 // ---------------------------------------------------------------------------
 
-export type RefusedState = 'yes' | 'no' | 'unknown'
+export type RefusedState = 'yes' | 'partial' | 'no' | 'unknown'
 
 /**
- * 会话是否拒答。
+ * 会话拒答状态。
  *
- * `ekbs_qa_session` 本身没有拒答列，但列表接口现在从 `ekbs_qa_message`
- * 汇总了 `refused_count`（本会话拒答轮数）；有值就按「>0 = 拒答过」判定，
- * 缺字段才回退 `unknown`（旧后端）。
+ * `ekbs_qa_session` 本身没有拒答列，列表接口从 `ekbs_qa_message` 汇总了
+ * `refused_count`（拒答轮数）与 `turn_count`（总轮数）。**不能**按「有过拒答 = 整会话拒答」
+ * 展示 —— 实测一个 18 轮的会话里 3 轮拒答、其余全是正常回答，列表却标「拒答」，
+ * 用户会以为"正常回答被标成拒答"。所以拆成三态：
+ *
+ * * `no`      —— 一轮都没拒答；
+ * * `partial` —— 部分轮次拒答（其余正常，界面显示 `部分拒答 3/18`）；
+ * * `yes`     —— 全部轮次都拒答。
  */
 export function refusedStateOf(row: QaSessionRow): RefusedState {
-  const count = row.refused_count
-  if (typeof count === 'number' && Number.isFinite(count)) {
-    return count > 0 ? 'yes' : 'no'
+  const refused = row.refused_count
+  if (typeof refused !== 'number' || !Number.isFinite(refused)) {
+    return 'unknown'
   }
-  return 'unknown'
+  if (refused <= 0) return 'no'
+  const turns = typeof row.turn_count === 'number' && Number.isFinite(row.turn_count) ? row.turn_count : 0
+  if (turns > 0 && refused >= turns) return 'yes'
+  return 'partial'
 }
 
-export const REFUSED_META: Record<RefusedState, { text: string; tone: 'error' | 'success' | 'default' }> = {
-  yes: { text: '拒答', tone: 'error' },
+export const REFUSED_META: Record<
+  RefusedState,
+  { text: string; tone: 'error' | 'warning' | 'success' | 'default' }
+> = {
+  yes: { text: '全部拒答', tone: 'error' },
+  partial: { text: '部分拒答', tone: 'warning' },
   no: { text: '已作答', tone: 'success' },
   unknown: { text: '接口未提供', tone: 'default' },
+}
+
+/** 拒答列文案：部分拒答附比例（`部分拒答 3/18`），其余用固定文案。 */
+export function refusedLabelOf(row: QaSessionRow): string {
+  const state = refusedStateOf(row)
+  if (state === 'partial') {
+    return `部分拒答 ${row.refused_count ?? 0}/${row.turn_count ?? 0}`
+  }
+  return REFUSED_META[state].text
 }
 
 /** 会话问题列：列表接口汇总的是**最新一轮**的问题原文（`last_question`）。 */
@@ -477,4 +498,30 @@ export function buildQaTurns(
 export function sessionDetailErrorText(status: number | undefined, fallback: string): string {
   if (status === 404) return '没有找到该会话（会话可能已归档或 id 有误）'
   return fallback || '加载失败'
+}
+
+/**
+ * 答案是不是「拒答话术」（而不是真的答了）。
+ *
+ * 后端拒答文案以这些前缀开头（`ekbs/retrieval/pipeline.py: refusal_answer_text` /
+ * `NO_BASIS_MARKER`）。
+ */
+const REFUSAL_PREFIXES = ['未找到可靠依据', '对不起', '没有找到']
+
+export function answerLooksRefused(answer: string | null | undefined): boolean {
+  const text = String(answer ?? '').trim()
+  if (!text) return true
+  const head = text.replace(/^[*#>\-—・\s「『"'《]+/, '')
+  return REFUSAL_PREFIXES.some((prefix) => head.startsWith(prefix))
+}
+
+/**
+ * 某轮是否应显示为「拒答」——**以答案实际内容为准**，不盲信 `refused` 标记。
+ *
+ * 历史记录里有一批 `refused=1` 但答案正常的误判（旧版 `missing_citation` 硬拒，
+ * 已在修复漏标引用后纠正）。详情页若照搬标记，会把正常回答标成"拒答"。
+ */
+export function turnRefusedOf(turn: { refused?: boolean; answer?: string }): boolean {
+  if (!String(turn.answer ?? '').trim()) return Boolean(turn.refused)
+  return answerLooksRefused(turn.answer)
 }

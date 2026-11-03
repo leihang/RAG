@@ -13,7 +13,7 @@ import { FileSearchOutlined, WarningOutlined } from '@ant-design/icons'
 import { Link } from 'react-router-dom'
 import FigureThumb from '@/components/FigureThumb'
 import { formatMs, formatTime } from '@/utils/format'
-import { textOrDash, type QaCitation, type QaTurn } from './qaLogHelpers'
+import { textOrDash, turnRefusedOf, type QaCitation, type QaTurn } from './qaLogHelpers'
 
 /** 引用项：文档名（此处只有 doc_id，方案未要求回查标题）与分块 id。 */
 function CitationItem({ citation }: { citation: QaCitation }) {
@@ -97,7 +97,9 @@ export default function QaTurnItem({ turn }: QaTurnItemProps) {
       title={
         <Space size={8} wrap>
           <Typography.Text strong>第 {textOrDash(turn.turn)} 轮</Typography.Text>
-          {turn.refused ? (
+          {/* 按**答案实际内容**判定拒答：历史记录里存在 refused=1 但答案正常的误判
+              （旧版 missing_citation 硬拒），照搬标记会把正常回答标成"拒答" */}
+          {turnRefusedOf(turn) ? (
             <Tag color="red" icon={<WarningOutlined />}>
               拒答
             </Tag>

@@ -32,6 +32,7 @@ import {
   REFUSED_META,
   matchQaKeyword,
   questionTextOf,
+  refusedLabelOf,
   refusedStateOf,
   textOrDash,
   userLabelOf,
@@ -89,26 +90,31 @@ const columns: ProColumns<QaSessionRow>[] = [
     },
   },
   {
-    // 方案 §3.2：拒答率是核心指标 —— 真能判定时用 error 色醒目呈现。
-    // 列表接口已从 ekbs_qa_message 汇总 refused_count（旧后端才回退 unknown）。
+    // 方案 §3.2：拒答率是核心指标 —— 真能判定时用醒目色呈现。
+    // 列表接口已从 ekbs_qa_message 汇总 refused_count / turn_count（旧后端才回退 unknown）。
+    // 三态：全部拒答 / 部分拒答 N/M / 已作答 —— 不能把"18 轮里 3 轮拒答"标成整会话拒答。
     title: '是否拒答',
     dataIndex: 'refused',
-    width: 130,
+    width: 150,
     valueEnum: {
-      yes: { text: '拒答' },
+      yes: { text: '全部拒答' },
+      partial: { text: '部分拒答' },
       no: { text: '已作答' },
       unknown: { text: '接口未提供' },
     },
     render: (_, row) => {
-      const meta = REFUSED_META[refusedStateOf(row)]
-      if (meta.tone === 'default') {
+      const state = refusedStateOf(row)
+      const meta = REFUSED_META[state]
+      if (state === 'unknown') {
         return (
           <Tooltip title="后端列表接口尚未汇总 refused_count（旧版本），无法判定本会话是否拒答；升级后端后自动生效">
             <Tag icon={<WarningOutlined />}>{meta.text}</Tag>
           </Tooltip>
         )
       }
-      return <Tag color={meta.tone === 'error' ? 'red' : 'green'}>{meta.text}</Tag>
+      const color =
+        meta.tone === 'error' ? 'red' : meta.tone === 'warning' ? 'orange' : 'green'
+      return <Tag color={color}>{refusedLabelOf(row)}</Tag>
     },
   },
   {
