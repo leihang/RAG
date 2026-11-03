@@ -42,9 +42,11 @@ from ekbs.retrieval.answer_verify import AnswerVerifier, VerifyResult
 from ekbs.retrieval.faithfulness import (
     DEGRADED_UNSUPPORTED,
     REFUSE_MISSING_CITATION,
+    FaithfulnessReport,
     assess_faithfulness,
     clause_mismatches,
     mostly_unsupported,
+    supporting_chunk_indices,
 )
 from ekbs.retrieval.numeric import (
     MODE_AUTO,
@@ -110,6 +112,39 @@ def _is_no_basis(text: str) -> bool:
     """判断生成结果是否为模型主动拒答（而非真的答了）。"""
     head = text.strip().lstrip("*#>-—・ \t\r\n「『\"'《")
     return head.startswith(NO_BASIS_MARKER)
+
+
+def _merge_faithfulness(parts: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """多子问的忠实度报告合并（保守：任一子问不 ok → 整体不 ok）。
+
+    ``AnswerResult.faithfulness`` 只有合并成一份，调试台「忠诚度」卡片才有数据可渲染；
+    不合并时多问句查询的该字段为空，界面就显示成 0。
+    """
+    reports = [p for p in parts if p]
+    if not reports:
+        return {}
+    claims: list[Any] = []
+    unsupported: list[str] = []
+    cited: list[int] = []
+    ok = True
+    reason = ""
+    for report in reports:
+        claims.extend(report.get("claims") or [])
+        unsupported.extend(report.get("unsupported") or [])
+        for index in report.get("cited_indices") or []:
+            if index not in cited:
+                cited.append(index)
+        if not report.get("ok"):
+            ok = False
+        if not reason and report.get("reason"):
+            reason = str(report["reason"])
+    return {
+        "ok": ok,
+        "cited_indices": cited,
+        "claims": claims,
+        "unsupported": unsupported,
+        "reason": reason,
+    }
 
 
 @dataclass
@@ -304,7 +339,8 @@ class RetrievalOverrides:
 
 SYSTEM_PROMPT = (
     "你是企业知识库问答助手。只能依据下面提供的资料回答，不得编造。\n"
-    "引用资料时必须在句末标注编号，格式如 [1]、[2]。\n"
+    "引用资料时必须在句末标注编号，格式如 [1]、[2]；**哪怕只有一句话也必须标**"
+    "（例如：「文件编号是 XJWY-GC-13[1]」），漏标会被判为无依据。\n"
     "资料里以【图片】开头的条目是可展示的原图：用户索要照片/图片/截图时，"
     "必须引用这些编号（界面会展示图片），不要因为无法在文字里嵌入图片就回复「未找到可靠依据」。\n"
     # 输出长度是硬约束（max_tokens=2048 ≈ 2000 字）：不加限制提示时，模型会试图复述
@@ -320,7 +356,7 @@ TRUNCATION_NOTICE = "（提示：回答已达长度上限被截断，未显示�
 
 #: 提示词版本（进答案缓存键）：**改动 SYSTEM_PROMPT 必须同步 +1**，
 #: 否则旧提示词生成的答案会继续从缓存里被服务。
-PROMPT_REVISION = "v5"
+PROMPT_REVISION = "v6"
 
 
 class RetrievalPipeline:
@@ -1612,6 +1648,20 @@ class RetrievalPipeline:
         degraded: list[str] = (
             [f"output_title_masked:{len(leaked_titles)}"] if leaked_titles else []
         )
+        # 模型漏标 [n]、但所有 claim 都能在资料里找到 → 按答案里的编号/特异数字反查分块补引用，
+        # 不整篇拒答（实测「XX 的编号是多少」这种一句话回答，模型常忘记标 [1]；
+        # 旧逻辑直接 missing_citation 硬拒，用户看到"答不出来 + 忠诚度 0"）。
+        if report.reason == REFUSE_MISSING_CITATION and not report.unsupported:
+            auto_indices = supporting_chunk_indices(answer_text, chunks)
+            if auto_indices:
+                report = FaithfulnessReport(
+                    ok=True,
+                    cited_indices=auto_indices,
+                    claims=report.claims,
+                    unsupported=[],
+                    reason="",
+                )
+                degraded.append("missing_citation:auto_cited")
         if not report.ok:
             hard_refuse = report.reason == REFUSE_MISSING_CITATION or mostly_unsupported(report)
             self.gate.record_security_event(
@@ -1694,7 +1744,11 @@ class RetrievalPipeline:
                     **timing_kw,
                 )
 
-        citations = self._post_check_citations(answer_text, chunks, perm)
+        # 引用编号以 `report.cited_indices` 为准：正常路径它来自答案里的 [n]，
+        # 而「漏标但全部 claim 都被支撑」时由 `supporting_chunk_indices` 反查补上。
+        citations = self._post_check_citations(
+            answer_text, chunks, perm, indices=report.cited_indices
+        )
         # 输出截断：撞到 max_tokens 上限时答案本身不完整，必须明确告诉用户，
         # 不能把半截答案伪装成完整答案（评测与用户都会被骗）。
         truncated = finish_reason == "length"
@@ -1967,15 +2021,26 @@ class RetrievalPipeline:
         return cleaned, sorted(set(bad))
 
     def _post_check_citations(
-        self, answer: str, chunks: Sequence[RetrievedChunk], perm: PermContext
+        self,
+        answer: str,
+        chunks: Sequence[RetrievedChunk],
+        perm: PermContext,
+        *,
+        indices: Sequence[int] | None = None,
     ) -> list[Citation]:
         """引用后置校验（`00` §2.2、`docs/spec/10` §8）：编号存在 + ACL 二次确认 + 页码区间。
 
         **P0**：答案里没有 ``[n]`` 时返回空列表 —— 禁止「没标出处却挂上全部候选」的假溯源。
+        ``indices``：显式指定引用编号（1 基）。默认从答案里的 ``[n]`` 解析；
+        「漏标但全部 claim 都被支撑」时由 :func:`supporting_chunk_indices` 反查补上。
         """
         if not answer.strip():
             return []
-        cited_indices = {int(m.group(1)) for m in _CITATION_RE.finditer(answer)}
+        cited_indices = (
+            {int(i) for i in indices}
+            if indices is not None
+            else {int(m.group(1)) for m in _CITATION_RE.finditer(answer)}
+        )
         if not cited_indices:
             return []
         allowed, dropped = self.gate.filter_chunks(
@@ -2476,8 +2541,9 @@ class RetrievalPipeline:
     ) -> tuple[RetrievalResult, dict[int, set[int]], list[tuple[int, RetrievalResult]]]:
         """多子问：每子问独立改写 + 独立召回，再合并去重 + 配额选择（P1+P2）。
 
-        ``collect_debug`` 只保留给未来调试扩展；子问级召回默认不收集分阶段明细，
-        避免 N 倍调试开销。返回 ``(合并结果, chunk_id → 命中它的子问集合, 各子问结果)``
+        ``collect_debug`` 透传给每个子问的召回：调试台看多问句时也要能看到
+        dense/sparse/rrf/rerank 各阶段（此前写死 False，导致多问句「检索过程」整块空白）。
+        返回 ``(合并结果, chunk_id → 命中它的子问集合, 各子问结果)``
         —— 各子问结果供"逐子问生成"使用（见 :meth:`_answer_multi_intent`）。
         """
         per_sub: list[tuple[int, RetrievalResult]] = []
@@ -2485,7 +2551,7 @@ class RetrievalPipeline:
             sub_rewrite = await self._rewrite(sq.text, messages)
             sq.rewritten = str(getattr(sub_rewrite, "rewritten", sq.text) or sq.text)
             result = await self.retrieve(
-                sq.rewritten, perm, overrides=overrides, collect_debug=False
+                sq.rewritten, perm, overrides=overrides, collect_debug=collect_debug
             )
             per_sub.append((sq.index, result))
         merged, hit_by = self._merge_retrievals(per_sub)
@@ -2537,6 +2603,16 @@ class RetrievalPipeline:
         citations: list[Citation] = []
         degraded: set[str] = set()
         refused_all = True
+        #: 第一个子问真正拒答的原因（用于合并结果的 refusal_reason；别再拿
+        #: 检索层的 merged.refusal_reason 兜底成 no_basis_in_context —— 那会把
+        #: missing_citation 之类的原因报错成"没有依据"）。
+        part_reason = ""
+        #: 多子问忠实度：逐子问合并（任一子问不 ok 则整体不 ok，保守口径）。
+        #: 不合并的话 `AnswerResult.faithfulness` 为空 → 调试台「忠诚度」显示 0。
+        faithfulness_parts: list[dict[str, Any]] = []
+        #: 多子问检索阶段：合并结果本身没有 stage_debug，借用第一个子问的明细，
+        #: 否则调试台「检索过程」整块空白（实测多问句一次就只剩空 stages）。
+        stage_debug: dict[str, Any] = {}
         truncated = False
         model = ""
         prompt_tokens = completion_tokens = total_ms = 0
@@ -2545,7 +2621,10 @@ class RetrievalPipeline:
             result = by_index.get(sq.index)
             if result is None or not result.chunks:
                 sections.append(f"{order}. {sq.text}\n未找到可靠依据。")
+                faithfulness_parts.append({"ok": False, "reason": "no_candidate"})
                 continue
+            if not stage_debug and result.stage_debug:
+                stage_debug = dict(result.stage_debug)
             part = await self.generate(sq.text, result, perm)
             model = model or part.model
             prompt_tokens += part.prompt_tokens
@@ -2555,6 +2634,10 @@ class RetrievalPipeline:
             degraded.update(part.degraded)
             if not part.refused:
                 refused_all = False
+            elif not part_reason:
+                part_reason = part.refusal_reason
+
+            faithfulness_parts.append(dict(part.faithfulness or {}))
 
             local_chunks = {i + 1: chunk.chunk_id for i, chunk in enumerate(result.chunks)}
 
@@ -2575,6 +2658,8 @@ class RetrievalPipeline:
 
         citations.sort(key=lambda cite: cite.cite_index)
         answer = "\n\n".join(sections).strip() or "未找到可靠依据。"
+        if stage_debug:
+            merged.stage_debug = stage_debug
         return AnswerResult(
             answer=answer,
             citations=citations,
@@ -2582,8 +2667,11 @@ class RetrievalPipeline:
             model=model,
             refused=refused_all,
             refusal_reason=(
-                "" if not refused_all else (merged.refusal_reason or REFUSE_NO_BASIS)
+                ""
+                if not refused_all
+                else (part_reason or merged.refusal_reason or REFUSE_NO_BASIS)
             ),
+            faithfulness=_merge_faithfulness(faithfulness_parts),
             degraded=sorted(degraded),
             truncated=truncated,
             prompt_tokens=prompt_tokens,

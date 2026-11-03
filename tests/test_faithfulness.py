@@ -18,6 +18,7 @@ from ekbs.retrieval.faithfulness import (
     clause_mismatches,
     extract_claims,
     mostly_unsupported,
+    supporting_chunk_indices,
 )
 from ekbs.retrieval.pipeline import RetrievalPipeline
 from tests.conftest import user_id_of
@@ -261,3 +262,23 @@ def test_clause_number_in_aggregated_chunk_content_is_allowed() -> None:
     assert clause_mismatches("依据第二条，须提前申请 [1]。", chunks) == []
     # 证据里根本没有的条号仍然要拒
     assert clause_mismatches("依据第五条，须提前申请 [1]。", chunks) == ["第5条"]
+
+
+def test_supporting_chunk_indices_finds_evidence_for_uncited_answer() -> None:
+    """模型漏标 [n] 时，按答案里的编号/特异数字反查真正支撑它的块。
+
+    实测「拆除作业指导书的编号？」：答案正确（编号 XJWY-GC-13）但没标 ``[1]``，
+    旧逻辑 ``missing_citation`` 硬拒 → 用户看到"答不出来 + 忠诚度 0"。
+    """
+    chunks = [
+        _chunk("无关内容。", title="其他", heading="别处"),
+        _chunk(
+            "文件编号：XJWY-GC-13；编制：雷航；审核：刘冀",
+            title="装饰拆除作业指导书",
+            heading="文件信息",
+        ),
+    ]
+    assert supporting_chunk_indices("文件编号是 XJWY-GC-13。", chunks) == [2]
+    # 没有可定位线索时返回空 —— 宁可拒答，也不能瞎挂引用
+    assert supporting_chunk_indices("好的。", chunks) == []
+    assert supporting_chunk_indices("编号是 XJWY-GC-99。", chunks) == []

@@ -196,6 +196,48 @@ def claim_supported(claim: str, evidence: str) -> bool:
     return False
 
 
+#: 编号类整词（与 FTS 自动词典同口径）：答案里出现时是**强证据线索**
+_CODE_TOKEN_RE = re.compile(r"[A-Za-z0-9]{2,}(?:[-/][A-Za-z0-9]+){1,}")
+
+
+def answer_needles(answer: str) -> list[str]:
+    """从答案抽「足够特异」的证据线索：编号类整词 + 特异数字。
+
+    普通词（「雷航」「编制人」）会命中一堆块，不能用来定位；编号与 ≥3 位/带小数的
+    数字才足以判断"是哪一块支撑了这句话"。
+    """
+    text = strip_citations(answer)
+    needles: list[str] = []
+    for match in _CODE_TOKEN_RE.finditer(text):
+        token = match.group(0)
+        if token and token not in needles:
+            needles.append(token)
+    for match in _SPECIFIC_NUMBER_RE.finditer(text):
+        core = match.group(0).replace(",", "")
+        if core and core not in needles:
+            needles.append(core)
+    return needles
+
+
+def supporting_chunk_indices(answer: str, chunks: Sequence[object]) -> list[int]:
+    """答案没标 ``[n]`` 时，反查**真正支撑它的分块**（1 基下标，去重保序）。
+
+    只在上层确认「所有 claim 都被资料支撑、只是漏了引用标记」后调用：
+    这时按答案里的编号/特异数字反查分块并补上引用，比整篇拒答更合理
+    （实测「拆除作业指导书的编号？」被 ``missing_citation`` 误拒，
+    而编号确实就在「文件信息」块里）。
+    """
+    needles = answer_needles(answer)
+    if not needles:
+        return []
+    indices: list[int] = []
+    for index, chunk in enumerate(chunks, start=1):
+        evidence = re.sub(r"\s+", "", build_evidence([chunk]))
+        if any(re.sub(r"\s+", "", needle) in evidence for needle in needles):
+            indices.append(index)
+    return indices[:3]
+
+
 def mostly_unsupported(report: FaithfulnessReport) -> bool:
     """`unsupported` 占比是否高到"不该放行"（整篇数字对不上 = 大概是编的）。"""
     total = len(report.claims)
