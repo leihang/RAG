@@ -13,12 +13,12 @@ import { useEffect, useState } from 'react'
 import {
   Alert, Button, Card, Descriptions, Form, Input, InputNumber, Radio, Select, Space, Switch, Table, Tag, Typography, message,
 } from 'antd'
-import Auth from '@/components/Auth'
 import ChunkPeekDrawer from '@/components/ChunkPeekDrawer'
 import ClearanceTag from '@/components/ClearanceTag'
 import StagesPanel from './StagesPanel'
 import FigureThumb from '@/components/FigureThumb'
 import { faithfulnessBanner, parseStages } from './playgroundData'
+import { usePermission } from '@/hooks/usePermission'
 import { listDocuments } from '@/api/doc'
 import { fetchDiscoveryCatalog, type DiscoveryCatalog } from '@/api/discovery'
 import { personalOwnerText } from '@/utils/personalKb'
@@ -88,8 +88,12 @@ function saveLastResult(result: DebugQueryResp | null): void {
 
 export default function Playground() {
   const [form] = Form.useForm()
-  const [simForm] = Form.useForm()
   const [docSearchForm] = Form.useForm()
+  // 身份：当前登录身份（默认）| 模拟用户（仅 super_admin）。与「检索并生成」并列选择。
+  const identity: string = Form.useWatch('identity', form) ?? 'self'
+  const { has } = usePermission()
+  // 权限模拟是唯一越权读取入口（§3.4 约束 3）：仅 super_admin 的 `rag:playground:simulate`
+  const canSimulate = has('rag:playground:simulate')
   const [result, setResult] = useState<DebugQueryResp | null>(loadLastResult)
   const [shards, setShards] = useState<ShardInfo | null>(null)
   const [loading, setLoading] = useState(false)
@@ -99,8 +103,10 @@ export default function Playground() {
   const [docHits, setDocHits] = useState<ChunkNode[]>([])
   const [docSearchLoading, setDocSearchLoading] = useState(false)
   const [catalog, setCatalog] = useState<DiscoveryCatalog | null>(null)
-  const [simResult, setSimResult] = useState<SimulateResp | null>(null)
   const [simUsers, setSimUsers] = useState<{ value: number; label: string }[]>([])
+  // 最近一次若为「模拟问答」，元信息直接从 result 派生（刷新后也能恢复）
+  const simInfo =
+    result && 'simulated_user' in result ? (result as SimulateResp) : null
 
   useEffect(() => {
     void listDocuments({ limit: 100 })
@@ -145,20 +151,39 @@ export default function Playground() {
     }
     form.setFieldsValue({ query: q })
     const v = form.getFieldsValue()
+    const simulate = canSimulate && v.identity === 'simulate'
+    if (simulate && (!v.sim_user || !String(v.sim_reason ?? '').trim())) {
+      message.error('模拟问答需要选择被测用户并填写原因（会写安全审计）')
+      return
+    }
     setLoading(true)
     try {
-      const next = await debugQuery({
-        query: q,
-        mode: v.mode ?? 'prose',
-        conversation_id: conversationId,
-        rerank_enabled: Boolean(v.rerank_enabled),
-        dense_top_k: v.top_k ?? undefined,
-        rerank_keep: v.keep ?? undefined,
-        rerank_min_score: v.min_score ?? undefined,
-      })
-      setResult(next)
-      // 刷新后还能看到刚才这轮（sessionStorage 与 conversation_id 同生命周期）
-      saveLastResult(next)
+      if (simulate) {
+        // 以被测用户身份走**完整问答**（检索 + 生成）：验证的是"他问这句会得到什么答复"，
+        // 只回检索块看不出拒答/引用/忠实度。
+        const body = await debugSimulate({
+          query: q,
+          user_id: Number(v.sim_user),
+          reason: String(v.sim_reason).trim(),
+          mode: v.mode === 'numeric' ? 'numeric' : 'prose',
+        })
+        setResult(body)
+        saveLastResult(body)
+        message.success(`已按用户 #${body.simulated_user} 身份问答`)
+      } else {
+        const next = await debugQuery({
+          query: q,
+          mode: v.mode ?? 'prose',
+          conversation_id: conversationId,
+          rerank_enabled: Boolean(v.rerank_enabled),
+          dense_top_k: v.top_k ?? undefined,
+          rerank_keep: v.keep ?? undefined,
+          rerank_min_score: v.min_score ?? undefined,
+        })
+        setResult(next)
+        // 刷新后还能看到刚才这轮（sessionStorage 与 conversation_id 同生命周期）
+        saveLastResult(next)
+      }
     } catch (err) { message.error(err instanceof Error ? err.message : String(err)) }
     finally { setLoading(false) }
   }
@@ -175,21 +200,6 @@ export default function Playground() {
   const loadShards = async () => {
     try { setShards(await debugShards()) }
     catch (err) { message.error(err instanceof Error ? err.message : String(err)) }
-  }
-
-  const runSimulate = async () => {
-    const v = await simForm.validateFields()
-    setLoading(true)
-    try {
-      const body = await debugSimulate({
-        query: String(v.query),
-        user_id: Number(v.user_id),
-        reason: String(v.reason),
-      })
-      setSimResult(body)
-      message.success(`已按用户 #${body.simulated_user} 检索，命中 ${body.chunks.length} 块`)
-    } catch (err) { message.error(err instanceof Error ? err.message : String(err)) }
-    finally { setLoading(false) }
   }
 
   const runDocChunkSearch = async () => {
@@ -225,6 +235,42 @@ export default function Playground() {
           <Form.Item name="query" label="问题" rules={[{ required: true, message: '请输入问题' }]}>
             <Input.TextArea rows={2} placeholder="如：年假有多少天；下一轮可追问「能介绍详细点吗？」" />
           </Form.Item>
+          {/* 身份与「检索并生成」并列：模拟用户走 /rag/debug/simulate，以被测用户身份做**完整问答** */}
+          {canSimulate ? (
+            <Space size={16} wrap align="end" style={{ marginBottom: 12 }}>
+              <Form.Item name="identity" label="身份" initialValue="self" style={{ marginBottom: 0 }}>
+                <Radio.Group>
+                  <Radio.Button value="self">当前身份</Radio.Button>
+                  <Radio.Button value="simulate">模拟用户</Radio.Button>
+                </Radio.Group>
+              </Form.Item>
+              {identity === 'simulate' ? (
+                <>
+                  <Form.Item
+                    name="sim_user"
+                    label="被测用户"
+                    rules={[{ required: true, message: '请选择用户' }]}
+                    style={{ minWidth: 260, marginBottom: 0 }}
+                  >
+                    <Select
+                      showSearch
+                      placeholder="选择用户"
+                      optionFilterProp="label"
+                      options={simUsers}
+                    />
+                  </Form.Item>
+                  <Form.Item
+                    name="sim_reason"
+                    label="模拟原因"
+                    rules={[{ required: true, message: '请填写原因（会写安全审计）' }]}
+                    style={{ minWidth: 260, marginBottom: 0 }}
+                  >
+                    <Input placeholder="如：核对工程部能否搜到本部门文件" maxLength={200} />
+                  </Form.Item>
+                </>
+              ) : null}
+            </Space>
+          ) : null}
           {/* D22-P0：空态示例问 chips —— 尚无结果时展示，点击即填入并跑 /rag/debug/query */}
           {!result && (catalog?.suggestions?.length ?? 0) > 0 ? (
             <div className="ekbs-discovery-chips" style={{ marginBottom: 12 }}>
@@ -269,7 +315,9 @@ export default function Playground() {
             <Form.Item name="min_score" label="min_score" style={{ marginBottom: 0 }}>
               <InputNumber min={0} max={1} step={0.05} placeholder="0.60" />
             </Form.Item>
-            <Button type="primary" loading={loading} onClick={() => void run()}>检索并生成</Button>
+            <Button type="primary" loading={loading} onClick={() => void run()}>
+              {identity === 'simulate' ? '以该身份问答' : '检索并生成'}
+            </Button>
             <Button onClick={() => void loadShards()}>看权限路由</Button>
             <Button onClick={resetConversation}>新会话</Button>
           </Space>
@@ -368,6 +416,53 @@ export default function Playground() {
 
       {result ? (
         <>
+          {/* 模拟问答：本次作答用的是被测用户身份，把身份/可见分片/命中块一起摆出来 */}
+          {simInfo ? (
+            <Card size="small" title="模拟身份问答（高危操作，已写安全审计）">
+              <Descriptions size="small" column={2} bordered>
+                <Descriptions.Item label="操作者">#{simInfo.operator}</Descriptions.Item>
+                <Descriptions.Item label="被测用户">#{simInfo.simulated_user}</Descriptions.Item>
+                <Descriptions.Item label="密级">
+                  <ClearanceTag level={simInfo.simulated_perm.clearance} />
+                </Descriptions.Item>
+                <Descriptions.Item label="原因">{simInfo.reason}</Descriptions.Item>
+                <Descriptions.Item label="可见分片" span={2}>
+                  {simInfo.simulated_perm.visible_shards.length
+                    ? simInfo.simulated_perm.visible_shards.map((shard) => (
+                        <Tag key={shard} color="blue">{shard}</Tag>
+                      ))
+                    : '无'}
+                </Descriptions.Item>
+              </Descriptions>
+              <Table
+                style={{ marginTop: 12 }}
+                size="small"
+                rowKey="chunk_id"
+                pagination={{ pageSize: 8 }}
+                dataSource={simInfo.chunks}
+                locale={{ emptyText: '没有命中分块' }}
+                columns={[
+                  {
+                    title: 'chunk',
+                    dataIndex: 'chunk_id',
+                    width: 90,
+                    render: (id: number) => (
+                      <Typography.Link onClick={() => openChunk(id)} className="ekbs-mono">{id}</Typography.Link>
+                    ),
+                  },
+                  { title: '文档', dataIndex: 'doc_title', ellipsis: true },
+                  { title: '分片', dataIndex: 'shard_id', width: 160 },
+                  { title: '标题路径', dataIndex: 'heading_path', ellipsis: true },
+                  {
+                    title: '精排',
+                    dataIndex: 'rerank_score',
+                    width: 90,
+                    render: (score: number | null) => (score == null ? '-' : score.toFixed(3)),
+                  },
+                ]}
+              />
+            </Card>
+          ) : null}
           <Card title="答案">
             {result.refused ? (
               <Alert
@@ -619,87 +714,8 @@ export default function Playground() {
         </Card>
       ) : null}
 
-      {/* §3.4 约束 3：权限模拟首期仅 super_admin 可调用，无该权限点时**整个入口不渲染** */}
-      <Auth code="rag:playground:simulate">
-      <Card title="权限模拟检索（高危）">
-        <Typography.Paragraph type="warning">
-          用被测用户的部门、密级和点名权限做检索。上方「检索并生成」走的是当前登录身份，看不到别人的部门文件。
-          这里只返回检索块，不生成回答，也不会写入对方的问答记录。每次调用都会落安全事件。
-        </Typography.Paragraph>
-        <Form form={simForm} layout="vertical">
-          <Space size={16} wrap align="start">
-            <Form.Item name="user_id" label="被测用户" rules={[{ required: true, message: '请选择用户' }]} style={{ minWidth: 280, marginBottom: 0 }}>
-              <Select
-                showSearch
-                placeholder="选择用户"
-                optionFilterProp="label"
-                options={simUsers}
-              />
-            </Form.Item>
-            <Form.Item name="query" label="问题" rules={[{ required: true, message: '请输入问题' }]} style={{ minWidth: 320, marginBottom: 0 }}>
-              <Input placeholder="要评估的问题" />
-            </Form.Item>
-            <Form.Item name="reason" label="原因" rules={[{ required: true, message: '请填写原因' }]} style={{ minWidth: 240, marginBottom: 0 }}>
-              <Input placeholder="如：核对工程部能否搜到本部门文件" maxLength={200} />
-            </Form.Item>
-            <Form.Item label=" " style={{ marginBottom: 0 }}>
-              <Button danger loading={loading} onClick={() => void runSimulate()}>以该身份检索</Button>
-            </Form.Item>
-          </Space>
-        </Form>
-        {simResult ? (
-          <div style={{ marginTop: 16 }}>
-            <Descriptions size="small" column={2} bordered>
-              <Descriptions.Item label="操作者">#{simResult.operator}</Descriptions.Item>
-              <Descriptions.Item label="被测用户">#{simResult.simulated_user}</Descriptions.Item>
-              <Descriptions.Item label="密级"><ClearanceTag level={simResult.simulated_perm.clearance} /></Descriptions.Item>
-              <Descriptions.Item label="原因">{simResult.reason}</Descriptions.Item>
-              <Descriptions.Item label="可见分片" span={2}>
-                {simResult.simulated_perm.visible_shards.length
-                  ? simResult.simulated_perm.visible_shards.map((shard) => <Tag key={shard} color="blue">{shard}</Tag>)
-                  : '无'}
-              </Descriptions.Item>
-            </Descriptions>
-            {simResult.refused ? (
-              <Alert
-                style={{ marginTop: 12 }}
-                type="warning"
-                showIcon
-                message="这次检索没有可用结果"
-                description={simResult.refusal_reason || '未返回原因'}
-              />
-            ) : null}
-            <Table
-              style={{ marginTop: 12 }}
-              size="small"
-              rowKey="chunk_id"
-              pagination={{ pageSize: 8 }}
-              dataSource={simResult.chunks}
-              locale={{ emptyText: '没有命中分块' }}
-              columns={[
-                {
-                  title: 'chunk',
-                  dataIndex: 'chunk_id',
-                  width: 90,
-                  render: (id: number) => (
-                    <Typography.Link onClick={() => openChunk(id)} className="ekbs-mono">{id}</Typography.Link>
-                  ),
-                },
-                { title: '文档', dataIndex: 'doc_title', ellipsis: true },
-                { title: '分片', dataIndex: 'shard_id', width: 160 },
-                { title: '标题路径', dataIndex: 'heading_path', ellipsis: true },
-                {
-                  title: '精排',
-                  dataIndex: 'rerank_score',
-                  width: 90,
-                  render: (score: number | null) => (score == null ? '-' : score.toFixed(3)),
-                },
-              ]}
-            />
-          </div>
-        ) : null}
-      </Card>
-      </Auth>
+      {/* 权限模拟已并入上方「检索并生成」的身份选择（当前身份 / 模拟用户），
+          不再单独占一张卡片：模拟也走完整问答（检索 + 生成），与正常问答同一套结果渲染。 */}
     </Space>
   )
 }

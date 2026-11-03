@@ -398,9 +398,17 @@ async def debug_simulate(
         )
         conn.commit()
 
-    result = await runtime.pipeline.retrieve(
-        payload.query, target, overrides=payload.overrides(), collect_debug=True
+    # 以被模拟用户的身份走**完整问答**（检索 + 生成），不只是检索：
+    # 管理台要验证的是"他问这句会得到什么答复"，只回 chunks 验证不了拒答/引用/忠实度。
+    answer = await runtime.pipeline.answer(
+        payload.query,
+        target,
+        use_cache=False,
+        overrides=payload.overrides(),
+        collect_debug=True,
+        mode=payload.mode,
     )
+    result = answer.retrieval
     return JSONResponse(
         {
             "operator": user.user_id,
@@ -413,8 +421,23 @@ async def debug_simulate(
                 "fingerprint": target.fingerprint,
             },
             "query": payload.query,
-            "refused": result.refused,
-            "refusal_reason": result.refusal_reason,
+            # 与 /rag/debug/query **同形**：前端复用同一套答案/引用/阶段/忠实度渲染
+            "rewritten_query": answer.rewritten_query,
+            "history_used": answer.history_used,
+            "answer": answer.answer,
+            "refused": answer.refused,
+            "refusal_reason": answer.refusal_reason,
+            "model": answer.model,
+            "citations": _citation_views(runtime, answer.citations),
+            "figure_attachments": list(answer.figure_attachments or []),
+            "degraded": [*result.degraded, *answer.degraded],
+            "mode": payload.mode,
+            "mode_used": answer.mode_used,
+            "intent": answer.intent,
+            "numeric": answer.numeric,
+            "faithfulness": answer.faithfulness,
+            "stages": result.stage_debug,
+            "timings_ms": {**result.timings_ms, "generate_ms": answer.ttft_ms},
             "chunks": [_chunk_view(chunk) for chunk in result.chunks],
         }
     )

@@ -119,7 +119,13 @@ export interface SimulatedChunk {
   rerank_score: number | null
 }
 
-export interface SimulateResp {
+/**
+ * 权限模拟**问答**（`POST /rag/debug/simulate`）。
+ *
+ * 后端走完整 `answer()`（检索 + 生成），响应与 `/rag/debug/query` 同形，
+ * 额外带 operator / simulated_user / simulated_perm，前端复用同一套答案渲染。
+ */
+export interface SimulateResp extends DebugQueryResp {
   operator: number
   simulated_user: number
   reason: string
@@ -129,13 +135,16 @@ export interface SimulateResp {
     visible_shards: string[]
     fingerprint: string
   }
-  query: string
-  refused: boolean
-  refusal_reason: string
+  /** 命中的检索块（给"看证据"用） */
   chunks: SimulatedChunk[]
 }
 
-export const debugSimulate = (body: { query: string; user_id: number; reason: string }) =>
+export const debugSimulate = (body: {
+  query: string
+  user_id: number
+  reason: string
+  mode?: string
+}) =>
   http.post('/rag/debug/simulate', body) as Promise<SimulateResp>
 
 export const debugShards = () =>
