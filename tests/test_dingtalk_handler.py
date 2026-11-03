@@ -663,3 +663,20 @@ async def test_self_intro_disabled_when_empty(handler) -> None:
 
     await handler.process({"data": payload(msg_id="intro-off")})
     assert routes["oto"].call_count == 0
+
+
+def test_answer_appends_recommended_questions_on_success() -> None:
+    """正常作答后附 2~3 条推荐问（「你可以接着问：」），最多 3 条、拒答提示不重复。"""
+    text = StreamMessageHandler._with_suggestions(
+        "答案正文。", ["问题 A", "问题 B", "", "问题 C", "问题 D"]
+    )
+    assert "你可以接着问" in text
+    assert "1. 问题 A" in text
+    assert "2. 问题 B" in text
+    assert "3. 问题 C" in text
+    assert "问题 D" not in text, "最多 3 条"
+    # 拒答时后端已拼过「你可以试试问」，不重复追加
+    refused = "对不起…\n你可以试试问：\n1. x"
+    assert StreamMessageHandler._with_suggestions(refused, ["y"]) == refused
+    # 没有推荐问时原样返回
+    assert StreamMessageHandler._with_suggestions("答案。", []) == "答案。"

@@ -227,15 +227,16 @@ async def qa_chat(
     )
 
     answer_text = answer.answer
-    suggested: list[dict[str, Any]] = []
-    if answer.refused:
-        # D22-P0：拒答时附 2～3 条推荐问（三档：代表问句 > 热门 > 原逻辑；过 ACL）
-        from ekbs.discovery import format_refusal_hints
-        from ekbs.recommend import recommend_questions
+    # 推荐问答：**拒答和正常作答都要算**（延展 / 相关 / 预判）。
+    # 拒答时把提示直接拼进答案正文（各通道无需再处理）；正常作答只走结构化字段
+    # `suggested_questions`，由钉钉/管理台按自己的排版决定是否展示。
+    from ekbs.discovery import format_refusal_hints
+    from ekbs.recommend import recommend_questions
 
-        suggested = recommend_questions(
-            runtime, perm, limit=3, query=safe_question, for_refusal=True
-        )
+    suggested = recommend_questions(
+        runtime, perm, limit=3, query=safe_question, for_refusal=answer.refused
+    )
+    if answer.refused:
         hint = format_refusal_hints(suggested)
         if hint and "你可以试试问" not in (answer_text or ""):
             answer_text = (answer_text or "未找到可靠依据。").rstrip() + hint

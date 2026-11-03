@@ -99,6 +99,8 @@ async def test_qa_with_internal_token_answers(client: AsyncClient, internal_head
     assert body["citations"], "必须带引用"
     assert body["citations"][0]["chunk_id"] > 0
     assert body["perm_fingerprint"]
+    # 推荐问答不只在拒答时给：正常作答也要带回「延展/相关/预判」推荐
+    assert body["suggested_questions"], "正常作答也要带推荐问"
     assert body["visible_shard_count"] >= 1
 
 

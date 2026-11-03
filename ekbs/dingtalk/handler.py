@@ -410,8 +410,11 @@ class StreamMessageHandler:
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="refused", answer=text)
 
-            # ⑤ 回复：取数成功时答案已含「值+依据」；再附参考资料；有图则再发原图
+            # ⑤ 回复：取数成功时答案已含「值+依据」；再附参考资料与 2~3 条推荐问；有图则再发原图
             rendered = self._render_answer(answer, citations)
+            rendered = self._with_suggestions(
+                rendered, payload.get("suggested_questions") or []
+            )
             if await self._reply_with_card(message, rendered):
                 await self._reply_cited_images(message, citations, figure_attachments)
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
@@ -628,6 +631,23 @@ class StreamMessageHandler:
                 lines.append(f"[{cite_index}] {label}{suffix}")
                 shown += 1
         return "\n".join(lines)
+
+    @staticmethod
+    def _with_suggestions(text: str, hints: Sequence[Any]) -> str:
+        """正常作答后附 2~3 条推荐问（延展 / 相关 / 预判）。
+
+        拒答时后端已经把「你可以试试问」拼进答案正文，这里不重复；正常作答后端只回
+        结构化 ``suggested_questions``，由本通道排版展示。
+        """
+        questions = [str(q).strip() for q in (hints or []) if str(q).strip()][:3]
+        if not questions:
+            return text
+        if "你可以接着问" in text or "你可以试试问" in text:
+            return text
+        lines = ["", "你可以接着问："]
+        for i, question in enumerate(questions, 1):
+            lines.append(f"{i}. {question}")
+        return text.rstrip() + "\n" + "\n".join(lines)
 
     async def _reply_with_card(self, message: InboundMessage, text: str) -> bool:
         if self.cards is None or not self.cards.card_template_id:
