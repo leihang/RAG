@@ -22,6 +22,7 @@ import {
   severityOfDoc,
   textOrDash,
   toBool,
+  userLabelOf,
 } from './qaLogHelpers'
 
 describe('textOrDash', () => {
@@ -60,6 +61,14 @@ describe('问答会话列表的缺字段处理', () => {
       '拆除作业指导书的编号？',
     )
     expect(questionTextOf({ session_id: 's1' })).toBe('')
+  })
+
+  it('用户列：昵称 #id（区分钉钉用户与管理台本地账号）', () => {
+    expect(userLabelOf({ session_id: 's1', user_id: 5, user_nick: '雷航' })).toBe('雷航 #5')
+    expect(userLabelOf({ session_id: 's1', user_id: 365, user_nick: '管理员' })).toBe('管理员 #365')
+    // 没有昵称（旧后端/用户已删）时只显示 id
+    expect(userLabelOf({ session_id: 's1', user_id: 7 })).toBe('7')
+    expect(userLabelOf({ session_id: 's1' })).toBe('-')
   })
 
   it('关键字过滤：命中最新问题或答案（大小写不敏感）', () => {

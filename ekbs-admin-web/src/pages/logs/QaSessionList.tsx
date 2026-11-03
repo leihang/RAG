@@ -34,6 +34,7 @@ import {
   questionTextOf,
   refusedStateOf,
   textOrDash,
+  userLabelOf,
   type QaSessionRow,
 } from './qaLogHelpers'
 
@@ -58,11 +59,16 @@ const columns: ProColumns<QaSessionRow>[] = [
     render: (_, row) => <Typography.Text code>{textOrDash(row.session_id)}</Typography.Text>,
   },
   {
-    title: '用户 id',
+    // 只给数字 user_id 时运维分不清是钉钉用户还是管理台本地账号（local:admin 也是普通自增 id）
+    title: '用户',
     dataIndex: 'user_id',
-    width: 100,
+    width: 160,
     valueType: 'digit',
-    render: (_, row) => textOrDash(row.user_id),
+    render: (_, row) => (
+      <Tooltip title={row.auth_source ? `${userLabelOf(row)} · ${row.auth_source}` : userLabelOf(row)}>
+        <Typography.Text>{userLabelOf(row)}</Typography.Text>
+      </Tooltip>
+    ),
   },
   {
     title: '最新问题',

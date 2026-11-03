@@ -14,6 +14,10 @@ export interface QaSessionRow {
   user_id?: number
   /** 钉钉 userid（可空） */
   dt_userid?: string | null
+  /** 用户昵称（列表接口 JOIN ekbs_user 带出；缺则只显示数字 id） */
+  user_nick?: string | null
+  /** dingtalk（钉钉同步）/ local（管理台本地账号）/ seed（演示数据） */
+  auth_source?: string | null
   /** dingtalk_robot | dingtalk_h5 | web | api */
   channel?: string
   conversation_id?: string | null
@@ -192,6 +196,19 @@ export const REFUSED_META: Record<RefusedState, { text: string; tone: 'error' | 
 export function questionTextOf(row: QaSessionRow): string {
   const text = String(row.last_question ?? row.question ?? '').trim()
   return text
+}
+
+/**
+ * 用户列展示：「昵称 #id」。
+ *
+ * 列表里只给数字 user_id 时无法区分来源 —— 钉钉同步用户（如雷航 #5）与管理台本地
+ * 管理员（local:admin #365）都是普通自增 id；带上昵称后运维一眼能认。
+ */
+export function userLabelOf(row: QaSessionRow): string {
+  const nick = String(row.user_nick ?? '').trim()
+  const id = row.user_id == null ? '' : String(row.user_id)
+  if (!nick) return id || '-'
+  return `${nick} #${id}`
 }
 
 export const QUESTION_UNKNOWN_TEXT = '列表接口未返回，见对话详情'
