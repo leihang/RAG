@@ -44,6 +44,12 @@ TABLE_SPLIT_TOKENS = 2048
 #: 每叶重复表头、逐块嵌入。整表一个向量时十几行数据会互相稀释（实测 920 token 的
 #: 「表1-年度能耗管理计划编制及实施要求」查「A级能耗普查」检索不中）。
 TABLE_LEAF_TOKENS = 384
+#: 表格父容器**硬上限**（与 ``table_serialize.TABLE_MAX_TOKENS`` 对齐）：DB 里任何块都
+#: 不得超过它。整表序列化 + 上下文超限时按行分段，检索命中任一叶子时由
+#: ``retrieval._expand_parents`` 展开全部分段（内容完整，见 ``TABLE_EXPAND_MAX_TOKENS``）。
+TABLE_CONTAINER_MAX_TOKENS = 2048
+#: 分段预算的安全余量：分段标记行的长度随「第 i/n 段」变化，留一点防越界。
+_TABLE_SEGMENT_MARGIN_TOKENS = 16
 FALLBACK_WINDOW_CHARS = 100
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
@@ -345,6 +351,9 @@ class ChunkNode:
     image_path: str | None = None
     #: 该块所属父块在结果列表中的下标（``chunk_type == 'child'`` 时非空）
     parent_index: int | None = None
+    #: 表格父容器**分段组**（``t<文档内表 id>``）：同表所有分段共用一个组 id，
+    #: 检索命中任一叶子时按组一次展开回全表；未分段（≤2048）的表块为 ``None``。
+    table_group: str | None = None
     token_count: int = 0
 
     def __post_init__(self) -> None:
@@ -545,6 +554,91 @@ def _table_leaf_blocks(
         row_chunks=row_chunks,
         max_tokens=TABLE_LEAF_TOKENS,
     )
+
+
+@dataclass
+class _TableContainerSegment:
+    """超限表格的一个分段：容器正文（标记 + 本段行块 + 段首/段尾上下文）+ 本段自己的叶子。"""
+
+    content: str
+    leaves: list[str]
+
+
+def _table_segment_marker(index: int, total: int) -> str:
+    """分段容器里的单行标记：让模型/审计看得出这是整表的第几段。"""
+    return f"本段为整表第 {index}/{total} 段"
+
+
+def _segment_table_container(
+    *,
+    table: TableInput,
+    section_path: str,
+    above: str,
+    below: str,
+    row_chunks: bool,
+) -> list[_TableContainerSegment] | None:
+    """把超 ``TABLE_CONTAINER_MAX_TOKENS`` 的表格父容器按行分段（每段 ≤ 硬上限）。
+
+    返回 ``None`` = 无法安全分段（单行本身就超过预算），调用方回退为原来的单容器
+    （并打 ``table_container_unsplittable`` 警告）—— 宁可保留旧行为，也不能丢行。
+
+    为什么**按段派生叶子**而不是先全局 384 行组再按首行映射：全局行组会跨段，
+    映射后可能出现「某段没有任何叶子」；而 ``retrievable`` 规则是「没有子块的块
+    才是检索单元」，没有叶子的分段会自己变成一个可检索的上下文容器（污染向量/FTS）。
+    按段调用 span 序列化（``row_range`` 限定该段行号）能保证每段 ≥1 个叶子。
+    """
+    from ekbs.ingest.table_serialize import serialize_table_body_spans
+
+    marker = _table_segment_marker(1, 2)
+    reserve = count_tokens(
+        _table_parent_content(
+            section_path=section_path, above=above, full_table=marker, below=below
+        )
+    ) + _TABLE_SEGMENT_MARGIN_TOKENS
+    budget = max(512, TABLE_CONTAINER_MAX_TOKENS - reserve)
+    # 预算是「表格正文」的，实际分段正文还要加标记行；一段仍超限就缩预算重试，
+    # 4 次后仍失败说明连最小预算都排不下 → 交给调用方回退。
+    for _attempt in range(4):
+        spans = serialize_table_body_spans(
+            caption=table.caption,
+            body=table.body,
+            table_id=table.table_id,
+            max_tokens=budget,
+        )
+        # 首行即超预算时序列化器会先吐一个只有 preamble 的退化块（空区间）：它不含数据行，
+        # 分段时跳过；preamble 在每段正文里都会重复，不丢内容。
+        row_spans = [span for span in spans if span[2] >= span[1]]
+        if len(row_spans) <= 1:
+            return None
+        total = len(row_spans)
+        segments: list[_TableContainerSegment] = []
+        for index, (block, first_row, last_row) in enumerate(row_spans):
+            content = _table_parent_content(
+                section_path=section_path,
+                above=above if index == 0 else "",
+                full_table=f"{_table_segment_marker(index + 1, total)}\n{block}",
+                below=below if index == total - 1 else "",
+            )
+            if count_tokens(content) > TABLE_CONTAINER_MAX_TOKENS:
+                break
+            leaves = [
+                text
+                for text, _first, _last in serialize_table_body_spans(
+                    caption=table.caption,
+                    body=table.body,
+                    table_id=table.table_id,
+                    row_chunks=row_chunks,
+                    max_tokens=TABLE_LEAF_TOKENS,
+                    row_range=(first_row, last_row),
+                )
+            ]
+            if not leaves:
+                break
+            segments.append(_TableContainerSegment(content=content, leaves=leaves))
+        else:
+            return segments
+        budget = max(512, budget * 3 // 4)
+    return None
 
 
 @dataclass
@@ -1009,6 +1103,208 @@ def _pages_for(
     return page_at(start), page_at(last)
 
 
+def _table_heading_and_section(
+    table: TableInput, *, doc_title: str, table_section_path: dict[str, str]
+) -> tuple[str, str]:
+    """表块 heading 与所在小节路径。
+
+    表名单独成块时没有文档上下文（「表 1」这种名字跨文档完全一样），把文档名并进
+    heading：UI 里一眼看得出是哪篇的表，精排文本也自带身份。
+    """
+    table_name = (table.caption or "").strip() or (
+        f"表 {table.table_id}" if table.table_id else ""
+    )
+    section_path = (table_section_path.get(str(table.table_id)) or "").strip()
+    if section_path:
+        base = f"{doc_title} > {section_path}" if doc_title else section_path
+        heading = ensure_heading_path(
+            f"{base} · {table_name}" if table_name else base, doc_title=doc_title
+        )
+    else:
+        heading = ensure_heading_path(
+            f"{doc_title} · {table_name}" if doc_title and table_name else table_name,
+            doc_title=doc_title,
+        )
+    return heading, section_path
+
+
+def _append_table_segments(
+    result: ChunkingResult,
+    seq: int,
+    *,
+    table: TableInput,
+    segments: Sequence[_TableContainerSegment],
+    table_heading: str,
+    prose_parent: int | None,
+    page: int | None,
+) -> int:
+    """超限表：逐段落节点（每段一个 table 容器 + 该段自己的叶子）。"""
+    # 表 id 是文档内计数器，正常非空；兜底用首段 seq 保证同文档不同表不撞组。
+    group_key = str(table.table_id).strip() or f"seq{seq + 1}"
+    table_group = f"t{group_key}"
+    for segment in segments:
+        seq += 1
+        segment_index = len(result.nodes)
+        result.nodes.append(
+            ChunkNode(
+                chunk_type="table",
+                seq=seq,
+                content=segment.content,
+                heading_path=table_heading,
+                page_from=page,
+                page_to=page,
+                figure_id=None,
+                parent_index=prose_parent,
+                table_group=table_group,
+            )
+        )
+        for block in segment.leaves:
+            seq += 1
+            result.nodes.append(
+                ChunkNode(
+                    chunk_type="table",
+                    seq=seq,
+                    content=block,
+                    heading_path=table_heading,
+                    page_from=page,
+                    page_to=page,
+                    figure_id=None,
+                    parent_index=segment_index,
+                )
+            )
+    return seq
+
+
+def _append_table_nodes(
+    result: ChunkingResult,
+    seq: int,
+    table: TableInput,
+    *,
+    doc_title: str,
+    table_section_path: dict[str, str],
+    raw_sections: Sequence[Section],
+    table_container: dict[str, int],
+    row_chunks: bool,
+) -> int:
+    """把一张表落成节点，返回新的 ``seq``。
+
+    * 小表（整表 ≤2048 且拆不出第二块）：上下文折进唯一叶子，不另设父容器；
+    * 大表：父容器（上文 + 整表 + 下文）+ 行组叶子；
+    * 父容器 > :data:`TABLE_CONTAINER_MAX_TOKENS`：按行分段（每段 ≤2048），
+      每段带自己的叶子；分段共用一个 ``table_group`` 供检索时整表展开。
+    """
+    from ekbs.ingest.table_serialize import serialize_table_body
+
+    # 整表先序列化一次（不拆）：拿「表格本身」全文给父块用。
+    full_blocks = serialize_table_body(
+        caption=table.caption, body=table.body, table_id=table.table_id
+    )
+    if not full_blocks:
+        return seq
+    table_heading, section_path = _table_heading_and_section(
+        table, doc_title=doc_title, table_section_path=table_section_path
+    )
+    above, below = _table_adjacent_prose(raw_sections, str(table.table_id))
+    prose_parent = table_container.get(str(table.table_id))
+    # 叶子预算：整表超过 384 token 就拆「行组叶子」。
+    # 920 token 的表（十几行数据）塞进同一个向量会被互相稀释 —— 查某一行
+    # 的语义（如「A级能耗普查」）时整表向量对不上，检索直接落空。
+    leaf_blocks = _table_leaf_blocks(table, full_blocks, row_chunks=row_chunks)
+
+    if len(full_blocks) == 1 and len(leaf_blocks) <= 1:
+        # 小表（整表一块；或单行就超预算、拆不出第二块）：上下文折进叶子，
+        # 不另设父容器（多一层只会重复）。
+        seq += 1
+        result.nodes.append(
+            ChunkNode(
+                chunk_type="table",
+                seq=seq,
+                content=_table_parent_content(
+                    section_path=section_path, above=above, full_table=full_blocks[0], below=below
+                ),
+                heading_path=table_heading,
+                page_from=table.page,
+                page_to=table.page,
+                # ⚠️ 表格**不要**写 `figure_id`。这里原本塞的是 `table.table_id`，
+                # 而那是"文档内第几张表"的计数器（1、2、3…）。后果是引用表格块时
+                # 前端看到 figure_id 有值就去渲染图片 → 取不到 → 显示"图不可用"
+                # （实测 164 个表格块全中）。表格的标识在正文里（`表名: …`），
+                # 若要单独追踪，应另开 `table_id` 字段而不是借 figure_id。
+                figure_id=None,
+                parent_index=prose_parent,
+            )
+        )
+        return seq
+
+    # 大表：出「父容器（上文 + 整表 + 下文）+ 行/组叶子」。父容器被子块覆盖后按
+    # 叶子规则不入向量（retrievable.py）；叶子命中后经 `parent_expand` 扩成整表父块。
+    container_content = _table_parent_content(
+        section_path=section_path,
+        above=above,
+        full_table="\n\n".join(full_blocks),
+        below=below,
+    )
+    # 硬上限：表格父容器 > 2048 token 时**分段**（DB 里任何块都不得超过 2048，
+    # 用户已拍板「容器 2048 + 超限分段展开」）。未超限 / 不可分段时保持原单容器行为。
+    segments: list[_TableContainerSegment] | None = None
+    if count_tokens(container_content) > TABLE_CONTAINER_MAX_TOKENS:
+        segments = _segment_table_container(
+            table=table,
+            section_path=section_path,
+            above=above,
+            below=below,
+            row_chunks=row_chunks,
+        )
+        if segments is None:
+            log.warning(
+                "table_container_unsplittable",
+                table_id=str(table.table_id),
+                caption=(table.caption or "")[:80],
+                container_tokens=count_tokens(container_content),
+                hint="单行即超分段预算，回退为单容器（不丢内容）",
+            )
+    if segments:
+        return _append_table_segments(
+            result,
+            seq,
+            table=table,
+            segments=segments,
+            table_heading=table_heading,
+            prose_parent=prose_parent,
+            page=table.page,
+        )
+
+    seq += 1
+    container_index = len(result.nodes)
+    result.nodes.append(
+        ChunkNode(
+            chunk_type="table",
+            seq=seq,
+            content=container_content,
+            heading_path=table_heading,
+            page_from=table.page,
+            page_to=table.page,
+            figure_id=None,
+            parent_index=prose_parent,
+        )
+    )
+    for block in leaf_blocks:
+        seq += 1
+        result.nodes.append(
+            ChunkNode(
+                chunk_type="table",
+                seq=seq,
+                content=block,
+                heading_path=table_heading,
+                page_from=table.page,
+                page_to=table.page,
+                figure_id=None,
+                parent_index=container_index,
+            )
+        )
+    return seq
+
+
 def chunk_markdown(
     markdown: str,
     *,
@@ -1049,7 +1345,6 @@ def chunk_markdown(
     * 同一段文字不会双索引：父块被子块覆盖后按「叶子块才是检索单元」规则不入向量
       （见 :mod:`ekbs.ingest.retrievable`）。
     """
-    from ekbs.ingest.table_serialize import serialize_table_body
 
     # 表行分块（一行一块）**只对电子表格成立**：xlsx/xls/xlsm 的一行就是一条记录
     # （RAGFlow spreadsheet 口径，实测 top1 有增益）；Word/PDF/PPT 的表行只是单元格
@@ -1134,101 +1429,16 @@ def chunk_markdown(
         )
 
     for table in tables:
-        # 整表先序列化一次（不拆）：拿「表格本身」全文给父块用。
-        full_blocks = serialize_table_body(
-            caption=table.caption,
-            body=table.body,
-            table_id=table.table_id,
+        seq = _append_table_nodes(
+            result,
+            seq,
+            table,
+            doc_title=doc_title,
+            table_section_path=table_section_path,
+            raw_sections=raw_sections,
+            table_container=table_container,
+            row_chunks=row_chunks,
         )
-        if not full_blocks:
-            continue
-        # 表名单独成块时没有文档上下文（「表 1」这种名字跨文档完全一样），
-        # 把文档名并进 heading：UI 里一眼看得出是哪篇的表，精排文本也自带身份。
-        table_name = (table.caption or "").strip() or (
-            f"表 {table.table_id}" if table.table_id else ""
-        )
-        section_path = (table_section_path.get(str(table.table_id)) or "").strip()
-        if section_path:
-            base = f"{doc_title} > {section_path}" if doc_title else section_path
-            table_heading = ensure_heading_path(
-                f"{base} · {table_name}" if table_name else base, doc_title=doc_title
-            )
-        else:
-            table_heading = ensure_heading_path(
-                f"{doc_title} · {table_name}" if doc_title and table_name else table_name,
-                doc_title=doc_title,
-            )
-        above, below = _table_adjacent_prose(raw_sections, str(table.table_id))
-        prose_parent = table_container.get(str(table.table_id))
-
-        # 叶子预算：整表超过 384 token 就拆「行组叶子」。
-        # 920 token 的表（十几行数据）塞进同一个向量会被互相稀释 —— 查某一行
-        # 的语义（如「A级能耗普查」）时整表向量对不上，检索直接落空。
-        leaf_blocks = _table_leaf_blocks(table, full_blocks, row_chunks=row_chunks)
-
-        if len(full_blocks) == 1 and len(leaf_blocks) <= 1:
-            # 小表（整表一块；或单行就超预算、拆不出第二块）：上下文折进叶子，
-            # 不另设父容器（多一层只会重复）。
-            seq += 1
-            result.nodes.append(
-                ChunkNode(
-                    chunk_type="table",
-                    seq=seq,
-                    content=_table_parent_content(
-                        section_path=section_path,
-                        above=above,
-                        full_table=full_blocks[0],
-                        below=below,
-                    ),
-                    heading_path=table_heading,
-                    page_from=table.page,
-                    page_to=table.page,
-                    # ⚠️ 表格**不要**写 `figure_id`。这里原本塞的是 `table.table_id`，
-                    # 而那是"文档内第几张表"的计数器（1、2、3…）。后果是引用表格块时
-                    # 前端看到 figure_id 有值就去渲染图片 → 取不到 → 显示"图不可用"
-                    # （实测 164 个表格块全中）。表格的标识在正文里（`表名: …`），
-                    # 若要单独追踪，应另开 `table_id` 字段而不是借 figure_id。
-                    figure_id=None,
-                    parent_index=prose_parent,
-                )
-            )
-            continue
-
-        # 大表：出「父容器（上文 + 整表 + 下文）+ 行/组叶子」。父容器被子块覆盖后按
-        # 叶子规则不入向量（retrievable.py）；叶子命中后经 `parent_expand` 扩成整表父块。
-        seq += 1
-        container_index = len(result.nodes)
-        result.nodes.append(
-            ChunkNode(
-                chunk_type="table",
-                seq=seq,
-                content=_table_parent_content(
-                    section_path=section_path,
-                    above=above,
-                    full_table="\n\n".join(full_blocks),
-                    below=below,
-                ),
-                heading_path=table_heading,
-                page_from=table.page,
-                page_to=table.page,
-                figure_id=None,
-                parent_index=prose_parent,
-            )
-        )
-        for block in leaf_blocks:
-            seq += 1
-            result.nodes.append(
-                ChunkNode(
-                    chunk_type="table",
-                    seq=seq,
-                    content=block,
-                    heading_path=table_heading,
-                    page_from=table.page,
-                    page_to=table.page,
-                    figure_id=None,
-                    parent_index=container_index,
-                )
-            )
     return result
 
 

@@ -74,6 +74,10 @@ REFUSE_NO_CANDIDATE = "no_candidate"
 REFUSE_BELOW_THRESHOLD = "below_threshold"
 #: 预算裁剪时，"最后一块"低于这个 token 数就不再截断（再截就没信息了）
 _BUDGET_MIN_CHUNK_TOKENS = 128
+#: 一张**分段表格**一次最多展开的 token。整表动辄 3000~8000 token，全量塞进 prompt
+#: 会挤掉其它资料；超过上限时按 seq 截断，并在最后一段正文末尾注明「共 N 段展开 M 段」。
+#: 截断只影响"同一命中"，命中另一分段时仍会把那张表的全部分段展开一遍。
+TABLE_EXPAND_MAX_TOKENS = 8192
 
 REFUSE_ALL_DENIED = "all_denied_by_c5"
 REFUSE_EMPTY_ANSWER = "empty_answer"
@@ -223,6 +227,9 @@ class RetrievedChunk:
     #: 为什么单独记：父块扩展会丢掉「精排选中的是哪个叶子」，审计/回源/调试都指着
     #: ``chunk_id`` 时，看到的会是一个从未参与 rerank 的父块 id（见 task-3）。
     expanded_from: int | None = None
+    #: 表格父容器**分段组** id（``t<表 id>``）：同表所有分段共用；非分段表/其它块为 None。
+    #: 命中任一分组内的叶子时，``_expand_parents`` 按组把全部分段展开进上下文。
+    table_group: str | None = None
 
     @property
     def is_visual(self) -> bool:
@@ -671,7 +678,7 @@ class RetrievalPipeline:
         sql = (
             "SELECT c.chunk_id, c.doc_id, c.parent_id, c.chunk_type, c.content, c.heading_path, "
             "       c.page_from, c.page_to, c.figure_id, c.image_path, c.shard_id, "
-            "       d.title AS doc_title, d.doc_version "
+            "       c.table_group, d.title AS doc_title, d.doc_version "
             "FROM ekbs_chunk c JOIN ekbs_document d ON d.doc_id = c.doc_id "
             f"WHERE c.chunk_id IN ({placeholders})"
         )
@@ -693,8 +700,29 @@ class RetrievalPipeline:
                 doc_title=str(row["doc_title"]),
                 doc_version=str(row["doc_version"]),
                 parent_chunk_id=row["parent_id"],
+                table_group=row["table_group"],
             )
         return result
+
+    def _table_group_segments(self, doc_id: int, table_group: str) -> list[RetrievedChunk]:
+        """同一张**分段表格**的全部分段（按 ``seq`` 升序）。
+
+        为什么按 ``doc_id + table_group`` 而不是 ``parent_id``：分段容器的 ``parent_id``
+        是正文父块（``prose_parent``），同一张表的所有分段共享它，但同一父块下的其它
+        表格也会被一起取回。``table_group`` 是分块时打的表级唯一键。
+        """
+        if not table_group:
+            return []
+        with self.db.sync_connect() as conn:
+            rows = conn.execute(
+                "SELECT chunk_id FROM ekbs_chunk "
+                "WHERE doc_id = ? AND table_group = ? AND chunk_type = 'table' "
+                "ORDER BY seq",
+                (int(doc_id), str(table_group)),
+            ).fetchall()
+        ids = [int(row["chunk_id"]) for row in rows]
+        docs = self.load_chunks(ids)
+        return [docs[chunk_id] for chunk_id in ids if chunk_id in docs]
 
     # ------------------------------------------------------------------
     # 检索主流程
@@ -1190,6 +1218,13 @@ class RetrievalPipeline:
                 and parent.chunk_type == "table"
             )
             if parent is not None and parent.chunk_id in allowed and should_expand:
+                if parent.table_group:
+                    # 超限表的分段容器：命中的只是整表的 1/N，必须把全部段展开，
+                    # 否则 prompt 里的「整表」其实是不完整的一段（比不展开更误导）。
+                    segments = self._expand_table_group(parent, chunk, perm)
+                    if segments:
+                        expanded.extend(segments)
+                        continue
                 # 父块只提供**上下文内容**；``heading_path`` 保留命中子块的条款层。
                 # 为什么不能整块换成父块：父块是章节容器，标题只剩「5. 工作程序和要求」，
                 # 答案里写「第X条」时 clause_mismatches 在引用块标题里找不到条号 →
@@ -1206,6 +1241,88 @@ class RetrievalPipeline:
                 expanded.append(hit)
             else:
                 expanded.append(chunk)
+        return expanded
+
+    def _expand_table_group(
+        self, hit_segment: RetrievedChunk, source_chunk: RetrievedChunk, perm: PermContext
+    ) -> list[RetrievedChunk]:
+        """把命中分段所属的**整张分段表格**展开进上下文（超限表专用）。
+
+        * 预算够：按 ``seq`` 返回全部分段（=原表行序，模型看到的是一张连续的表）；
+        * 预算不够：**先放命中段**再按 ``seq`` 补其它段 —— 命中位置一定看得见，
+          被截掉的部分在最后一段正文末尾注明「共 N 段，本次仅展开 M 段」并打 warning。
+
+        每段都继承命中叶子的精排分与 ``expanded_from``：引用回源仍指向真正被精排
+        选中的叶子，而不是某个分段。所有分段同样过 C5（与单父块展开同一口径）。
+        """
+        if not hit_segment.table_group:
+            return []
+        segments = self._table_group_segments(
+            hit_segment.doc_id, str(hit_segment.table_group)
+        )
+        if not segments:
+            return []
+        kept, dropped = self.gate.filter_chunks(
+            perm, [(seg.chunk_id, seg.doc_id) for seg in segments]
+        )
+        if dropped:
+            log.info(
+                "c5_denied_parent",
+                count=len(dropped),
+                user_id=perm.user_id,
+                table_group=hit_segment.table_group,
+            )
+        allowed = {chunk_id for chunk_id, _ in kept}
+        segments = [seg for seg in segments if seg.chunk_id in allowed]
+        if not segments:
+            return []
+        hit_pos = next(
+            (i for i, seg in enumerate(segments) if seg.chunk_id == hit_segment.chunk_id),
+            None,
+        )
+        # 命中段优先；其余保持 seq 顺序（load_chunks 已按 seq 升序返回）
+        ordered = ([segments[hit_pos]] if hit_pos is not None else []) + [
+            seg for i, seg in enumerate(segments) if i != hit_pos
+        ]
+        included: list[RetrievedChunk] = []
+        total_tokens = 0
+        for seg in ordered:
+            tokens = count_tokens(seg.content)
+            # 第一段永远保留：命中段被预算完全截掉等于这次扩展白做。
+            if included and total_tokens + tokens > TABLE_EXPAND_MAX_TOKENS:
+                break
+            included.append(seg)
+            total_tokens += tokens
+        index_by_id = {seg.chunk_id: i for i, seg in enumerate(segments)}
+        included.sort(key=lambda seg: index_by_id[seg.chunk_id])
+        expanded: list[RetrievedChunk] = []
+        for seg in included:
+            hit = replace(
+                seg,
+                heading_path=source_chunk.heading_path or seg.heading_path,
+                expanded_from=source_chunk.chunk_id,
+            )
+            hit.rerank_score = source_chunk.rerank_score
+            hit.rrf_score = source_chunk.rrf_score
+            hit.dense_rank = source_chunk.dense_rank
+            hit.sparse_rank = source_chunk.sparse_rank
+            expanded.append(hit)
+        if len(included) < len(segments):
+            note = (
+                f"\n\n（整表共 {len(segments)} 段，本次因上下文预算仅展开 "
+                f"{len(included)} 段）"
+            )
+            expanded[-1] = replace(expanded[-1], content=expanded[-1].content + note)
+            log.warning(
+                "table_expand_truncated",
+                table_group=hit_segment.table_group,
+                doc_id=hit_segment.doc_id,
+                total_segments=len(segments),
+                expanded_segments=len(included),
+                expanded_tokens=total_tokens,
+                budget=TABLE_EXPAND_MAX_TOKENS,
+                user_id=perm.user_id,
+            )
         return expanded
 
     def _expand_short_siblings(

@@ -2,12 +2,56 @@
 
 这组方法此前**零测试**：正文命中但图没召回时，模型会因上下文无图而拒答，
 或乱引其他文档的图（典型故障：问「计量表更换」要照片却答「资料区没有像素」）。
+
+另覆盖超限表格的**分段展开**（task-7）：命中任一叶子 → 同一 ``table_group`` 的全部
+≤2048 分段按 seq 进上下文；超预算时先保命中段、再按 seq 补，末尾注明截断。
 """
 
 from __future__ import annotations
 
-from ekbs.retrieval.pipeline import RetrievedChunk, _dedupe_expanded
+from types import SimpleNamespace
+
+from ekbs.ingest.chunker import TableInput, count_tokens
+from ekbs.ingest.pipeline import IngestPipeline
+from ekbs.retrieval.pipeline import (
+    TABLE_EXPAND_MAX_TOKENS,
+    RetrievalPipeline,
+    RetrievedChunk,
+    _dedupe_expanded,
+)
 from tests.conftest import user_id_of
+
+
+def _oversized_table_body(min_tokens: int = 4000) -> str:
+    """构造序列化后 ≥``min_tokens`` 的 3 列表（长说明文字），用于触发容器分段。"""
+    from ekbs.ingest.table_serialize import serialize_table_body
+
+    rows: list[str] = []
+    body = ""
+    total = 0
+    while total < min_tokens:
+        index = len(rows)
+        rows.append(
+            f"| 项目{index} | 与年度能耗管理计划相关的说明文字第{index}条，"
+            f"需记录责任人及时间节点并确保执行到位 | {index} |"
+        )
+        body = "| 项目 | 说明 | 数值 |\n| --- | --- | --- |\n" + "\n".join(rows)
+        total = sum(
+            count_tokens(block)
+            for block in serialize_table_body(caption="大表", body=body, table_id="1")
+        )
+    return body
+
+
+def _ingest_pipeline(runtime) -> IngestPipeline:
+    return IngestPipeline(
+        db=runtime.db,
+        settings=runtime.settings,
+        providers=runtime.providers,
+        shards=runtime.shards,
+        fts=runtime.fts,
+        figure_index=runtime.figure_index,
+    )
 
 
 def _visible_doc(runtime, title: str = "员工手册（总则）") -> tuple[int, str]:
@@ -190,3 +234,132 @@ def test_post_check_citations_carries_source_chunk_id() -> None:
     assert citations[1].chunk_id == 35276
     assert citations[1].source_chunk_id is None, "未扩展的块自己就是精排候选"
 
+
+# --- 超限表格：分段容器 → 命中任一叶子展开整表（task-7）--------------------------
+
+
+async def test_expand_oversized_table_returns_all_segments(seeded) -> None:
+    """命中分段表的叶子 → 同一 ``table_group`` 的全部分段按 seq 顺序进上下文。"""
+    runtime, summary = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    body = _oversized_table_body(4000)
+    ingested = await _ingest_pipeline(runtime).ingest_markdown(
+        title="超限表格回归",
+        markdown="# 制度\n\n## 5. 工作程序和要求\n\n[表格 1]\n\n",
+        kb_id=int(summary["kb_id"]),
+        level=1,
+        visible_dept_ids=[],
+        tables=[TableInput(body=body, table_id="1", caption="大表")],
+    )
+    with runtime.db.sync_connect() as conn:
+        rows = conn.execute(
+            "SELECT chunk_id, parent_id, seq, table_group FROM ekbs_chunk "
+            "WHERE doc_id = ? AND chunk_type = 'table' ORDER BY seq",
+            (ingested.doc_id,),
+        ).fetchall()
+    segment_rows = [row for row in rows if row["table_group"]]
+    assert len(segment_rows) > 1, "本用例前提：整表父容器被分成多段"
+    segment_ids = [int(row["chunk_id"]) for row in segment_rows]
+    segment_id_set = set(segment_ids)
+    leaf_rows = [
+        row
+        for row in rows
+        if row["table_group"] is None and row["parent_id"] in segment_id_set
+    ]
+    assert leaf_rows, "每个分段都必须有叶子"
+    leaf = leaf_rows[0]
+    anchor = RetrievedChunk(
+        chunk_id=int(leaf["chunk_id"]),
+        doc_id=ingested.doc_id,
+        shard_id=ingested.shard_id,
+        content="",
+        chunk_type="table",
+        parent_chunk_id=int(leaf["parent_id"]),
+        heading_path="制度 > 5. 工作程序和要求",
+        rerank_score=0.9,
+        rrf_score=0.5,
+        dense_rank=1,
+        sparse_rank=2,
+    )
+    out = runtime.pipeline._expand_parents([anchor], alice)
+    assert [chunk.chunk_id for chunk in out] == segment_ids, "整表全部分段按 seq 顺序展开"
+    assert all(chunk.expanded_from == anchor.chunk_id for chunk in out), "引用可回溯到命中叶子"
+    assert all(chunk.heading_path == anchor.heading_path for chunk in out)
+    assert all(chunk.rerank_score == 0.9 for chunk in out)
+    total_tokens = sum(count_tokens(chunk.content) for chunk in out)
+    assert total_tokens <= TABLE_EXPAND_MAX_TOKENS, "未超预算时不应截断"
+    assert "仅展开" not in out[-1].content
+
+    # 同一张表的另一个叶子也命中：去重后整表只出现一次，保留首次出现（最高分来源）
+    other = leaf_rows[-1]
+    anchor2 = RetrievedChunk(
+        chunk_id=int(other["chunk_id"]),
+        doc_id=ingested.doc_id,
+        shard_id=ingested.shard_id,
+        content="",
+        chunk_type="table",
+        parent_chunk_id=int(other["parent_id"]),
+        heading_path="制度 > 5. 工作程序和要求",
+        rerank_score=0.7,
+    )
+    expanded_both = runtime.pipeline._expand_parents([anchor, anchor2], alice)
+    assert len(expanded_both) == len(segment_ids) * 2, "两个叶子各自展开整表"
+    deduped, dropped = _dedupe_expanded(expanded_both)
+    assert dropped == len(segment_ids)
+    assert [chunk.chunk_id for chunk in deduped] == segment_ids
+    assert all(chunk.expanded_from == anchor.chunk_id for chunk in deduped)
+
+
+def test_expand_table_group_truncates_over_budget_and_keeps_hit_segment() -> None:
+    """分段总量超 ``TABLE_EXPAND_MAX_TOKENS``：先保命中段，再按 seq 补，末尾注明截断。"""
+
+    class _Gate:
+        def filter_chunks(self, perm, pairs):
+            return list(pairs), []
+
+        def record_security_event(self, *args, **kwargs):
+            return None
+
+    def _segment(chunk_id: int) -> RetrievedChunk:
+        content = "表名: 整表分段\n"
+        while count_tokens(content) < 3000:
+            content += "项目=项目0; 说明=用于验证分段预算与命中优先级的占位说明文字。\n"
+        return RetrievedChunk(
+            chunk_id=chunk_id,
+            doc_id=1,
+            shard_id="s",
+            content=content,
+            chunk_type="table",
+            heading_path="制度 > 5. 工作程序和要求",
+            table_group="t1",
+        )
+
+    segments = [_segment(chunk_id) for chunk_id in (1, 2, 3, 4)]
+    pipe = object.__new__(RetrievalPipeline)
+    pipe.gate = _Gate()  # type: ignore[attr-defined]
+    pipe._table_group_segments = lambda doc_id, group: segments  # type: ignore[attr-defined]
+    source = RetrievedChunk(
+        chunk_id=99,
+        doc_id=1,
+        shard_id="s",
+        content="命中叶子",
+        chunk_type="table",
+        parent_chunk_id=4,
+        heading_path="制度 > 5. 工作程序和要求",
+        rerank_score=0.88,
+        rrf_score=0.4,
+        dense_rank=3,
+        sparse_rank=4,
+    )
+    out = pipe._expand_table_group(segments[-1], source, SimpleNamespace(user_id=1))
+
+    assert len(out) == 2, "每段 ~3000 token，8192 预算只够 2 段"
+    assert [chunk.chunk_id for chunk in out] == [1, 4], "命中段 4 必须保留，最终按 seq 排序"
+    assert all(chunk.expanded_from == source.chunk_id for chunk in out)
+    assert all(chunk.rerank_score == 0.88 for chunk in out)
+    included_tokens = sum(
+        count_tokens(chunk.content.split("\n\n（整表共")[0]) for chunk in out
+    )
+    assert included_tokens <= TABLE_EXPAND_MAX_TOKENS
+    note = out[-1].content
+    assert "整表共 4 段" in note and "仅展开 2 段" in note, "截断必须在最后一段正文里注明"

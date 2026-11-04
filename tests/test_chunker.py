@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import pytest
 
 from ekbs.ingest.chunker import (
@@ -10,6 +12,7 @@ from ekbs.ingest.chunker import (
     OVERLAP_MIN_RATIO,
     PARENT_MAX_TOKENS,
     PARENT_MIN_TOKENS,
+    TABLE_CONTAINER_MAX_TOKENS,
     TABLE_LEAF_TOKENS,
     TableInput,
     chunk_markdown,
@@ -567,7 +570,8 @@ def test_table_row_chunks_only_when_table_exceeds_budget() -> None:
     )
     big_tables = [n for n in big_result.nodes if n.chunk_type == "table"]
     assert len(big_tables) > 1, "超预算的大表才按行出块"
-    assert all(node.content.startswith("表名:") for node in big_tables)
+    # 超限表的容器分段带标记行，不再是裸「表名:」开头；叶子/分段的正文里都必须有表名+表头
+    assert all("表名:" in node.content for node in big_tables), "每段/每叶都要自解释（表名+表头）"
 
 
 def test_placeholder_merge_uses_leaf_heading_not_breadcrumb() -> None:
@@ -617,7 +621,11 @@ def test_small_table_folds_surrounding_prose_into_leaf() -> None:
 
 
 def test_large_table_gets_container_parent_and_row_leaves() -> None:
-    """大表：父容器（上文 + 整表 + 下文）+ 行/组叶子，叶子 parent_index 指向容器。"""
+    """大表：父容器（上文 + 整表 + 下文）+ 行/组叶子。
+
+    300 行 xlsx 的表格父容器远超 2048 → 必须按行**分段**（每段 ≤2048），叶子挂到
+    各自分段上。上下文（段落标题/上文/下文）只在首段/末段出现一次，不重复。
+    """
     rows = "\n".join(f"| 项目{i} | 数值{i} |" for i in range(300))
     big = f"| 项目 | 值 |\n| --- | --- |\n{rows}"
     md = (
@@ -634,20 +642,17 @@ def test_large_table_gets_container_parent_and_row_leaves() -> None:
         source_path="设备清单.xlsx",
         table_row_chunks=True,
     )
-    tables = [n for n in result.nodes if n.chunk_type == "table"]
-    container_idx = {
-        n.parent_index
-        for n in tables
-        if n.parent_index is not None and result.nodes[n.parent_index].chunk_type == "table"
-    }
-    assert len(container_idx) == 1, "应恰有一个表父容器"
-    container = result.nodes[next(iter(container_idx))]
-    assert "下表列出全部质量记录" in container.content, "上方临近文字进父容器"
-    assert "以上记录保存三年" in container.content, "下方结论进父容器"
-    assert "6．质量记录" in container.content, "段落标题名进父容器"
-    leaves = [n for n in tables if n.parent_index in container_idx]
+    segments, leaves = _table_segments_and_leaves(result)
+    assert len(segments) > 1, "300 行的整表父容器 > 2048，必须分段"
+    assert all(node.token_count <= TABLE_CONTAINER_MAX_TOKENS for node in segments)
+    assert "下表列出全部质量记录" in segments[0].content, "上方临近文字进首段"
+    assert "以上记录保存三年" in segments[-1].content, "下方结论进末段"
+    assert "6．质量记录" in segments[0].content, "段落标题名进首段"
     assert len(leaves) > 1, "大表应按行出叶子"
     assert all(n.content.startswith("表名:") for n in leaves)
+    assert all(
+        result.nodes[n.parent_index].table_group == "t2" for n in leaves
+    ), "每个叶子的父都必须是本表的分段"
 
 
 def test_medium_table_splits_into_row_group_leaves_at_384_tokens() -> None:
@@ -687,6 +692,121 @@ def test_medium_table_splits_into_row_group_leaves_at_384_tokens() -> None:
     assert "级别=级别A" in container.content
 
 
+# --- 表格父容器硬上限 2048 + 超限分段（doc 206 表 3 暴露的缺口）--------------------
+#
+# 用户拍板：**容器 2048 + 超限分段展开** —— DB 里任何块 ≤2048；超限表格父容器按行
+# 分成几段（同表共用 `table_group`），检索命中任一叶子时由 `_expand_parents` 把整表
+# 全部分段展开回 prompt（内容完整）。叶子规则「无行重叠 + 每叶重复表头」不变。
+
+
+def test_oversized_table_container_segments_and_every_segment_owns_leaves() -> None:
+    """>2048 的表格父容器按行分段：每段 ≤2048、同组、且每段都必须有叶子。"""
+    body, row_count = _oversized_table_body(4000)
+    result = chunk_markdown(
+        "# 制度\n\n"
+        "## 6．质量记录\n\n"
+        "下表列出全部质量记录。\n"
+        "[表格 2]\n"
+        "以上记录保存三年。\n",
+        doc_title="设备编号作业指导书",
+        tables=[TableInput(body=body, table_id="2", caption="大表")],
+    )
+    segments, leaves = _table_segments_and_leaves(result)
+    assert len(segments) > 1, "序列化 >2048 的整表容器必须分段，不能塞成一个块"
+    assert {node.table_group for node in segments} == {"t2"}, "同表分段必须共用一个组 id"
+    assert all(node.token_count <= TABLE_CONTAINER_MAX_TOKENS for node in segments)
+    # 分段标记：段号/总段数写在容器正文里，模型/审计看得出这是整表的第几段
+    assert "本段为整表第 1/" in segments[0].content
+    assert f"第 {len(segments)}/{len(segments)} 段" in segments[-1].content
+
+    # 每个分段都必须有叶子：没有子块的 table 节点会变成可检索单元（retrievable.py）
+    owned = Counter(node.parent_index for node in leaves)
+    for index, node in enumerate(result.nodes):
+        if node.table_group:
+            assert owned[index] >= 1, f"分段 {index} 没有叶子，会自己变成可检索块"
+    for leaf in leaves:
+        assert leaf.parent_index is not None
+        assert result.nodes[leaf.parent_index].table_group == "t2", "叶子必须挂在分段上"
+        assert leaf.token_count <= TABLE_LEAF_TOKENS + CHILD_MAX_TOKENS, "叶子预算不变（384+单行余量）"
+        assert leaf.content.startswith("表名:"), "每叶仍要重复表头"
+
+    # 内容完整：全部数据行都出现在某个分段里（分段是行号的连续分区，不丢行）
+    joined = "\n".join(node.content for node in segments)
+    for index in (0, row_count // 2, row_count - 1):
+        assert f"项目=项目{index}" in joined, f"第 {index} 行在分段里丢了"
+
+
+def test_table_container_at_or_below_cap_stays_single_without_group() -> None:
+    """≤2048 的表格父容器保持原行为：单容器 + 行组叶子、没有 table_group（doc 206 形态）。"""
+    body, _row_count = _oversized_table_body(1500)
+    result = chunk_markdown(
+        "# 制度\n\n"
+        "## 5. 工作程序和要求\n\n"
+        "表3-维修作业等级划分\n"
+        "[表格 3]\n\n",
+        doc_title="XJWY-GC-09维修作业指导书",
+        tables=[TableInput(body=body, table_id="3", caption="表3-维修作业等级划分")],
+        source_path="维修作业指导书.docx",
+        table_row_chunks=True,
+    )
+    assert not any(node.table_group for node in result.nodes), "未超上限不该分段"
+    container, leaves = _table_container_leaves(result)
+    assert container.token_count <= TABLE_CONTAINER_MAX_TOKENS
+    assert len(leaves) > 1, "超 384 token 仍按行组出叶子"
+    assert all(node.content.startswith("表名:") for node in leaves)
+
+
+def test_unsplittable_table_falls_back_to_single_container() -> None:
+    """单行本身就超过分段预算 → 回退单容器（内容优先，不能为了 2048 丢行）。
+
+    这种表是病态输入（一个单元格 >2000 token），线上几乎不会出现；但必须有确定的
+    兜底路径：回退后仍是「容器 + 行组叶子」，只是容器可能略超硬上限。
+    """
+    from ekbs.ingest.table_serialize import serialize_table_body
+
+    huge = "超长单元格说明文字" * 400
+    body = (
+        "| 项目 | 说明 |\n| --- | --- |\n"
+        f"| 项目0 | {huge} |\n| 项目1 | 短说明 |\n| 项目2 | 短说明 |"
+    )
+    serialized = sum(
+        count_tokens(block)
+        for block in serialize_table_body(caption="大表", body=body, table_id="2")
+    )
+    assert serialized > TABLE_CONTAINER_MAX_TOKENS, "本用例前提：整表序列化超硬上限"
+    result = chunk_markdown(
+        "# 制度\n\n## 6．质量记录\n\n[表格 2]\n\n",
+        doc_title="设备编号作业指导书",
+        tables=[TableInput(body=body, table_id="2", caption="大表")],
+    )
+    assert not any(node.table_group for node in result.nodes), "不可分段时不得打组（回退旧行为）"
+    container, leaves = _table_container_leaves(result)
+    assert container.token_count > TABLE_CONTAINER_MAX_TOKENS, (
+        "不可分段时容器按原样保留（内容优先）；线上病态输入才走到这里"
+    )
+    assert len(leaves) > 1, "叶子规则不变：仍按 384 行组出叶子"
+    joined = container.content + "\n".join(leaf.content for leaf in leaves)
+    assert "项目=项目0" in joined and "项目=项目2" in joined, "回退路径不得丢行"
+
+
+def test_xlsx_row_chunks_keeps_one_leaf_per_row_after_segmentation() -> None:
+    """分段只改变容器打包；xlsx「一行=一条记录」的叶子粒度不变（叶子数 = 数据行数）。
+
+    这条对应"叶子规则不变"：分段前后，同一张表的可检索叶子数不因容器超限而减少或翻倍。
+    """
+    body, row_count = _oversized_table_body(4000)
+    result = chunk_markdown(
+        "# 制度\n\n正文。\n",
+        doc_title="大表",
+        tables=[TableInput(body=body, table_id="2")],
+        source_path="大表.xlsx",
+        table_row_chunks=True,
+    )
+    segments, leaves = _table_segments_and_leaves(result)
+    assert len(segments) > 1
+    assert len(leaves) == row_count, "xlsx 一行=一条记录：分段后仍是一行一叶"
+
+
 # --- 表格来源决定粒度（2026-11 修「其它块太碎了，你规则有问题」）-----------------------
 #
 # doc 205（.docx）在 ``retrieval.table_row_chunks=true`` 下被切成 41 块 / 36 个表块，
@@ -716,6 +836,40 @@ def _table_container_leaves(result):
     assert len(container_idx) == 1, ">384 token 的表应出且只出一个表格父容器"
     index = next(iter(container_idx))
     return result.nodes[index], [node for node in tables if node.parent_index == index]
+
+
+def _oversized_table_body(min_tokens: int = 4000) -> tuple[str, int]:
+    """构造序列化后 ≥``min_tokens`` 的 3 列表（带长说明文字），返回 ``(body, 数据行数)``。
+
+    按 token 而不是按行数造夹具：token 口径换了之后同样的行数会算出不同预算，
+    测试就会假失败（与 ``_long_doc`` 同理由）。
+    """
+    from ekbs.ingest.table_serialize import serialize_table_body
+
+    rows: list[str] = []
+    body = ""
+    total = 0
+    while total < min_tokens:
+        index = len(rows)
+        rows.append(
+            f"| 项目{index} | 与年度能耗管理计划相关的说明文字第{index}条，"
+            f"需记录责任人及时间节点并确保执行到位 | {index} |"
+        )
+        body = "| 项目 | 说明 | 数值 |\n| --- | --- | --- |\n" + "\n".join(rows)
+        total = sum(
+            count_tokens(block)
+            for block in serialize_table_body(caption="大表", body=body, table_id="2")
+        )
+    return body, len(rows)
+
+
+def _table_segments_and_leaves(result):
+    """超限表：返回 ``(分段列表, 叶子列表)``（分段靠 ``table_group`` 识别）。"""
+    tables = [node for node in result.nodes if node.chunk_type == "table"]
+    segments = [node for node in tables if node.table_group]
+    leaves = [node for node in tables if not node.table_group]
+    return segments, leaves
+
 
 
 def _chunk_word_table(source_path: str):

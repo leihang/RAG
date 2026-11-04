@@ -149,6 +149,20 @@ class Database:
             if "parse_ms" not in cols:
                 conn.execute("ALTER TABLE ekbs_document ADD COLUMN parse_ms INTEGER")
                 conn.commit()
+            # 表格父容器分段组：超 2048 的整表按行分段后共用组 id，检索时一次展开回全表。
+            # 存量库缺这列时 INSERT 直接失败、父块扩展也取不回整表 —— 与 deleted_at 一样
+            # 必须在启动自检后补齐；新库由 001_init.sql 建好。
+            chunk_cols = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(ekbs_chunk)").fetchall()
+            }
+            if "table_group" not in chunk_cols:
+                conn.execute("ALTER TABLE ekbs_chunk ADD COLUMN table_group TEXT")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_chunk_table_group "
+                    "ON ekbs_chunk(doc_id, table_group)"
+                )
+                conn.commit()
             # 引用身份拆分：chunk_id（喂给 LLM 的上下文块）与 source_chunk_id（精排来源块）。
             # 存量库缺这列会让审计 INSERT 直接失败，必须像 deleted_at 一样在启动自检后补齐。
             citation_cols = {

@@ -6,8 +6,88 @@ from ekbs.ingest.chunker import TableInput, chunk_markdown
 from ekbs.ingest.table_serialize import (
     coerce_rows,
     serialize_information_blocks,
+    serialize_information_blocks_spans,
     serialize_table_body,
 )
+
+
+def _sample_rows(count: int) -> list[list[str]]:
+    return [["项目", "说明", "金额"]] + [
+        [
+            f"项目{i}",
+            f"与年度能耗管理计划相关的说明文字第{i}条，需记录责任人及时间节点并确保执行到位",
+            str(i),
+        ]
+        for i in range(count)
+    ]
+
+
+# --- span 序列化（表格父容器超限分段用；与整块序列化同口径）-------------------
+
+def test_span_serializer_matches_full_serializer() -> None:
+    """span 只是换"打包单位"：同预算下每段文本与 ``serialize_information_blocks`` 逐字节一致。"""
+    rows = _sample_rows(40)
+    for max_tokens in (2048, 600, 200):
+        full = serialize_information_blocks(caption="费用", rows=rows, max_tokens=max_tokens)
+        spans = serialize_information_blocks_spans(
+            caption="费用", rows=rows, max_tokens=max_tokens
+        )
+        assert [span[0] for span in spans] == full, f"max_tokens={max_tokens}"
+
+
+def test_span_serializer_marks_preamble_only_block_with_empty_range() -> None:
+    """首行就超预算时，整块序列化会先吐一个只有 preamble 的退化块。
+
+    span 版要逐字节复刻这段文本（口径一致），但用 ``last_row < first_row`` 的空区间标记
+    它没有数据行 —— 分段器据此跳过，不会伪造成某一行。
+    """
+    rows = [["项目", "说明"]] + [["项目0", "超长单元格说明文字" * 400], ["项目1", "短说明"]]
+    full = serialize_information_blocks(caption="大表", rows=rows, max_tokens=384)
+    spans = serialize_information_blocks_spans(caption="大表", rows=rows, max_tokens=384)
+    assert [span[0] for span in spans] == full
+    assert spans[0][2] < spans[0][1], "只有 preamble 的退化块必须标成空区间"
+    assert all(span[2] >= span[1] for span in spans[1:]), "其余段必须覆盖真实数据行"
+    covered = [row for span in spans[1:] for row in range(span[1], span[2] + 1)]
+    assert covered == list(range(2)), "数据行区间仍连续覆盖每一行"
+
+
+def test_span_serializer_spans_are_contiguous_and_cover_every_row_once() -> None:
+    rows = _sample_rows(40)
+    spans = serialize_information_blocks_spans(caption="费用", rows=rows, max_tokens=200)
+    per_row = serialize_information_blocks_spans(caption="费用", rows=rows, row_chunks=True)
+    assert len(per_row) == 40, "row_chunks=True 应一行一段"
+    assert [(span[1], span[2]) for span in per_row] == [(i, i) for i in range(40)]
+    assert len(spans) > 1, "200 token 预算下 41 行必须切成多段"
+    assert spans[0][1] == 0
+    for prev, cur in zip(spans, spans[1:]):
+        assert cur[1] == prev[2] + 1, f"数据行必须连续覆盖、无重叠：{prev} → {cur}"
+    assert spans[-1][2] == 39
+
+
+def test_span_serializer_row_range_keeps_header_and_absolute_indices() -> None:
+    """按行号只序列化一段：仍重复表头，返回的是**整表绝对下标**（供叶子映射）。"""
+    rows = _sample_rows(10)
+    single = serialize_information_blocks_spans(
+        caption="费用", rows=rows, max_tokens=2048, row_range=(2, 3)
+    )
+    assert [(span[1], span[2]) for span in single] == [(2, 3)]
+    assert "相关表头: 项目 | 说明 | 金额" in single[0][0], "每段必须重复表头（自解释）"
+    assert "项目=项目2" in single[0][0]
+    assert "项目=项目0" not in single[0][0], "行范围之外的数据行不得出现"
+
+    per_row = serialize_information_blocks_spans(
+        caption="费用", rows=rows, row_chunks=True, row_range=(2, 4)
+    )
+    assert [(span[1], span[2]) for span in per_row] == [(2, 2), (3, 3), (4, 4)]
+    assert all("相关表头:" in span[0] for span in per_row)
+
+
+def test_span_serializer_rejects_out_of_range_row_range() -> None:
+    import pytest
+
+    rows = _sample_rows(3)
+    with pytest.raises(ValueError):
+        serialize_information_blocks_spans(rows=rows, row_range=(0, 3))
 
 
 def test_html_table_serialize_contains_headers_and_values() -> None:

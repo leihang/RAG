@@ -227,6 +227,10 @@ CREATE TABLE IF NOT EXISTS ekbs_chunk (
     --              **不存绝对路径**，避免换机器/换目录时全部失效
     figure_id       TEXT,
     image_path      TEXT,
+    -- 表格父容器**分段组** id（t<文档内表 id>）：超过容器上限（2048）的整表按行
+    -- 分成多段，同表所有分段共用组 id；检索命中任一叶子时按组展开回全表。
+    -- 未分段（≤2048）的表格块为 NULL。
+    table_group     TEXT,
     shard_id        TEXT    NOT NULL,                    -- 所属 FAISS 分片，如 kb_hr_L2
     embedding_fingerprint TEXT,                          -- 生成该向量的模型指纹
     faiss_row       INTEGER,                             -- 在分片中的行号
@@ -237,6 +241,8 @@ CREATE INDEX IF NOT EXISTS idx_chunk_shard   ON ekbs_chunk(shard_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_parent  ON ekbs_chunk(parent_id);
 -- 图片资源端点按 shard_id 做 ACL 复检，再按 doc_id+figure_id 取路径（06 §4.11）
 CREATE INDEX IF NOT EXISTS idx_chunk_figure  ON ekbs_chunk(doc_id, figure_id) WHERE figure_id IS NOT NULL;
+-- 表格分段：父块扩展按 doc_id + table_group 一次取回整表全部分段（06 §3.4）
+CREATE INDEX IF NOT EXISTS idx_chunk_table_group ON ekbs_chunk(doc_id, table_group);
 
 -- 分片元数据（FAISS 索引文件的登记与自检依据）
 CREATE TABLE IF NOT EXISTS ekbs_shard (

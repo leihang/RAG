@@ -604,13 +604,13 @@ class IngestPipeline:
                 conn.execute(
                     "INSERT INTO ekbs_chunk(doc_id, parent_id, chunk_type, seq, content, "
                     "token_count, heading_path, page_from, page_to, figure_id, image_path, "
-                    "shard_id, embedding_fingerprint) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "shard_id, embedding_fingerprint, table_group) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         doc_id, parent_id, node.chunk_type, node.seq, node.content,
                         node.token_count, node.heading_path, node.page_from, node.page_to,
                         node.figure_id, node.image_path, shard_id,
-                        self.providers.embed.ref.fingerprint,
+                        self.providers.embed.ref.fingerprint, node.table_group,
                     ),
                 )
                 id_by_index[index] = int(

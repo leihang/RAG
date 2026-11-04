@@ -147,3 +147,41 @@ def test_apply_schema_patches_adds_context_chunk_ids_idempotently(db) -> None:
 
     db.apply_schema_patches()
     assert _message_columns(db).count("context_chunk_ids") == 1
+
+
+def _chunk_columns(db) -> list[str]:
+    with db.sync_connect() as conn:
+        rows = conn.execute("PRAGMA table_info(ekbs_chunk)").fetchall()
+    return [str(r["name"]) for r in rows]
+
+
+def _chunk_table_group_index(db) -> list[str]:
+    with db.sync_connect() as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND tbl_name = 'ekbs_chunk' ORDER BY name"
+        ).fetchall()
+    return [str(r["name"]) for r in rows]
+
+
+def test_chunk_has_table_group_on_fresh_schema(db) -> None:
+    """超限表格的分段组 id 落在块上（task-7：容器 2048 + 超限分段展开）。"""
+    assert "table_group" in _chunk_columns(db)
+    assert "idx_chunk_table_group" in _chunk_table_group_index(db)
+
+
+def test_apply_schema_patches_adds_table_group_idempotently(db) -> None:
+    """存量库缺列/缺索引时由启动补丁补齐；重复执行 no-op。"""
+    with db.sync_connect() as conn:
+        conn.execute("DROP INDEX IF EXISTS idx_chunk_table_group")
+        conn.execute("ALTER TABLE ekbs_chunk DROP COLUMN table_group")
+        conn.commit()
+    assert "table_group" not in _chunk_columns(db)
+
+    db.apply_schema_patches()
+    assert _chunk_columns(db).count("table_group") == 1
+    assert "idx_chunk_table_group" in _chunk_table_group_index(db)
+
+    db.apply_schema_patches()
+    assert _chunk_columns(db).count("table_group") == 1
+    assert _chunk_table_group_index(db).count("idx_chunk_table_group") == 1

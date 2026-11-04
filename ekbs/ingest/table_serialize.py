@@ -361,6 +361,31 @@ def _chunk_by_budget(
     return blocks
 
 
+def _prepare_information_blocks(
+    *, caption: str, rows: Sequence[Sequence[str]], table_id: str
+) -> tuple[str, list[str], bool, list[str], list[list[str]]] | None:
+    """矩阵预处理：规整 → 剥标题行 → 定表头 → 拼 preamble。
+
+    整块序列化与 span 序列化**共用这一段**，两种入口对同一批数据行才会逐字节一致
+    （测试钉住）；空表返回 ``None``。
+    """
+    matrix = _normalize_matrix(rows)
+    if not matrix:
+        return None
+    titles, matrix = _strip_title_rows(matrix)
+    if not matrix:
+        # 极端：整张表只有标题行 → 保留内容（当单列数据），不丢
+        matrix = [[t] for t in titles]
+        titles = []
+    if titles:
+        title_text = " / ".join(dict.fromkeys(titles))
+        base = caption.strip()
+        caption = f"{base}（{title_text}）" if base else title_text
+    form_like, headers, data_rows = _resolve_headers_and_data(matrix)
+    preamble = _build_preamble(caption, table_id, headers, form_like)
+    return caption, preamble, form_like, headers, data_rows
+
+
 def serialize_information_blocks(
     *,
     caption: str = "",
@@ -374,20 +399,10 @@ def serialize_information_blocks(
     ``max_tokens``：每段预算。默认 2048（整表父容器用）；行组叶子传更小的值
     （见 ``chunker.TABLE_LEAF_TOKENS=384``），避免十几行挤进同一个向量被稀释。
     """
-    matrix = _normalize_matrix(rows)
-    if not matrix:
+    prepared = _prepare_information_blocks(caption=caption, rows=rows, table_id=table_id)
+    if prepared is None:
         return []
-    titles, matrix = _strip_title_rows(matrix)
-    if not matrix:
-        # 极端：整张表只有标题行 → 保留内容（当单列数据），不丢
-        matrix = [[t] for t in titles]
-        titles = []
-    if titles:
-        title_text = " / ".join(dict.fromkeys(titles))
-        base = caption.strip()
-        caption = f"{base}（{title_text}）" if base else title_text
-    form_like, headers, data_rows = _resolve_headers_and_data(matrix)
-    preamble = _build_preamble(caption, table_id, headers, form_like)
+    _caption, preamble, _form_like, headers, data_rows = prepared
     if row_chunks:
         # RAGFlow spreadsheet 口径：一行一个块，每块重复表头；header-only 保留表头。
         if not data_rows:
@@ -411,6 +426,108 @@ def serialize_table_body(
         table_id=table_id,
         row_chunks=row_chunks,
         max_tokens=max_tokens,
+    )
+
+
+def _chunk_spans_by_budget(
+    preamble: list[str],
+    data_rows: list[list[str]],
+    headers: list[str],
+    *,
+    max_tokens: int = TABLE_MAX_TOKENS,
+    start_row: int = 0,
+    end_row: int | None = None,
+) -> list[tuple[str, int, int]]:
+    """``_chunk_by_budget`` 的行号版：同样的分批算法，额外返回首/末**数据行**下标（闭区间）。
+
+    分批条件必须与 ``_chunk_by_budget`` 完全一致，否则「同预算下 span 文本 == 整块文本」
+    这条不变量（正确性测试）会破。
+
+    ⚠️ 首行本身就超预算时，``_chunk_by_budget`` 会先 flush 一个**只有 preamble 的退化块**
+    （``current_lines is not preamble`` 对 ``list(preamble)`` 恒为真）；这里原样保留该文本
+    以维持一致性，但给它 ``last_row = first_row - 1`` 的**空区间** —— 它不含数据行，
+    分段器据此跳过（preamble 在后续每块里都会重复，不会丢内容）。
+    """
+    if end_row is None:
+        end_row = len(data_rows) - 1
+    spans: list[tuple[str, int, int]] = []
+    current_lines = list(preamble)
+    first_row = start_row
+    last_row = start_row - 1
+    for row in range(start_row, end_row + 1):
+        line = _format_row(data_rows[row], headers)
+        candidate = "\n".join([*current_lines, line])
+        if current_lines is not preamble and count_tokens(candidate) > max_tokens:
+            if last_row >= first_row:
+                spans.append(("\n".join(current_lines), first_row, last_row))
+            else:
+                # preamble-only 退化块：文本保留（口径一致），区间留空（无数据行）
+                spans.append(("\n".join(current_lines), row, row - 1))
+            current_lines = [*preamble, line]
+            first_row = row
+            last_row = row
+        else:
+            current_lines.append(line)
+            last_row = row
+    if len(current_lines) > len(preamble):
+        spans.append(("\n".join(current_lines), first_row, last_row))
+    return spans
+
+
+def serialize_information_blocks_spans(
+    *,
+    caption: str = "",
+    rows: Sequence[Sequence[str]] = (),
+    table_id: str = "",
+    row_chunks: bool = False,
+    max_tokens: int = TABLE_MAX_TOKENS,
+    row_range: tuple[int, int] | None = None,
+) -> list[tuple[str, int, int]]:
+    """同 :func:`serialize_information_blocks`，但返回 ``(block_text, first_row, last_row)``。
+
+    ``first_row``/``last_row`` 是**解析后数据行**的闭区间下标（0 基）：分块器用它按行
+    切「表格父容器」、再让每段派生自己的 ≤384 叶子（见 ``chunker`` 的超限分段）。
+    ``row_range`` 只序列化某一段数据行（表头仍按整表解析并重复），行号是**整表绝对下标**。
+
+    对同一组行 / 同一 ``max_tokens``，本函数的文本与 :func:`serialize_information_blocks`
+    逐字节一致 —— 分段只是换个"打包单位"，不改序列化口径。
+    """
+    prepared = _prepare_information_blocks(caption=caption, rows=rows, table_id=table_id)
+    if prepared is None:
+        return []
+    _caption, preamble, _form_like, headers, data_rows = prepared
+    start, end = 0, len(data_rows) - 1
+    if row_range is not None:
+        start, end = int(row_range[0]), int(row_range[1])
+        if start < 0 or end < start or end >= len(data_rows):
+            raise ValueError(f"row_range 越界：{row_range}（数据行 0..{len(data_rows) - 1}）")
+    if row_chunks:
+        return [
+            ("\n".join([*preamble, _format_row(data_rows[row], headers)]), row, row)
+            for row in range(start, end + 1)
+        ]
+    return _chunk_spans_by_budget(
+        preamble, data_rows, headers, max_tokens=max_tokens, start_row=start, end_row=end
+    )
+
+
+def serialize_table_body_spans(
+    *,
+    caption: str = "",
+    body: str = "",
+    table_id: str = "",
+    row_chunks: bool = False,
+    max_tokens: int = TABLE_MAX_TOKENS,
+    row_range: tuple[int, int] | None = None,
+) -> list[tuple[str, int, int]]:
+    """从 MinerU ``table_body`` / 题注做 span 序列化（见 :func:`serialize_information_blocks_spans`）。"""
+    return serialize_information_blocks_spans(
+        caption=caption,
+        rows=coerce_rows(body),
+        table_id=table_id,
+        row_chunks=row_chunks,
+        max_tokens=max_tokens,
+        row_range=row_range,
     )
 
 
