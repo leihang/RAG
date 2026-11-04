@@ -2,9 +2,13 @@
 
 背景：父块扩展后 ``chunk_id`` 是喂给 LLM 的上下文块（35274），而精排真正选中
 的是叶子（35277）。审计表只存 chunk_id 时，事后无法核对回源到底指哪一块。
+task-5 追加：消息行还要落「模型实际看到的上下文块列表」（context_chunk_ids），
+否则只看引用会把「已发送但未引用」误判成「没发送」。
 """
 
 from __future__ import annotations
+
+import json
 
 from ekbs.audit import AuditService, TurnRecord, _snippet_hash
 from ekbs.retrieval.pipeline import AnswerResult, Citation, RetrievalResult
@@ -41,12 +45,15 @@ def _open_session(db) -> str:
     return session_id
 
 
-def _answer(citations: list[Citation]) -> AnswerResult:
+def _answer(
+    citations: list[Citation], context_chunk_ids: list[int] | None = None
+) -> AnswerResult:
     return AnswerResult(
         answer="能耗管理员负责…… [1]",
         citations=citations,
         retrieval=RetrievalResult(query="能耗管理员在能耗管理中的主要作用"),
         model="audit-test",
+        context_chunk_ids=list(context_chunk_ids or []),
     )
 
 
@@ -112,3 +119,61 @@ def test_snippet_hash_covers_context_and_ranked_source() -> None:
     from_leaf_b = _snippet_hash(_citation(source_chunk_id=35276))
     plain = _snippet_hash(_citation(source_chunk_id=None))
     assert len({from_leaf_a, from_leaf_b, plain}) == 3
+
+
+def _ordered_context_ids(message_id: int, db) -> list[int]:
+    with db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT context_chunk_ids FROM ekbs_qa_message WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+    assert row is not None
+    return json.loads(row["context_chunk_ids"])
+
+
+def test_record_turn_persists_context_chunk_ids(db) -> None:
+    """消息行落「模型实际看到的上下文」：引用只是它的子集。"""
+    session_id = _open_session(db)
+    context_ids = [35280, 35274, 35281]  # doc 205：第 3 块进了 prompt 但没被引用
+    message_id = AuditService(db).record_turn(
+        TurnRecord(
+            session_id=session_id,
+            user_id=1,
+            dt_userid="",
+            channel="web",
+            conversation_id=None,
+            perm_fingerprint="fp",
+            clearance=2,
+            turn=1,
+        ),
+        question="能耗管理员在能耗管理中的主要作用",
+        answer=_answer([_citation()], context_chunk_ids=context_ids),
+    )
+
+    assert _ordered_context_ids(message_id, db) == context_ids
+    # 引用只有 1 行 → 恰好说明「引用不是上下文全集」
+    with db.sync_connect() as conn:
+        cited = conn.execute(
+            "SELECT COUNT(*) AS c FROM ekbs_qa_citation WHERE message_id = ?", (message_id,)
+        ).fetchone()["c"]
+    assert int(cited) == 1 == len(_answer([_citation()]).citations)
+
+
+def test_record_turn_without_context_ids_writes_empty_json_array(db) -> None:
+    """无上下文信息时写 ``[]``：前端解析统一走 JSON，不用区分 NULL / 缺失。"""
+    session_id = _open_session(db)
+    message_id = AuditService(db).record_turn(
+        TurnRecord(
+            session_id=session_id,
+            user_id=1,
+            dt_userid="",
+            channel="web",
+            conversation_id=None,
+            perm_fingerprint="fp",
+            clearance=2,
+            turn=1,
+        ),
+        question="q",
+        answer=_answer([_citation()]),
+    )
+    assert _ordered_context_ids(message_id, db) == []

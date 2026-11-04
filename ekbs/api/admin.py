@@ -190,7 +190,8 @@ async def get_qa_session(
             for r in conn.execute(
                 "SELECT message_id, turn, role, question, rewritten_query, answer, model, "
                 "prompt_tokens, completion_tokens, ttft_ms, total_ms, retrieve_ms, rerank_ms, "
-                "generate_ms, candidate_count, rerank_top_score, refused, trace_id, created_at "
+                "generate_ms, candidate_count, rerank_top_score, refused, trace_id, "
+                "context_chunk_ids, created_at "
                 "FROM ekbs_qa_message WHERE session_id = ? ORDER BY turn, message_id",
                 (session_id,),
             ).fetchall()

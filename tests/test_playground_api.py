@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -181,6 +182,65 @@ async def test_debug_query_returns_answer_and_stages(client, playground_headers)
     assert body.get("history_used") is False
     assert body.get("rewritten_query") == "年假有多少天"
     assert body.get("session_id"), "完整作答应落审计并回传 session_id"
+
+
+async def test_debug_query_exposes_model_context(client, playground_headers) -> None:
+    """模型实际看到的上下文块 vs 引用：**全集 vs 子集**（task-5 的 doc 205 误判）。
+
+    用户过去只看引用，就把「进了 prompt 但没被引用」的块误判成「没发给模型」。
+    """
+    _runtime, _uid, headers = playground_headers
+    body = (
+        await client.post(
+            "/api/v1/rag/debug/query", headers=headers, json={"query": "年假 申请 审批"}
+        )
+    ).json()
+
+    context = body["context_chunks"]
+    assert context, body
+    assert [item["index"] for item in context] == list(range(1, len(context) + 1)), (
+        "index 必须是 prompt 里的 1-based 编号（= 引用编号）"
+    )
+    assert len(context) >= 3, f"该问句应命中 3 个上下文块，实际 {context}"
+    assert [item["chunk_id"] for item in context] == list(
+        dict.fromkeys(item["chunk_id"] for item in context)
+    ), "上下文块不得重复"
+    assert body["context_tokens"] == sum(item["token_count"] for item in context)
+    assert body["context_tokens"] > 0
+
+    # cited = 引用集合的反推；未引用的第 3 块仍在 context_chunks 里（cited=false）
+    cited = {item["cite_index"] for item in body["citations"]}
+    assert {item["index"] for item in context if item["cited"]} == cited
+    assert context[-1]["cited"] is False, "mock LLM 只引前两块；第 3 块是「已发送未引用」"
+    # 引用块必须都能在上下文里找到（引用 ⊆ 上下文）
+    assert {item["chunk_id"] for item in body["citations"]} <= {
+        item["chunk_id"] for item in context
+    }
+    # 上下文块 ← 精排来源：扩展块要能追到 source_chunk_id / 名次
+    assert all("source_chunk_id" in item and "source_rerank_rank" in item for item in context)
+    with_context = [item for item in context if item["source_chunk_id"] is not None]
+    assert with_context, "父块扩展后的上下文块必须带精排来源身份"
+    assert with_context[0]["source_rerank_rank"] >= 1
+
+
+async def test_debug_query_audit_row_records_model_context(client, playground_headers) -> None:
+    """完整作答应把「喂了哪些块」写进 ekbs_qa_message.context_chunk_ids（JSON）。"""
+    runtime, _uid, headers = playground_headers
+    body = (
+        await client.post(
+            "/api/v1/rag/debug/query", headers=headers, json={"query": "年假有多少天"}
+        )
+    ).json()
+    expected = [item["chunk_id"] for item in body["context_chunks"]]
+    assert expected
+    with runtime.db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT context_chunk_ids FROM ekbs_qa_message WHERE session_id = ? "
+            "ORDER BY message_id DESC LIMIT 1",
+            (body["session_id"],),
+        ).fetchone()
+    assert row is not None
+    assert json.loads(row["context_chunk_ids"]) == expected
 
 
 async def test_debug_query_multi_turn_rewrites_followup(client, playground_headers) -> None:

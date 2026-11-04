@@ -122,3 +122,28 @@ def test_apply_schema_patches_adds_source_chunk_id_idempotently(db) -> None:
     # 幂等：第二次是 no-op（PRAGMA table_info 守卫）
     db.apply_schema_patches()
     assert _citation_columns(db).count("source_chunk_id") == 1
+
+
+def _message_columns(db) -> list[str]:
+    with db.sync_connect() as conn:
+        rows = conn.execute("PRAGMA table_info(ekbs_qa_message)").fetchall()
+    return [str(r["name"]) for r in rows]
+
+
+def test_qa_message_has_context_chunk_ids_on_fresh_schema(db) -> None:
+    """消息行要能回答「模型实际看到了哪几块」（task-5：引用 ≠ 上下文全集）。"""
+    assert "context_chunk_ids" in _message_columns(db)
+
+
+def test_apply_schema_patches_adds_context_chunk_ids_idempotently(db) -> None:
+    """存量库（没有该列）由启动补丁补齐；重复执行 no-op。"""
+    with db.sync_connect() as conn:
+        conn.execute("ALTER TABLE ekbs_qa_message DROP COLUMN context_chunk_ids")
+        conn.commit()
+    assert "context_chunk_ids" not in _message_columns(db)
+
+    db.apply_schema_patches()
+    assert _message_columns(db).count("context_chunk_ids") == 1
+
+    db.apply_schema_patches()
+    assert _message_columns(db).count("context_chunk_ids") == 1

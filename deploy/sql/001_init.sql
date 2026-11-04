@@ -385,6 +385,10 @@ CREATE TABLE IF NOT EXISTS ekbs_qa_message (
     rerank_top_score  REAL,
     refused           INTEGER NOT NULL DEFAULT 0,
     trace_id          TEXT,
+    -- 实际进入生成 prompt 的上下文块（_fit_prompt 裁剪后）chunk_id 列表，JSON 数组字符串。
+    -- 引用（ekbs_qa_citation）只说明「模型用了哪几块」，不等于「模型看到了哪几块」：
+    -- doc 205 的 35281 进了 prompt 但未被引用，只查引用会把"已发送"误判成"没发送"。
+    context_chunk_ids TEXT,
     created_at        TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_qa_message_session ON ekbs_qa_message(session_id, turn);

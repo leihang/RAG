@@ -147,6 +147,33 @@ def _merge_faithfulness(parts: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _merge_prompt_context(
+    parts: Sequence[AnswerResult],
+) -> tuple[list[RetrievedChunk], list[int]]:
+    """多子问合并「模型上下文」：按首见顺序去重（与全局引用重编号同序）。
+
+    引用是**全局**重编号的，上下文也必须全局去重；否则同一块在多个子问里各出现一次，
+    前端按 index 看到的 ``[n]`` 与真正喂给模型的编号就对不上。
+    """
+    chunks: list[RetrievedChunk] = []
+    ids: list[int] = []
+    seen: set[int] = set()
+    for part in parts:
+        for chunk in part.context_chunks:
+            if chunk.chunk_id in seen:
+                continue
+            seen.add(chunk.chunk_id)
+            chunks.append(chunk)
+            ids.append(chunk.chunk_id)
+        # 缓存命中的子结果只有 id、没有正文：id 仍必须并进来，两个列表保持同序
+        for chunk_id in part.context_chunk_ids:
+            if chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            ids.append(chunk_id)
+    return chunks, ids
+
+
 def _dedupe_expanded(
     chunks: Sequence[RetrievedChunk],
 ) -> tuple[list[RetrievedChunk], int]:
@@ -314,6 +341,15 @@ class AnswerResult:
     sub_questions: list[dict[str, Any]] = field(default_factory=list)
     #: 子问覆盖情况：{total, covered, uncovered}；单问时为空 dict
     coverage: dict[str, Any] = field(default_factory=dict)
+    #: **真正进入生成 prompt 的上下文块**（``_fit_prompt`` 裁剪后），按 ``build_context``
+    #: 的 ``[n]`` 顺序排列 —— 索引 i 对应引用编号 i+1。
+    #: 为什么需要它：``citations`` 只说明「模型引用了哪几块」，不等于「模型看到了哪几块」。
+    #: 实测 doc 205 的 prompt 有 3 块而只引用 2 块，用户因此误以为未被引用的块没发出去。
+    #: 缓存命中路径无法重建块内容，保持空列表（id 仍可见 ``context_chunk_ids``）。
+    context_chunks: list[RetrievedChunk] = field(default_factory=list)
+    #: 与 ``context_chunks`` 同序的 chunk_id；**缓存命中也从缓存载荷恢复**，
+    #: 保证「这次喂了哪些块」在任何返回路径上都不丢。
+    context_chunk_ids: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1624,6 +1660,14 @@ class RetrievalPipeline:
             chunks, history, question,
             system_tokens=count_tokens(SYSTEM_PROMPT.format(context="")),
         )
+        # 裁剪后的 ``chunks`` 正是 ``build_context`` 编号 [1]..[N] 的那几块，也就是
+        # 「模型实际看到的上下文」。记住快照，下面**每条**返回路径都要带上：引用只说明
+        # 模型用了哪几块，未被引用的块不等于没发出去（doc 205 的 35281 就是这么被误解的）。
+        prompt_chunks = list(chunks)
+        context_kw = {
+            "context_chunks": prompt_chunks,
+            "context_chunk_ids": [chunk.chunk_id for chunk in prompt_chunks],
+        }
         messages: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT.format(context=self.build_context(chunks))}
         ]
@@ -1642,6 +1686,7 @@ class RetrievalPipeline:
                 model=self.providers.llm.ref.ident,
                 refused=True,
                 refusal_reason="llm_unavailable",
+                **context_kw,
             )
         llm_done = time.perf_counter()
         finish_reason = str(getattr(llm_result, "finish_reason", "") or "")
@@ -1682,6 +1727,7 @@ class RetrievalPipeline:
                 refused=True,
                 refusal_reason=REFUSE_NO_BASIS,
                 hallucinated_citations=hallucinated,
+                **context_kw,
                 **timing_kw,
             )
 
@@ -1736,6 +1782,7 @@ class RetrievalPipeline:
                     hallucinated_citations=hallucinated,
                     faithfulness=report.as_dict(),
                     degraded=degraded,
+                    **context_kw,
                     **timing_kw,
                 )
             degraded.append(f"{DEGRADED_UNSUPPORTED}:{len(report.unsupported)}")
@@ -1759,6 +1806,7 @@ class RetrievalPipeline:
                 hallucinated_citations=hallucinated,
                 faithfulness=report.as_dict(),
                 degraded=degraded,
+                **context_kw,
                 **timing_kw,
             )
 
@@ -1791,6 +1839,7 @@ class RetrievalPipeline:
                     hallucinated_citations=hallucinated,
                     faithfulness=report.as_dict(),
                     degraded=degraded,
+                    **context_kw,
                     **timing_kw,
                 )
 
@@ -1823,6 +1872,7 @@ class RetrievalPipeline:
             dropped_history=int(budget["dropped_history"]),
             context_truncated=bool(budget["truncated"]),
             truncated=truncated,
+            **context_kw,
             **timing_kw,
         )
 
@@ -1881,6 +1931,12 @@ class RetrievalPipeline:
         )
         if _numeric_budget["dropped_chunks"] or _numeric_budget["truncated"]:
             log.warning("prompt_budget_trimmed_numeric", **_numeric_budget)
+        # 与 generate() 同口径：裁剪后的 chunks 就是 prompt 里 [1]..[N] 的上下文
+        numeric_prompt_chunks = list(chunks)
+        context_kw = {
+            "context_chunks": numeric_prompt_chunks,
+            "context_chunk_ids": [chunk.chunk_id for chunk in numeric_prompt_chunks],
+        }
         messages = [
             {
                 "role": "system",
@@ -1905,6 +1961,7 @@ class RetrievalPipeline:
                 model=model_ident,
                 refused=True,
                 refusal_reason="llm_unavailable",
+                **context_kw,
             )
         numeric = parse_numeric_payload(llm_result.text)
         if numeric.parse_error:
@@ -1952,6 +2009,7 @@ class RetrievalPipeline:
                 total_ms=elapsed_ms,
                 prompt_tokens=llm_result.prompt_tokens,
                 completion_tokens=llm_result.completion_tokens,
+                **context_kw,
             )
 
         if numeric.is_na:
@@ -2012,6 +2070,7 @@ class RetrievalPipeline:
             total_ms=elapsed_ms,
             prompt_tokens=llm_result.prompt_tokens,
             completion_tokens=llm_result.completion_tokens,
+            **context_kw,
         )
 
     def _retrieval_only_answer(
@@ -2035,6 +2094,9 @@ class RetrievalPipeline:
             answer=answer, citations=citations, retrieval=retrieval,
             model="retrieval-only", refused=False,
             degraded=["generation_skipped_by_content_guard"],
+            # 不调 LLM 时「模型上下文」就是这份证据列表（接口对外仍是同一契约）
+            context_chunks=list(chunks),
+            context_chunk_ids=[chunk.chunk_id for chunk in chunks],
         )
 
     def _apply_output_guard(
@@ -2306,6 +2368,9 @@ class RetrievalPipeline:
             figure_attachments=list(cached.get("figure_attachments") or []),
             sub_questions=list(cached.get("sub_questions") or []),
             coverage=dict(cached.get("coverage") or {}),
+            # 缓存只存 id、不存块内容（payload 里没有正文）：这样「这次喂了哪些块」在
+            # 缓存命中路径上依然可查；老缓存条目没有该键 → 空列表，不崩。
+            context_chunk_ids=[int(cid) for cid in (cached.get("context_chunk_ids") or [])],
             degraded=["answer_cache_hit"],
         )
 
@@ -2429,6 +2494,9 @@ class RetrievalPipeline:
             "rewritten_query": result.rewritten_query,
             "sub_questions": result.sub_questions,
             "coverage": result.coverage,
+            # 只存 id，不存块正文（审计/缓存都不该复制片段全文）；缓存命中时重建
+            # context_chunks 已不可能，但「喂过哪些块」仍必须可查。
+            "context_chunk_ids": result.context_chunk_ids,
         }
 
     @staticmethod
@@ -2671,6 +2739,8 @@ class RetrievalPipeline:
         truncated = False
         model = ""
         prompt_tokens = completion_tokens = total_ms = 0
+        #: 各子问的结果先收集，循环外统一合并「模型上下文」（见 _merge_prompt_context）
+        context_parts: list[AnswerResult] = []
 
         for order, sq in enumerate(sub_questions, start=1):
             result = by_index.get(sq.index)
@@ -2693,6 +2763,7 @@ class RetrievalPipeline:
                 part_reason = part.refusal_reason
 
             faithfulness_parts.append(dict(part.faithfulness or {}))
+            context_parts.append(part)
 
             local_chunks = {i + 1: chunk.chunk_id for i, chunk in enumerate(result.chunks)}
 
@@ -2715,6 +2786,7 @@ class RetrievalPipeline:
         answer = "\n\n".join(sections).strip() or "未找到可靠依据。"
         if stage_debug:
             merged.stage_debug = stage_debug
+        context_chunks, context_chunk_ids = _merge_prompt_context(context_parts)
         return AnswerResult(
             answer=answer,
             citations=citations,
@@ -2732,6 +2804,8 @@ class RetrievalPipeline:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_ms=total_ms,
+            context_chunks=context_chunks,
+            context_chunk_ids=context_chunk_ids,
         )
 
     def _merge_retrievals(

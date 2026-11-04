@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from dataclasses import dataclass
 
@@ -116,8 +117,9 @@ class AuditService:
             conn.execute(
                 "INSERT INTO ekbs_qa_message(session_id, turn, role, question, rewritten_query, "
                 "answer, model, prompt_tokens, completion_tokens, ttft_ms, total_ms, retrieve_ms, "
-                "rerank_ms, generate_ms, candidate_count, rerank_top_score, refused, trace_id) "
-                "VALUES (?, ?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "rerank_ms, generate_ms, candidate_count, rerank_top_score, refused, trace_id, "
+                "context_chunk_ids) "
+                "VALUES (?, ?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.session_id, record.turn, question,
                     rewritten_query or answer.rewritten_query, answer.answer, answer.model,
@@ -126,6 +128,9 @@ class AuditService:
                     int(timings.get("rerank", 0) or 0), answer.ttft_ms,
                     retrieval.candidate_count, retrieval.top_score,
                     1 if answer.refused else 0, trace_id,
+                    # 「模型实际看到的上下文」：引用只说明用了哪几块，这里记的是喂了哪几块
+                    # （doc 205 的 35281 进了 prompt 但没被引用，只查引用会误判"没发出去"）。
+                    json.dumps(answer.context_chunk_ids, ensure_ascii=False),
                 ),
             )
             message_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])

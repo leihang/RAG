@@ -42,6 +42,7 @@ from ekbs.api.auth import INTERNAL_TOKEN_HEADER, INTERNAL_USER_HEADER
 from ekbs.api.qa import _authenticate
 from ekbs.audit import AuditService, TurnRecord
 from ekbs.errors import PermissionDenied
+from ekbs.ingest.chunker import count_tokens
 from ekbs.logging import get_logger, trace_id_var
 from ekbs.permission.console import is_console_role, widen_for_console
 from ekbs.retrieval.pipeline import RetrievalOverrides
@@ -150,6 +151,37 @@ def _chunk_views_with_source_rank(result: Any) -> list[dict[str, Any]]:
         )
         view["source_rerank_rank"] = ranks.get(int(source_id))
         views.append(view)
+    return views
+
+
+def _context_chunk_views(answer: Any) -> list[dict[str, Any]]:
+    """**模型实际看到的上下文**（``_fit_prompt`` 裁剪后进 prompt 的块，按 ``[n]`` 顺序）。
+
+    为什么需要：``citations`` 只说明模型引用了哪几块，不等于它看到了哪几块。
+    实测 doc 205 的 prompt 有 3 块、答案只引用 2 块，用户因此误判第三块「没发给模型」。
+    ``index`` 是 1-based 的 prompt 编号（= 引用编号），``cited`` 由引用集合反推。
+    """
+    ranks = _rerank_rank_map(getattr(answer, "retrieval", None))
+    cited_indices = {int(c.cite_index) for c in (getattr(answer, "citations", None) or [])}
+    views: list[dict[str, Any]] = []
+    for index, chunk in enumerate(getattr(answer, "context_chunks", None) or [], start=1):
+        expanded_from = getattr(chunk, "expanded_from", None)
+        source_id = expanded_from if expanded_from is not None else chunk.chunk_id
+        views.append(
+            {
+                "index": index,
+                "chunk_id": chunk.chunk_id,
+                "chunk_type": chunk.chunk_type,
+                "doc_title": chunk.doc_title,
+                "heading_path": chunk.heading_path,
+                "token_count": count_tokens(chunk.content or ""),
+                "rerank_score": chunk.rerank_score,
+                # 上下文块 ← 精排来源块：父块/表容器不在精排候选里，必须显式给出溯源
+                "source_chunk_id": expanded_from,
+                "source_rerank_rank": ranks.get(int(source_id)),
+                "cited": index in cited_indices,
+            }
+        )
     return views
 
 
@@ -381,6 +413,9 @@ async def debug_query(
         if footer and "你可以试试问" not in (answer_text or ""):
             answer_text = (answer_text or "未找到可靠依据。").rstrip() + footer
 
+    # 模型实际看到的上下文（[n] 顺序）；引用只是它的子集 —— 两者分开展示才不会
+    # 让人把"没被引用的上下文块"误判成"没发给模型"（doc 205 的 35281）。
+    context_chunks = _context_chunk_views(answer)
     return JSONResponse(
         {
             "query": payload.query,
@@ -402,6 +437,10 @@ async def debug_query(
             "mode_used": answer.mode_used,
             "intent": answer.intent,
             "citations": _citation_views(runtime, answer.citations),
+            # 「模型上下文」：prompt 里 [1]..[N] 的块（index 即引用编号），
+            # cited=false 只表示模型没引用它，不代表它没被发送。
+            "context_chunks": context_chunks,
+            "context_tokens": sum(item["token_count"] for item in context_chunks),
             "figure_attachments": list(answer.figure_attachments or []),
             "faithfulness": answer.faithfulness,
             "stages": result.stage_debug,
@@ -468,6 +507,8 @@ async def debug_simulate(
         mode=payload.mode,
     )
     result = answer.retrieval
+    # 与 /rag/debug/query 同形：模拟作答也要能看出「模型实际看到了哪几块」
+    context_chunks = _context_chunk_views(answer)
     return JSONResponse(
         {
             "operator": user.user_id,
@@ -488,6 +529,8 @@ async def debug_simulate(
             "refusal_reason": answer.refusal_reason,
             "model": answer.model,
             "citations": _citation_views(runtime, answer.citations),
+            "context_chunks": context_chunks,
+            "context_tokens": sum(item["token_count"] for item in context_chunks),
             "figure_attachments": list(answer.figure_attachments or []),
             "degraded": [*result.degraded, *answer.degraded],
             "mode": payload.mode,

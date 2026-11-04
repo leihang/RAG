@@ -160,6 +160,17 @@ class Database:
                     "ALTER TABLE ekbs_qa_citation ADD COLUMN source_chunk_id INTEGER"
                 )
                 conn.commit()
+            # 「模型上下文」落审计：引用只说明引用了哪块，不等于喂了哪块。
+            # 存量库缺该列时审计 INSERT 会直接失败，故与 source_chunk_id 同样在启动时补齐。
+            message_cols = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(ekbs_qa_message)").fetchall()
+            }
+            if "context_chunk_ids" not in message_cols:
+                conn.execute(
+                    "ALTER TABLE ekbs_qa_message ADD COLUMN context_chunk_ids TEXT"
+                )
+                conn.commit()
             policy_cols = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(ekbs_policy_version)").fetchall()
