@@ -271,7 +271,8 @@ _GENERIC_TITLE_KEYS = frozenset(
 #: 元数据类问句（问文档生效/截止/版本/编号等）：这类问题的答案现在只存在于
 #: 解析层抽取的文档元数据里（父块上下文行），正文检索单元里没有日期。
 _METADATA_QUERY_RE = re.compile(
-    r"(生效|截止|失效|有效期|实施日期|发布日期|发布日|文件编号|文档编号|版本号|版本)"
+    r"(生效|截止|失效|有效期|实施日期|发布日期|发布日|文件编号|文档编号|版本号|版本"
+    r"|编制|审核|批准|审批|制定|起草|校对)"
 )
 
 
@@ -282,6 +283,20 @@ def _is_metadata_query(query: str) -> bool:
 
 #: 问句里的年份（用于「哪些制度 2025 年生效」这类**未点名文档**的元数据问题）
 _METADATA_YEAR_RE = re.compile(r"(20\d{2})")
+#: 问句里紧邻「编制/审核/批准/审批/制定/起草/校对」的人名候选（2~4 个汉字）。
+#: 例：「刘冀批准了哪些制度」→ 刘冀；「由刘冀编制的制度」→ 刘冀（去掉前导「由/被/是/为」）。
+_METADATA_PERSON_RE = re.compile(
+    r"([\u4e00-\u9fa5]{2,4})(?=(?:编制|审核|批准|审批|制定|起草|校对))"
+)
+
+
+def _extract_metadata_person(query: str) -> str:
+    """从元数据问句里抽人名候选（只用于结构化 LIKE 扫描，不猜、不扩展）。"""
+    for match in _METADATA_PERSON_RE.finditer(query or ""):
+        name = match.group(1).lstrip("由被是为让给")
+        if len(name) >= 2:
+            return name
+    return ""
 
 
 def _normalize_for_title_match(text: str) -> str:
@@ -1244,19 +1259,29 @@ class RetrievalPipeline:
         里按父块过 C5，不在这里放宽。
         """
         years = sorted({str(year) for year in _METADATA_YEAR_RE.findall(query or "")})
-        if not years:
+        person = _extract_metadata_person(query)
+        if not years and not person:
             return []
-        clauses = " OR ".join(
-            "(effective_date LIKE ? OR expire_date LIKE ?)" for _ in years
-        )
+        conditions: list[str] = []
         params: list[str] = []
-        for year in years:
-            params.extend([f"{year}-%", f"{year}-%"])
+        if years:
+            conditions.append(
+                "("
+                + " OR ".join("(effective_date LIKE ? OR expire_date LIKE ?)" for _ in years)
+                + ")"
+            )
+            for year in years:
+                params.extend([f"{year}-%", f"{year}-%"])
+        if person:
+            # 人名字段住在 metadata_json 里（文档级 JSON），LIKE 扫描足够 100~1000 篇量级；
+            # 真到十万级再抽成独立列/表加索引，不在当前阶段过度设计。
+            conditions.append("metadata_json LIKE ?")
+            params.append(f"%{person}%")
         with self.db.sync_connect() as conn:
             rows = conn.execute(
-                "SELECT doc_id FROM ekbs_document WHERE status = 'published' AND ("
-                + clauses
-                + ") ORDER BY effective_date DESC, doc_id LIMIT 5",
+                "SELECT doc_id FROM ekbs_document WHERE status = 'published' AND "
+                + " AND ".join(conditions)
+                + " ORDER BY effective_date DESC, doc_id LIMIT 5",
                 tuple(params),
             ).fetchall()
         return [int(row["doc_id"]) for row in rows]

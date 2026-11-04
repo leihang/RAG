@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -164,6 +165,12 @@ def document_metadata_line(
     if effective_date:
         parts.append(f"生效日期：{effective_date}")
     parts.append(f"截止日期：{expire_date}" if expire_date else "截止日期：未标注")
+    # 人名字段（编制/审核/批准人）：很多文档相同（同一批人签批），**绝不能**做成
+    # 独立检索单元，否则 100 篇里 50 篇同值会互相稀释；只进上下文容器，按文档/人名
+    # 走元数据检索时由父块带入（见 retrieval 的 metadata_rescue/scan）。
+    for key in ("编制", "审核", "批准人"):
+        if meta.get(key):
+            parts.append(f"{key}：{meta[key]}")
     return "【文档信息】" + "；".join(parts)
 
 
@@ -331,6 +338,9 @@ class IngestPipeline:
             ]
         effective_date, expire_date = document_dates_from_header_meta(header_meta)
         metadata_line = document_metadata_line(header_meta, effective_date, expire_date)
+        metadata_json = (
+            json.dumps(dict(header_meta), ensure_ascii=False) if header_meta else None
+        )
         if existing_doc_id is not None:
             self._replace_existing(existing_doc_id, shard_id=shard_id)
             doc_id = int(existing_doc_id)
@@ -339,6 +349,7 @@ class IngestPipeline:
                 visible_dept_ids=list(visible_dept_ids), checksum=checksum,
                 doc_version=doc_version, status="indexing",
                 effective_date=effective_date, expire_date=expire_date,
+                metadata_json=metadata_json,
             )
         else:
             doc_id = self._insert_document(
@@ -346,6 +357,7 @@ class IngestPipeline:
                 visible_dept_ids=list(visible_dept_ids), checksum=checksum,
                 doc_version=doc_version, status="indexing",
                 effective_date=effective_date, expire_date=expire_date,
+                metadata_json=metadata_json,
             )
 
         try:
@@ -573,6 +585,7 @@ class IngestPipeline:
         status: str,
         effective_date: str | None = None,
         expire_date: str | None = None,
+        metadata_json: str | None = None,
     ) -> None:
         import json
 
@@ -582,11 +595,12 @@ class IngestPipeline:
                 "visible_dept_ids = ?, status = ?, checksum = ?, doc_version = ?, "
                 "effective_date = COALESCE(?, effective_date), "
                 "expire_date = COALESCE(?, expire_date), "
+                "metadata_json = COALESCE(?, metadata_json), "
                 "updated_at = datetime('now') WHERE doc_id = ?",
                 (
                     kb_id, title, source_path or title, level,
                     json.dumps(visible_dept_ids, ensure_ascii=False), status, checksum,
-                    doc_version, effective_date, expire_date, doc_id,
+                    doc_version, effective_date, expire_date, metadata_json, doc_id,
                 ),
             )
             conn.commit()
@@ -641,19 +655,20 @@ class IngestPipeline:
         status: str,
         effective_date: str | None = None,
         expire_date: str | None = None,
+        metadata_json: str | None = None,
     ) -> int:
         import json
 
         with self.db.sync_connect() as conn:
             conn.execute(
                 "INSERT INTO ekbs_document(kb_id, title, source_path, level, visible_dept_ids, "
-                "status, checksum, doc_version, effective_date, expire_date, "
+                "status, checksum, doc_version, effective_date, expire_date, metadata_json, "
                 "created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
                 (
                     kb_id, title, source_path or title, level,
                     json.dumps(visible_dept_ids, ensure_ascii=False), status, checksum,
-                    doc_version, effective_date, expire_date,
+                    doc_version, effective_date, expire_date, metadata_json,
                 ),
             )
             doc_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])

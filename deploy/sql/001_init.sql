@@ -197,6 +197,10 @@ CREATE TABLE IF NOT EXISTS ekbs_document (
     visible_dept_ids TEXT   NOT NULL DEFAULT '[]',       -- JSON 数组，空表示不限部门
     effective_date  TEXT,
     expire_date     TEXT,
+    -- 解析层抽取的**完整文档元数据**（JSON：文件名称/编号/版本/生效日期/截止日期/页数/
+    -- 编制/审核/批准人…）。用于按元数据检索（如「刘冀批准了哪些制度」），
+    -- 不参与向量/FTS 分块；缺省 NULL（旧文档）。
+    metadata_json   TEXT,
     status          TEXT    NOT NULL DEFAULT 'pending',  -- pending|parsing|review|indexing|published|failed|offline|deleted
     checksum        TEXT,                                -- SHA-256，用于秒传与去重
     created_by      INTEGER,

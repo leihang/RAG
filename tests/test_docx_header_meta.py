@@ -168,6 +168,71 @@ async def test_ingest_writes_document_dates_and_no_header_chunk(seeded) -> None:
     assert leaves and all("【文档信息】" not in str(item["content"]) for item in leaves)
 
 
+async def test_people_metadata_stored_and_answerable(seeded) -> None:
+    """编制/审核/批准人存 metadata_json，并进入父块【文档信息】行；点名文档可回答。"""
+    from ekbs.provider.base import RerankResult
+    from tests.conftest import user_id_of
+
+    runtime, summary = seeded
+    pipeline = _pipeline(runtime)
+    header = {
+        "文件编号": "XJWY-GC-09",
+        "版本": "2025A",
+        "生效日期": "2025年1月1日",
+        "编制": "雷航",
+        "审核": "雷航",
+        "批准人": "刘冀",
+    }
+    await pipeline.ingest_markdown(
+        title="工程部/XJWY-GC-09维修作业指导书",
+        markdown="# 维修作业指导书\n\n## 1. 目的\n\n规范维修服务。\n",
+        kb_id=int(summary["kb_id"]),
+        level=1,
+        visible_dept_ids=[],
+        header_meta=header,
+        real_corpus=False,
+    )
+    await pipeline.ingest_markdown(
+        title="工程部/XJWY-GC-10电梯作业指导书",
+        markdown="# 电梯作业指导书\n\n## 1. 目的\n\n规范电梯巡检。\n",
+        kb_id=int(summary["kb_id"]),
+        level=1,
+        visible_dept_ids=[],
+        header_meta={"文件编号": "XJWY-GC-10", "生效日期": "2025年3月1日",
+                     "编制": "雷航", "审核": "刘冀", "批准人": "刘冀"},
+        real_corpus=False,
+    )
+
+    async def fake_rerank(query, docs, top_n):  # noqa: ANN001, ANN202
+        return [
+            RerankResult(chunk_id=doc.chunk_id, score=0.05, shard_id=doc.shard_id)
+            for doc in docs
+        ]
+
+    runtime.providers.rerank.rerank = fake_rerank  # type: ignore[method-assign]
+    perm = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+
+    named = await runtime.pipeline.retrieve(
+        "工程部/XJWY-GC-09维修作业指导书的编制人、审核人和批准人是谁",
+        perm,
+        collect_debug=True,
+    )
+    assert named.refused is False
+    assert "metadata_rescue" in named.degraded
+    assert any(
+        "编制：雷航" in chunk.content and "批准人：刘冀" in chunk.content
+        for chunk in named.chunks
+    )
+
+    by_person = await runtime.pipeline.retrieve(
+        "刘冀批准了哪些制度", perm, collect_debug=True
+    )
+    assert by_person.refused is False, "人名 + 元数据问句应走结构化扫描"
+    assert "metadata_scan" in by_person.degraded
+    scan = by_person.stage_debug.get("metadata_scan") or {}
+    assert len(scan.get("doc_ids") or []) == 2, "两篇文档的批准人相同，都应扫出"
+
+
 def test_system_prompt_handles_missing_expire_date() -> None:
     """源文件没写截止日期时，提示词要求回答「文件未标注」而不是「资料中没有」。"""
     from ekbs.retrieval.pipeline import SYSTEM_PROMPT
