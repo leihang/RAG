@@ -11,7 +11,7 @@
  */
 import { useEffect, useState } from 'react'
 import {
-  Alert, Button, Card, Descriptions, Form, Input, InputNumber, Radio, Select, Space, Switch, Table, Tag, Typography, message,
+  Alert, Button, Card, Descriptions, Form, Input, InputNumber, Radio, Select, Space, Switch, Table, Tag, Tooltip, Typography, message,
 } from 'antd'
 import ChunkPeekDrawer from '@/components/ChunkPeekDrawer'
 import ClearanceTag from '@/components/ClearanceTag'
@@ -621,6 +621,31 @@ export default function Playground() {
                   render: (id: number) => (
                     <Typography.Link onClick={() => openChunk(id)} className="ekbs-mono">{id}</Typography.Link>
                   ),
+                },
+                {
+                  /*
+                    引用的两个身份必须分开看：
+                    * chunk_id      = 真正喂给 LLM 的上下文块（可能是精排后扩展出的父块/整表容器，如 35274）；
+                    * source_chunk_id = 它由哪条精排检索单元扩展而来（如 35277）。
+                    父块不在精排候选里是设计使然，不是异常 —— 这里把它讲清楚。
+                  */
+                  title: '精排来源/类型',
+                  dataIndex: 'source_chunk_id',
+                  width: 160,
+                  render: (source: number | null | undefined, r: Citation) => {
+                    // 兼容旧后端：没有该字段（null/undefined）时保持原样，不渲染假的来源
+                    if (source == null || source === r.chunk_id) return <Tag>精排块</Tag>
+                    return (
+                      <Space size={4} wrap>
+                        <Tooltip title={`该引用是精排后扩展出的父块/整表上下文，由精排块 #${source} 扩展而来`}>
+                          <Tag color="orange">父块上下文</Tag>
+                        </Tooltip>
+                        <Typography.Link onClick={() => openChunk(source)} className="ekbs-mono">
+                          ← #{source}
+                        </Typography.Link>
+                      </Space>
+                    )
+                  },
                 },
                 { title: '页', dataIndex: 'page_from', width: 70, render: (v) => v ?? '-' },
                 { title: '标题路径', dataIndex: 'heading_path', ellipsis: true },

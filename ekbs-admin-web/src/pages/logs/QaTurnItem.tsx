@@ -13,12 +13,16 @@ import { FileSearchOutlined, WarningOutlined } from '@ant-design/icons'
 import { Link } from 'react-router-dom'
 import FigureThumb from '@/components/FigureThumb'
 import { formatMs, formatTime } from '@/utils/format'
-import { textOrDash, turnRefusedOf, type QaCitation, type QaTurn } from './qaLogHelpers'
+import { citationSourceOf, textOrDash, turnRefusedOf, type QaCitation, type QaTurn } from './qaLogHelpers'
 
 /** 引用项：文档名（此处只有 doc_id，方案未要求回查标题）与分块 id。 */
 function CitationItem({ citation }: { citation: QaCitation }) {
   const aclBad = citation.aclResult && citation.aclResult !== 'pass'
   const pageBad = citation.pageCheck && citation.pageCheck !== 'pass'
+  // 上下文块（喂给 LLM 的 chunkId）可能是精排后扩展出来的父块/整表容器；
+  // 有来源时显示 `#父块 ← #精排块`，让「这块从哪来的」一眼可见（旧数据无该列时保持原样）
+  const sourceChunkId = citationSourceOf(citation)
+  const chunkLabel = `#${textOrDash(citation.chunkId)}`
   const page =
     citation.pageFrom != null && citation.pageTo != null
       ? `p.${citation.pageFrom}-${citation.pageTo}`
@@ -32,7 +36,16 @@ function CitationItem({ citation }: { citation: QaCitation }) {
         {citation.citeIndex != null ? `[${citation.citeIndex}] ` : ''}doc
         {textOrDash(citation.docId)}
       </Tag>
-      <Typography.Text type="secondary">分块 id：{textOrDash(citation.chunkId)}</Typography.Text>
+      {sourceChunkId != null ? (
+        <Tooltip title={`上下文块（由精排块 #${sourceChunkId} 扩展）`}>
+          <Typography.Text type="secondary" style={{ cursor: 'help' }}>
+            分块 id：
+            <span className="ekbs-mono">{`${chunkLabel} ← #${sourceChunkId}`}</span>
+          </Typography.Text>
+        </Tooltip>
+      ) : (
+        <Typography.Text type="secondary">分块 id：{chunkLabel}</Typography.Text>
+      )}
       {citation.docVersion ? (
         <Typography.Text type="secondary">版本 {citation.docVersion}</Typography.Text>
       ) : null}
@@ -187,7 +200,7 @@ export default function QaTurnItem({ turn }: QaTurnItemProps) {
       {turn.citations.length ? (
         <Flex vertical gap={8} style={{ marginTop: 8 }}>
           {turn.citations.map((c, idx) => (
-            <CitationItem key={`${c.citationId ?? c.chunkId ?? idx}`} citation={c} />
+            <CitationItem key={`${c.citationId ?? c.chunkId ?? idx}-${c.sourceChunkId ?? ''}`} citation={c} />
           ))}
         </Flex>
       ) : (

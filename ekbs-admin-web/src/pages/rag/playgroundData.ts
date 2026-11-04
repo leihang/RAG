@@ -15,6 +15,9 @@
  *   rrf:    { k, fused: [{chunk_id, score}] },
  *   rerank: { enabled, requested_top_n, keep, min_score, scores: [{chunk_id, rerank_score}] },
  *   c5:     { kept: number[], dropped: number[] },
+ *   expand: { enabled, deduped,
+ *             expanded: [{context_chunk_id, source_chunk_id, chunk_type, heading_path,
+ *                         rerank_score, rerank_rank}] },
  * }
  * ```
  *
@@ -101,6 +104,28 @@ export interface C5Stage {
   dropped: number[]
 }
 
+/**
+ * 一条「上下文块 ← 精排检索单元」的扩展记录（`stages.expand.expanded[i]`）。
+ *
+ * 精排只给检索单元（叶子/行组）打分，父块/整表容器是精排**之后**才被扩展出来的上下文，
+ * 所以 `context_chunk_id` 常常不在 rerank 候选里 —— 这不是异常，来源就是 `source_chunk_id`。
+ */
+export interface ExpandRow {
+  context_chunk_id: number | null
+  source_chunk_id: number | null
+  chunk_type: string | null
+  heading_path: string | null
+  rerank_score: number | null
+  rerank_rank: number | null
+}
+
+/** 第 5 跳：精排后的上下文扩展（父块回溯 / 整表展开）。 */
+export interface ExpandStage {
+  enabled: boolean | null
+  deduped: number | null
+  expanded: ExpandRow[]
+}
+
 export interface DebugStages {
   params: StageParams | null
   dense: DenseStage | null
@@ -108,6 +133,7 @@ export interface DebugStages {
   rrf: RrfStage | null
   rerank: RerankStage | null
   c5: C5Stage | null
+  expand: ExpandStage | null
 }
 
 function parseParams(value: unknown): StageParams | null {
@@ -185,6 +211,22 @@ function parseC5(value: unknown): C5Stage | null {
   return { kept: numList(value.kept), dropped: numList(value.dropped) }
 }
 
+function parseExpand(value: unknown): ExpandStage | null {
+  if (!isRecord(value)) return null
+  return {
+    enabled: bool(value.enabled),
+    deduped: num(value.deduped),
+    expanded: recordList(value.expanded).map((row) => ({
+      context_chunk_id: num(row.context_chunk_id),
+      source_chunk_id: num(row.source_chunk_id),
+      chunk_type: str(row.chunk_type),
+      heading_path: str(row.heading_path),
+      rerank_score: num(row.rerank_score),
+      rerank_rank: num(row.rerank_rank),
+    })),
+  }
+}
+
 /** `stages` 总解析结果；`raw` 不是对象时全为 null（页面直接不渲染逐跳明细）。 */
 export function parseStages(value: unknown): DebugStages {
   const record = isRecord(value) ? value : {}
@@ -195,6 +237,7 @@ export function parseStages(value: unknown): DebugStages {
     rrf: parseRrf(record.rrf),
     rerank: parseRerank(record.rerank),
     c5: parseC5(record.c5),
+    expand: parseExpand(record.expand),
   }
 }
 
@@ -207,7 +250,20 @@ export function stageSectionKeys(stages: DebugStages): string[] {
   if (stages.rrf) keys.push('rrf')
   if (stages.rerank) keys.push('rerank')
   if (stages.c5) keys.push('c5')
+  // 扩展发生在 C5 之后（精排/C5 只处理检索单元，父块是之后才回溯出来的），排最后
+  if (stages.expand) keys.push('expand')
   return keys
+}
+
+/** 逐跳段落的展示名（key 与 `stageSectionKeys` 的取值一一对应）。 */
+export const STAGE_TITLES: Record<string, string> = {
+  params: '本次生效参数',
+  dense: '向量召回',
+  sparse: 'BM25 召回',
+  rrf: 'RRF 融合',
+  rerank: 'Rerank 精排',
+  c5: 'C5 密级闸门',
+  expand: '上下文扩展（父块/整表）',
 }
 
 // ---------------------------------------------------------------------------
@@ -254,17 +310,20 @@ export function timingRows(timings: Record<string, number> | undefined | null): 
 export interface CitationRow {
   cite_index: number | null
   chunk_id: number | null
+  /** 上下文块由哪条精排检索单元扩展而来；null = 引用本身就是精排单元 */
+  source_chunk_id: number | null
   doc_title: string | null
   page_from: number | null
   acl_result: string | null
   page_check: string | null
 }
 
-/** 引用表（后端 `playground.py::debug_query` 只回这 6 个字段；`doc_id`/`heading_path` 不下发）。 */
+/** 引用表（后端 `playground.py::debug_query` 回这 7 个字段；`doc_id`/`heading_path` 不下发）。 */
 export function citationRows(value: unknown): CitationRow[] {
   return recordList(value).map((item) => ({
     cite_index: num(item.cite_index),
     chunk_id: num(item.chunk_id),
+    source_chunk_id: num(item.source_chunk_id),
     doc_title: str(item.doc_title),
     page_from: num(item.page_from),
     acl_result: str(item.acl_result),

@@ -94,7 +94,13 @@ export interface QaTurn {
 export interface QaCitation {
   citationId?: number
   citeIndex?: number
+  /** 实际喂给 LLM 的上下文块 id（可能是父块/整表容器） */
   chunkId?: number
+  /**
+   * 上下文块由哪条精排检索单元扩展而来（admin.py 的 `c.*` 原样带出 `source_chunk_id`）；
+   * 缺省 = 引用本身就是精排单元（旧数据没有这一列）。
+   */
+  sourceChunkId?: number | null
   docId?: number
   docVersion?: string
   headingPath?: string
@@ -107,6 +113,16 @@ export interface QaCitation {
   pageCheck?: string
   figureId?: string
   imagePath?: string
+}
+
+/**
+ * 引用的「精排来源块」：上下文块是精排后才扩展出来的父块/整表容器时，返回来源块 id；
+ * 引用本身即精排单元、或旧数据没有该列时返回 undefined（渲染保持原样，不编造来源）。
+ */
+export function citationSourceOf(citation: QaCitation): number | undefined {
+  const source = citation.sourceChunkId
+  if (source == null || source === citation.chunkId) return undefined
+  return source
 }
 
 /** `GET /audit/security-events` 的实际行字段（admin.py:208-213 的 SELECT）。 */
@@ -446,6 +462,7 @@ export function citationOfDoc(raw: unknown): QaCitation {
     citationId: num(c.citation_id),
     citeIndex: num(c.cite_index),
     chunkId: num(c.chunk_id),
+    sourceChunkId: num(c.source_chunk_id),
     docId: num(c.doc_id),
     docVersion: str(c.doc_version) || undefined,
     headingPath: str(c.heading_path) || undefined,

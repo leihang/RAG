@@ -36,7 +36,13 @@ export interface DebugQueryBody {
 
 export interface Citation {
   cite_index: number
+  /** 实际喂给 LLM 的**上下文块** id（可能是父块/整表容器，如 35274） */
   chunk_id: number
+  /**
+   * 该上下文块由哪条**精排检索单元**扩展而来（如 35277）；null/缺省 = 引用本身就是精排单元。
+   * 精排只给检索单元打分，父块容器不在精排候选里 —— 两个 id 分开暴露才能解释「这块从哪来的」。
+   */
+  source_chunk_id?: number | null
   doc_id?: number
   doc_title?: string
   page_from?: number | null
@@ -117,6 +123,10 @@ export interface SimulatedChunk {
   sparse_rank: number | null
   rrf_score: number
   rerank_score: number | null
+  /** 非空 = 本块是精排后扩展出的父块/整表上下文，来源块 id（=`_chunk_view` 的 expanded_from） */
+  expanded_from?: number | null
+  /** 精排名次（1-based）：未扩展时是本块自己的名次，无精排分数时为 null */
+  source_rerank_rank?: number | null
 }
 
 /**

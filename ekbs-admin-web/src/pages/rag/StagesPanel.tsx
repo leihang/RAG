@@ -5,12 +5,13 @@
  * 此时只剩 `params`）。不确定的字段一律不猜、不补零 —— 见 `./playgroundData.ts` 的解析注释。
  */
 import { useState } from 'react'
-import { Alert, Badge, Card, Col, Row, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Badge, Card, Col, Row, Space, Table, Tag, Tooltip, Typography } from 'antd'
+import { QuestionCircleOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import EmptyState from '@/components/EmptyState'
 import { formatNumber } from '@/utils/format'
-import type { DensePerShard, DebugStages, StageParams } from './playgroundData'
-import { stageSectionKeys } from './playgroundData'
+import type { DensePerShard, DebugStages, ExpandRow, StageParams } from './playgroundData'
+import { STAGE_TITLES, stageSectionKeys } from './playgroundData'
 
 const TOP_N = 10
 
@@ -360,6 +361,90 @@ function C5Card({
   )
 }
 
+function ExpandCard({
+  expand,
+  onOpenChunk,
+}: {
+  expand: NonNullable<DebugStages['expand']>
+  onOpenChunk?: (chunkId: number) => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const columns: ColumnsType<ExpandRow> = [
+    {
+      title: '上下文块',
+      dataIndex: 'context_chunk_id',
+      width: 130,
+      render: (value: number | null) => <ChunkLink value={value} onOpen={onOpenChunk} />,
+    },
+    {
+      title: '精排来源',
+      dataIndex: 'source_chunk_id',
+      width: 130,
+      render: (value: number | null) => <ChunkLink value={value} onOpen={onOpenChunk} />,
+    },
+    {
+      title: '精排名次',
+      dataIndex: 'rerank_rank',
+      width: 90,
+      render: (value: number | null) => (value == null ? '-' : `#${value}`),
+    },
+    {
+      title: '分数',
+      dataIndex: 'rerank_score',
+      width: 100,
+      render: (value: number | null) => (value == null ? '-' : value.toFixed(4)),
+    },
+    {
+      title: '标题路径',
+      dataIndex: 'heading_path',
+      ellipsis: true,
+      render: (value: string | null) => value ?? '-',
+    },
+  ]
+  return (
+    <Card
+      size="small"
+      title={
+        <Space size={8}>
+          <span>第 5 跳 · 上下文扩展（父块/整表）</span>
+          <Badge
+            status={expand.enabled === false ? 'default' : 'success'}
+            text={expand.enabled === false ? '本次未启用' : '已启用'}
+          />
+          <Badge count={expand.expanded.length} showZero color="orange" />
+        </Space>
+      }
+      extra={
+        <Space size={6}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            去重 {expand.deduped ?? '-'} 条
+          </Typography.Text>
+          {/* 这是用户最容易误解的一跳：父块不在 rerank 候选里不是异常，是设计 */}
+          <Tooltip title="精排只给检索单元打分；父块/整表容器是精排后扩展的上下文，不在精排候选里属正常">
+            <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+          </Tooltip>
+        </Space>
+      }
+    >
+      <Table
+        size="small"
+        rowKey={(_row, index) => `expand-${index ?? 0}`}
+        columns={columns}
+        dataSource={preview(expand.expanded, expanded)}
+        pagination={false}
+        locale={{
+          emptyText: <EmptyState description="本次没有发生上下文扩展（未启用 parent_expand，或精排块本身就是上下文块）" />,
+        }}
+      />
+      <ExpandHint
+        total={expand.expanded.length}
+        expanded={expanded}
+        onToggle={() => setExpanded((v) => !v)}
+      />
+    </Card>
+  )
+}
+
 export default function StagesPanel({
   stages,
   onOpenChunk,
@@ -386,8 +471,10 @@ export default function StagesPanel({
       {stages.rrf ? <RrfCard rrf={stages.rrf} onOpenChunk={onOpenChunk} /> : null}
       {stages.rerank ? <RerankCard rerank={stages.rerank} onOpenChunk={onOpenChunk} /> : null}
       {stages.c5 ? <C5Card c5={stages.c5} onOpenChunk={onOpenChunk} /> : null}
+      {stages.expand ? <ExpandCard expand={stages.expand} onOpenChunk={onOpenChunk} /> : null}
       <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-        共 {keys.length} 段明细（{keys.join(' / ')}）；未出现的段落代表后端本次没有写入，不是 0。
+        共 {keys.length} 段明细（{keys.map((key) => STAGE_TITLES[key] ?? key).join(' / ')}）；
+        未出现的段落代表后端本次没有写入，不是 0。
         {onOpenChunk ? ' 点击 chunk_id 可查看块内容。' : ''}
       </Typography.Text>
       {formatNumber(keys.length) ? null : null}

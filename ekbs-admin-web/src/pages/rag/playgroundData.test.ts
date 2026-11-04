@@ -9,6 +9,7 @@ import {
   readDebugHistory,
   readShardVisibility,
   readSimulated,
+  STAGE_TITLES,
   stageSectionKeys,
   timingRows,
 } from './playgroundData'
@@ -63,12 +64,36 @@ const REAL_STAGES = {
     ],
   },
   c5: { kept: [9871, 4512], dropped: [7711] },
+  // 文档 205 实测：精排块 35277（#2，0.899）被替换成整篇父块 35274；
+  // 表格行组叶子 35284/35282 都扩展成同一张表容器 35281，去重后只留分数最高的一条。
+  expand: {
+    enabled: true,
+    deduped: 1,
+    expanded: [
+      {
+        context_chunk_id: 35274,
+        source_chunk_id: 35277,
+        chunk_type: 'parent',
+        heading_path: '能耗管理作业指导书 > 能耗管理员职责',
+        rerank_score: 0.899,
+        rerank_rank: 2,
+      },
+      {
+        context_chunk_id: 35281,
+        source_chunk_id: 35284,
+        chunk_type: 'table',
+        heading_path: '能耗管理作业指导书 > 表2 能耗指标',
+        rerank_score: 0.812,
+        rerank_rank: 4,
+      },
+    ],
+  },
 }
 
 describe('parseStages 逐跳解析', () => {
   it('完整 stages 全部解析出来', () => {
     const stages = parseStages(REAL_STAGES)
-    expect(stageSectionKeys(stages)).toEqual(['params', 'dense', 'sparse', 'rrf', 'rerank', 'c5'])
+    expect(stageSectionKeys(stages)).toEqual(['params', 'dense', 'sparse', 'rrf', 'rerank', 'c5', 'expand'])
     expect(stages.params?.dense_top_k).toBe(50)
     expect(stages.dense?.requestedTopK).toBe(50)
     expect(stages.dense?.perShard).toHaveLength(2)
@@ -82,6 +107,48 @@ describe('parseStages 逐跳解析', () => {
     expect(stages.rerank?.minScore).toBe(0.35)
     expect(stages.c5?.kept).toEqual([9871, 4512])
     expect(stages.c5?.dropped).toEqual([7711])
+    expect(stages.expand?.enabled).toBe(true)
+    expect(stages.expand?.deduped).toBe(1)
+    expect(stages.expand?.expanded[0]).toEqual({
+      context_chunk_id: 35274,
+      source_chunk_id: 35277,
+      chunk_type: 'parent',
+      heading_path: '能耗管理作业指导书 > 能耗管理员职责',
+      rerank_score: 0.899,
+      rerank_rank: 2,
+    })
+  })
+
+  it('expand 解析出 `上下文块 ← 精排来源` 的对应关系（35274 ← 35277）', () => {
+    const expand = parseStages(REAL_STAGES).expand
+    // 父块 35274 不在精排候选里，来源是精排 #2 的 35277 —— 这是设计，不是丢块
+    expect(expand?.expanded[0].context_chunk_id).toBe(35274)
+    expect(expand?.expanded[0].source_chunk_id).toBe(35277)
+    expect(expand?.expanded[0].rerank_rank).toBe(2)
+    expect(expand?.expanded[0].rerank_score).toBeCloseTo(0.899)
+    // 同一表容器的多个来源在扩展阶段已去重（deduped=1），只剩分数最高的来源
+    expect(expand?.expanded[1].context_chunk_id).toBe(35281)
+    expect(expand?.expanded[1].source_chunk_id).toBe(35284)
+  })
+
+  it('expand 为空列表也保留段落（后端明确说「没扩展」，与「没有这段」不同）', () => {
+    const stages = parseStages({ expand: { enabled: false, deduped: 0, expanded: [] } })
+    expect(stageSectionKeys(stages)).toContain('expand')
+    expect(stages.expand).toEqual({ enabled: false, deduped: 0, expanded: [] })
+  })
+
+  it('expand 行缺字段时局部为 null，不抛错', () => {
+    const expand = parseStages({ expand: { expanded: [{ context_chunk_id: 35274 }] } }).expand
+    expect(expand?.enabled).toBeNull()
+    expect(expand?.deduped).toBeNull()
+    expect(expand?.expanded[0]).toEqual({
+      context_chunk_id: 35274,
+      source_chunk_id: null,
+      chunk_type: null,
+      heading_path: null,
+      rerank_score: null,
+      rerank_rank: null,
+    })
   })
 
   it('拒答提前 return 时只有 params（不能凭空补出 dense/rerank）', () => {
@@ -90,6 +157,14 @@ describe('parseStages 逐跳解析', () => {
     expect(stages.dense).toBeNull()
     expect(stages.rerank).toBeNull()
     expect(stages.c5).toBeNull()
+    // 旧后端没有 stages.expand：段落不出现，面板不渲染扩展卡（优雅降级）
+    expect(stages.expand).toBeNull()
+  })
+
+  it('阶段展示名表覆盖全部段落，且扩展段排在 C5 之后', () => {
+    expect(STAGE_TITLES.expand).toBe('上下文扩展（父块/整表）')
+    const stages = parseStages(REAL_STAGES)
+    expect(stageSectionKeys(stages).map((key) => STAGE_TITLES[key])).toContain('上下文扩展（父块/整表）')
   })
 
   it('stages 缺失/不是对象时全为 null，不抛错', () => {
@@ -137,18 +212,40 @@ describe('timingRows 耗时表', () => {
 })
 
 describe('citationRows 引用表', () => {
-  it('后端只回 6 个字段', () => {
+  it('读数索引、上下文块与精排来源（source_chunk_id 可空）', () => {
     const rows = citationRows([
-      { cite_index: 1, chunk_id: 9871, doc_title: '差旅费管理办法', page_from: 12, acl_result: 'allow', page_check: 'pass' },
+      {
+        cite_index: 1,
+        chunk_id: 35280,
+        source_chunk_id: null,
+        doc_title: '能耗管理作业指导书',
+        page_from: 5,
+        acl_result: 'pass',
+        page_check: 'pass',
+      },
+      {
+        cite_index: 2,
+        chunk_id: 35274,
+        source_chunk_id: 35277,
+        doc_title: '能耗管理作业指导书',
+        page_from: 5,
+        acl_result: 'pass',
+        page_check: 'pass',
+      },
     ])
+    // 引用 [1] 本身就是精排块；引用 [2] 是整篇父块 35274，由精排块 35277 扩展而来
     expect(rows[0]).toEqual({
       cite_index: 1,
-      chunk_id: 9871,
-      doc_title: '差旅费管理办法',
-      page_from: 12,
-      acl_result: 'allow',
+      chunk_id: 35280,
+      source_chunk_id: null,
+      doc_title: '能耗管理作业指导书',
+      page_from: 5,
+      acl_result: 'pass',
       page_check: 'pass',
     })
+    expect(rows[1].source_chunk_id).toBe(35277)
+    // 旧后端没有该字段 → null（页面按「本块就是精排块」渲染，不编造来源）
+    expect(citationRows([{ cite_index: 9, chunk_id: 1 }])[0].source_chunk_id).toBeNull()
     expect(citationRows(undefined)).toEqual([])
   })
 })

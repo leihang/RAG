@@ -11,6 +11,7 @@ import {
   answerLooksRefused,
   buildQaTurns,
   citationOfDoc,
+  citationSourceOf,
   eventTypeLabel,
   matchDocAccessResult,
   matchQaKeyword,
@@ -259,6 +260,27 @@ describe('citationOfDoc（ekbs_qa_citation 的 SELECT c.* 列）', () => {
       pageCheck: 'out_of_range',
     })
     expect(c.rerankScore).toBeCloseTo(0.8123)
+  })
+
+  it('映射精排来源 source_chunk_id（上下文块 35274 ← 精排块 35277）', () => {
+    const c = citationOfDoc({ cite_index: 2, chunk_id: 35274, source_chunk_id: 35277, doc_id: 205 })
+    expect(c.chunkId).toBe(35274)
+    expect(c.sourceChunkId).toBe(35277)
+    // 旧数据没有该列 / 空值 → undefined（不编造来源）
+    expect(citationOfDoc({ chunk_id: 35280 }).sourceChunkId).toBeUndefined()
+    expect(citationOfDoc({ chunk_id: 35280, source_chunk_id: null }).sourceChunkId).toBeUndefined()
+  })
+})
+
+describe('citationSourceOf（上下文块 ← 精排来源）', () => {
+  it('有来源且与 chunkId 不同 → 返回精排块 id', () => {
+    expect(citationSourceOf({ chunkId: 35274, sourceChunkId: 35277 })).toBe(35277)
+  })
+
+  it('引用本身就是精排单元 / 旧数据无来源 → undefined（渲染保持原样）', () => {
+    expect(citationSourceOf({ chunkId: 35280 })).toBeUndefined()
+    expect(citationSourceOf({ chunkId: 35280, sourceChunkId: 35280 })).toBeUndefined()
+    expect(citationSourceOf({ chunkId: 35280, sourceChunkId: null })).toBeUndefined()
   })
 })
 
