@@ -18,7 +18,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from ekbs.ingest.chunker import FigureInput, TableInput
 from ekbs.ingest.clean import clean_figure_text, clean_markdown
@@ -91,6 +91,9 @@ class ReviewSidecar:
     #: 文档总页数。docx 无真实分页时由解析器从页眉「页数：1/2」抽取；
     #: 不存的话入库阶段只能靠 page_map 推算，而 docx 的 page_map 为空 → page_count 永远 NULL。
     page_count: int | None = None
+    #: 页眉/页脚里的文档管控信息（文件名称/编号/生效日期/版本/页数/编制/审核/批准人…）。
+    #: 这是**元数据**不是正文，不入分块；复核 UI 可只读展示，入库用它填文档生效/截止日期。
+    header_meta: dict[str, str] = field(default_factory=dict)
 
 
 def save_review_draft(
@@ -104,6 +107,7 @@ def save_review_draft(
     tables: Sequence[TableInput] | None = None,
     clean_stats: dict[str, Any] | None = None,
     page_count: int | None = None,
+    header_meta: Mapping[str, str] | None = None,
 ) -> str:
     """写入清洗后正文与 sidecar；返回相对 ``data_dir`` 的 parse_path（目录）。"""
     out = draft_dir(data_dir, doc_id)
@@ -117,6 +121,7 @@ def save_review_draft(
         tables=[asdict(t) for t in (tables or [])],
         clean_stats=dict(clean_stats or {}),
         page_count=int(page_count) if page_count else None,
+        header_meta=dict(header_meta or {}),
     )
     (out / DRAFT_SIDECAR_NAME).write_text(
         json.dumps(asdict(sidecar), ensure_ascii=False, indent=2),
@@ -194,6 +199,7 @@ def save_review_asset_edits(
             for item in next_tables
         ],
         clean_stats=sidecar.clean_stats,
+        header_meta=sidecar.header_meta,
     )
 
 
@@ -256,6 +262,7 @@ def load_review_sidecar(data_dir: Path, doc_id: int) -> ReviewSidecar:
         tables=list(raw.get("tables") or []),
         clean_stats=dict(raw.get("clean_stats") or {}),
         page_count=int(raw["page_count"]) if raw.get("page_count") else None,
+        header_meta=dict(raw.get("header_meta") or {}),
     )
 
 
@@ -309,6 +316,7 @@ def prepare_scan_draft(
     tables: Sequence[TableInput],
     source_path: str | None = None,
     page_count: int | None = None,
+    header_meta: Mapping[str, str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """清洗正文与图注，落盘，返回 (parse_path 相对路径, clean_stats)。"""
     cleaned = clean_markdown(raw_markdown)
@@ -366,6 +374,7 @@ def prepare_scan_draft(
         tables=merged_tables,
         clean_stats=stats,
         page_count=page_count,
+        header_meta=header_meta,
     )
     return rel, stats
 
@@ -405,6 +414,7 @@ def upgrade_review_draft_seals(data_dir: Path, doc_id: int) -> dict[str, Any]:
         figures=kept,
         tables=tables_from_sidecar(sidecar),
         clean_stats=clean_stats,
+        header_meta=sidecar.header_meta,
     )
     log.info("review_draft_seals_dropped", doc_id=doc_id, count=len(dropped))
     return {"seal_figures_dropped": len(dropped)}
@@ -437,6 +447,7 @@ def upgrade_review_draft_tables(data_dir: Path, doc_id: int) -> dict[str, Any]:
         figures=figures_from_sidecar(sidecar),
         tables=new_tables,
         clean_stats=clean_stats,
+        header_meta=sidecar.header_meta,
     )
     return stats
 
@@ -475,6 +486,7 @@ def upgrade_review_draft_tail(
         figures=figures,
         tables=tables_from_sidecar(sidecar),
         clean_stats=clean_stats,
+        header_meta=sidecar.header_meta,
     )
     log.info("review_draft_tail_upgraded", doc_id=doc_id, **stats)
     return stats

@@ -17,6 +17,7 @@ from __future__ import annotations
 import html
 import re
 import subprocess
+from datetime import date
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path, PurePath
@@ -72,6 +73,11 @@ class ParsedDocument:
     figures: list[ParsedFigure] = field(default_factory=list)
     #: 抽出的表格（确定性序列化后入索引，不重复写进 markdown）
     tables: list[ParsedTable] = field(default_factory=list)
+    #: 页眉/页脚里的**文档管控信息**（文件名称/文件编号/生效日期/版本/页数/编制/审核/批准人…）。
+    #: 这些是**元数据**，不是正文：不再作为「文件信息」章节写进 markdown（否则每篇制度
+    #: 都会生成一段高度同质的正文块，入库后互相竞争）。入库时用于填
+    #: ``ekbs_document.effective_date / expire_date``，侧车 JSON 也保留一份供人工复核。
+    header_meta: dict[str, str] = field(default_factory=dict)
 
 
 def parse_markdown(text: str, *, engine: str = "text") -> ParsedDocument:
@@ -362,6 +368,49 @@ def _parse_text(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
 _DOCX_HEADER_PAGE_TOTAL = re.compile(
     r"页\s*数\s*[：:]\s*\d+\s*/\s*(\d+)", re.IGNORECASE
 )
+#: 页眉行拆键值：全角/半角分号；键值之间全角/半角冒号
+_HEADER_KV_SPLIT = re.compile(r"[；;]")
+_HEADER_KV = re.compile(r"^\s*([^：:]{1,24})\s*[：:]\s*(.+?)\s*$")
+#: 中文/短横线/点号/斜杠日期：2025年1月1日 / 2025-1-1 / 2025.1.1 / 2025/1/1
+_DATE_PATTERN = re.compile(r"(\d{4})\s*[年./\-]\s*(\d{1,2})\s*[月./\-]\s*(\d{1,2})\s*日?")
+
+
+def parse_cn_dates(text: str) -> list[str]:
+    """抽出一段文字里的全部日期并归一化为 ``YYYY-MM-DD``（无效日期跳过，保序去重）。"""
+    out: list[str] = []
+    for match in _DATE_PATTERN.finditer(str(text or "")):
+        year, month, day = (int(part) for part in match.groups())
+        try:
+            date(year, month, day)
+        except ValueError:
+            continue
+        value = f"{year:04d}-{month:02d}-{day:02d}"
+        if value not in out:
+            out.append(value)
+    return out
+
+
+def parse_cn_date(text: str) -> str | None:
+    """取文字里的**第一个**日期（``YYYY-MM-DD``）；没有/无效返回 ``None``。"""
+    dates = parse_cn_dates(text)
+    return dates[0] if dates else None
+
+
+def parse_header_meta(lines: Sequence[str]) -> dict[str, str]:
+    """把页眉/页脚文字解析成 ``{键: 值}``（键去掉空格，保留中文原名）。"""
+    meta: dict[str, str] = {}
+    for line in lines:
+        for part in _HEADER_KV_SPLIT.split(str(line or "")):
+            match = _HEADER_KV.match(part.strip())
+            if not match:
+                continue
+            key = re.sub(r"[\s\u3000]+", "", match.group(1))
+            value = match.group(2).strip()
+            if key and value and key not in meta:
+                meta[key] = value
+    return meta
+
+
 #: 页眉装饰小图阈值：短边与长边都偏小时视为 logo，不进正文 figure
 _DOCX_DECORATIVE_MAX_EDGE = 120
 
@@ -855,15 +904,6 @@ class _DocxState:
     table_seq: int = 0
 
 
-def _docx_header_lines(header_meta: list[str]) -> list[str]:
-    """页眉/页脚文字作为「文件信息」写进文首。"""
-    if not header_meta:
-        return []
-    # 用 H2：与一级编号章（level=2）同级，后续 ``1. 目的`` 会弹出本节点，
-    # 避免 ``文件信息 > 4.1 …`` 污染 heading_path。
-    return ["## 文件信息", *header_meta, ""]
-
-
 def _docx_nearby_caption(recent_texts: list[str]) -> str:
     """优先带「二维码/扫描/下载」的近邻段，再退到 APP/图片，最后取最近正文。"""
     for keys in (
@@ -1017,9 +1057,12 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
     document = docx.Document(str(path))
     # 自动编号住在 numbering.xml + 段落的 w:numPr 里，正文 w:t 中看不到；先展开再遍历
     numbering_expanded = _expand_docx_numbering(document, qn, _read_docx_numbering(path))
-    header_meta, header_page_count = _docx_header_meta(document)
+    header_lines, header_page_count = _docx_header_meta(document)
+    # 页眉管控信息是**元数据**，不是正文：抽成结构化 header_meta 交给入库阶段
+    # （effective_date/expire_date + 侧车），不再写「## 文件信息」章节。旧做法会让
+    # 每篇制度多出一段高度同质的正文块，检索时跨文档互相竞争（实测「文件信息」四连发）。
+    header_meta = parse_header_meta(header_lines)
     state = _DocxState(assets_dir=assets_dir, log_file=path.name)
-    state.lines.extend(_docx_header_lines(header_meta))
     _walk_docx_body(document, state, qn)
     _collect_docx_fallback_images(path, document, state)
     _attach_textless_captions(state, path.stem.strip())
@@ -1042,6 +1085,7 @@ def _parse_docx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
         tables=state.tables,
         figures=state.figures,
         page_count=header_page_count,
+        header_meta=header_meta,
     )
 
 
@@ -1545,6 +1589,7 @@ def _parse_doc(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
         page_count=parsed.page_count,
         figures=figures,
         tables=parsed.tables,
+        header_meta=dict(parsed.header_meta or {}),
     )
 
 

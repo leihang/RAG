@@ -669,6 +669,7 @@ async def approve_parse_task(
                 if not str(fig.figure_id or "").startswith("handwrite")
             ],
             tables=tables_from_sidecar(sidecar),
+            header_meta=sidecar.header_meta,
             existing_doc_id=task_id,
             checksum=(str(row["checksum"]) if row["checksum"] else None),
             defer_vector=True,

@@ -120,10 +120,15 @@ def test_docx_preserves_header_control_fields(tmp_path: Path) -> None:
     assets = tmp_path / "parse" / "ctrl"
     parsed = parse_file(path, assets_dir=assets)
 
-    assert "## 文件信息" in parsed.markdown
-    assert "设备编号作业指导书" in parsed.markdown
-    assert "XJWY-GC-02" in parsed.markdown
-    assert "2024年4月1日" in parsed.markdown
+    # 页眉管控信息是**文档元数据**：进 header_meta，不再作为「文件信息」正文块落库。
+    assert parsed.header_meta["文件名称"] == "设备编号作业指导书"
+    assert parsed.header_meta["文件编号"] == "XJWY-GC-02"
+    assert parsed.header_meta["生效日期"] == "2024年4月1日"
+    assert parsed.header_meta["页数"] == "1 / 2"
+    assert "文件信息" not in parsed.markdown
+    assert "设备编号作业指导书" not in parsed.markdown
+    assert "XJWY-GC-02" not in parsed.markdown
+    assert "2024年4月1日" not in parsed.markdown
     assert parsed.page_count == 2
     assert parsed.figures == [], "页眉装饰小图不应进 figure"
     assert "1. 目的" in parsed.markdown

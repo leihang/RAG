@@ -17,8 +17,9 @@ from __future__ import annotations
 import asyncio
 
 import hashlib
+import re
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from ekbs.config import Settings
 from ekbs.db import Database
@@ -32,6 +33,7 @@ from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE, retrievable_chunk_ids
 from ekbs.ingest import token_calib
 from ekbs.ingest.clean import clean_figure_text, clean_markdown, clean_profile_for_path
 from ekbs.ingest.seal_filter import partition_seal_figures, strip_figure_anchors
+from ekbs.ingest.parser import parse_cn_dates
 from ekbs.ingest.table_merge import merge_continued_tables
 from ekbs.ingest.chunker import (
     active_token_counter,
@@ -110,6 +112,34 @@ def _first_line(text: str, *, limit: int = 80) -> str:
         if cleaned:
             return cleaned[:limit]
     return ""
+
+
+#: 页眉元数据里「生效」类键（按顺序找，值里取第一个日期）
+_EFFECTIVE_KEYS = ("生效日期", "生效时间", "起始日期", "实施日期")
+#: 「截止/失效」类键（值可能是区间，取最后一个日期）
+_EXPIRE_KEYS = ("截止日期", "失效日期", "有效期至", "有效期止", "终止日期")
+
+
+def document_dates_from_header_meta(
+    header_meta: Mapping[str, str] | None,
+) -> tuple[str | None, str | None]:
+    """从页眉元数据解析 ``(effective_date, expire_date)``，归一化为 ``YYYY-MM-DD``。
+
+    文档没写截止日期时返回 ``None`` —— **不推断**「长期有效」之类的语义，交给上层
+    决定措辞；只有源文档明确写了日期才落库。
+    """
+    meta = {re.sub(r"[\s\u3000]+", "", str(k)): str(v) for k, v in (header_meta or {}).items()}
+
+    def _find(keys: tuple[str, ...], *, last: bool) -> str | None:
+        for wanted in keys:
+            for key, value in meta.items():
+                if key == wanted or wanted in key:
+                    dates = parse_cn_dates(value)
+                    if dates:
+                        return dates[-1] if last else dates[0]
+        return None
+
+    return _find(_EFFECTIVE_KEYS, last=False), _find(_EXPIRE_KEYS, last=True)
 
 
 class IngestPipeline:
@@ -193,6 +223,7 @@ class IngestPipeline:
         existing_doc_id: int | None = None,
         figures: Sequence[FigureInput] = (),
         tables: Sequence[TableInput] = (),
+        header_meta: Mapping[str, str] | None = None,
         personal: bool = False,
         defer_vector: bool = False,
     ) -> IngestResult:
@@ -273,6 +304,7 @@ class IngestPipeline:
                 )
                 for fig in figures
             ]
+        effective_date, expire_date = document_dates_from_header_meta(header_meta)
         if existing_doc_id is not None:
             self._replace_existing(existing_doc_id, shard_id=shard_id)
             doc_id = int(existing_doc_id)
@@ -280,12 +312,14 @@ class IngestPipeline:
                 doc_id, kb_id=kb_id, title=title, source_path=source_path, level=level,
                 visible_dept_ids=list(visible_dept_ids), checksum=checksum,
                 doc_version=doc_version, status="indexing",
+                effective_date=effective_date, expire_date=expire_date,
             )
         else:
             doc_id = self._insert_document(
                 kb_id=kb_id, title=title, source_path=source_path, level=level,
                 visible_dept_ids=list(visible_dept_ids), checksum=checksum,
                 doc_version=doc_version, status="indexing",
+                effective_date=effective_date, expire_date=expire_date,
             )
 
         try:
@@ -510,6 +544,8 @@ class IngestPipeline:
         checksum: str,
         doc_version: str,
         status: str,
+        effective_date: str | None = None,
+        expire_date: str | None = None,
     ) -> None:
         import json
 
@@ -517,11 +553,13 @@ class IngestPipeline:
             conn.execute(
                 "UPDATE ekbs_document SET kb_id = ?, title = ?, source_path = ?, level = ?, "
                 "visible_dept_ids = ?, status = ?, checksum = ?, doc_version = ?, "
+                "effective_date = COALESCE(?, effective_date), "
+                "expire_date = COALESCE(?, expire_date), "
                 "updated_at = datetime('now') WHERE doc_id = ?",
                 (
                     kb_id, title, source_path or title, level,
                     json.dumps(visible_dept_ids, ensure_ascii=False), status, checksum,
-                    doc_version, doc_id,
+                    doc_version, effective_date, expire_date, doc_id,
                 ),
             )
             conn.commit()
@@ -574,17 +612,21 @@ class IngestPipeline:
         checksum: str,
         doc_version: str,
         status: str,
+        effective_date: str | None = None,
+        expire_date: str | None = None,
     ) -> int:
         import json
 
         with self.db.sync_connect() as conn:
             conn.execute(
                 "INSERT INTO ekbs_document(kb_id, title, source_path, level, visible_dept_ids, "
-                "status, checksum, doc_version, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+                "status, checksum, doc_version, effective_date, expire_date, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
                 (
                     kb_id, title, source_path or title, level,
-                    json.dumps(visible_dept_ids, ensure_ascii=False), status, checksum, doc_version,
+                    json.dumps(visible_dept_ids, ensure_ascii=False), status, checksum,
+                    doc_version, effective_date, expire_date,
                 ),
             )
             doc_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])

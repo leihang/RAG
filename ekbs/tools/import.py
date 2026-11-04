@@ -368,6 +368,7 @@ async def _import_one(
         page_count=parsed.page_count,
         figures=figures,
         tables=tables,
+        header_meta=parsed.header_meta,
         real_corpus=not synthetic,
         checksum=checksum,
     )
