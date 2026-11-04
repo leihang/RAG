@@ -59,7 +59,7 @@ describe('分块预览的向量标签', () => {
     expect(screen.queryByText('未入向量')).toBeNull()
   })
 
-  it('叶子块（有父块但 faiss_row 为空）仍然报警「未入向量」', async () => {
+  it('叶子块（有父块但 faiss_row 为空）仍然报警「未入文本向量」', async () => {
     api.getChunkTree.mockResolvedValue({
       document: { doc_id: 1, title: '月度汇报', status: 'published', level: 1 },
       parents: 0,
@@ -76,7 +76,8 @@ describe('分块预览的向量标签', () => {
     })
 
     mount()
-    await waitFor(() => expect(screen.getByText('未入向量')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('未入文本向量')).toBeInTheDocument())
+    expect(screen.getByText('未入向量（异常，可点「重新向量化」）')).toBeInTheDocument()
     expect(screen.queryByText('上下文块')).toBeNull()
   })
 
@@ -131,5 +132,91 @@ describe('分块预览的向量标签', () => {
 
     mount()
     await waitFor(() => expect(screen.getAllByText('多模态已索引').length).toBeGreaterThan(0))
+  })
+})
+
+/**
+ * 用户实测 doc 205：表格父容器 35240（920 token、12 个 chunk_type='table' 行组叶子、
+ * faiss_row 为空）被当成"向量失败"报警。它是上下文容器（retrievable.py：有子块的块
+ * 按设计不进向量），告警应只留给"叶子块缺 faiss_row"。
+ */
+function tableContainerTree() {
+  return {
+    document: { doc_id: 1, title: '月度能耗汇报', status: 'published', level: 1 },
+    parents: 1,
+    children: 3,
+    tree: [
+      {
+        chunk_id: 100, doc_id: 1, chunk_type: 'parent', seq: 1, content: '月度能耗汇报正文',
+        heading_path: '月度汇报', token_count: 400, page_from: 1, page_to: 1, faiss_row: null,
+        is_container: true,
+        children: [
+          {
+            chunk_id: 101, doc_id: 1, chunk_type: 'table', seq: 2,
+            content: '表 1：年度能耗计划（整表上下文）', heading_path: '月度汇报 > 表 1',
+            token_count: 920, page_from: 2, page_to: 2, faiss_row: null, is_container: true,
+            children: [
+              {
+                chunk_id: 102, doc_id: 1, chunk_type: 'table', seq: 3,
+                content: '表 1：第 1-3 行（A 级能耗普查）', heading_path: '月度汇报 > 表 1',
+                token_count: 120, page_from: 2, page_to: 2, faiss_row: 7, is_container: false,
+                children: [],
+              },
+              {
+                chunk_id: 103, doc_id: 1, chunk_type: 'table', seq: 4,
+                content: '表 1：第 4-6 行（B 级能耗普查）', heading_path: '月度汇报 > 表 1',
+                token_count: 130, page_from: 2, page_to: 2, faiss_row: 8, is_container: false,
+                children: [],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    orphan_children: [],
+  }
+}
+
+describe('分块预览的表格父容器', () => {
+  it('表格父容器（有行组叶子、faiss_row 为空）显示「表格父容器」，不报「未入文本向量」', async () => {
+    api.getChunkTree.mockResolvedValue(tableContainerTree())
+
+    mount()
+    await waitFor(() => expect(screen.getByText('表格父容器')).toBeInTheDocument())
+    expect(screen.queryByText('未入文本向量')).toBeNull()
+    expect(screen.queryByText('未入向量（异常，可点「重新向量化」）')).toBeNull()
+  })
+
+  it('表格父容器下的行组叶子以缩进组渲染（行组 N + token + 内容）', async () => {
+    api.getChunkTree.mockResolvedValue(tableContainerTree())
+
+    mount()
+    await waitFor(() => expect(screen.getByText('行组 2')).toBeInTheDocument())
+    expect(screen.getByText('920 tok')).toBeInTheDocument()
+    expect(screen.getByText('120 tok')).toBeInTheDocument()
+    expect(screen.getByText('130 tok')).toBeInTheDocument()
+    expect(screen.getByText('表 1：第 1-3 行（A 级能耗普查）')).toBeInTheDocument()
+    expect(screen.getByText('表 1：第 4-6 行（B 级能耗普查）')).toBeInTheDocument()
+  })
+
+  it('表格行组叶子（无子块、faiss_row 为空）仍然报警「未入文本向量」', async () => {
+    api.getChunkTree.mockResolvedValue({
+      document: { doc_id: 1, title: '月度能耗汇报', status: 'published', level: 1 },
+      parents: 1,
+      children: 0,
+      tree: [
+        {
+          chunk_id: 200, doc_id: 1, chunk_type: 'table', seq: 1,
+          content: '表 2：独立小表', heading_path: '月度汇报 > 表 2', token_count: 60,
+          page_from: 2, page_to: 2, faiss_row: null, is_container: false, children: [],
+        },
+      ],
+      orphan_children: [],
+    })
+
+    mount()
+    await waitFor(() => expect(screen.getByText('未入文本向量')).toBeInTheDocument())
+    expect(screen.getByText('未入向量（异常，可点「重新向量化」）')).toBeInTheDocument()
+    expect(screen.queryByText('表格父容器')).toBeNull()
   })
 })

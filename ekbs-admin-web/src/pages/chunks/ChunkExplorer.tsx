@@ -3,6 +3,8 @@
  *
  * 数据结构按后端**实际**返回：`{document, parents(计数), children(计数), tree(嵌套), orphan_children}`。
  * 注意 `parents`/`children` 是数字不是数组 —— 早先当数组用，页面直接崩。
+ * 后端按 `parent_id`（与 `chunk_type` 无关）递归建树：`parents` = 顶层块数、
+ * `children` = 树内后代总数；有子节点 = 上下文容器（如 `table` 父容器），按设计不进向量。
  *
  * 后端的真实约束（`ekbs/api/chunks.py`）：**拆分/合并/编辑只支持 `chunk_type='child'`**；
  * 改子块会**追加新向量并重写 FTS**（不是原地改），提交前必须提示。
@@ -22,15 +24,64 @@ const TYPE_TEXT: Record<string, string> = {
   parent: '父容器', child: '子块', table: '表格', figure: '图片', summary: '摘要',
 }
 
-function isLeafParent(node: ChunkTreeNode | null | undefined): boolean {
-  return Boolean(node && node.chunk_type === 'parent' && !(node.children?.length))
+/** 容器提示：有子节点 = 上下文容器，按设计不进向量（检索命中叶子后用它扩展上下文）。 */
+const CONTAINER_VECTOR_HINT = '按设计不进向量（检索命中叶子后用它扩展上下文）'
+
+function childNodes(node: ChunkNode | ChunkTreeNode | null | undefined): ChunkTreeNode[] {
+  return ((node as ChunkTreeNode | null | undefined)?.children ?? []) as ChunkTreeNode[]
 }
 
-function typeLabel(node: ChunkNode, leafParent: boolean): string {
+/**
+ * 是否有子节点 —— 判断"容器 vs 叶子"的**唯一依据**，与 chunk_type 无关：
+ * 表格父容器（chunk_type='table' 且有行组叶子）和父块一样不进向量；
+ * 叶子（含独立 figure/table）才必须入向量。
+ */
+function hasChildren(node: ChunkNode | ChunkTreeNode | null | undefined): boolean {
+  return childNodes(node).length > 0
+}
+
+function isLeafTopNode(node: ChunkTreeNode | null | undefined): boolean {
+  return Boolean(node) && !hasChildren(node)
+}
+
+function typeLabel(node: ChunkNode, leafTop: boolean): string {
   if (node.chunk_type === 'figure') return '图片'
-  if (node.chunk_type === 'table') return '表格'
-  if (leafParent) return '叶子块（短节）'
+  if (node.chunk_type === 'table') return hasChildren(node) ? '表格父容器' : '表格'
+  if (leafTop) return '叶子块（短节）'
   return TYPE_TEXT[node.chunk_type] ?? node.chunk_type
+}
+
+/** 递归找 focus 分块的路径（树可有三层：parent -> table 容器 -> table 行组叶子）。 */
+function findNodePath(nodes: ChunkTreeNode[], chunkId: number): ChunkTreeNode[] | null {
+  for (const node of nodes) {
+    if (node.chunk_id === chunkId) return [node]
+    const rest = findNodePath(childNodes(node), chunkId)
+    if (rest) return [node, ...rest]
+  }
+  return null
+}
+
+/** 向量状态标签：容器按设计不进向量（不是异常）；叶子缺 faiss_row 才是异常。 */
+function VectorTag({ node }: { node: ChunkNode | ChunkTreeNode }) {
+  if (hasChildren(node)) {
+    return (
+      <Tooltip title={CONTAINER_VECTOR_HINT}>
+        <Tag>{node.chunk_type === 'table' ? '表格父容器' : '上下文块'}</Tag>
+      </Tooltip>
+    )
+  }
+  if (node.faiss_row == null) {
+    return (
+      <Tooltip title="叶子块本该进向量，但没有 faiss_row —— 异常，需重新向量化。">
+        <Tag color="orange">未入文本向量</Tag>
+      </Tooltip>
+    )
+  }
+  return (
+    <Tooltip title="叶子块是检索单元，已入向量。">
+      <Tag color="success">已入文本向量</Tag>
+    </Tooltip>
+  )
 }
 
 function MmBadge({ node }: { node: ChunkNode }) {
@@ -68,18 +119,12 @@ export default function ChunkExplorer() {
       setTree(data)
       const focus = Number.isFinite(focusChunkId) && focusChunkId > 0 ? focusChunkId : null
       if (focus != null) {
-        for (const parent of data.tree ?? []) {
-          if (parent.chunk_id === focus) {
-            setActiveParentId(parent.chunk_id)
-            setActiveChunk(parent)
-            return
-          }
-          const child = (parent.children ?? []).find((c) => c.chunk_id === focus)
-          if (child) {
-            setActiveParentId(parent.chunk_id)
-            setActiveChunk(child)
-            return
-          }
+        // 树可有三层：parent -> table 父容器 -> table 行组叶子，focus 可能是任意一层
+        const path = findNodePath(data.tree ?? [], focus)
+        if (path) {
+          setActiveParentId(path[0].chunk_id)
+          setActiveChunk(path[path.length - 1])
+          return
         }
         const orphan = (data.orphan_children ?? []).find((c) => c.chunk_id === focus)
         if (orphan) {
@@ -130,7 +175,7 @@ export default function ChunkExplorer() {
   if (!tree) return <Card>文档不存在或尚未产生分块</Card>
 
   const total = (tree.parents ?? 0) + (tree.children ?? 0)
-  const leafParents = (tree.tree ?? []).filter((p) => !(p.children?.length)).length
+  const leafParents = (tree.tree ?? []).filter((p) => !hasChildren(p)).length
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -139,8 +184,12 @@ export default function ChunkExplorer() {
           <Typography.Title level={5} style={{ margin: 0 }}>{tree.document?.title ?? `文档 #${id}`}</Typography.Title>
           <ClearanceTag level={tree.document?.level} />
           <StatusTag status={tree.document?.status} />
-          <Tag>父块 {tree.parents}</Tag>
-          <Tag>子块 {tree.children}</Tag>
+          <Tooltip title="顶层块数（parent_id 为空）：L1 父块、叶子父块、独立 figure/table 叶子">
+            <Tag>父块 {tree.parents}</Tag>
+          </Tooltip>
+          <Tooltip title="树内全部后代数（含表格父容器下的行组叶子）">
+            <Tag>子块 {tree.children}</Tag>
+          </Tooltip>
           {leafParents > 0 ? (
             <Tooltip title="PPT/短节常见：整页短于子块下限时不建同文 child，父块本身作为检索叶子并已入向量。不是解析失败。">
               <Tag color="blue">叶子父块 {leafParents}</Tag>
@@ -162,7 +211,7 @@ export default function ChunkExplorer() {
               size="small"
               dataSource={tree.tree}
               renderItem={(p) => {
-                const leaf = !(p.children?.length)
+                const container = hasChildren(p)
                 return (
                 <List.Item
                   onClick={() => { setActiveParentId(p.chunk_id); setActiveChunk(p); setEditing(false) }}
@@ -172,32 +221,14 @@ export default function ChunkExplorer() {
                     title={<Typography.Text ellipsis style={{ maxWidth: 320 }}>{p.heading_path || '(无标题路径)'}</Typography.Text>}
                     description={
                       <Space size={6} wrap>
-                        <Tag color={p.chunk_type === 'figure' ? 'purple' : leaf ? 'blue' : undefined}>
-                          {p.chunk_type === 'figure' ? '图片' : leaf ? '叶子块' : '父容器'}
+                        <Tag color={p.chunk_type === 'figure' ? 'purple' : container ? (p.chunk_type === 'table' ? 'geekblue' : undefined) : 'blue'}>
+                          {p.chunk_type === 'figure' ? '图片' : p.chunk_type === 'table' ? '表格' : container ? '父容器' : '叶子块'}
                         </Tag>
                         <span>{p.token_count ?? 0} tok</span>
-                        {!leaf ? <span>子块 {p.children?.length ?? 0}</span> : null}
+                        {container ? <span>子块 {childNodes(p).length}</span> : null}
                         <MmBadge node={p} />
-                        {/* 有子块的父 = 上下文容器，不进向量；无子块的父 = 叶子，必须进向量 */}
-                        {p.chunk_type === 'figure' || p.chunk_type === 'table' ? (
-                          p.faiss_row == null ? (
-                            <Tag color="orange">未入文本向量</Tag>
-                          ) : (
-                            <Tag color="success">已入文本向量</Tag>
-                          )
-                        ) : !leaf ? (
-                          <Tooltip title="父块是上下文容器：检索命中叶子块后用它扩展上下文。按设计不进向量。">
-                            <Tag>上下文块</Tag>
-                          </Tooltip>
-                        ) : p.faiss_row == null ? (
-                          <Tooltip title="叶子块本该进向量，但没有 faiss_row —— 异常，需重新向量化。">
-                            <Tag color="orange">未入向量</Tag>
-                          </Tooltip>
-                        ) : (
-                          <Tooltip title="短节未切出子块；本块即检索单元，已入向量。">
-                            <Tag color="success">已入向量</Tag>
-                          </Tooltip>
-                        )}
+                        {/* 有子块 = 上下文容器，按设计不进向量；无子块 = 叶子，必须进向量 */}
+                        <VectorTag node={p} />
                       </Space>
                     }
                   />
@@ -208,7 +239,7 @@ export default function ChunkExplorer() {
           </Card>
 
           <Card
-            title={isLeafParent(activeParent) ? '检索单元（短节无子块）' : `子块（${children.length}）`}
+            title={isLeafTopNode(activeParent) ? '检索单元（短节无子块）' : `子块（${children.length}）`}
             style={{ flex: '1 1 360px', minWidth: 360 }}
             extra={
               activeChunk?.chunk_type === 'child' ? (
@@ -229,15 +260,15 @@ export default function ChunkExplorer() {
               ) : (
                 <Typography.Text type="secondary">
                   {activeChunk
-                    ? isLeafParent(activeParent) && activeChunk.chunk_id === activeParent?.chunk_id
+                    ? isLeafTopNode(activeParent) && activeChunk.chunk_id === activeParent?.chunk_id
                       ? '短节叶子块：内容即检索单元（PPT 常见），仅 child 支持在线拆分/编辑'
-                      : `${TYPE_TEXT[activeChunk.chunk_type] ?? activeChunk.chunk_type} 不支持在线编辑（后端仅支持 child）`
+                      : `${typeLabel(activeChunk, false)} 不支持在线编辑（后端仅支持 child）`
                     : ''}
                 </Typography.Text>
               )
             }
           >
-            {isLeafParent(activeParent) && activeParent?.chunk_type === 'parent' ? (
+            {isLeafTopNode(activeParent) && activeParent?.chunk_type === 'parent' ? (
               <Empty
                 description={
                   <span>
@@ -247,7 +278,7 @@ export default function ChunkExplorer() {
                   </span>
                 }
               />
-            ) : isLeafParent(activeParent) && (activeParent?.chunk_type === 'figure' || activeParent?.chunk_type === 'table') ? (
+            ) : isLeafTopNode(activeParent) && (activeParent?.chunk_type === 'figure' || activeParent?.chunk_type === 'table') ? (
               <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
                 {activeParent.chunk_type === 'figure' ? '图片块为独立检索单元（见下方详情与多模态标识）。' : '表格块为独立检索单元。'}
               </Typography.Paragraph>
@@ -256,22 +287,85 @@ export default function ChunkExplorer() {
               size="small"
               dataSource={children}
               locale={{ emptyText: <Empty description="该父块下没有子块（父块本身即检索单元）" /> }}
-              renderItem={(c) => (
-                <List.Item
-                  onClick={() => { setActiveChunk(c); setEditing(false) }}
-                  style={{ cursor: 'pointer', background: activeChunk?.chunk_id === c.chunk_id ? '#f5f7fa' : undefined }}
-                >
-                  <List.Item.Meta
-                    title={
-                      <Space size={6} wrap>
-                        <Typography.Text ellipsis style={{ maxWidth: 420 }}>{c.heading_path || `#${c.seq}`}</Typography.Text>
-                        <MmBadge node={c} />
-                      </Space>
-                    }
-                    description={<Typography.Paragraph className="ekbs-ellipsis-2" style={{ marginBottom: 0 }}>{c.content}</Typography.Paragraph>}
-                  />
-                </List.Item>
-              )}
+              renderItem={(c) => {
+                const grandchildren = childNodes(c)
+                // 表格父容器（chunk_type='table' 且有行组叶子）：组头 + 缩进的行组叶子，
+                // 让"整表上下文 -> 检索单元"的真实结构可见，而不是把它当成一个平铺的表格块。
+                if (grandchildren.length > 0) {
+                  return (
+                    <List.Item style={{ display: 'block' }}>
+                      <div
+                        onClick={() => { setActiveChunk(c); setEditing(false) }}
+                        style={{
+                          cursor: 'pointer',
+                          padding: '6px 0',
+                          background: activeChunk?.chunk_id === c.chunk_id ? '#f5f7fa' : undefined,
+                        }}
+                      >
+                        <Space size={6} wrap>
+                          <Typography.Text ellipsis style={{ maxWidth: 420 }}>{c.heading_path || `#${c.seq}`}</Typography.Text>
+                          <VectorTag node={c} />
+                          <span>{c.token_count ?? 0} tok</span>
+                          <Tag>{c.chunk_type === 'table' ? '行组' : '子块'} {grandchildren.length}</Tag>
+                          <MmBadge node={c} />
+                        </Space>
+                        <Typography.Paragraph className="ekbs-ellipsis-2" style={{ marginBottom: 0 }}>
+                          {c.content}
+                        </Typography.Paragraph>
+                      </div>
+                      <List
+                        size="small"
+                        dataSource={grandchildren}
+                        style={{ marginLeft: 20 }}
+                        renderItem={(g) => (
+                          <List.Item
+                            onClick={() => { setActiveChunk(g); setEditing(false) }}
+                            style={{
+                              cursor: 'pointer',
+                              background: activeChunk?.chunk_id === g.chunk_id ? '#f5f7fa' : undefined,
+                              paddingInline: 8,
+                            }}
+                          >
+                            <List.Item.Meta
+                              title={
+                                <Space size={6} wrap>
+                                  <Typography.Text ellipsis style={{ maxWidth: 420 }}>{g.heading_path || `#${g.seq}`}</Typography.Text>
+                                  <span>{g.token_count ?? 0} tok</span>
+                                  <VectorTag node={g} />
+                                  <MmBadge node={g} />
+                                </Space>
+                              }
+                              description={
+                                <Typography.Paragraph className="ekbs-ellipsis-2" style={{ marginBottom: 0 }}>
+                                  {g.content}
+                                </Typography.Paragraph>
+                              }
+                            />
+                          </List.Item>
+                        )}
+                      />
+                    </List.Item>
+                  )
+                }
+                return (
+                  <List.Item
+                    onClick={() => { setActiveChunk(c); setEditing(false) }}
+                    style={{ cursor: 'pointer', background: activeChunk?.chunk_id === c.chunk_id ? '#f5f7fa' : undefined }}
+                  >
+                    <List.Item.Meta
+                      title={
+                        <Space size={6} wrap>
+                          <Typography.Text ellipsis style={{ maxWidth: 420 }}>{c.heading_path || `#${c.seq}`}</Typography.Text>
+                          <span>{c.token_count ?? 0} tok</span>
+                          <VectorTag node={c} />
+                          <MmBadge node={c} />
+                        </Space>
+                      }
+                      description={<Typography.Paragraph className="ekbs-ellipsis-2" style={{ marginBottom: 0 }}>{c.content}</Typography.Paragraph>}
+                    />
+                  </List.Item>
+                )
+              }}
             />
             )}
 
@@ -281,7 +375,7 @@ export default function ChunkExplorer() {
                   <Descriptions.Item label="chunk_id">{activeChunk.chunk_id}</Descriptions.Item>
                   <Descriptions.Item label="类型">
                     <Space size={6} wrap>
-                      {typeLabel(activeChunk, isLeafParent(activeParent) && activeChunk.chunk_id === activeParent?.chunk_id)}
+                      {typeLabel(activeChunk, isLeafTopNode(activeParent) && activeChunk.chunk_id === activeParent?.chunk_id)}
                       <MmBadge node={activeChunk} />
                     </Space>
                   </Descriptions.Item>
@@ -289,10 +383,13 @@ export default function ChunkExplorer() {
                   <Descriptions.Item label="token">{activeChunk.token_count ?? '-'}</Descriptions.Item>
                   <Descriptions.Item label="分片">{activeChunk.shard_id ?? '-'}</Descriptions.Item>
                   <Descriptions.Item label="向量行">
-                    {activeChunk.faiss_row ??
-                      (activeChunk.chunk_type === 'parent' && !isLeafParent(activeParent)
-                        ? '父容器按设计不进向量（正常）'
-                        : '未入向量（异常，可点「重新向量化」）')}
+                    {activeChunk.faiss_row != null
+                      ? activeChunk.faiss_row
+                      : hasChildren(activeChunk)
+                        ? (activeChunk.chunk_type === 'table'
+                          ? '表格父容器按设计不进向量（正常）'
+                          : '父容器按设计不进向量（正常）')
+                        : '未入向量（异常，可点「重新向量化」）'}
                   </Descriptions.Item>
                   <Descriptions.Item label="页码">
                     {activeChunk.page_from

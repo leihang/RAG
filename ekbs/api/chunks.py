@@ -176,7 +176,25 @@ async def chunk_tree(
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
 ) -> JSONResponse:
-    """父子块树 + 标题路径（编辑器的数据源）。"""
+    """父子块树 + 标题路径（编辑器的数据源）。
+
+    **层级按 ``parent_id`` 组织，与 ``chunk_type`` 无关**：分块器会产出三层结构
+    （``parent`` -> ``table`` 父容器 -> ``table`` 行组叶子），若只把 ``chunk_type='child'``
+    收进 ``children``，表格行组叶子就会被错误地提到顶层（实测 doc 205：表格容器
+    35240 的 12 个行组叶子全变成了顶层"父块"）。
+
+    响应语义：
+
+    * ``tree``：顶层节点 = ``parent_id`` 为 NULL 的行（L1 父块、叶子父块、独立的
+      figure/table 叶子）；每个节点的 ``children`` 是以它为父的**直系子节点
+      （任意 ``chunk_type``）**，按 ``seq`` 递归嵌套；
+    * ``parents``：顶层节点数（**不再是"所有非 child 块"**）；
+    * ``children``：树内**后代总数**（递归展开的 children 计数，不含孤儿）；
+    * ``orphan_children``：``parent_id`` 指向本文档不存在的块的遗留行（数据修复用）；
+    * 每个节点带 ``is_container``：有子节点 = 上下文容器 —— 按
+      :mod:`ekbs.ingest.retrievable` 的规则**按设计不进向量**，前端据此区分
+      "上下文块（正常）"与"未入向量（异常）"。
+    """
     _principal(request, _h(authorization, x_internal_token, x_internal_user_id), "doc:chunk:read")
     runtime = request.app.state.runtime
     with runtime.db.sync_connect() as conn:
@@ -192,27 +210,60 @@ async def chunk_tree(
             "FROM ekbs_chunk WHERE doc_id = ? ORDER BY seq",
             (doc_id,),
         ).fetchall()
-    parents = [dict(r) for r in rows if str(r["chunk_type"]) != "child"]
-    children = [dict(r) for r in rows if str(r["chunk_type"]) == "child"]
-    flat = parents + children
-    _annotate_figure_mm(runtime, flat)
+    items = [dict(r) for r in rows]
+    _annotate_figure_mm(runtime, items)
+    by_id = {int(item["chunk_id"]): item for item in items}
+    children_by_parent: dict[int, list[dict[str, Any]]] = {}
+    roots: list[dict[str, Any]] = []
+    orphans: list[dict[str, Any]] = []
+    for item in items:
+        parent_id = item.get("parent_id")
+        if parent_id is None:
+            roots.append(item)
+        elif int(parent_id) in by_id:
+            children_by_parent.setdefault(int(parent_id), []).append(item)
+        else:
+            orphans.append(item)
+
+    seen: set[int] = set()
+
+    def build(node: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        """递归建子树，返回（节点, 后代数）。"""
+        chunk_id = int(node["chunk_id"])
+        seen.add(chunk_id)
+        out = dict(node)
+        kids: list[dict[str, Any]] = []
+        descendants = 0
+        for child in children_by_parent.get(chunk_id, []):
+            if int(child["chunk_id"]) in seen:
+                # 防御脏数据里的环：宁可不展示，也不能递归爆栈
+                continue
+            kid, kid_descendants = build(child)
+            kids.append(kid)
+            descendants += 1 + kid_descendants
+        out["children"] = kids
+        out["is_container"] = bool(kids)
+        return out, descendants
+
     tree: list[dict[str, Any]] = []
-    for parent in parents:
-        node = dict(parent)
-        node["children"] = [
-            dict(child) for child in children if child.get("parent_id") == parent["chunk_id"]
-        ]
+    child_total = 0
+    for root in roots:
+        node, descendants = build(root)
         tree.append(node)
-    orphans = [
-        dict(child)
-        for child in children
-        if not any(child.get("parent_id") == parent["chunk_id"] for parent in parents)
-    ]
+        child_total += descendants
+    # 数据里若有环，环上的块从顶层不可达；仍按孤儿暴露出来，别静默丢块
+    orphan_ids = {int(item["chunk_id"]) for item in orphans}
+    orphans.extend(
+        item
+        for item in items
+        if int(item["chunk_id"]) not in seen and int(item["chunk_id"]) not in orphan_ids
+    )
+    orphans.sort(key=lambda item: int(item["seq"]))
     return JSONResponse(
         {
             "document": dict(doc),
-            "parents": len(parents),
-            "children": len(children),
+            "parents": len(tree),
+            "children": child_total,
             "tree": tree,
             "orphan_children": orphans,
         }

@@ -69,6 +69,39 @@ def fts_content_for(runtime, chunk_id: int) -> str:
     return str(row["content_tok"]) if row else ""
 
 
+def insert_chunk(
+    conn,
+    *,
+    doc_id: int,
+    parent_id: int | None,
+    chunk_type: str,
+    seq: int,
+    content: str,
+    token_count: int,
+    heading_path: str,
+    shard_id: str,
+    faiss_row: int | None = None,
+) -> int:
+    """直接插一行 ``ekbs_chunk``（表格父容器/行组叶子在种子语料里没有，只能手工造）。"""
+    conn.execute(
+        "INSERT INTO ekbs_chunk(doc_id, parent_id, chunk_type, seq, content, token_count, "
+        "heading_path, shard_id, faiss_row) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            doc_id, parent_id, chunk_type, seq, content, token_count,
+            heading_path, shard_id, faiss_row,
+        ),
+    )
+    return int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+
+def descendant_count(nodes: list[dict]) -> int:
+    total = 0
+    for node in nodes:
+        kids = node.get("children") or []
+        total += len(kids) + descendant_count(kids)
+    return total
+
+
 async def test_permissions_by_role(client, seeded) -> None:
     """`05` §3.4：read（SA/KA/DR/AU）、update（SA/KA/DR）、reembed（仅 SA/KA）。"""
     runtime, _ = seeded
@@ -129,6 +162,105 @@ async def test_tree_and_detail(client, admin) -> None:
     assert search["document"]["doc_id"] == doc_id
     assert search["total"] >= 1
     assert any(c["chunk_id"] == chunk_id for c in search["chunks"])
+
+
+async def test_tree_nests_table_container_row_group_leaves(client, admin) -> None:
+    """表格父容器是上下文容器：行组叶子必须按 ``parent_id`` 挂在它下面，不能平铺到顶层。
+
+    复现 doc 205：表格容器（920 tok、``faiss_row`` 为空）+ 若干 ``chunk_type='table'``
+    行组叶子。旧实现只把 ``chunk_type='child'`` 收进 ``children``，于是容器 children=[]，
+    行组叶子全被当成顶层"父块"（前端因此把 25 行渲染成 ~37 行平铺）。
+    """
+    runtime, user_id = admin
+    headers = headers_for(user_id)
+    with runtime.db.sync_connect() as conn:
+        doc_id = int(
+            conn.execute("SELECT doc_id FROM ekbs_document ORDER BY doc_id LIMIT 1").fetchone()[
+                "doc_id"
+            ]
+        )
+    url = f"/api/v1/chunks/documents/{doc_id}/tree"
+    before = (await client.get(url, headers=headers)).json()
+
+    with runtime.db.sync_connect() as conn:
+        shard_id = str(
+            conn.execute(
+                "SELECT shard_id FROM ekbs_chunk WHERE doc_id = ? ORDER BY seq LIMIT 1", (doc_id,)
+            ).fetchone()["shard_id"]
+        )
+        seq = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS seq FROM ekbs_chunk WHERE doc_id = ?", (doc_id,)
+            ).fetchone()["seq"]
+        )
+        # 三层结构：prose parent -> table 父容器 -> table 行组叶子（真实分块器产物）
+        prose_parent = insert_chunk(
+            conn, doc_id=doc_id, parent_id=None, chunk_type="parent", seq=seq + 1,
+            content="表 1 所在小节的正文", token_count=320,
+            heading_path="月度汇报 > 表 1", shard_id=shard_id,
+        )
+        container = insert_chunk(
+            conn, doc_id=doc_id, parent_id=prose_parent, chunk_type="table", seq=seq + 2,
+            content="表 1：年度能耗计划（整表上下文）", token_count=920,
+            heading_path="月度汇报 > 表 1", shard_id=shard_id,
+        )
+        leaf_a = insert_chunk(
+            conn, doc_id=doc_id, parent_id=container, chunk_type="table", seq=seq + 3,
+            content="表 1：第 1-3 行（A 级能耗普查）", token_count=120,
+            heading_path="月度汇报 > 表 1", shard_id=shard_id, faiss_row=101,
+        )
+        leaf_b = insert_chunk(
+            conn, doc_id=doc_id, parent_id=container, chunk_type="table", seq=seq + 4,
+            content="表 1：第 4-6 行（B 级能耗普查）", token_count=130,
+            heading_path="月度汇报 > 表 1", shard_id=shard_id, faiss_row=102,
+        )
+        # 独立小表：没有子块 -> 自己就是检索叶子，parent_id 为 NULL 时仍是顶层节点
+        standalone = insert_chunk(
+            conn, doc_id=doc_id, parent_id=None, chunk_type="table", seq=seq + 5,
+            content="表 2：独立小表", token_count=60, heading_path="月度汇报 > 表 2",
+            shard_id=shard_id, faiss_row=103,
+        )
+        # parent_id 指向本文档不存在的块 -> 必须进 orphan_children（前端靠它兜底展示）
+        orphan = insert_chunk(
+            conn, doc_id=doc_id, parent_id=999_999_999, chunk_type="table", seq=seq + 6,
+            content="父块已被删除的遗留表格叶子", token_count=10,
+            heading_path="月度汇报 > 表 3", shard_id=shard_id, faiss_row=104,
+        )
+        conn.commit()
+
+    after = (await client.get(url, headers=headers)).json()
+
+    assert after["parents"] == before["parents"] + 2, "顶层应多出 prose 父块 + 独立小表"
+    assert after["children"] == descendant_count(after["tree"]), "children 必须是树内后代总数"
+    assert after["children"] == before["children"] + 3, "表格父容器 + 两个行组叶子"
+    assert len(after["orphan_children"]) == len(before["orphan_children"]) + 1
+
+    top_ids = {int(node["chunk_id"]) for node in after["tree"]}
+    assert {prose_parent, standalone} <= top_ids
+    assert container not in top_ids, "表格父容器挂在 prose 父块下，不该是顶层"
+    assert not ({leaf_a, leaf_b} & top_ids), "行组叶子必须挂在容器下，不能平铺到顶层"
+
+    node = next(n for n in after["tree"] if int(n["chunk_id"]) == prose_parent)
+    assert node["is_container"] is True
+    nested = next(n for n in node["children"] if int(n["chunk_id"]) == container)
+    assert nested["is_container"] is True
+    assert nested["chunk_type"] == "table" and nested["faiss_row"] is None, (
+        "表格父容器按设计不入向量"
+    )
+    assert [int(c["chunk_id"]) for c in nested["children"]] == [leaf_a, leaf_b]
+    assert all(int(c["parent_id"]) == container for c in nested["children"])
+    assert all(c["is_container"] is False for c in nested["children"])
+    assert all(c["faiss_row"] is not None for c in nested["children"]), "行组叶子是检索单元"
+    for child in nested["children"]:
+        assert len(str(child["content_head"])) <= 200, "content_head 仍截断到 200 字符"
+        assert str(child["content"]).startswith("表 1")
+
+    standalone_node = next(n for n in after["tree"] if int(n["chunk_id"]) == standalone)
+    assert standalone_node["is_container"] is False and standalone_node["children"] == []
+    assert standalone_node["faiss_row"] == 103
+
+    orphan_node = next(o for o in after["orphan_children"] if int(o["chunk_id"]) == orphan)
+    assert int(orphan_node["parent_id"]) == 999_999_999
 
 
 async def test_edit_child_swaps_vector_and_rewrites_fts(client, admin) -> None:

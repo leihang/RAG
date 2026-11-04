@@ -106,17 +106,22 @@ export interface ChunkNode {
 
 /**
  * 分块树（`GET /chunks/documents/{id}/tree` 的**真实**结构）：
- * `parents` / `children` 是**计数**（不是数组！），真正的层级在 `tree` 里，
- * 每个父节点把自己那一层子块内嵌在 `children`。
+ * `parents` / `children` 是**计数**（不是数组！），真正的层级在 `tree` 里。
+ *
+ * 后端按 `parent_id`（与 `chunk_type` 无关）递归建树，因此 `children` 可多层：
+ * `parent` -> `table` 父容器 -> `table` 行组叶子。`is_container` = 有子节点 =
+ * 上下文容器（按设计不进向量）。
  */
 export interface ChunkTreeNode extends ChunkNode {
-  children?: ChunkNode[]
-  content_head?: string
+  children?: ChunkTreeNode[]
+  is_container?: boolean
 }
 
 export interface ChunkTree {
   document: { doc_id: number; title?: string; status?: string; level?: number }
+  /** 顶层节点数（parent_id 为 NULL 的行） */
   parents: number
+  /** 树内后代总数（递归展开的 children 计数，不含 orphan_children） */
   children: number
   tree: ChunkTreeNode[]
   orphan_children?: ChunkNode[]
