@@ -280,6 +280,10 @@ def _is_metadata_query(query: str) -> bool:
     return bool(_METADATA_QUERY_RE.search(query or ""))
 
 
+#: 问句里的年份（用于「哪些制度 2025 年生效」这类**未点名文档**的元数据问题）
+_METADATA_YEAR_RE = re.compile(r"(20\d{2})")
+
+
 def _normalize_for_title_match(text: str) -> str:
     """标题匹配归一化：小写 + 只留字母/数字/CJK（去空白与标点）。
 
@@ -1034,6 +1038,7 @@ class RetrievalPipeline:
             and result.top_score is not None
             and result.top_score < params["rerank_min_score"]
             and "metadata_rescue" not in result.degraded
+            and "metadata_scan" not in result.degraded
         ):
             result.refused = True
             result.refusal_reason = REFUSE_BELOW_THRESHOLD
@@ -1182,38 +1187,79 @@ class RetrievalPipeline:
         perm: PermContext,
         collect_debug: bool,
     ) -> list[RetrievedChunk]:
-        """④.6 元数据兜底：需要时把点名文档的父块上下文插到候选最前面。
+        """④.6 元数据兜底：把相关文档的父块上下文插到候选最前面。
 
-        触发条件全部满足才兜底：问句点名了文档、问的是元数据类字段、本次精排未降级、
-        且（没有精排分或）top_score 低于阈值。元数据不在检索单元里（正文检索块不含
-        日期），所以这类问题很容易出现「内容其实有、精排分不够」；兜底块不伪造精排分，
-        只在 ``retrieval.degraded`` 记 ``metadata_rescue``。
+        两条路径：
+        * **点名文档**：问句点名了某文档、问的是元数据类字段、精排未降级且 top_score
+          低于阈值 → 该文档顶层父块兜底（记 ``metadata_rescue``）；
+        * **未点名文档**：问句问元数据且带年份（「哪些制度 2025 年生效」）→ 按
+          ``ekbs_document.effective_date/expire_date`` 扫出该年份的文档，用它们的父块
+          兜底（记 ``metadata_scan``）。元数据没有单独的检索单元，这类列表问题靠正文
+          召回必然落空，只能查元数据表。
+
+        兜底块不伪造精排分；ACL 仍在 ``_metadata_context_chunks`` 里过 C5。
         """
+        if not _is_metadata_query(query) or "rerank_skipped" in result.degraded:
+            return survivors
         matched = [int(doc_id) for doc_id in (title_debug.get("matched_doc_ids") or [])]
-        if not matched or not _is_metadata_query(query):
+        marker = ""
+        doc_ids: list[int] = []
+        if matched:
+            min_score = float(params["rerank_min_score"])
+            if result.top_score is not None and float(result.top_score) >= min_score:
+                return survivors
+            doc_ids, marker = matched, "metadata_rescue"
+        else:
+            scanned = await asyncio.to_thread(self._metadata_scan_doc_ids, query)
+            if scanned:
+                doc_ids, marker = scanned, "metadata_scan"
+        if not doc_ids:
             return survivors
-        if "rerank_skipped" in result.degraded:
-            return survivors
-        min_score = float(params["rerank_min_score"])
-        if result.top_score is not None and float(result.top_score) >= min_score:
-            return survivors
-        chunks = await asyncio.to_thread(self._metadata_context_chunks, matched, perm)
+        chunks = await asyncio.to_thread(self._metadata_context_chunks, doc_ids, perm)
         if not chunks:
             return survivors
-        result.degraded.append("metadata_rescue")
+        result.degraded.append(marker)
         log.info(
-            "metadata_rescue",
-            matched_doc_ids=matched,
+            marker,
+            doc_ids=doc_ids,
             chunk_ids=[c.chunk_id for c in chunks],
             top_score=result.top_score,
-            min_score=min_score,
         )
         if collect_debug:
-            result.stage_debug["metadata_rescue"] = {
-                "doc_ids": matched,
+            result.stage_debug[marker] = {
+                "doc_ids": doc_ids,
                 "chunk_ids": [c.chunk_id for c in chunks],
             }
+        # 被元数据兜底的文档不再保留它自己的其它候选块：父块正文已含该文档全文，
+        # 再带一个同文档父块/子块只会在引用里重复同一篇文档（实测 doc 207 两个父块）。
+        rescued_docs = {chunk.doc_id for chunk in chunks}
+        survivors = [chunk for chunk in survivors if chunk.doc_id not in rescued_docs]
         return [*chunks, *survivors]
+
+    def _metadata_scan_doc_ids(self, query: str) -> list[int]:
+        """未点名文档、但问句带年份时：按文档生效/截止日期扫出该年份的文档。
+
+        只扫 ``published`` 文档，最多 5 篇（避免「所有制度」类列表把上下文撑爆）；
+        返回空 = 该年份没有文档或问句没有年份。权限在 ``_metadata_context_chunks``
+        里按父块过 C5，不在这里放宽。
+        """
+        years = sorted({str(year) for year in _METADATA_YEAR_RE.findall(query or "")})
+        if not years:
+            return []
+        clauses = " OR ".join(
+            "(effective_date LIKE ? OR expire_date LIKE ?)" for _ in years
+        )
+        params: list[str] = []
+        for year in years:
+            params.extend([f"{year}-%", f"{year}-%"])
+        with self.db.sync_connect() as conn:
+            rows = conn.execute(
+                "SELECT doc_id FROM ekbs_document WHERE status = 'published' AND ("
+                + clauses
+                + ") ORDER BY effective_date DESC, doc_id LIMIT 5",
+                tuple(params),
+            ).fetchall()
+        return [int(row["doc_id"]) for row in rows]
 
     def _metadata_context_chunks(
         self, doc_ids: Sequence[int], perm: PermContext
@@ -1228,12 +1274,21 @@ class RetrievalPipeline:
         placeholders = ",".join("?" for _ in doc_ids)
         with self.db.sync_connect() as conn:
             rows = conn.execute(
-                "SELECT chunk_id FROM ekbs_chunk "
+                "SELECT chunk_id, doc_id FROM ekbs_chunk "
                 "WHERE doc_id IN (" + placeholders + ") "
                 "AND chunk_type = 'parent' AND parent_id IS NULL ORDER BY doc_id, seq",
                 tuple(int(doc_id) for doc_id in doc_ids),
             ).fetchall()
-        ids = [int(row["chunk_id"]) for row in rows]
+        # 每篇文档只取**一个**顶层父块：长文档可能有多个父块，但【文档信息】行是
+        # 同一份元数据，多取只会在上下文/引用里重复同一文档（实测 doc 207 两个父块）。
+        ids: list[int] = []
+        seen_docs: set[int] = set()
+        for row in rows:
+            doc_id = int(row["doc_id"])
+            if doc_id in seen_docs:
+                continue
+            seen_docs.add(doc_id)
+            ids.append(int(row["chunk_id"]))
         if not ids:
             return []
         docs = self.load_chunks(ids)

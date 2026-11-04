@@ -37,7 +37,14 @@ export default function ChunkPeekDrawer({ chunkId, open, onClose }: ChunkPeekDra
       .catch((err: unknown) => {
         if (!cancelled) {
           setChunk(null)
-          message.error(err instanceof Error ? err.message : String(err))
+          const text = err instanceof Error ? err.message : String(err)
+          // 旧问答审计里的引用来自重灌前的分块（chunk_id 已随重建失效）：
+          // 这是历史事实，不能回改审计；这里只把「404」翻译成人话，避免用户以为系统坏了。
+          if (/404|chunk_not_found/i.test(text)) {
+            message.warning('该引用来自重灌前的旧分块（chunk 已重建、旧 id 不再存在），请到该文档的最新分块中查看')
+          } else {
+            message.error(text)
+          }
         }
       })
       .finally(() => {

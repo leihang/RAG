@@ -224,3 +224,45 @@ async def test_metadata_query_rescued_when_rerank_below_threshold(seeded) -> Non
     assert result.refused is False, "元数据兜底后不应因精排分低拒答"
     assert "metadata_rescue" in result.degraded
     assert any("【文档信息】" in chunk.content for chunk in result.chunks)
+
+
+async def test_metadata_scan_answers_unnamed_year_query(seeded) -> None:
+    """问句没点名文档、但带年份时：按文档元数据扫出该年生效的文档并兜底。"""
+    from ekbs.provider.base import RerankResult
+    from tests.conftest import user_id_of
+
+    runtime, summary = seeded
+    pipeline = _pipeline(runtime)
+    for title, effective in (
+        ("工程部/XJWY-GC-20甲制度", "2025年1月1日"),
+        ("工程部/XJWY-GC-21乙制度", "2024年4月1日"),
+    ):
+        await pipeline.ingest_markdown(
+            title=title,
+            markdown=f"# {title}\n\n## 1. 目的\n\n正文内容。\n",
+            kb_id=int(summary["kb_id"]),
+            level=1,
+            visible_dept_ids=[],
+            header_meta={"生效日期": effective},
+            real_corpus=False,
+        )
+
+    async def fake_rerank(query, docs, top_n):  # noqa: ANN001, ANN202
+        return [
+            RerankResult(chunk_id=doc.chunk_id, score=0.05, shard_id=doc.shard_id)
+            for doc in docs
+        ]
+
+    runtime.providers.rerank.rerank = fake_rerank  # type: ignore[method-assign]
+    perm = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    result = await runtime.pipeline.retrieve(
+        "哪些制度是2025年生效的", perm, collect_debug=True
+    )
+    assert result.refused is False, "元数据扫描命中后不应因精排分低拒答"
+    assert "metadata_scan" in result.degraded
+    scan = result.stage_debug.get("metadata_scan") or {}
+    assert len(scan.get("doc_ids") or []) == 1, "只应扫出 2025 年生效的那篇"
+    matched_contents = [
+        chunk.content for chunk in result.chunks if chunk.chunk_id in (scan.get("chunk_ids") or [])
+    ]
+    assert matched_contents and "2025-01-01" in matched_contents[0]
