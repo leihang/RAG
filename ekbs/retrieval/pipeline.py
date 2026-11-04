@@ -268,6 +268,18 @@ _GENERIC_TITLE_KEYS = frozenset(
 )
 
 
+#: 元数据类问句（问文档生效/截止/版本/编号等）：这类问题的答案现在只存在于
+#: 解析层抽取的文档元数据里（父块上下文行），正文检索单元里没有日期。
+_METADATA_QUERY_RE = re.compile(
+    r"(生效|截止|失效|有效期|实施日期|发布日期|发布日|文件编号|文档编号|版本号|版本)"
+)
+
+
+def _is_metadata_query(query: str) -> bool:
+    """问句是否在问文档元数据（生效/截止/失效/有效期/编号/版本…）。"""
+    return bool(_METADATA_QUERY_RE.search(query or ""))
+
+
 def _normalize_for_title_match(text: str) -> str:
     """标题匹配归一化：小写 + 只留字母/数字/CJK（去空白与标点）。
 
@@ -573,6 +585,11 @@ SYSTEM_PROMPT = (
     # 整份合同/全文，结果被静默截断，用户看到半截还以为答完了。
     "回答要简洁，只答被问到的内容；如果用户要求返回整份文档/全文（例如整份合同），"
     "不要复述全文，只给出要点摘要，并明确说明「篇幅有限，完整内容请查看引用原文或使用文件下发」。\n"
+    # 文档元数据（文件编号/生效日期/截止日期）现在存在**父块上下文**里；源文件没写
+    # 截止日期时必须说清楚是「文件未标注」，而不是「资料里没有」——后者会被读成
+    # 检索没找到，前者才是事实（doc 206 的实测反馈）。
+    "如果资料只给出文件的生效日期、没有写截止日期/失效日期，回答要明确说"
+    "「该文件未标注截止日期（仅标注生效日期 …）」；不要笼统说「资料中没有提供」。\n"
     "若资料完全不足以回答，才直接回复「未找到可靠依据」。\n\n"
     "资料：\n{context}"
 )
@@ -582,7 +599,7 @@ TRUNCATION_NOTICE = "（提示：回答已达长度上限被截断，未显示�
 
 #: 提示词版本（进答案缓存键）：**改动 SYSTEM_PROMPT 必须同步 +1**，
 #: 否则旧提示词生成的答案会继续从缓存里被服务。
-PROMPT_REVISION = "v6"
+PROMPT_REVISION = "v7"
 
 
 class RetrievalPipeline:
@@ -974,6 +991,12 @@ class RetrievalPipeline:
                 (c.rerank_score for c in survivors if c.rerank_score is not None),
                 default=None,
             )
+        # ④.6 元数据兜底：点名文档的元数据问题（生效/截止/编号/版本）在正文精排分
+        # 低于阈值时，用该文档顶层父块的【文档信息】行兜底（见 _apply_metadata_rescue）。
+        survivors = await self._apply_metadata_rescue(
+            query, title_debug, params, result, survivors, perm, collect_debug
+        )
+
         if not survivors:
             result.refused = True
             # 粗筛（D18）与复检（C5）任一拦截过候选，都算「全被权限拦掉」而非「无候选」
@@ -1010,6 +1033,7 @@ class RetrievalPipeline:
             and "rerank_skipped" not in result.degraded
             and result.top_score is not None
             and result.top_score < params["rerank_min_score"]
+            and "metadata_rescue" not in result.degraded
         ):
             result.refused = True
             result.refusal_reason = REFUSE_BELOW_THRESHOLD
@@ -1147,6 +1171,81 @@ class RetrievalPipeline:
         """
         if collect_debug:
             result.stage_debug["title_match"] = debug
+
+    async def _apply_metadata_rescue(
+        self,
+        query: str,
+        title_debug: dict[str, Any],
+        params: dict[str, Any],
+        result: Any,
+        survivors: list[RetrievedChunk],
+        perm: PermContext,
+        collect_debug: bool,
+    ) -> list[RetrievedChunk]:
+        """④.6 元数据兜底：需要时把点名文档的父块上下文插到候选最前面。
+
+        触发条件全部满足才兜底：问句点名了文档、问的是元数据类字段、本次精排未降级、
+        且（没有精排分或）top_score 低于阈值。元数据不在检索单元里（正文检索块不含
+        日期），所以这类问题很容易出现「内容其实有、精排分不够」；兜底块不伪造精排分，
+        只在 ``retrieval.degraded`` 记 ``metadata_rescue``。
+        """
+        matched = [int(doc_id) for doc_id in (title_debug.get("matched_doc_ids") or [])]
+        if not matched or not _is_metadata_query(query):
+            return survivors
+        if "rerank_skipped" in result.degraded:
+            return survivors
+        min_score = float(params["rerank_min_score"])
+        if result.top_score is not None and float(result.top_score) >= min_score:
+            return survivors
+        chunks = await asyncio.to_thread(self._metadata_context_chunks, matched, perm)
+        if not chunks:
+            return survivors
+        result.degraded.append("metadata_rescue")
+        log.info(
+            "metadata_rescue",
+            matched_doc_ids=matched,
+            chunk_ids=[c.chunk_id for c in chunks],
+            top_score=result.top_score,
+            min_score=min_score,
+        )
+        if collect_debug:
+            result.stage_debug["metadata_rescue"] = {
+                "doc_ids": matched,
+                "chunk_ids": [c.chunk_id for c in chunks],
+            }
+        return [*chunks, *survivors]
+
+    def _metadata_context_chunks(
+        self, doc_ids: Sequence[int], perm: PermContext
+    ) -> list[RetrievedChunk]:
+        """点名文档的顶层父块（其正文含入库时注入的【文档信息】行）。
+
+        元数据答案路径**不伪造精排分**：这些块不参与 rerank，作为兜底上下文注入，
+        `retrieval.degraded` 会记 ``metadata_rescue`` 供调试台/审计识别。
+        """
+        if not doc_ids:
+            return []
+        placeholders = ",".join("?" for _ in doc_ids)
+        with self.db.sync_connect() as conn:
+            rows = conn.execute(
+                "SELECT chunk_id FROM ekbs_chunk "
+                "WHERE doc_id IN (" + placeholders + ") "
+                "AND chunk_type = 'parent' AND parent_id IS NULL ORDER BY doc_id, seq",
+                tuple(int(doc_id) for doc_id in doc_ids),
+            ).fetchall()
+        ids = [int(row["chunk_id"]) for row in rows]
+        if not ids:
+            return []
+        docs = self.load_chunks(ids)
+        kept, _dropped = self.gate.filter_chunks(
+            perm, [(cid, docs[cid].doc_id) for cid in ids if cid in docs]
+        )
+        allowed = {cid for cid, _ in kept}
+        return [
+            docs[cid]
+            for cid in ids
+            if cid in docs and cid in allowed and "【文档信息】" in docs[cid].content
+        ]
 
     def _record_recall_debug(
         self,

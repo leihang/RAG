@@ -151,16 +151,28 @@ async def test_ingest_writes_document_dates_and_no_header_chunk(seeded) -> None:
             "SELECT effective_date, expire_date FROM ekbs_document WHERE doc_id = ?",
             (result.doc_id,),
         ).fetchone()
-        contents = [
-            str(r["content"])
+        rows = [
+            dict(r)
             for r in conn.execute(
-                "SELECT content FROM ekbs_chunk WHERE doc_id = ? ORDER BY seq", (result.doc_id,)
+                "SELECT chunk_type, content FROM ekbs_chunk WHERE doc_id = ? ORDER BY seq",
+                (result.doc_id,),
             )
         ]
     assert row["effective_date"] == "2025-01-01"
     assert row["expire_date"] == "2027-12-31"
-    assert all("文件信息" not in text for text in contents)
-    assert all("2025年1月1日" not in text for text in contents)
+    assert all("文件信息" not in str(item["content"]) for item in rows)
+    # 元数据只注入上下文容器（父块），不写进叶子检索单元
+    parents = [item for item in rows if item["chunk_type"] == "parent"]
+    leaves = [item for item in rows if item["chunk_type"] in {"child", "table"}]
+    assert parents and all(str(item["content"]).startswith("【文档信息】") for item in parents)
+    assert leaves and all("【文档信息】" not in str(item["content"]) for item in leaves)
+
+
+def test_system_prompt_handles_missing_expire_date() -> None:
+    """源文件没写截止日期时，提示词要求回答「文件未标注」而不是「资料中没有」。"""
+    from ekbs.retrieval.pipeline import SYSTEM_PROMPT
+
+    assert "未标注截止日期" in SYSTEM_PROMPT
 
 
 async def test_ingest_without_dates_keeps_columns_null(seeded) -> None:
@@ -180,3 +192,35 @@ async def test_ingest_without_dates_keeps_columns_null(seeded) -> None:
         ).fetchone()
     assert row["effective_date"] is None
     assert row["expire_date"] is None
+
+
+async def test_metadata_query_rescued_when_rerank_below_threshold(seeded) -> None:
+    """点名文档问生效日期、正文精排分不够时，用父块的【文档信息】行兜底回答。"""
+    from ekbs.provider.base import RerankResult
+    from tests.conftest import user_id_of
+
+    runtime, summary = seeded
+    await _pipeline(runtime).ingest_markdown(
+        title="工程部/XJWY-GC-09维修作业指导书",
+        markdown="# 维修作业指导书\n\n## 1. 目的\n\n规范维修服务，接报后本班内完成。\n",
+        kb_id=int(summary["kb_id"]),
+        level=1,
+        visible_dept_ids=[],
+        header_meta={"生效日期": "2025年1月1日"},
+        real_corpus=False,
+    )
+
+    async def fake_rerank(query, docs, top_n):  # noqa: ANN001, ANN202
+        return [
+            RerankResult(chunk_id=doc.chunk_id, score=0.05, shard_id=doc.shard_id)
+            for doc in docs
+        ]
+
+    runtime.providers.rerank.rerank = fake_rerank  # type: ignore[method-assign]
+    perm = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    result = await runtime.pipeline.retrieve(
+        "工程部/XJWY-GC-09维修作业指导书的生效日期", perm
+    )
+    assert result.refused is False, "元数据兜底后不应因精排分低拒答"
+    assert "metadata_rescue" in result.degraded
+    assert any("【文档信息】" in chunk.content for chunk in result.chunks)

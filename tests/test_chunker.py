@@ -944,3 +944,31 @@ def test_is_spreadsheet_source_only_spreadsheets(path: str, expected: bool) -> N
     from ekbs.ingest.parser import is_spreadsheet_source
 
     assert is_spreadsheet_source(path) is expected
+
+def test_doc_metadata_line_only_injects_context_containers() -> None:
+    """文档元数据只进上下文容器（父块/表格父容器），不进叶子检索单元。"""
+    line = "【文档信息】文件编号：XJWY-GC-09；生效日期：2025-01-01；截止日期：未标注"
+    big_table = (
+        "| 序号 | 项目 | 说明 |\n| --- | --- | --- |\n"
+        + "\n".join(f"| {i} | 项目{i} | {'说明文字' * 8}{i} |" for i in range(30))
+    )
+    result = chunk_markdown(
+        "# 制度\n\n## 1. 目的\n\n" + "正文内容说明。" * 400 + "\n",
+        doc_title="测试制度",
+        tables=[TableInput(body=big_table, table_id="1")],
+        doc_metadata_line=line,
+    )
+    containers = {
+        int(node.parent_index) for node in result.nodes if node.parent_index is not None
+    }
+    container_nodes = [result.nodes[i] for i in sorted(containers)]
+    assert container_nodes, "应有父块/表格父容器"
+    assert all(node.content.startswith("【文档信息】") for node in container_nodes)
+    leaves = [
+        node
+        for index, node in enumerate(result.nodes)
+        if index not in containers
+    ]
+    assert leaves
+    assert all("【文档信息】" not in node.content for node in leaves)
+

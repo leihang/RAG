@@ -1305,6 +1305,38 @@ def _append_table_nodes(
     return seq
 
 
+def _inject_doc_metadata_line(nodes: list["ChunkNode"], line: str) -> None:
+    """把一行文档元数据注入**上下文容器**（有子块的 parent / table）。
+
+    为什么只给容器：容器不进向量/FTS（`retrievable.py` 的叶子规则），不会制造
+    跨文档同质检索块；而它会在命中子块后由 ``parent_expand`` 带进 prompt。
+    叶子块保持纯净（检索文本里不出现日期/编号等元数据）。
+    """
+    if not line:
+        return
+    container_indexes = {
+        int(node.parent_index) for node in nodes if node.parent_index is not None
+    }
+    for index in sorted(container_indexes):
+        if index < 0 or index >= len(nodes):
+            continue
+        node = nodes[index]
+        if node.chunk_type not in {"parent", "table"}:
+            continue
+        content = f"{line}\n\n{node.content}"
+        tokens = count_tokens(content)
+        # 表格容器有硬上限：加元数据后若越界，就放弃这一张表的注入（不破坏 2048 不变量）。
+        if node.chunk_type == "table" and tokens > TABLE_CONTAINER_MAX_TOKENS:
+            log.warning(
+                "doc_metadata_skipped_for_table_container",
+                tokens=tokens,
+                limit=TABLE_CONTAINER_MAX_TOKENS,
+            )
+            continue
+        node.content = content
+        node.token_count = tokens
+
+
 def chunk_markdown(
     markdown: str,
     *,
@@ -1318,6 +1350,7 @@ def chunk_markdown(
     doc_title: str = "",
     source_path: str = "",
     table_row_chunks: bool = False,
+    doc_metadata_line: str = "",
 ) -> ChunkingResult:
     """Markdown → 父块 + 子块 + 图片块 + 表格块（`06` §3 的口径）。
 
@@ -1329,6 +1362,12 @@ def chunk_markdown(
     不与正文 parent/child 重复索引。
 
     ``doc_title``：小节无标题时注入 ``heading_path`` 根，避免检索用文本丢限定词。
+
+    ``doc_metadata_line``：从解析层页眉元数据生成的一行文档信息（文件编号/版本/
+    生效日期/截止日期，如 ``【文档信息】文件编号：XJWY-GC-09；生效日期：2025-01-01；
+    截止日期：未标注``）。它只注入**上下文容器**（有子块的父块/表格父容器）的正文，
+    不写进叶子块——否则又会变成每篇文档都一样的可检索文本。容器不进向量/FTS，
+    命中子块后经 ``parent_expand`` 带进 prompt，日期类问题才有依据。
 
     ``source_path``：原始文件路径，只用于**判定表块粒度** —— ``table_row_chunks``
     只对电子表格（xlsx/xls/xlsm，一行=一条记录）生效；Word/PDF/PPT 与**漏传来源**
@@ -1439,6 +1478,8 @@ def chunk_markdown(
             table_container=table_container,
             row_chunks=row_chunks,
         )
+    # 一行文档元数据只进上下文容器（不制造可检索的同质块，见 _inject_doc_metadata_line）
+    _inject_doc_metadata_line(result.nodes, doc_metadata_line)
     return result
 
 

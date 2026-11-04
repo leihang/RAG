@@ -142,6 +142,31 @@ def document_dates_from_header_meta(
     return _find(_EFFECTIVE_KEYS, last=False), _find(_EXPIRE_KEYS, last=True)
 
 
+def document_metadata_line(
+    header_meta: Mapping[str, str] | None,
+    effective_date: str | None,
+    expire_date: str | None,
+) -> str:
+    """生成一行注入**上下文容器**的文档信息（文件编号/版本/生效/截止日期）。
+
+    只进父块/表格父容器，不进叶子块（叶子是检索单元；重复元数据会变成跨文档同质
+    检索文本，正是「文件信息」被当成正文块的老问题）。没有页眉元数据时返回空串，
+    不无中生有地写「未标注」。
+    """
+    if not header_meta:
+        return ""
+    meta = {re.sub(r"[\s\u3000]+", "", str(k)): str(v).strip() for k, v in header_meta.items()}
+    parts: list[str] = []
+    if meta.get("文件编号"):
+        parts.append(f"文件编号：{meta['文件编号']}")
+    if meta.get("版本"):
+        parts.append(f"版本：{meta['版本']}")
+    if effective_date:
+        parts.append(f"生效日期：{effective_date}")
+    parts.append(f"截止日期：{expire_date}" if expire_date else "截止日期：未标注")
+    return "【文档信息】" + "；".join(parts)
+
+
 class IngestPipeline:
     def __init__(
         self,
@@ -305,6 +330,7 @@ class IngestPipeline:
                 for fig in figures
             ]
         effective_date, expire_date = document_dates_from_header_meta(header_meta)
+        metadata_line = document_metadata_line(header_meta, effective_date, expire_date)
         if existing_doc_id is not None:
             self._replace_existing(existing_doc_id, shard_id=shard_id)
             doc_id = int(existing_doc_id)
@@ -358,6 +384,7 @@ class IngestPipeline:
                     # 表行分块只对电子表格生效；判据在 chunker（pipeline 只透传来源）。
                     source_path=source_path,
                     table_row_chunks=bool(getattr(self.settings.retrieval, "table_row_chunks", False)),
+                    doc_metadata_line=metadata_line,
                 )
             # **零丢失守卫**：分块把"整行当标题"时文字会静默消失（实测 22 段丢 11 段，
             # 而空页率/乱码率/空 heading 全 PASS）。这里逐行核对，丢实质内容就打警告 +
