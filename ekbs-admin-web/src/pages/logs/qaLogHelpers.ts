@@ -88,6 +88,13 @@ export interface QaTurn {
   candidateCount?: number
   rerankTopScore?: number
   citations: QaCitation[]
+  /**
+   * 该轮**最终喂给 LLM 的上下文块 id**（消息行 `context_chunk_ids` 的 JSON 字符串解析结果）。
+   *
+   * 与 `citations` 不是一回事：引用只含答案里标了 [n] 的块，而上下文还包含没被引用、
+   * 但同样进了 prompt 的块。历史行（旧后端/旧数据）为 `[]`，界面据此不渲染该行。
+   */
+  contextChunkIds: number[]
 }
 
 /** `ekbs_qa_citation` 的真实列（sql/001 里该表 SELECT c.*）。 */
@@ -438,6 +445,34 @@ function num(value: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined
 }
 
+/**
+ * 消息行的 `context_chunk_ids` → 上下文块 id 数组。
+ *
+ * 后端存的是 **JSON 字符串**（如 `"[35280,35274,35281]"`），历史行是 NULL；
+ * 这里做防御解析：NULL / 空串 / 非法 JSON / 非数组 / 非法元素统统降级，
+ * 解析失败返回 `[]`（界面据此不渲染「模型上下文」行，而不是炸掉整个详情页）。
+ * 允许传入已解析的数组，兼容将来后端直接给 JSON 数组的写法。
+ */
+export function parseContextChunkIds(value: unknown): number[] {
+  if (value == null || value === '') return []
+  let parsed: unknown = value
+  if (typeof value === 'string') {
+    try {
+      parsed = JSON.parse(value)
+    } catch {
+      return []
+    }
+  }
+  if (!Array.isArray(parsed)) return []
+  const ids: number[] = []
+  for (const item of parsed) {
+    const id = num(item)
+    // chunk id 是正整数；小数/负数/字符串都当脏数据丢弃
+    if (id != null && Number.isInteger(id) && id > 0) ids.push(id)
+  }
+  return ids
+}
+
 /** 会话头部字段（`ekbs_qa_session` 的真实列）。 */
 export function sessionMetaOf(raw: unknown): QaSessionMeta {
   const s = (raw ?? {}) as Record<string, unknown>
@@ -527,6 +562,8 @@ export function buildQaTurns(
       candidateCount: num(m.candidate_count),
       rerankTopScore: num(m.rerank_top_score),
       citations: (messageId != null ? byMessage.get(messageId) : undefined) ?? [],
+      // 旧后端没有该列 → []（QaTurnItem 据此隐藏「模型上下文」行）
+      contextChunkIds: parseContextChunkIds(m.context_chunk_ids),
     })
   }
   return turns.sort((a, b) => (a.turn ?? 0) - (b.turn ?? 0) || (a.messageId ?? 0) - (b.messageId ?? 0))

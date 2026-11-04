@@ -16,6 +16,7 @@ import {
 import ChunkPeekDrawer from '@/components/ChunkPeekDrawer'
 import ClearanceTag from '@/components/ClearanceTag'
 import StagesPanel from './StagesPanel'
+import ContextCard from './ContextCard'
 import FigureThumb from '@/components/FigureThumb'
 import { faithfulnessBanner, parseStages } from './playgroundData'
 import { usePermission } from '@/hooks/usePermission'
@@ -673,6 +674,18 @@ export default function Playground() {
               ]}
             />
           </Card>
+
+          {/*
+            引用卡与上下文卡是两件事，必须分开摆：
+            引用 = 答案里真的标了 [n] 的块；上下文 = 最终进 prompt 的全部块
+            （实测 doc 205：3 块进 prompt，只有 2 块被引用 —— 用户因此以为 35281 没推给模型）。
+            旧后端没有 context_chunks 时组件返回 null，下面引用卡等原有卡片不受影响。
+          */}
+          <ContextCard
+            contextChunks={result.context_chunks}
+            contextTokens={result.context_tokens}
+            onOpenChunk={openChunk}
+          />
 
           {(result.figure_attachments?.length ?? 0) > 0 ? (
             <Card

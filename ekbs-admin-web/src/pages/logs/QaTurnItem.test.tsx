@@ -24,6 +24,7 @@ const BASE_TURN: QaTurn = {
   traceId: 'trace-205',
   timing: {},
   citations: [],
+  contextChunkIds: [],
 }
 
 function renderTurn(turn: QaTurn) {
@@ -68,5 +69,48 @@ describe('QaTurnItem 引用的精排来源', () => {
     })
 
     expect(screen.queryByText(/#\d+ ← #\d+/)).toBeNull()
+  })
+})
+
+describe('QaTurnItem 模型上下文行（引用 ≠ 上下文）', () => {
+  it('显示该轮全部上下文块：被引用的标 [引用]，未引用的标 [仅上下文]', () => {
+    renderTurn({
+      ...BASE_TURN,
+      // 实测 doc 205：prompt 3 块，只有前 2 块被引用
+      citations: [
+        { citeIndex: 1, chunkId: 35280, docId: 205 },
+        { citeIndex: 2, chunkId: 35274, sourceChunkId: 35277, docId: 205 },
+      ],
+      contextChunkIds: [35280, 35274, 35281],
+    })
+
+    expect(screen.getByText('模型上下文（3 块）：')).toBeInTheDocument()
+    expect(screen.getByText('#35280[引用]')).toBeInTheDocument()
+    expect(screen.getByText('#35274[引用]')).toBeInTheDocument()
+    // 35281 没进引用，但同样推给了模型 —— 这一行就是它存在的证据
+    expect(screen.getByText('#35281[仅上下文]')).toBeInTheDocument()
+  })
+
+  it('重复的上下文 id 只显示一次（顺序按后端存的顺序）', () => {
+    renderTurn({
+      ...BASE_TURN,
+      citations: [{ citeIndex: 1, chunkId: 35280, docId: 205 }],
+      contextChunkIds: [35280, 35274, 35280],
+    })
+
+    expect(screen.getByText('模型上下文（2 块）：')).toBeInTheDocument()
+    expect(screen.getByText('#35280[引用]')).toBeInTheDocument()
+    expect(screen.getByText('#35274[仅上下文]')).toBeInTheDocument()
+  })
+
+  it('历史行没有 context_chunk_ids 时整行不渲染（旧页面行为不变）', () => {
+    renderTurn({
+      ...BASE_TURN,
+      citations: [{ citeIndex: 1, chunkId: 35280, docId: 205 }],
+      contextChunkIds: [],
+    })
+
+    expect(screen.queryByText(/模型上下文/)).toBeNull()
+    expect(screen.queryByText(/#\d+\[(引用|仅上下文)\]/)).toBeNull()
   })
 })

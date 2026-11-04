@@ -56,6 +56,33 @@ export interface Citation {
   figure_mm_indexed?: boolean
 }
 
+/**
+ * 真正喂给 LLM 的**一块上下文**（`POST /rag/debug/query` 的 `context_chunks[]`，task-5 新增）。
+ *
+ * 必须和「引用（citations）」分开看：引用只包含答案里真的标了 `[n]` 的块，
+ * 而上下文还包含没被引用、但同样进了 prompt 的块（实测 doc 205：3 块进 prompt、2 块被引用）。
+ * `index` 为 1-based，与答案里的 `[n]` 编号一致；`cited` = 该编号是否被答案引用。
+ */
+export interface ContextChunk {
+  /** 1-based，与答案中的 `[n]` 编号一致 */
+  index: number
+  /** 上下文块 id（可能是父块/整表容器） */
+  chunk_id: number
+  /** parent | child | table | figure */
+  chunk_type: string
+  doc_title?: string | null
+  heading_path?: string | null
+  /** 该块内容的 token 数（后端按生成模型分词口径统计） */
+  token_count: number
+  rerank_score?: number | null
+  /** 非空 = 该上下文块由这条精排检索单元扩展而来（父块/整表） */
+  source_chunk_id?: number | null
+  /** 精排名次（1-based）：扩展块取来源块的名次，未扩展块取自身名次 */
+  source_rerank_rank?: number | null
+  /** 答案里是否真的标了 `[index]`（false = 仅进入上下文，未进引用/审计） */
+  cited: boolean
+}
+
 export interface FaithfulnessClaim {
   text: string
   supported: boolean
@@ -81,6 +108,13 @@ export interface DebugQueryResp {
   suggested_questions?: string[] | null
   model?: string
   citations?: Citation[]
+  /**
+   * 最终喂给 LLM 的上下文块（按 `[n]` 顺序）。旧后端没有该字段 ——
+   * 前端据此**整卡不渲染**，而不是显示一张空表。
+   */
+  context_chunks?: ContextChunk[]
+  /** 上下文总 token（后端给出的合计，等于 context_chunks 各 token_count 之和） */
+  context_tokens?: number
   /** 找图意图或引用含图时：后端汇总的可回源图片（调试台单独展示原图） */
   figure_attachments?: {
     chunk_id: number

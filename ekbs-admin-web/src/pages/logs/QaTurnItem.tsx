@@ -104,6 +104,18 @@ export default function QaTurnItem({ turn }: QaTurnItemProps) {
     timing.rerank_ms != null ||
     timing.generate_ms != null
 
+  // 「模型上下文」行：答案实际引用到的块（citations 的 chunkId 集合）才标 [引用]，
+  // 其余同样喂给模型的块标 [仅上下文]。顺序按后端存进去的顺序，重复 id 只显示一次。
+  const citedChunkIds = new Set(
+    turn.citations.map((citation) => citation.chunkId).filter((id): id is number => id != null),
+  )
+  const seenContextIds = new Set<number>()
+  const contextChunkIds = turn.contextChunkIds.filter((id) => {
+    if (seenContextIds.has(id)) return false
+    seenContextIds.add(id)
+    return true
+  })
+
   return (
     <Card
       size="small"
@@ -210,6 +222,32 @@ export default function QaTurnItem({ turn }: QaTurnItemProps) {
           </Typography.Text>
         </div>
       )}
+
+      {/*
+        引用 ≠ 上下文：只有答案里标了 [n] 的块才进引用/审计，其余块同样进了 prompt。
+        实测 doc 205 的这一轮 prompt 有 3 块（35280/35274/35281），引用只有前 2 块，
+        用户因此以为 35281「根本没推给模型」—— 这一行就是用来消除这个误解的。
+        历史行没有 context_chunk_ids（解析为 []），整行不渲染，旧页面行为不变。
+      */}
+      {contextChunkIds.length ? (
+        <div style={{ marginTop: 8 }}>
+          <Typography.Text type="secondary">
+            <span>模型上下文（{contextChunkIds.length} 块）：</span>
+            {contextChunkIds.map((chunkId) => {
+              const cited = citedChunkIds.has(chunkId)
+              return (
+                <span
+                  key={chunkId}
+                  className="ekbs-mono"
+                  style={{ marginLeft: 8, color: cited ? '#389e0d' : undefined }}
+                >
+                  #{chunkId}[{cited ? '引用' : '仅上下文'}]
+                </span>
+              )
+            })}
+          </Typography.Text>
+        </div>
+      ) : null}
     </Card>
   )
 }

@@ -16,6 +16,7 @@ import {
   matchDocAccessResult,
   matchQaKeyword,
   matchSecurityEvent,
+  parseContextChunkIds,
   parseDetail,
   questionTextOf,
   refusedHintOf,
@@ -284,6 +285,30 @@ describe('citationSourceOf（上下文块 ← 精排来源）', () => {
   })
 })
 
+describe('parseContextChunkIds（消息行的 context_chunk_ids 是 JSON 字符串）', () => {
+  it('合法 JSON 字符串 → 上下文块 id 数组（顺序照存）', () => {
+    expect(parseContextChunkIds('[35280,35274,35281]')).toEqual([35280, 35274, 35281])
+    expect(parseContextChunkIds('[35281]')).toEqual([35281])
+  })
+
+  it('NULL / 空串 / 非法 JSON / 非数组 → []（历史行降级，不炸详情页）', () => {
+    expect(parseContextChunkIds(null)).toEqual([])
+    expect(parseContextChunkIds(undefined)).toEqual([])
+    expect(parseContextChunkIds('')).toEqual([])
+    expect(parseContextChunkIds('not json')).toEqual([])
+    expect(parseContextChunkIds('{"chunk_ids":[35280]}')).toEqual([])
+    expect(parseContextChunkIds('null')).toEqual([])
+  })
+
+  it('数组里的非法元素逐项丢弃，合法 id 保留', () => {
+    expect(parseContextChunkIds('[35280,"abc",35274,null,-1,1.5,35281]')).toEqual([35280, 35274, 35281])
+  })
+
+  it('也接受已解析的数组（兼容后端将来直接给 JSON 数组）', () => {
+    expect(parseContextChunkIds([35280, 35274])).toEqual([35280, 35274])
+  })
+})
+
 describe('buildQaTurns', () => {
   const messages = [
     {
@@ -344,6 +369,19 @@ describe('buildQaTurns', () => {
     expect(turns[0].citations.map((c) => c.citeIndex)).toEqual([1, 2])
     expect(turns[1].citations).toHaveLength(1)
     expect(turns[1].citations[0].docId).toBe(10)
+  })
+
+  it('映射消息行的 context_chunk_ids（顶层 JSON 字符串），历史行 → []', () => {
+    const turns = buildQaTurns(
+      [
+        { message_id: 2, turn: 1, role: 'assistant', question: 'q1', answer: 'a1', context_chunk_ids: '[35280,35274,35281]' },
+        { message_id: 5, turn: 2, role: 'assistant', question: 'q2', answer: 'a2' },
+      ],
+      [],
+    )
+    expect(turns[0].contextChunkIds).toEqual([35280, 35274, 35281])
+    // 旧后端 / 历史行没有该列 → 空数组（QaTurnItem 据此隐藏「模型上下文」行）
+    expect(turns[1].contextChunkIds).toEqual([])
   })
 
   it('容忍空数据', () => {
