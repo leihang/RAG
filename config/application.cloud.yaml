@@ -85,7 +85,10 @@ retrieval:
   # ⚠️ 语料仅 16 份，扩语料后应按同一套题复测（python -m ekbs.tools.eval_switch_sweep）。
   fusion: alpha
   hybrid_alpha: 0.75  # α=稠密权重；关键词/BM25 权重=1-α=25%（原 15%）
-  table_row_chunks: true  # 表格一行一个块，表头每块重复（RAGFlow 口径）
+  # **仅电子表格**（xlsx/xls/xlsm，一行=一条记录）：表格一行一个块、表头每块重复
+  # （RAGFlow spreadsheet 口径）。Word/PDF/PPT 的表行不是记录，一律按 384 token
+  # 行组叶子切（避免 55~115 token 的碎块，实测 doc 205）；来源判定在 ingest/chunker.py。
+  table_row_chunks: true
   # 确定性 Doc2Query：假设问句进 FTS（口语召回）；不写 FAISS、不调 LLM
   doc2query_enabled: true
   doc2query_max: 4

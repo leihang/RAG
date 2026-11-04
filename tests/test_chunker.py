@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from ekbs.ingest.chunker import (
     CHILD_MAX_TOKENS,
     CHILD_MIN_TOKENS,
@@ -537,12 +539,17 @@ def test_table_chunk_carries_section_heading_and_parent() -> None:
 
 
 def test_table_row_chunks_only_when_table_exceeds_budget() -> None:
-    """`table_row_chunks` 只对超预算的大表生效；小表整表一块（spec §3.4）。"""
+    """``table_row_chunks`` 只对超预算的大表生效；小表整表一块（spec §3.4）。
+
+    表格来源是 **.xlsx**（一行=一条记录）：行级分块只对电子表格成立，见
+    ``test_word_table_ignores_table_row_chunks_and_uses_row_groups``。
+    """
     small = "| 项目 | 值 |\n| --- | --- |\n| a | 1 |\n| b | 2 |"
     small_result = chunk_markdown(
         "# 制度\n\n正文。\n",
         doc_title="小表",
         tables=[TableInput(body=small, table_id="1")],
+        source_path="小表.xlsx",
         table_row_chunks=True,
     )
     small_tables = [n for n in small_result.nodes if n.chunk_type == "table"]
@@ -555,6 +562,7 @@ def test_table_row_chunks_only_when_table_exceeds_budget() -> None:
         "# 制度\n\n正文。\n",
         doc_title="大表",
         tables=[TableInput(body=big, table_id="2")],
+        source_path="大表.xlsx",
         table_row_chunks=True,
     )
     big_tables = [n for n in big_result.nodes if n.chunk_type == "table"]
@@ -623,6 +631,7 @@ def test_large_table_gets_container_parent_and_row_leaves() -> None:
         md,
         doc_title="设备编号作业指导书",
         tables=[TableInput(body=big, table_id="2")],
+        source_path="设备清单.xlsx",
         table_row_chunks=True,
     )
     tables = [n for n in result.nodes if n.chunk_type == "table"]
@@ -676,3 +685,108 @@ def test_medium_table_splits_into_row_group_leaves_at_384_tokens() -> None:
     container = result.nodes[next(iter(container_idx))]
     assert "表1-年度能耗管理计划" in container.content
     assert "级别=级别A" in container.content
+
+
+# --- 表格来源决定粒度（2026-11 修「其它块太碎了，你规则有问题」）-----------------------
+#
+# doc 205（.docx）在 ``retrieval.table_row_chunks=true`` 下被切成 41 块 / 36 个表块，
+# 表 6 的 962 token 变成 18 个 55~115 token 的叶子。根因：一行一块（RAGFlow
+# spreadsheet 口径）被套到了大表上。行级分块只对「行=一条记录」的电子表格成立；
+# Word/PDF/PPT 与未知来源必须走 384 token 行组叶子。
+
+#: 约 900 token 的 Word 表格（4 列 × 26 行），复刻 doc 205 表1/表6 的量级。
+_WORD_TABLE = (
+    "| 级别 | 工作内容 | 时间节点 | 责任人 |\n| --- | --- | --- | --- |\n"
+    + "\n".join(
+        f"| 级别{chr(65 + i % 6)} | 工作内容{i}与年度能耗管理计划相关的说明文字 | 时间节点{i} | 责任人{i} |"
+        for i in range(26)
+    )
+)
+
+
+def _table_container_leaves(result):
+    """返回 ``(表格父容器, 行/组叶子列表)``。"""
+    tables = [node for node in result.nodes if node.chunk_type == "table"]
+    container_idx = {
+        node.parent_index
+        for node in tables
+        if node.parent_index is not None
+        and result.nodes[node.parent_index].chunk_type == "table"
+    }
+    assert len(container_idx) == 1, ">384 token 的表应出且只出一个表格父容器"
+    index = next(iter(container_idx))
+    return result.nodes[index], [node for node in tables if node.parent_index == index]
+
+
+def _chunk_word_table(source_path: str):
+    return chunk_markdown(
+        "# 制度\n\n## 5. 工作程序和要求\n\n表1-年度能耗管理计划\n[表格 1]\n\n",
+        doc_title="XJWY-GC-12能耗管理作业指导书 - 定稿",
+        tables=[TableInput(body=_WORD_TABLE, table_id="1", caption="表1-年度能耗管理计划")],
+        source_path=source_path,
+        table_row_chunks=True,
+    )
+
+
+def test_word_table_ignores_table_row_chunks_and_uses_row_groups() -> None:
+    """Word 表格即使 ``table_row_chunks=True`` 也只按 384 行组切，不逐行碎块。"""
+    assert count_tokens(_WORD_TABLE) >= 900, "样本要复刻 doc 205 的 ~900 token 表"
+    container, leaves = _table_container_leaves(_chunk_word_table("能耗管理作业指导书 - 定稿.docx"))
+    assert "表1-年度能耗管理计划" in container.content
+    assert 1 < len(leaves) <= 6, f"行组叶子应是少数几块，而不是一行一块（实际 {len(leaves)}）"
+    assert len(leaves) < 26, "不能一行一块（表格共 26 数据行）"
+    assert all(node.content.startswith("表名:") for node in leaves), "每叶必须重复表头"
+    assert all(
+        "相关表头: 级别 | 工作内容 | 时间节点 | 责任人" in node.content for node in leaves
+    )
+    assert all(
+        count_tokens(node.content) <= TABLE_LEAF_TOKENS + CHILD_MAX_TOKENS for node in leaves
+    ), "每叶 ≤ 384 + 单行余量"
+
+    # 漏传来源（未知来源）必须与 .docx 等价：默认退回行组，不因忘传参数而碎块
+    _, forgot_leaves = _table_container_leaves(_chunk_word_table(""))
+    assert [node.content for node in forgot_leaves] == [node.content for node in leaves]
+
+
+def test_xlsx_source_still_chunks_one_row_per_block() -> None:
+    """电子表格（.xlsx）一行=一条记录：``table_row_chunks=True`` 仍一行一块。"""
+    table = (
+        "| 项目 | 金额 | 备注 |\n| --- | --- | --- |\n"
+        + "\n".join(f"| 项目{i} | {i * 100} | 费用说明{i}与执行口径 |" for i in range(60))
+    )
+    result = chunk_markdown(
+        "# 月度费用表\n\n[表格 1]\n\n",
+        doc_title="月度费用表",
+        tables=[TableInput(body=table, table_id="1")],
+        source_path="月度费用表.xlsx",
+        table_row_chunks=True,
+    )
+    _, leaves = _table_container_leaves(result)
+    assert len(leaves) == 60, "xlsx 一行=一条记录，应一行一块"
+    assert all(node.content.startswith("表名:") for node in leaves)
+    assert all("相关表头: 项目 | 金额 | 备注" in node.content for node in leaves)
+    assert "项目=项目0; 金额=0" in leaves[0].content
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("报表.xlsx", True),
+        ("报表．xlsx ", True),  # 全角句点 + 尾部空格：normalize_suffix 归一后仍是 xlsx
+        ("旧表.XLS", True),
+        ("宏表.xlsm", True),
+        ("/var/raw/制度/能耗管理作业指导书.docx", False),
+        ("扫描件.pdf", False),
+        ("汇报.pptx", False),
+        ("说明.md", False),
+        ("导出.csv", False),  # csv 走 text 引擎、不产出 ParsedTable，不算表格来源
+        ("service.py", False),
+        ("能耗管理作业指导书", False),  # 无后缀（把标题当来源）
+        ("", False),
+    ],
+)
+def test_is_spreadsheet_source_only_spreadsheets(path: str, expected: bool) -> None:
+    """行级表块只对电子表格开放；未知/空来源必须为 False（默认行组）。"""
+    from ekbs.ingest.parser import is_spreadsheet_source
+
+    assert is_spreadsheet_source(path) is expected

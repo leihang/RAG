@@ -133,6 +133,24 @@ def normalize_suffix(filename: str) -> str:
     return PurePath(name).suffix.lower().lstrip(".")
 
 
+#: 电子表格来源 —— 一行就是一条记录，RAGFlow 的「表格一行一块」口径只对它们成立。
+#: 为什么**不收 ``csv``**：`SUFFIX_ENGINES` 里没有 ``.csv``，它落到 ``text`` 引擎的
+#: 纯文本分支，解析产物里根本不产生 ``ParsedTable`` —— 给一个不会产出表格的来源开
+#: 行级分块没有意义（真要支持 csv 表格，先让解析层把它当表解析，再来改这里）。
+SPREADSHEET_SUFFIXES: frozenset[str] = frozenset({"xlsx", "xls", "xlsm"})
+
+
+def is_spreadsheet_source(path: str) -> bool:
+    """来源是否是**电子表格**（一行=一条记录）—— 决定表块按行还是按行组切。
+
+    **默认 False（行组叶子）是刻意的安全默认**：行级分块只对「行是记录」的电子表格
+    成立；套到 Word/PDF/PPT 的制度表格上会把每行切成 55~115 token 的碎片（实测
+    doc 205：41 块 / 36 个表块，表 6 的 962 token 被拆成 18 叶）。调用方漏传来源时
+    必须回到行组，不能因为忘传参数就退化成碎块。
+    """
+    return normalize_suffix(str(path)) in SPREADSHEET_SUFFIXES
+
+
 def parse_file(
     path: str | Path, *, engine: str = "auto", assets_dir: Path | None = None
 ) -> ParsedDocument:

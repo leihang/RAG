@@ -530,7 +530,8 @@ def _table_leaf_blocks(
 
     整表一个向量时十几行数据会互相稀释（实测 920 token 的「表1-年度能耗管理计划编制
     及实施要求」查「A级能耗普查」检索不中）。``row_chunks=True`` 时退化为一行一块
-    （配置项 ``ingest.table_row_chunks``，默认关）。
+    （``retrieval.table_row_chunks``）—— 但**只有电子表格**能走到这里，来源判定在
+    :func:`chunk_markdown`（Word/PDF 的表行不是记录，逐行切会碎成 55~115 token 的块）。
     """
     # 延迟导入：table_serialize 反向依赖本模块的 count_tokens，模块级导入会成环
     from ekbs.ingest.table_serialize import serialize_table_body
@@ -1019,6 +1020,7 @@ def chunk_markdown(
     figures: Sequence[FigureInput] = (),
     tables: Sequence[TableInput] = (),
     doc_title: str = "",
+    source_path: str = "",
     table_row_chunks: bool = False,
 ) -> ChunkingResult:
     """Markdown → 父块 + 子块 + 图片块 + 表格块（`06` §3 的口径）。
@@ -1032,6 +1034,11 @@ def chunk_markdown(
 
     ``doc_title``：小节无标题时注入 ``heading_path`` 根，避免检索用文本丢限定词。
 
+    ``source_path``：原始文件路径，只用于**判定表块粒度** —— ``table_row_chunks``
+    只对电子表格（xlsx/xls/xlsm，一行=一条记录）生效；Word/PDF/PPT 与**漏传来源**
+    一律走 :data:`TABLE_LEAF_TOKENS` 行组叶子。规则放在这里而不是调用点：调用方
+    忘传来源时不能退化成一行一块（doc 205 的 41 块/36 表块就是这么来的）。
+
     结构（`20` §3.1/§3.2）：**按 token 目标切，不按标题切**。
     制度/作业指导书每个标题下常常只有一两行，按标题切出来的块只有 10~60 token ——
     父块和子块同时退化成碎片，父子关系名存实亡（用户实测反馈）。
@@ -1043,6 +1050,15 @@ def chunk_markdown(
       （见 :mod:`ekbs.ingest.retrievable`）。
     """
     from ekbs.ingest.table_serialize import serialize_table_body
+
+    # 表行分块（一行一块）**只对电子表格成立**：xlsx/xls/xlsm 的一行就是一条记录
+    # （RAGFlow spreadsheet 口径，实测 top1 有增益）；Word/PDF/PPT 的表行只是单元格
+    # 网格，逐行切会把制度表格碎成 55~115 token 的块。规则放在分块器内而不是调用点：
+    # ``source_path`` 漏传时默认 False（行组叶子），调用方忘传也不能退化。
+    # 延迟导入：parser → code_chunker → chunker 模块级会成环。
+    from ekbs.ingest.parser import is_spreadsheet_source
+
+    row_chunks = bool(table_row_chunks) and is_spreadsheet_source(source_path)
 
     result = ChunkingResult()
     seq = 0
@@ -1148,7 +1164,7 @@ def chunk_markdown(
         # 叶子预算：整表超过 384 token 就拆「行组叶子」。
         # 920 token 的表（十几行数据）塞进同一个向量会被互相稀释 —— 查某一行
         # 的语义（如「A级能耗普查」）时整表向量对不上，检索直接落空。
-        leaf_blocks = _table_leaf_blocks(table, full_blocks, row_chunks=table_row_chunks)
+        leaf_blocks = _table_leaf_blocks(table, full_blocks, row_chunks=row_chunks)
 
         if len(full_blocks) == 1 and len(leaf_blocks) <= 1:
             # 小表（整表一块；或单行就超预算、拆不出第二块）：上下文折进叶子，

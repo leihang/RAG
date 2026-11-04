@@ -321,6 +321,8 @@ class IngestPipeline:
                     figures=figures,
                     tables=tables,
                     doc_title=title,
+                    # 表行分块只对电子表格生效；判据在 chunker（pipeline 只透传来源）。
+                    source_path=source_path,
                     table_row_chunks=bool(getattr(self.settings.retrieval, "table_row_chunks", False)),
                 )
             # **零丢失守卫**：分块把"整行当标题"时文字会静默消失（实测 22 段丢 11 段，

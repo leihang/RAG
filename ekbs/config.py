@@ -168,7 +168,9 @@ class RetrievalCfg(_Section):
     dense_multi_query: int = 1
     #: figure 图片进多模态旁路索引，检索时作为 RRF 第三路（课程 17）
     figure_multimodal: bool = True
-    #: 表格按"一行一个块"切（RAGFlow spreadsheet 口径）；False=整表块（默认）
+    #: 表格按"一行一个块"切（RAGFlow spreadsheet 口径）。**只对电子表格生效**
+    #: （xlsx/xls/xlsm）；Word/PDF/PPT 与未知来源一律走 384 token 行组叶子
+    #: （``chunker.TABLE_LEAF_TOKENS``），来源判定在 ``chunk_markdown``。
     table_row_chunks: bool = False
 
 
