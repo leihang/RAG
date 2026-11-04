@@ -236,6 +236,154 @@ class RetrievedChunk:
         return self.chunk_type in {"figure", "table"}
 
 
+#: 文档编号（``XJWY-GC-09`` / ``XIWY-QR-GC-002`` / ``XJ-01-11-1F02``）：
+#: 字母开头 + 至少两段「分隔符 + 字母数字」。用来从标题里剥出中文核心名。
+_DOC_CODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:[-_/][A-Za-z0-9]+)+")
+#: 标题头/尾的版本标记（``维修作业指导书 - 定稿`` / ``（定稿）XJWY-…``）：
+#: 定稿/征求意见稿并存时，核心名应能被剥成同一个。
+_DRAFT_SUFFIX_RE = re.compile(r"[\s\-_—－·]*(?:[（(]\s*定稿\s*[）)]|定稿)\s*$")
+_DRAFT_PREFIX_RE = re.compile(r"^\s*(?:[（(]\s*定稿\s*[）)]|定稿)[\s\-_—－·]*")
+#: 剥掉文档编号后，核心名前面可能残留的分隔标点。
+_TITLE_LEAD_STRIP = " \t\-_—－·.、，,（）()【】[]:：/／"
+#: 只由**通用体裁词**构成的标题不参与点名匹配。
+#: 否则问「作业指导书的编制要求」会把库里所有叫「作业指导书」的文件都点成目标，
+#: 而真正被点名的往往是「维修作业指导书」这类带限定词的核心名。
+_GENERIC_TITLE_KEYS = frozenset(
+    {
+        "作业指导书",
+        "操作规程",
+        "管理办法",
+        "管理制度",
+        "管理规定",
+        "实施细则",
+        "工作规程",
+        "工作标准",
+        "岗位职责",
+        "岗位说明书",
+        "应急预案",
+        "使用说明",
+        "操作手册",
+        "技术规范",
+    }
+)
+
+
+def _normalize_for_title_match(text: str) -> str:
+    """标题匹配归一化：小写 + 只留字母/数字/CJK（去空白与标点）。
+
+    为什么不用 ``str.lower()`` 后直接比对：同一份文件在不同来源里会写成
+    ``XJWY-GC-09 维修作业指导书`` / ``XJWY-GC-09维修作业指导书`` /
+    ``XJWY-GC-09（维修作业指导书）``，标点与全半角差异会让包含判断失效。
+    """
+    return "".join(ch for ch in (text or "").lower() if ch.isalnum())
+
+
+def _title_match_keys(doc_title: str) -> tuple[str, str, str]:
+    """``doc_title`` → ``(归一化全名, 归一化核心名, 归一化文档编号)``。
+
+    全名去导入路径前缀（``工程部/1、程序文件/XJWY-GC-02设备编号作业指导书``
+    → ``XJWY-GC-02设备编号作业指导书``）、去扩展名与 ``- 定稿`` 尾巴；
+    核心名 = 全名再剥掉开头文档编号（``XJWY-GC-02`` → ``设备编号作业指导书``）。
+    """
+    text = (doc_title or "").strip()
+    if "/" in text or "\\" in text:
+        text = text.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    # 扩展名（``demo/service.py`` 之类）会影响「编号 / 核心名」的切分
+    text = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", text).strip()
+    text = _DRAFT_SUFFIX_RE.sub("", text).strip()
+    text = _DRAFT_PREFIX_RE.sub("", text).strip()
+    match = _DOC_CODE_RE.match(text)
+    if match:
+        code = match.group(0)
+        core = text[len(code):].lstrip(_TITLE_LEAD_STRIP)
+    else:
+        code = ""
+        core = text
+    return (
+        _normalize_for_title_match(text),
+        _normalize_for_title_match(core),
+        _normalize_for_title_match(code),
+    )
+
+
+def _title_match_doc_ids(query: str, chunks: Sequence[RetrievedChunk]) -> set[int]:
+    """问句**点名**了哪些候选文档（文档名 / 核心名 / 文档编号硬匹配）。
+
+    只在传入的候选块里找（不查全库）：命中集合为空 = 问句没点名任何候选文档。
+    匹配口径（归一化后判断包含）：
+
+    * 全名被问句包含（``XJWY-GC-09维修作业指导书`` 整串出现）；
+    * 核心名（去文档编号，长度 ≥ 4）被问句包含（``维修作业指导书``）；
+    * 文档编号（长度 ≥ 4）被问句包含（``xjwy-gc-09``，容忍任意分隔/空格）。
+
+    短标题（< 4）不参与匹配：两三个字的标题在长问句里几乎必然误命中。
+    通用体裁词（见 ``_GENERIC_TITLE_KEYS``）同样不算被点名。
+    """
+    query_key = _normalize_for_title_match(query)
+    if len(query_key) < 2:
+        return set()
+    keys_by_title: dict[str, tuple[str, str, str]] = {}
+    matched: set[int] = set()
+    for chunk in chunks:
+        title = chunk.doc_title or ""
+        keys = keys_by_title.get(title)
+        if keys is None:
+            keys = _title_match_keys(title)
+            keys_by_title[title] = keys
+        display, core, code = keys
+        if display and len(display) >= 4 and display in query_key:
+            matched.add(int(chunk.doc_id))
+        elif (
+            core
+            and len(core) >= 4
+            and core not in _GENERIC_TITLE_KEYS
+            and core in query_key
+        ):
+            matched.add(int(chunk.doc_id))
+        elif code and len(code) >= 4 and code in query_key:
+            matched.add(int(chunk.doc_id))
+    return matched
+
+
+def _apply_title_priority(
+    query: str, survivors: list[RetrievedChunk]
+) -> tuple[list[RetrievedChunk], dict[str, Any]]:
+    """问句点名文档时，把幸存候选**硬过滤**到这些文档；返回 (候选, 调试信息)。
+
+    为什么是硬过滤而不是加分：同模板的「文件信息」块在不同文档里几乎逐字相同，
+    精排分差只反映文档名等细枝末节（实测点名文档 0.9486、其它三份 0.66~0.75 都能
+    过阈值），软加权仍会把别人的块带进上下文，答案照样可能引错文件。
+    只过滤、不动精排顺序：点名的多份文档之间仍按精排分排序。
+    """
+    before = len(survivors)
+    matched = _title_match_doc_ids(query, survivors)
+    debug: dict[str, Any] = {
+        "matched_doc_ids": sorted(matched),
+        "before": before,
+        "after": before,
+    }
+    if not matched:
+        return survivors, debug
+    survivor_docs = {int(c.doc_id) for c in survivors}
+    if matched == survivor_docs:
+        # 幸存候选本来就只属于被点名的文档：无需过滤
+        return survivors, debug
+    filtered = [c for c in survivors if int(c.doc_id) in matched]
+    if not filtered:
+        # 理论上 matched ⊆ survivor_docs 保证非空；兜底保持原候选（宁可多给不可漏给）
+        return survivors, debug
+    debug["after"] = len(filtered)
+    log.info(
+        "retrieval_title_priority",
+        matched_doc_ids=debug["matched_doc_ids"],
+        matched_docs=len(matched),
+        total_docs=len(survivor_docs),
+        before=before,
+        after=len(filtered),
+    )
+    return filtered, debug
+
+
 @dataclass
 class RetrievalResult:
     query: str
@@ -813,6 +961,13 @@ class RetrievalPipeline:
         result.c5_dropped = len(dropped)
         survivors = [c for c in ranked if c.chunk_id not in dropped_ids]
 
+        # ④.5 文档标题命中优先级：问句点名了某份文档时，只保留点名文档的候选。
+        # 为什么放在阈值判定之前：top_score 必须从**过滤后**的候选重算 ——
+        # 否则「点名文档分低、别的文档分高」时，阈值判定看的是别人的分，
+        # 既可能掩盖点名文档其实不相关，也可能错误抬高/压低拒答判定。
+        survivors, title_debug = _apply_title_priority(query, survivors)
+        self._record_title_debug(result, title_debug, collect_debug)
+
         # 阈值判定：以**幸存候选**的最高分为准（否则会出现「最高分被 C5 拦掉却仍回答」）
         if survivors:
             result.top_score = max(
@@ -981,6 +1136,17 @@ class RetrievalPipeline:
         except Exception as exc:  # noqa: BLE001 - 多模态旁路失败不拖垮检索
             log.warning("figure_mm_recall_failed", error=str(exc)[:160])
             return [], [], True, ["figure_mm_unavailable"]
+
+    def _record_title_debug(
+        self, result: RetrievalResult, debug: dict[str, Any], collect_debug: bool
+    ) -> None:
+        """把标题命中优先级结果写进调试台（仅 ``collect_debug`` 时）。
+
+        单独成方法而不是在 ``retrieve`` 里写 ``if collect_debug``：``retrieve``
+        的圈复杂度已卡在棘轮上限（mccabe max-complexity=15），加一个分支就超。
+        """
+        if collect_debug:
+            result.stage_debug["title_match"] = debug
 
     def _record_recall_debug(
         self,
@@ -3064,6 +3230,10 @@ class RetrievalPipeline:
             f":{getattr(cfg.intent_split, 'max_questions', 0)}",
             f"expand={getattr(getattr(getattr(self.rewriter, 'expand_llm', None), 'ref', None), 'ident', '')}",
             f"prompt={PROMPT_REVISION}",
+            # 标题命中优先级（④.5）会改变最终上下文块集合，但没有任何配置开关能表达它：
+            # 不在这里留版本位，上线后同一问句会继续命中改动前的答案缓存（最长 1 小时），
+            # 表现为「代码已修但用户仍看到旧结果」。改行为时把这里的序号 +1。
+            "title_priority=1",
         ]
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
