@@ -94,3 +94,31 @@ def test_policy_version_seed_single_row(db) -> None:
     with db.sync_connect() as conn:
         count = conn.execute("SELECT COUNT(*) AS c FROM ekbs_policy_version").fetchone()["c"]
     assert int(count) == 1
+
+
+def _citation_columns(db) -> list[str]:
+    with db.sync_connect() as conn:
+        rows = conn.execute("PRAGMA table_info(ekbs_qa_citation)").fetchall()
+    return [str(r["name"]) for r in rows]
+
+
+def test_qa_citation_has_source_chunk_id_on_fresh_schema(db) -> None:
+    """引用表同时存上下文块与精排来源块（task-3 的拆分身份）。"""
+    cols = _citation_columns(db)
+    assert "chunk_id" in cols
+    assert "source_chunk_id" in cols
+
+
+def test_apply_schema_patches_adds_source_chunk_id_idempotently(db) -> None:
+    """存量库缺列时由启动补丁补齐；重复执行不报错、不重复加列。"""
+    with db.sync_connect() as conn:
+        conn.execute("ALTER TABLE ekbs_qa_citation DROP COLUMN source_chunk_id")
+        conn.commit()
+    assert "source_chunk_id" not in _citation_columns(db)
+
+    db.apply_schema_patches()
+    assert _citation_columns(db).count("source_chunk_id") == 1
+
+    # 幂等：第二次是 no-op（PRAGMA table_info 守卫）
+    db.apply_schema_patches()
+    assert _citation_columns(db).count("source_chunk_id") == 1

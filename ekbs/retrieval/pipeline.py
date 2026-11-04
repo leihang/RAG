@@ -147,6 +147,29 @@ def _merge_faithfulness(parts: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _dedupe_expanded(
+    chunks: Sequence[RetrievedChunk],
+) -> tuple[list[RetrievedChunk], int]:
+    """按 ``chunk_id`` 去重扩展后的上下文块，保留首次出现（=精排序里的最高分）。
+
+    父块扩展会把「同一父块下的多个叶子」折叠成同一个父块；这些重复块既白占
+    prompt 预算，又让引用编号出现两个指向同一块的条目。保留第一次出现的那份，
+    也即保留**精排分最高**的来源（``expanded_from`` 随保留项一起留下）。
+
+    返回 ``(去重后列表, 丢弃数)``。
+    """
+    seen: set[int] = set()
+    kept: list[RetrievedChunk] = []
+    dropped = 0
+    for chunk in chunks:
+        if chunk.chunk_id in seen:
+            dropped += 1
+            continue
+        seen.add(chunk.chunk_id)
+        kept.append(chunk)
+    return kept, dropped
+
+
 @dataclass
 class RetrievedChunk:
     """最终进入 Prompt 的块（引用卡片所需字段一并带上，见 `00` §2.2）。"""
@@ -168,6 +191,11 @@ class RetrievedChunk:
     sparse_rank: int | None = None
     rrf_score: float = 0.0
     rerank_score: float | None = None
+    #: 本块是**上下文块**（父块/表容器），是由哪个**精排候选块**扩展而来的。
+    #: ``None`` = 它本身就是精排候选（没被父块扩展替换）。
+    #: 为什么单独记：父块扩展会丢掉「精排选中的是哪个叶子」，审计/回源/调试都指着
+    #: ``chunk_id`` 时，看到的会是一个从未参与 rerank 的父块 id（见 task-3）。
+    expanded_from: int | None = None
 
     @property
     def is_visual(self) -> bool:
@@ -182,6 +210,8 @@ class RetrievalResult:
     c5_dropped: int = 0
     #: D18 粗筛（rerank 之前的 doc 级 ACL）丢弃数；与 c5_dropped（rerank 后复检）分列
     c5_pre_dropped: int = 0
+    #: 扩展后按 ``chunk_id`` 去重丢掉的数量（多个叶子扩到同一父块/表容器时 > 0）
+    deduped_chunks: int = 0
     top_score: float | None = None
     refused: bool = False
     refusal_reason: str = ""
@@ -237,6 +267,11 @@ class Citation:
     page_check: str
     figure_id: str | None = None
     image_path: str | None = None
+    #: 该引用块是由哪个**精排候选块**扩展来的（上下文块 ≠ 精排来源）。
+    #: ``chunk_id`` 仍是实际喂给 LLM 的上下文块 id（对外契约不变）；
+    #: ``source_chunk_id`` 让审计/回源/调试台能追到真正被精排选中的那块。
+    #: 默认 ``None``：老答案缓存里没有这个键时 ``Citation(**item)`` 仍可重建。
+    source_chunk_id: int | None = None
 
 
 @dataclass
@@ -782,6 +817,17 @@ class RetrievalPipeline:
         selected = await asyncio.to_thread(self._expand_page_figures, selected, perm)
         # docx 等常无页码：同页扩不到时，再按同文档补 figure（熙物联二维码踩过）
         selected = await asyncio.to_thread(self._expand_doc_figures, selected, perm)
+        # 父块/整表扩展会把同一父块的多个叶子折叠成重复块（实测 35274×2 / 35281×2）：
+        # 必须在**所有扩展之后**去重，否则重复块会白占 prompt 预算、生成两个指向同块的引用编号。
+        selected, deduped = _dedupe_expanded(selected)
+        result.deduped_chunks = deduped
+        if deduped:
+            log.info(
+                "retrieval_expanded_deduped",
+                dropped=deduped,
+                kept=len(selected),
+                user_id=perm.user_id,
+            )
 
         expand_done = time.perf_counter()
         result.chunks = selected
@@ -1112,7 +1158,11 @@ class RetrievalPipeline:
                 # 为什么不能整块换成父块：父块是章节容器，标题只剩「5. 工作程序和要求」，
                 # 答案里写「第X条」时 clause_mismatches 在引用块标题里找不到条号 →
                 # 正确的条款引用被判幻觉、整答拒掉（faithfulness.clause_mismatches）。
-                hit = replace(parent, heading_path=chunk.heading_path or parent.heading_path)
+                hit = replace(
+                    parent,
+                    heading_path=chunk.heading_path or parent.heading_path,
+                    expanded_from=chunk.chunk_id,
+                )
                 hit.rerank_score = chunk.rerank_score
                 hit.rrf_score = chunk.rrf_score
                 hit.dense_rank = chunk.dense_rank
@@ -2080,6 +2130,10 @@ class RetrievalPipeline:
                     page_check=page_check,
                     figure_id=chunk.figure_id,
                     image_path=chunk.image_path,
+                    # 上下文块（父块/整表）被引用时，审计要能追到真正的精排来源；
+                    # 未扩展的块这里就是 None（它自己就是精排候选）。
+                    # getattr 兼容测试/降级路径里没有这个字段的轻量 chunk 对象。
+                    source_chunk_id=getattr(chunk, "expanded_from", None),
                 )
             )
         return citations
@@ -2354,6 +2408,7 @@ class RetrievalPipeline:
                             page_check="pass",
                             figure_id=src.figure_id,
                             image_path=src.image_path,
+                            source_chunk_id=src.expanded_from,
                         )
                     )
                 result.citations = rebuilt

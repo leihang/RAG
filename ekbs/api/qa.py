@@ -160,6 +160,9 @@ def _citation_payload(citations: list[Any]) -> list[dict[str, Any]]:
             "page_check": c.page_check,
             "figure_id": c.figure_id,
             "image_path": c.image_path,
+            # chunk_id 是喂给 LLM 的上下文块；source_chunk_id 是扩展前的精排来源块
+            # （父块/整表容器不在精排候选里属正常）。旧缓存条目没有该键 → None。
+            "source_chunk_id": getattr(c, "source_chunk_id", None),
         }
         for c in citations
     ]

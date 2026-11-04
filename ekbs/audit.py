@@ -131,15 +131,15 @@ class AuditService:
             message_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
 
             conn.executemany(
-                "INSERT INTO ekbs_qa_citation(message_id, cite_index, chunk_id, doc_id, "
-                "doc_version, heading_path, page_from, page_to, rerank_score, acl_result, "
-                "page_check, snippet_hash, figure_id, image_path) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO ekbs_qa_citation(message_id, cite_index, chunk_id, "
+                "source_chunk_id, doc_id, doc_version, heading_path, page_from, page_to, "
+                "rerank_score, acl_result, page_check, snippet_hash, figure_id, image_path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
-                        message_id, c.cite_index, c.chunk_id, c.doc_id, c.doc_version,
-                        c.heading_path, c.page_from, c.page_to, c.rerank_score, c.acl_result,
-                        c.page_check, _snippet_hash(c), c.figure_id, c.image_path,
+                        message_id, c.cite_index, c.chunk_id, c.source_chunk_id, c.doc_id,
+                        c.doc_version, c.heading_path, c.page_from, c.page_to, c.rerank_score,
+                        c.acl_result, c.page_check, _snippet_hash(c), c.figure_id, c.image_path,
                     )
                     for c in answer.citations
                 ],
@@ -166,8 +166,16 @@ class AuditService:
 
 
 def _snippet_hash(citation: Citation) -> str:
-    """片段指纹（不存全文）：用于事后核对「当时引用的到底是哪一段」。"""
-    raw = f"{citation.doc_id}|{citation.chunk_id}|{citation.page_from}|{citation.page_to}"
+    """片段指纹（不存全文）：用于事后核对「当时引用的到底是哪一段」。
+
+    指纹必须同时覆盖**上下文块**与**精排来源**：同一父块可由不同精排叶子扩展而来
+    （doc 205 的 35274 ← 35277 / 35276），只 hash 父块 chunk_id 时，事后无法核对
+    「这次回源到底指哪个被精排选中的叶子」，审计与回源就会各说各话。
+    """
+    raw = (
+        f"{citation.doc_id}|{citation.chunk_id}|{citation.source_chunk_id}|"
+        f"{citation.page_from}|{citation.page_to}"
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

@@ -395,7 +395,11 @@ CREATE TABLE IF NOT EXISTS ekbs_qa_citation (
     citation_id  INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id   INTEGER NOT NULL REFERENCES ekbs_qa_message(message_id) ON DELETE CASCADE,
     cite_index   INTEGER,
+    -- chunk_id = 实际喂给 LLM 的**上下文块**（可能是精排后扩展出的父块/整表容器）；
+    -- source_chunk_id = 这次扩展的**精排来源块**（精排只给检索单元打分，父块不在候选里）。
+    -- 两列分开才能同时回答「模型看到的是哪段」与「精排选中的是哪段」。
     chunk_id     INTEGER,
+    source_chunk_id INTEGER,
     doc_id       INTEGER,
     doc_version  TEXT,
     heading_path TEXT,

@@ -149,6 +149,17 @@ class Database:
             if "parse_ms" not in cols:
                 conn.execute("ALTER TABLE ekbs_document ADD COLUMN parse_ms INTEGER")
                 conn.commit()
+            # 引用身份拆分：chunk_id（喂给 LLM 的上下文块）与 source_chunk_id（精排来源块）。
+            # 存量库缺这列会让审计 INSERT 直接失败，必须像 deleted_at 一样在启动自检后补齐。
+            citation_cols = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(ekbs_qa_citation)").fetchall()
+            }
+            if "source_chunk_id" not in citation_cols:
+                conn.execute(
+                    "ALTER TABLE ekbs_qa_citation ADD COLUMN source_chunk_id INTEGER"
+                )
+                conn.commit()
             policy_cols = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(ekbs_policy_version)").fetchall()

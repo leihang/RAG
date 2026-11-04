@@ -118,7 +118,39 @@ def _chunk_view(chunk: Any) -> dict[str, Any]:
         "rerank_score": chunk.rerank_score,
         "figure_id": getattr(chunk, "figure_id", None),
         "image_path": getattr(chunk, "image_path", None),
+        # 父块/整表扩展来的上下文块：记录它由哪个精排候选扩展而来（None = 自己就是候选）
+        "expanded_from": getattr(chunk, "expanded_from", None),
     }
+
+
+def _rerank_rank_map(result: Any) -> dict[int, int]:
+    """``chunk_id → 1-based 精排名次``。
+
+    ``stage_debug['rerank']['scores']`` 已按 rerank 降序，序号即名次；精排被关闭/
+    降级时该字段为空，此时名次一律 ``None``（不伪造）。
+    """
+    scores = ((getattr(result, "stage_debug", None) or {}).get("rerank") or {}).get("scores") or []
+    ranks: dict[int, int] = {}
+    for index, item in enumerate(scores, start=1):
+        chunk_id = item.get("chunk_id") if isinstance(item, dict) else None
+        if chunk_id is not None:
+            ranks[int(chunk_id)] = index
+    return ranks
+
+
+def _chunk_views_with_source_rank(result: Any) -> list[dict[str, Any]]:
+    """最终上下文块视图 + ``source_rerank_rank``（扩展块看来源块的名次）。"""
+    ranks = _rerank_rank_map(result)
+    views: list[dict[str, Any]] = []
+    for chunk in result.chunks:
+        view = _chunk_view(chunk)
+        source_id = (
+            chunk.expanded_from if getattr(chunk, "expanded_from", None) is not None
+            else chunk.chunk_id
+        )
+        view["source_rerank_rank"] = ranks.get(int(source_id))
+        views.append(view)
+    return views
 
 
 def _citation_views(runtime: Any, citations: list[Any]) -> list[dict[str, Any]]:
@@ -152,6 +184,8 @@ def _citation_views(runtime: Any, citations: list[Any]) -> list[dict[str, Any]]:
                 "figure_id": c.figure_id,
                 "image_path": c.image_path,
                 "figure_mm_indexed": (int(c.chunk_id) in indexed) if is_figure else False,
+                # chunk_id = 上下文块；source_chunk_id = 精排来源块（扩展过才有值）
+                "source_chunk_id": getattr(c, "source_chunk_id", None),
             }
         )
     return views
@@ -226,7 +260,32 @@ async def debug_retrieve(
         "degraded": result.degraded,
         "timings_ms": result.timings_ms,
         "stages": result.stage_debug,
-        "chunks": [_chunk_view(chunk) for chunk in result.chunks],
+        "chunks": _chunk_views_with_source_rank(result),
+    }
+    # 上下文扩展（父块/整表）**在精排之后**发生：精排只给检索单元打分，父块/表容器
+    # 本来就不在候选里。把「上下文块 ← 精排来源 + 精排名次」显式暴露，调试台/审计
+    # 才不会把从没参与 rerank 的父块 id 误当成召回来源（doc 205 的 35274 ← 35277）。
+    ranks = _rerank_rank_map(result)
+    params = (result.stage_debug.get("params") or {}) if result.stage_debug else {}
+    expanded_entries: list[dict[str, Any]] = []
+    for chunk in result.chunks:
+        source_id = getattr(chunk, "expanded_from", None)
+        if source_id is None:
+            continue
+        expanded_entries.append(
+            {
+                "context_chunk_id": chunk.chunk_id,
+                "source_chunk_id": source_id,
+                "chunk_type": chunk.chunk_type,
+                "heading_path": chunk.heading_path,
+                "rerank_score": chunk.rerank_score,
+                "rerank_rank": ranks.get(int(source_id)),
+            }
+        )
+    result.stage_debug["expand"] = {
+        "enabled": bool(params.get("parent_expand")),
+        "deduped": result.deduped_chunks,
+        "expanded": expanded_entries,
     }
     await _record_history(
         runtime,
