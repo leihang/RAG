@@ -48,7 +48,7 @@ from ekbs.retrieval.faithfulness import (
     mostly_unsupported,
     supporting_chunk_indices,
 )
-from ekbs.retrieval.period_math import compute_period_aggregate
+from ekbs.retrieval.table_query import compute_table_comparison
 from ekbs.retrieval.numeric import (
     MODE_AUTO,
     MODE_NUMERIC,
@@ -2863,20 +2863,20 @@ class RetrievalPipeline:
             overrides=overrides,
             collect_debug=collect_debug,
         )
-        period_answer = (
-            compute_period_aggregate(question, retrieval.chunks)
+        table_answer = (
+            compute_table_comparison(question, retrieval.chunks)
             if allow_generation and mode_used == MODE_PROSE and not multi_intent
             else None
         )
-        if period_answer is not None:
-            # 部分期间（1-9月）对比：直接按表内月份列求和，禁止模型拿年度合计做算术。
-            period_text = period_answer.render()
+        if table_answer is not None:
+            # 部分期间对比：直接按表内月份列求和，禁止模型拿年度合计做算术。
+            table_text = table_answer.render()
             result = AnswerResult(
-                answer=period_text,
-                citations=self._post_check_citations(period_text, retrieval.chunks, perm),
+                answer=table_text,
+                citations=self._post_check_citations(table_text, retrieval.chunks, perm),
                 retrieval=retrieval,
-                model="period_math",
-                degraded=["deterministic_period_math"],
+                model="table_query",
+                degraded=["deterministic_table_query"],
             )
         elif allow_generation and mode_used == MODE_NUMERIC:
             result = await self._answer_numeric(question, retrieval, perm)
