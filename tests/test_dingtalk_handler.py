@@ -315,28 +315,30 @@ async def test_card_failure_falls_back_to_plain_message(handler) -> None:
 
 
 @respx.mock
-async def test_group_message_replies_via_group_endpoint(handler) -> None:
+async def test_group_message_is_ignored_without_reply(handler) -> None:
+    """群聊一律不回复：不调 QA、不写卡片、不发单聊/群消息。"""
     routes = mock_dingtalk()
-    respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
     code, _ = await handler.process(
         {"data": payload(conversation_type="2", conversation="cid-group")}
     )
     assert code == ACK_OK
-    # 群聊：卡片投放用 IM_GROUP，且没有走单聊接口
-    deliver = json.loads(routes["deliver"].calls[0].request.content)
-    assert deliver["openSpaceId"] == "dtv1.card//IM_GROUP.cid-group"
+    assert qa.call_count == 0
     assert routes["oto"].call_count == 0
+    assert routes["group"].call_count == 0
+    assert routes["deliver"].call_count == 0
 
 
 @respx.mock
-async def test_group_without_card_uses_group_message(handler, cards) -> None:
+async def test_group_message_ignored_even_without_card(handler, cards) -> None:
     routes = mock_dingtalk()
-    handler.cards.card_template_id = ""  # 未配模板 → 走普通消息
-    respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
-    await handler.process({"data": payload(conversation_type="2", conversation="cid-g2")})
-    body = json.loads(routes["group"].calls[0].request.content)
-    assert body["openConversationId"] == "cid-g2"
-    assert body["msgKey"] == "sampleMarkdown"
+    handler.cards.card_template_id = ""
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    code, _ = await handler.process({"data": payload(conversation_type="2", conversation="cid-g2")})
+    assert code == ACK_OK
+    assert qa.call_count == 0
+    assert routes["oto"].call_count == 0
+    assert routes["group"].call_count == 0
 
 
 @respx.mock
@@ -551,7 +553,7 @@ async def test_single_chat_file_over_configured_limit(handler, seeded) -> None:
 
 
 @respx.mock
-async def test_group_file_is_refused(handler) -> None:
+async def test_group_file_is_ignored(handler) -> None:
     routes = mock_dingtalk()
     download = respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(
         return_value=httpx.Response(200, json={"downloadUrl": "https://files.example/note.txt"})
@@ -561,8 +563,8 @@ async def test_group_file_is_refused(handler) -> None:
     code, _ = await handler.process({"data": body})
     assert code == ACK_OK
     assert download.call_count == 0
-    sent = json.loads(json.loads(routes["group"].calls[0].request.content)["msgParam"])
-    assert "单聊" in sent["text"]
+    assert routes["group"].call_count == 0
+    assert routes["oto"].call_count == 0
 
 
 @respx.mock
@@ -683,8 +685,8 @@ def test_answer_appends_recommended_questions_on_success() -> None:
 
 
 @respx.mock
-async def test_group_personal_list_is_refused_locally(handler) -> None:
-    """群聊里「我的文件」不能调私有库 API，也不能把私有列表发群。"""
+async def test_group_personal_list_never_calls_personal_api(handler) -> None:
+    """群聊「我的文件」不回复、也不调私有库 API。"""
     routes = mock_dingtalk()
     personal = respx.get(f"{API_BASE}/api/v1/personal/files").mock(
         return_value=httpx.Response(200, json={"message": "不应调用"})
@@ -694,38 +696,32 @@ async def test_group_personal_list_is_refused_locally(handler) -> None:
     )
     assert code == ACK_OK
     assert personal.call_count == 0
-    sent = json.loads(json.loads(routes["group"].calls[0].request.content)["msgParam"])
-    assert "单聊" in sent["text"]
+    assert routes["group"].call_count == 0
 
 
 @respx.mock
-async def test_group_help_requests_public_only_catalog(handler) -> None:
-    """群聊帮助必须带 conversation_type=2，让 API 剪掉个人库文档。"""
+async def test_group_help_never_calls_catalog(handler) -> None:
+    """群聊「帮助」不回复、也不调 catalog。"""
     routes = mock_dingtalk()
-    catalog = respx.get(f"{API_BASE}/api/v1/discovery/catalog?conversation_type=2").mock(
-        return_value=httpx.Response(
-            200,
-            json={"help_text": "当前群聊可查询的公开文档：\n1. 年假管理制度", "documents": [], "suggestions": []},
-        )
+    catalog = respx.get(f"{API_BASE}/api/v1/discovery/catalog").mock(
+        return_value=httpx.Response(200, json={"help_text": "不应调用", "documents": [], "suggestions": []})
     )
     code, _ = await handler.process(
         {"data": payload(msg_id="help-group", text="帮助", conversation_type="2", conversation="cid-hg")}
     )
     assert code == ACK_OK
-    assert catalog.call_count == 1
-    sent = json.loads(json.loads(routes["group"].calls[0].request.content)["msgParam"])
-    assert "公开文档" in sent["text"]
+    assert catalog.call_count == 0
+    assert routes["group"].call_count == 0
 
 
 @respx.mock
-async def test_group_qa_sends_conversation_type(handler) -> None:
-    """群聊问答要把 conversation_type=2 传给 API，API 才能按公开范围检索。"""
+async def test_group_qa_never_calls_qa_api(handler) -> None:
+    """群聊问答不回复、也不调 /qa/chat。"""
     routes = mock_dingtalk()
     qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
     code, _ = await handler.process(
         {"data": payload(msg_id="qa-group", text="年假有多少天", conversation_type="2", conversation="cid-qg")}
     )
     assert code == ACK_OK
-    body = json.loads(qa.calls[0].request.content)
-    assert body["conversation_type"] == "2"
-    assert routes["oto"].call_count == 0
+    assert qa.call_count == 0
+    assert routes["group"].call_count == 0

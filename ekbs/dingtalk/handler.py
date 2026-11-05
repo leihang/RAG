@@ -247,6 +247,18 @@ class StreamMessageHandler:
             log.info("dingtalk_duplicate_message", msg_id=message.msg_id)
             return ReplyResult(True, reason="duplicate")
 
+        if message.is_group:
+            # 群聊一律不回复（含问答/帮助/目录/文件/个人库命令）。
+            # 仍 ACK 并标记 inbox 完成，避免钉钉重投；不调用任何下游 API、不发消息。
+            if message.msg_id:
+                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+            log.info(
+                "dingtalk_group_message_ignored",
+                conversation=message.conversation_id,
+                msg_id=message.msg_id,
+            )
+            return ReplyResult(True, reason="group_chat_disabled")
+
         # ②~⑤ 在同会话串行锁内完成（08 §3.2 per-user FIFO：多轮上下文顺序的前提）
         async with self._conv_lock(message.conversation_id or message.sender_staff_id):
             await asyncio.to_thread(self.inbox.mark_processing, message.msg_id)
