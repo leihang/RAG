@@ -1151,11 +1151,43 @@ def _convert_date_serials_in_header(values: list[str]) -> list[str]:
     return out
 
 
+#: 百分比格式（``0.00%`` / ``0.0%`` / ``0%``）：Excel 的 0.0513 显示成 5.13%。
+_PERCENT_NUMBER_FORMAT = re.compile(r"(?<!\\)0(?:\.(0+))?\s*%")
+
+
+def _xlsx_percent_text(value: Any, number_format: str) -> str | None:
+    """按 Excel 显示格式把小数还原成百分比文本；不是百分比格式返回 None。
+
+    用户实测：表格里显示 ``-5.14%``，入库后序列化却输出 ``-0.051353...``。
+    Excel 的 ``number_format='0.00%'`` 是**显示格式**，``cell.value`` 仍是小数；
+    不还原格式，LLM 会把百分比当小数回答。
+    """
+    fmt = str(number_format or "")
+    if "%" not in fmt or isinstance(value, bool):
+        return None
+    match = _PERCENT_NUMBER_FORMAT.search(fmt)
+    if not match:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    decimals = min(6, len(match.group(1) or ""))
+    # 格式里带千分位（如 #,##0.00%）才加逗号；否则保持 Excel 默认
+    if "," in fmt:
+        return f"{number * 100:,.{decimals}f}%"
+    return f"{number * 100:.{decimals}f}%"
+
+
 def _xlsx_cell_text(cell: Any) -> str:
-    """Excel 单元格 → 文本；日期序列号转成可读日期，避免表头出现 46295。"""
+    """Excel 单元格 → 文本；日期序列号转成可读日期，百分比按 Excel 显示格式还原。"""
     value = getattr(cell, "value", None)
     if value is None:
         return ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        percent = _xlsx_percent_text(value, str(getattr(cell, "number_format", "") or ""))
+        if percent is not None:
+            return percent
     if hasattr(value, "strftime"):
         try:
             return value.strftime("%Y-%m-%d")

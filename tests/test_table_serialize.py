@@ -459,3 +459,24 @@ def test_empty_placeholder_columns_are_dropped() -> None:
     kept_headers, kept_rows = _drop_empty_columns(headers, rows)
     assert kept_headers == ["用量日期", "2026-09-30", "无数据标签"]
     assert kept_rows == [["总电量", "4379405", ""], ["经营用电", "186726", ""]]
+
+
+def test_xlsx_percent_cell_preserves_excel_display(tmp_path) -> None:
+    """Excel 百分比格式 ``0.00%`` 必须还原成 -5.14%，不能把 0.0513 原样入库。"""
+    from openpyxl import Workbook
+    from ekbs.ingest.parser import parse_file
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "用电分析"
+    ws.append(["项目", "同比", "环比"])
+    ws.append(["总电量", -0.0513530345122631, -0.17188876236521])
+    ws["B2"].number_format = "0.00%"
+    ws["C2"].number_format = "0.00%"
+    path = tmp_path / "percent.xlsx"
+    wb.save(path)
+    doc = parse_file(path)
+    body = doc.tables[0].body
+    assert "-5.14%" in body
+    assert "-17.19%" in body
+    assert "0.0513530345122631" not in body
