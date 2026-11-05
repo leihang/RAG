@@ -341,3 +341,11 @@ async def test_metadata_scan_answers_unnamed_year_query(seeded) -> None:
         chunk.content for chunk in result.chunks if chunk.chunk_id in (scan.get("chunk_ids") or [])
     ]
     assert matched_contents and "2025-01-01" in matched_contents[0]
+
+
+def test_period_limited_question_must_not_use_annual_total() -> None:
+    from ekbs.retrieval.pipeline import SYSTEM_PROMPT
+
+    assert "1-9月" in SYSTEM_PROMPT
+    assert "年度合计" in SYSTEM_PROMPT
+    assert "禁止用年度合计代替" in SYSTEM_PROMPT

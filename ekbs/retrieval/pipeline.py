@@ -48,6 +48,7 @@ from ekbs.retrieval.faithfulness import (
     mostly_unsupported,
     supporting_chunk_indices,
 )
+from ekbs.retrieval.period_math import compute_period_aggregate
 from ekbs.retrieval.numeric import (
     MODE_AUTO,
     MODE_NUMERIC,
@@ -613,6 +614,12 @@ SYSTEM_PROMPT = (
     # 8.1.4–8.4 全丢）。这里只对操作性问法要求覆盖全部步骤，其他问题仍保持简洁。
     "如果用户问的是「流程/步骤/怎么办/如何处理」这类操作性问题，资料里列出的相关步骤"
     "要尽量全部覆盖（可按部门/阶段分组列出），不要只给摘要或省略中间步骤。\n"
+    # 实测 DingTalk「公司承担水费 2026年1-9月 vs 2025年1-9月」：模型把 2025 全年
+    # 「年度合计」当成 1-9 月合计，结论从“减少 66,271.62”变成“减少 52,837.60”。
+    # 表格同时有分月列和年度合计，必须明确禁止用全年数代替部分期间。
+    "如果问题限定月份区间（如「1-9月」「1—9月」「前9个月」），只能累加/使用对应"
+    "月份列的数据；表格里同时出现「年度合计/全年」时，禁止用年度合计代替不足一年"
+    "的区间合计，并要说明你累加的是哪几个月。\n"
     "若资料完全不足以回答，才直接回复「未找到可靠依据」。\n\n"
     "资料：\n{context}"
 )
@@ -622,7 +629,7 @@ TRUNCATION_NOTICE = "（提示：回答已达长度上限被截断，未显示�
 
 #: 提示词版本（进答案缓存键）：**改动 SYSTEM_PROMPT 必须同步 +1**，
 #: 否则旧提示词生成的答案会继续从缓存里被服务。
-PROMPT_REVISION = "v8"
+PROMPT_REVISION = "v9"
 
 
 class RetrievalPipeline:
@@ -2856,7 +2863,22 @@ class RetrievalPipeline:
             overrides=overrides,
             collect_debug=collect_debug,
         )
-        if allow_generation and mode_used == MODE_NUMERIC:
+        period_answer = (
+            compute_period_aggregate(question, retrieval.chunks)
+            if allow_generation and mode_used == MODE_PROSE and not multi_intent
+            else None
+        )
+        if period_answer is not None:
+            # 部分期间（1-9月）对比：直接按表内月份列求和，禁止模型拿年度合计做算术。
+            period_text = period_answer.render()
+            result = AnswerResult(
+                answer=period_text,
+                citations=self._post_check_citations(period_text, retrieval.chunks, perm),
+                retrieval=retrieval,
+                model="period_math",
+                degraded=["deterministic_period_math"],
+            )
+        elif allow_generation and mode_used == MODE_NUMERIC:
             result = await self._answer_numeric(question, retrieval, perm)
         elif allow_generation and multi_intent and per_sub:
             # 多问题：逐子问生成再拼接（共享 2048 输出上限会让后面的问题被略过）
