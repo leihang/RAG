@@ -512,6 +512,8 @@ class AnswerResult:
     #: **取数模式**的结构化结果（值/单位/页码/原文片段/是否通过抄写校验）。
     #: 业务问答（prose）下为 None —— 两种模式的答案形态不同，前端据此分别渲染。
     numeric: dict[str, Any] | None = None
+    #: 数值答案的计算溯源；没有 provenance 的数值答案不得作为最终答案。
+    provenance: dict[str, Any] | None = None
     #: 解析后的实际作答模式（``prose`` | ``numeric``）；请求可为 ``auto``
     mode_used: str = MODE_PROSE
     #: 查询改写侧意图标签（factual / numeric / figure / procedure）
@@ -638,6 +640,24 @@ PROMPT_REVISION = "v9"
 
 
 
+
+
+
+def _numbers_are_copied(answer: str, chunks: Any) -> bool:
+    """答案中的数字是否全部能在表格原文中逐字找到（只允许抄写，不允许模型计算）。"""
+    import re
+
+    tokens = re.findall(r"\d[\d,]*(?:\.\d+)?%?", str(answer or ""))
+    if not tokens:
+        return True
+    source = " ".join(str(getattr(chunk, "content", "") or "") for chunk in chunks)
+    source = source.replace(",", "")
+    for token in tokens:
+        raw = token.rstrip("%").replace(",", "")
+        variants = {raw, raw.rstrip("0").rstrip(".") if "." in raw else raw}
+        if not any(variant and variant in source for variant in variants):
+            return False
+    return True
 
 class RetrievalPipeline:
     def __init__(
@@ -2906,6 +2926,12 @@ class RetrievalPipeline:
                 citations=self._post_check_citations(lookup_text, retrieval.chunks, perm),
                 retrieval=retrieval,
                 model="table_lookup",
+                provenance={
+                    "op": "table_lookup",
+                    "subject": table_lookup.subject,
+                    "field": table_lookup.field,
+                    "value": table_lookup.value,
+                },
                 degraded=["deterministic_table_lookup"],
             )
         elif table_answer is not None:
@@ -2916,6 +2942,12 @@ class RetrievalPipeline:
                 citations=self._post_check_citations(table_text, retrieval.chunks, perm),
                 retrieval=retrieval,
                 model="table_query",
+                provenance={
+                    "op": "table_compare",
+                    "subject": table_answer.subject,
+                    "years": list(table_answer.years),
+                    "totals": dict(table_answer.totals),
+                },
                 degraded=["deterministic_table_query"],
             )
         elif table_value is not None:
@@ -2925,6 +2957,12 @@ class RetrievalPipeline:
                 citations=self._post_check_citations(value_text, retrieval.chunks, perm),
                 retrieval=retrieval,
                 model="table_value",
+                provenance={
+                    "op": "table_value",
+                    "subject": table_value.subject,
+                    "year": table_value.year,
+                    "value": table_value.value,
+                },
                 degraded=["deterministic_table_value"],
             )
         elif numeric_unplanned:
@@ -2949,6 +2987,7 @@ class RetrievalPipeline:
             result = await self.generate(question, retrieval, perm, token_callback=token_callback)
         else:
             result = self._retrieval_only_answer(question, retrieval, perm)
+        result = self._enforce_numeric_provenance(result, calc_plan, mode_used, retrieval)
         self._annotate_result(
             result,
             rewrite,
@@ -2977,6 +3016,41 @@ class RetrievalPipeline:
     # answer() 的后处理（缓存命中 / 结果标注 / 找图修正 / 缓存写回）
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _enforce_numeric_provenance(
+        result: AnswerResult,
+        calc_plan: Any,
+        mode_used: str,
+        retrieval: Any,
+    ) -> AnswerResult:
+        """数值计划存在但答案无计算溯源时拦截；数字全部来自表格原文可放行。"""
+        if (
+            result.provenance is not None
+            or calc_plan is None
+            or mode_used != MODE_PROSE
+            or result.refused
+            or not any(
+                str(getattr(chunk, "chunk_type", "")) == "table"
+                for chunk in retrieval.chunks
+            )
+        ):
+            return result
+        if _numbers_are_copied(result.answer, retrieval.chunks):
+            result.provenance = {"op": "copy", "source": "table_chunks"}
+            return result
+        return AnswerResult(
+            answer=(
+                "资料里有表格，但这个问题需要计算，当前未能从表内确定性解析。"
+                "请明确指标、年份和期间（如“2026年1-9月”），我再按表计算。"
+            ),
+            citations=[],
+            retrieval=retrieval,
+            model="table_numeric_gate",
+            refused=True,
+            refusal_reason="table_numeric_unproven",
+            degraded=["table_numeric_unproven"],
+        )
+
     def _answer_from_cache(
         self, cached: dict[str, Any], rewrite: Any, mode_used: str, intent: str
     ) -> AnswerResult:
@@ -2996,6 +3070,7 @@ class RetrievalPipeline:
             refused=bool(cached.get("refused", False)),
             refusal_reason=str(cached.get("refusal_reason", "")),
             numeric=cached.get("numeric"),
+            provenance=cached.get("provenance"),
             mode_used=str(cached.get("mode_used") or mode_used),
             intent=str(cached.get("intent") or intent),
             figure_attachments=list(cached.get("figure_attachments") or []),
@@ -3121,6 +3196,7 @@ class RetrievalPipeline:
             "refusal_reason": result.refusal_reason,
             "citations": [c.__dict__ for c in result.citations],
             "numeric": result.numeric,
+            "provenance": result.provenance,
             "mode_used": mode_used,
             "intent": intent,
             "figure_attachments": result.figure_attachments,
