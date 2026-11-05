@@ -61,3 +61,29 @@ def test_duplicate_segments_do_not_double_count() -> None:
     two = compute_table_comparison(question, [_chunk(), _chunk()])
     assert one is not None and two is not None
     assert one.totals == two.totals
+
+
+def test_quarter_is_derived_from_month_columns() -> None:
+    result = compute_table_comparison(
+        "公司承担水费，2026年Q1较2025年Q1是增长还是减少", [_chunk()]
+    )
+    assert result is not None
+    assert abs(result.totals[2026] - 210499.60) < 0.01
+    assert result.years == (2026, 2025)
+    assert "Q1" in result.render()
+
+
+def test_three_years_are_not_fixed_to_two() -> None:
+    content = CONTENT.replace(
+        "日期=公司承担水费; 年       月份=2025;",
+        "日期=公司承担水费; 年       月份=2024; 1月=1.00; 2月=1.00; 3月=1.00; 4月=1.00; 5月=1.00; 6月=1.00; 7月=1.00; 8月=1.00; 9月=1.00; 10月=1.00; 11月=1.00; 12月=12.00; 年度合计=23.00\n"
+        "日期=公司承担水费; 年       月份=2025;",
+    )
+    result = compute_table_comparison(
+        "公司承担水费，2026年1-9月较2025年1-9月、2024年1-9月是增长还是减少",
+        [_chunk(content)],
+    )
+    assert result is not None
+    assert len(result.years) == 3
+    assert result.totals[2024] == 9.0
+    assert "对比：" in result.render()

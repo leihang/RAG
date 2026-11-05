@@ -1,12 +1,12 @@
-"""确定性表格问答：按“指标行 × 年份 × 月份区间”求和/比较。
+"""确定性表格问答：时间表达式 + 统一表事实 + 模板回答。
 
-与 :mod:`table_struct` 配套：不再写死“元/1-9月/前两年”的单点规则，而是：
-* 从问题里解析月份区间、年份、指标；
-* 从命中的结构化表行里按列求和；
-* 用表名里的单位（元/万元/度/m³…）回答；
-* 同表 1-12 月之和与「年度合计」可校验时先校验，避免拿脏表硬算。
+流程：
+1. ``table_time.parse_time_spec`` 解析月份区间/季度/半年/YTD；
+2. 读 ``table_row_index``（过渡期回退 chunk）→ ``CanonicalTable``；
+3. 按指标 + 年份 + 时间集合筛选 facts，代码求和/比较；
+4. 模板回填，不让 LLM 做算术。
 
-无法可靠解析时返回 None，继续走原 LLM 链路。
+覆盖不了时返回 None，继续原 prose 链路。
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ from typing import Any, Sequence
 
 from ekbs.retrieval.table_canonical import CanonicalTable, canonical_from_rows
 from ekbs.retrieval.table_struct import TableRow, load_table_rows
+from ekbs.retrieval.table_time import TimeSpec, parse_time_spec, time_label
 
-_PERIOD_RE = re.compile(r"(\d{1,2})\s*[-—–~～至到]\s*(\d{1,2})\s*月")
 _YEAR_RE = re.compile(r"(20\d{2})\s*年")
 _COMPARE_WORDS = ("增长", "减少", "对比", "较", "同比", "增加", "下降")
 
@@ -28,7 +28,7 @@ def _normalize(text: str) -> str:
 
 
 def _subject_from_question(question: str) -> str:
-    head = re.split(r"[，,。；;：:]", str(question or ""), maxsplit=1)[0]
+    head = re.split(r"[，,。；;：:。]", str(question or ""), maxsplit=1)[0]
     head = re.sub(r"20\d{2}\s*年.*$", "", head)
     return head.strip()
 
@@ -38,39 +38,44 @@ class TableComparison:
     subject: str
     start_month: int
     end_month: int
-    years: tuple[int, int]
+    years: tuple[int, ...]
     totals: dict[int, float]
     chunk_indices: dict[int, int]
     diff: float
     percent: float | None
     unit: str
+    label: str = ""
+
+    def _marks(self, year: int) -> str:
+        return f"[{self.chunk_indices[year]}]" if year in self.chunk_indices else ""
 
     def render(self) -> str:
-        year_a, year_b = self.years
-        a, b = self.totals[year_a], self.totals[year_b]
-        mark_a = f"[{self.chunk_indices[year_a]}]" if year_a in self.chunk_indices else ""
-        mark_b = f"[{self.chunk_indices[year_b]}]" if year_b in self.chunk_indices else ""
-        direction = "增长" if self.diff > 0 else ("减少" if self.diff < 0 else "持平")
-        pct = f"（约 {self.percent:+.2f}%）" if self.percent is not None else ""
-        return (
-            f"{year_a}年{self.start_month}—{self.end_month}月{self.subject}合计为 "
-            f"{a:,.2f} {self.unit}{mark_a}；{year_b}年同期"
-            f"（{self.start_month}—{self.end_month}月）合计为 {b:,.2f} {self.unit}{mark_b}；"
-            f"因此 {year_a}年{self.start_month}—{self.end_month}月较 {year_b}年同期"
-            f"**{direction}** {abs(self.diff):,.2f} {self.unit}{pct}。"
-        )
-
-
-def _best_row(rows: list[TableRow], start: int, end: int) -> TableRow | None:
-    complete = [row for row in rows if all(month in row.months for month in range(start, end + 1))]
-    if not complete:
-        return None
-    complete.sort(key=lambda row: (len(row.months), row.chunk_index), reverse=True)
-    return complete[0]
+        label = self.label or f"{self.start_month}—{self.end_month}月"
+        if len(self.years) == 2:
+            year_a, year_b = self.years
+            a, b = self.totals[year_a], self.totals[year_b]
+            direction = "增长" if self.diff > 0 else ("减少" if self.diff < 0 else "持平")
+            pct = f"（约 {self.percent:+.2f}%）" if self.percent is not None else ""
+            return (
+                f"{year_a}年{label}{self.subject}合计为 {a:,.2f} {self.unit}{self._marks(year_a)}；"
+                f"{year_b}年同期（{label}）合计为 {b:,.2f} {self.unit}{self._marks(year_b)}；"
+                f"因此 {year_a}年{label}较 {year_b}年同期**{direction}** "
+                f"{abs(self.diff):,.2f} {self.unit}{pct}。"
+            )
+        lines = [
+            f"{year}年{label}{self.subject}合计为 {self.totals[year]:,.2f} {self.unit}{self._marks(year)}"
+            for year in self.years
+        ]
+        changes: list[str] = []
+        for previous, current in zip(self.years, self.years[1:]):
+            before, after = self.totals[current], self.totals[previous]
+            delta = after - before
+            direction = "增长" if delta > 0 else ("减少" if delta < 0 else "持平")
+            changes.append(f"{current}年较{previous}年{direction} {abs(delta):,.2f} {self.unit}")
+        return "；".join(lines) + "。对比：" + "；".join(changes) + "。"
 
 
 def _valid_annual(row: TableRow) -> bool:
-    """若行含全年 1-12 月与年度合计，先校验；不一致的表不接管。"""
     if row.annual_total is None or not all(month in row.months for month in range(1, 13)):
         return True
     total = sum(row.months.values())
@@ -83,7 +88,6 @@ def _rows_for_question(db: Any | None, chunks: Sequence[Any]) -> list[TableRow]:
         rows = load_table_rows(db, doc_ids)
         if rows:
             return [row for row in rows if _valid_annual(row)]
-    # 过渡兜底：尚未回填索引/旧测试直接传 chunk 时，仍从文本解析。
     from ekbs.retrieval.table_struct import TableIndex
 
     return [row for row in TableIndex.from_chunks(chunks).rows if _valid_annual(row)]
@@ -103,16 +107,101 @@ def _candidate_tables(rows: Sequence[TableRow], subject: str) -> list[CanonicalT
     return out
 
 
+def _year_months(
+    table: CanonicalTable, subject: str, year: int
+) -> dict[int, tuple[float, int | None]]:
+    out: dict[int, tuple[float, int | None]] = {}
+    for fact in table.facts_for(subject):
+        if fact.dimensions.get("year") != year:
+            continue
+        month = fact.dimensions.get("month")
+        if month is None:
+            continue
+        out[month] = (fact.value, fact.chunk_id)
+    return out
+
+
+def _sum_for_spec(
+    table: CanonicalTable,
+    subject: str,
+    year: int,
+    spec: TimeSpec,
+    *,
+    ytd_end: int | None = None,
+) -> tuple[float, int | None] | None:
+    months = _year_months(table, subject, year)
+    if not months:
+        return None
+    if spec.kind == "ytd":
+        selected = spec.month_set(max_month=ytd_end or max(months))
+    else:
+        selected = spec.month_set()
+    if spec.require_complete and not selected.issubset(months):
+        return None
+    present = [month for month in selected if month in months]
+    if not present:
+        return None
+    total = sum(months[month][0] for month in present)
+    chunk_id = next((months[month][1] for month in present if months[month][1] is not None), None)
+    return total, chunk_id
+
+
+def _pick_candidate(
+    rows: Sequence[TableRow],
+    subject: str,
+    years: Sequence[int],
+    spec: TimeSpec,
+    chunk_pos: dict[int, int],
+    table_pos: dict[int, int],
+) -> tuple[CanonicalTable, tuple[int, ...], dict[int, float], dict[int, int]] | None:
+    candidates: list[tuple[CanonicalTable, dict[int, tuple[float, int | None]]]] = []
+    for table in _candidate_tables(rows, subject):
+        ytd_end: int | None = None
+        if spec.kind == "ytd":
+            # 同期口径：用**最新年份**在表里的最大月份做截止，所有年份用同一个月，
+            # 否则 2026 YTD 会对 2025 全年（12 月）算，口径不一致。
+            ytd_end = max(
+                (
+                    month
+                    for fact in table.facts_for(subject)
+                    if fact.dimensions.get("year") in years
+                    for month in [fact.dimensions.get("month")]
+                    if month is not None
+                ),
+                default=None,
+            )
+        sums: dict[int, tuple[float, int | None]] = {}
+        for year in years:
+            value = _sum_for_spec(table, subject, year, spec, ytd_end=ytd_end)
+            if value is not None:
+                sums[year] = value
+        if len(sums) >= 2:
+            candidates.append((table, sums))
+    if not candidates:
+        return None
+    if len({table.unit for table, _ in candidates}) > 1:
+        return None
+    table, sums = candidates[0]
+    common_years = tuple(year for year in years if year in sums)
+    if len(common_years) < 2:
+        return None
+    totals = {year: sums[year][0] for year in common_years}
+    indices: dict[int, int] = {}
+    for year in common_years:
+        chunk_id = sums[year][1]
+        index = chunk_pos.get(chunk_id or 0) or table_pos.get(table.doc_id) or 0
+        if index:
+            indices[year] = index
+    return table, common_years, totals, indices
+
+
 def compute_table_comparison(
     question: str, chunks: Sequence[Any], *, db: Any | None = None
 ) -> TableComparison | None:
     """能确定性比较则返回结果；否则 None。"""
-    period = _PERIOD_RE.search(str(question or ""))
+    spec = parse_time_spec(question)
     years = tuple(dict.fromkeys(int(y) for y in _YEAR_RE.findall(str(question or ""))))
-    if not period or len(years) < 2:
-        return None
-    start, end = int(period.group(1)), int(period.group(2))
-    if not (1 <= start <= end <= 12):
+    if spec is None or len(years) < 2:
         return None
     if not any(word in str(question or "") for word in _COMPARE_WORDS):
         return None
@@ -133,44 +222,22 @@ def compute_table_comparison(
         if str(getattr(chunk, "chunk_type", "")) == "table":
             table_pos.setdefault(int(getattr(chunk, "doc_id", 0) or 0), index)
 
-    for table in _candidate_tables(rows, subject):
-        totals: dict[int, tuple[float, int | None]] = {}
-        valid = True
-        for year in years:
-            year_facts = [
-                fact
-                for fact in table.facts_for(subject)
-                if fact.dimensions.get("year") == year
-                and fact.dimensions.get("month") is not None
-            ]
-            present = {fact.dimensions["month"] for fact in year_facts}
-            if not all(month in present for month in range(start, end + 1)):
-                valid = False
-                break
-            total = sum(fact.value for fact in year_facts if start <= fact.dimensions["month"] <= end)
-            chunk_id = next((fact.chunk_id for fact in year_facts), None)
-            totals[year] = (total, chunk_id)
-        if not valid or len(totals) < 2:
-            continue
-        year_a, year_b = years[0], years[1]
-        a, b = totals[year_a][0], totals[year_b][0]
-        diff = a - b
-        percent = diff / b * 100.0 if b else None
-        indices: dict[int, int] = {}
-        for year in (year_a, year_b):
-            chunk_id = totals[year][1]
-            index = chunk_pos.get(chunk_id or 0) or table_pos.get(table.doc_id) or 0
-            if index:
-                indices[year] = index
-        return TableComparison(
-            subject=subject,
-            start_month=start,
-            end_month=end,
-            years=(year_a, year_b),
-            totals={year_a: a, year_b: b},
-            chunk_indices=indices,
-            diff=diff,
-            percent=percent,
-            unit=table.unit,
-        )
-    return None
+    picked = _pick_candidate(rows, subject, years, spec, chunk_pos, table_pos)
+    if picked is None:
+        return None
+    table, common_years, totals, indices = picked
+    diff = totals[common_years[0]] - totals[common_years[1]]
+    percent = diff / totals[common_years[1]] * 100.0 if totals[common_years[1]] else None
+    label = time_label(spec)
+    return TableComparison(
+        subject=subject,
+        start_month=int(spec.start_month or 1),
+        end_month=int(spec.end_month or 12),
+        years=common_years,
+        totals=totals,
+        chunk_indices=indices,
+        diff=diff,
+        percent=percent,
+        unit=table.unit,
+        label=label,
+    )
