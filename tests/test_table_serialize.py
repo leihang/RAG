@@ -480,3 +480,33 @@ def test_xlsx_percent_cell_preserves_excel_display(tmp_path) -> None:
     assert "-5.14%" in body
     assert "-17.19%" in body
     assert "0.0513530345122631" not in body
+
+
+def test_xlsx_table_body_is_html_for_document_compare(tmp_path) -> None:
+    """复核页「文档对比」直接渲染 body_html；xlsx 表体必须是带合并的 HTML 表格。
+
+    旧实现存 Markdown 管道表，复核页 iframe 里就是 `| a | b |` 文本，和原件对不上。
+    """
+    from openpyxl import Workbook
+    from ekbs.ingest.parser import parse_file
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "用电分析"
+    ws.merge_cells("A1:D1")
+    ws["A1"] = "熙街2026年9月用电分析表"
+    ws.append(["项目", "2026-09-30", "同比", "环比"])
+    ws.append(["总电量", 4379405, -0.0513530345122631, -0.17188876236521])
+    ws["B3"].number_format = "0.00"
+    ws["C3"].number_format = "0.00%"
+    ws["D3"].number_format = "0.00%"
+    path = tmp_path / "compare.xlsx"
+    wb.save(path)
+    doc = parse_file(path)
+    body = doc.tables[0].body
+    assert body.startswith("<table>")
+    assert 'colspan="4"' in body
+    assert "-5.14%" in body
+    assert "-17.19%" in body
+    assert "4379405.00" in body
+    assert not body.lstrip().startswith("|")

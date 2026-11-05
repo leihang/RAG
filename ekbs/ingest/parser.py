@@ -1179,15 +1179,51 @@ def _xlsx_percent_text(value: Any, number_format: str) -> str | None:
     return f"{number * 100:.{decimals}f}%"
 
 
+#: 数字格式里取「正数段的小数位/千分位」；只覆盖常用格式，复杂格式退回原值。
+_NUMBER_FORMAT_RE = re.compile(r"[#0?][#0?,]*(?:\.([0#?]+))?")
+
+
+def _xlsx_number_text(value: Any, number_format: str) -> str | None:
+    """按 Excel ``number_format`` 还原数字的显示文本（0.00 / #,##0.00 / 0%）。"""
+    fmt = str(number_format or "")
+    if not fmt or fmt.lower() in {"general", "@"}:
+        return None
+    if "%" in fmt:
+        return _xlsx_percent_text(value, fmt)
+    if re.search(r"[eE][+-]0", fmt):
+        return None
+    positive = fmt.split(";", 1)[0]
+    if "(" in fmt and ";" in fmt:  # (0.00) 负数段：括号表示负
+        negative = fmt.split(";", 1)[1]
+    else:
+        negative = ""
+    match = _NUMBER_FORMAT_RE.search(positive)
+    if not match:
+        return None
+    decimals = min(6, len(match.group(1) or ""))
+    use_comma = "," in match.group(0) or "," in positive
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0 and "(" in negative:
+        body = f"{abs(number):,.{decimals}f}" if use_comma else f"{abs(number):.{decimals}f}"
+        return f"({body})"
+    if use_comma:
+        return f"{number:,.{decimals}f}"
+    return f"{number:.{decimals}f}"
+
+
 def _xlsx_cell_text(cell: Any) -> str:
-    """Excel 单元格 → 文本；日期序列号转成可读日期，百分比按 Excel 显示格式还原。"""
+    """Excel 单元格 → 文本；日期/百分比/常用数字格式按 Excel 显示还原。"""
     value = getattr(cell, "value", None)
     if value is None:
         return ""
+    number_format = str(getattr(cell, "number_format", "") or "")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        percent = _xlsx_percent_text(value, str(getattr(cell, "number_format", "") or ""))
-        if percent is not None:
-            return percent
+        number_text = _xlsx_number_text(value, number_format)
+        if number_text is not None:
+            return number_text
     if hasattr(value, "strftime"):
         try:
             return value.strftime("%Y-%m-%d")
@@ -1321,6 +1357,104 @@ def _xlsx_image_anchor_rows(sheet: Any) -> list[int]:
     return rows
 
 
+def _xlsx_span_maps(
+    sheet: Any,
+    row_numbers: list[int],
+    width: int,
+) -> tuple[dict[tuple[int, int], tuple[int, int, int, int]], set[tuple[int, int]]]:
+    """返回块内合并单元格的 master→(min_row,min_col,max_row,max_col) 与覆盖格集合。"""
+    from openpyxl.utils import range_boundaries
+
+    first_row, last_row = row_numbers[0], row_numbers[-1]
+    masters: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+    covered: set[tuple[int, int]] = set()
+    try:
+        ranges = list(sheet.merged_cells.ranges)
+    except Exception:
+        ranges = []
+    for merged in ranges:
+        try:
+            min_col, min_row, max_col, max_row = range_boundaries(str(merged))
+        except Exception:
+            continue
+        if max_row < first_row or min_row > last_row or min_col > width:
+            continue
+        min_row_c = max(min_row, first_row)
+        max_row_c = min(max_row, last_row)
+        max_col_c = min(max_col, width)
+        if min_col > max_col_c or min_row_c > max_row_c:
+            continue
+        masters[(min_row_c, min_col)] = (min_row_c, min_col, max_row_c, max_col_c)
+        for r in range(min_row_c, max_row_c + 1):
+            for c in range(min_col, max_col_c + 1):
+                if (r, c) != (min_row_c, min_col):
+                    covered.add((r, c))
+    return masters, covered
+
+
+def _xlsx_rows_to_html(
+    sheet: Any,
+    rows_with_nums: list[tuple[int, list[str]]],
+    *,
+    header_row: int | None = None,
+) -> str:
+    """把 Excel 数据块还原成带 colspan/rowspan 的 HTML 表格（复核页对照用）。
+
+    xlsx 的语义不只在单元格文本里：合并标题、分组表头、百分比/金额显示格式都在
+    ``sheet`` 上。之前这里输出 Markdown 管道表，复核页 iframe 里显示的是 ``| a | b |``
+    文本，和原件表格对不上；改成 HTML 后复核页可逐格对照，检索侧仍由
+    ``parse_table_html`` 摊平单元格。
+    """
+    if not rows_with_nums:
+        return ""
+    row_numbers = [n for n, _values in rows_with_nums]
+    width = 0
+    for row_number, _values in rows_with_nums:
+        for col in range(1, max(len(_values), 1) + 1):
+            if sheet.cell(row_number, col).value is not None:
+                width = max(width, col)
+    if width <= 0:
+        return ""
+
+    masters, covered = _xlsx_span_maps(sheet, row_numbers, width)
+    # 表头里的 General 日期序列号（46295）也要转成可读日期；与行文本口径一致。
+    header_text: dict[int, str] = {}
+    if header_row is not None and header_row in row_numbers:
+        raw_header = [
+            _xlsx_cell_text(sheet.cell(header_row, col)) for col in range(1, width + 1)
+        ]
+        header_text = {
+            col: text for col, text in enumerate(_convert_date_serials_in_header(raw_header), 1)
+        }
+    rows_html: list[str] = []
+    for row_number in row_numbers:
+        cells: list[str] = []
+        for col in range(1, width + 1):
+            if (row_number, col) in covered:
+                continue
+            cell = sheet.cell(row_number, col)
+            text = (
+                header_text.get(col, "")
+                if row_number == header_row
+                else _xlsx_cell_text(cell)
+            ).replace("\n", "<br>")
+            tag = "th" if header_row is not None and row_number == header_row else "td"
+            attrs = ""
+            master = masters.get((row_number, col))
+            if master is not None:
+                _min_r, _min_c, max_r, max_c = master
+                rowspan = max_r - row_number + 1
+                colspan = max_c - col + 1
+                if rowspan > 1:
+                    attrs += f' rowspan="{rowspan}"'
+                if colspan > 1:
+                    attrs += f' colspan="{colspan}"'
+            cells.append(f"<{tag}{attrs}>{html.escape(text)}</{tag}>")
+        if cells:
+            rows_html.append("<tr>" + "".join(cells) + "</tr>")
+    return ("<table>" + "".join(rows_html) + "</table>") if rows_html else ""
+
+
 def _xlsx_serialize_blocks(
     sheet: Any,
     merged_blocks: list[list[tuple[int, list[str]]]],
@@ -1354,8 +1488,8 @@ def _xlsx_serialize_blocks(
         else:
             parts = [rows_with_nums]
         for part_index, part in enumerate(parts, start=1):
-            part_rows = [values for _n, values in part]
-            body = _rows_to_pipe_markdown(part_rows)
+            part_header = header_abs if any(n == header_abs for n, _v in part) else None
+            body = _xlsx_rows_to_html(sheet, part, header_row=part_header)
             if not body:
                 continue
             state.table_seq += 1
@@ -1370,6 +1504,7 @@ def _xlsx_serialize_blocks(
                     caption=caption,
                     page=sheet_index,
                     table_id=str(state.table_seq),
+                    preserve_layout=True,
                 )
             )
             state.lines.append(f"[表格 {state.table_seq}] {caption}".rstrip())
