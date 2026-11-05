@@ -136,3 +136,20 @@ def test_single_period_value_uses_total_or_months() -> None:
     assert annual is not None and annual.value == 240.0
     partial = compute_table_value("测试指标2026年1-9月总费用是多少", [chunk])
     assert partial is not None and partial.value == 180.0
+
+
+def test_wide_table_cell_value() -> None:
+    from ekbs.retrieval.table_query import compute_table_value
+
+    content = """表名: 用电分析（熙街2026年9月用电分析表 / 电量分析(KW/h））
+相关表头: 用量   日期 | 2026年9月 | 2025年9月 | 2026年8月 | 同比 | 环比
+用量   日期=总电量; 2026年9月=4379405.00; 2025年9月=4616475.00; 2026年8月=5288426.00; 同比=-5.14%; 环比=-17.19%
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    result = compute_table_value("2026年9月总电量是多少", [chunk])
+    assert result is not None
+    assert result.value == 4379405.00
+    assert result.unit == "KW/h" or result.unit

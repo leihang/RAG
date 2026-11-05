@@ -266,6 +266,25 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_table_record_chunk "
                 "ON table_record_index(chunk_id)"
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS table_cell_index ("
+                " row_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " doc_id INTEGER NOT NULL,"
+                " chunk_id INTEGER,"
+                " caption TEXT NOT NULL DEFAULT '',"
+                " unit TEXT NOT NULL DEFAULT '',"
+                " subject TEXT NOT NULL,"
+                " year INTEGER NOT NULL,"
+                " month INTEGER,"
+                " value_num REAL,"
+                " value_text TEXT NOT NULL DEFAULT '',"
+                " created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_table_cell_doc_subject "
+                "ON table_cell_index(doc_id, subject, year, month)"
+            )
             table_cols = {
                 str(row[1]) for row in conn.execute("PRAGMA table_info(table_row_index)").fetchall()
             }

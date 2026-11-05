@@ -21,6 +21,7 @@ from ekbs.retrieval.table_canonical import CanonicalTable, canonical_from_rows
 from ekbs.retrieval.table_plan import parse_table_plan
 from ekbs.retrieval.table_struct import (
     TableRow,
+    load_cell_facts,
     load_record_facts,
     load_table_rows,
 )
@@ -330,22 +331,7 @@ class TableValue:
         )
 
 
-def compute_table_value(
-    question: str, chunks: Sequence[Any], *, db: Any | None = None
-) -> TableValue | None:
-    """单期数值直查（含年度合计/单月/季度）。"""
-    years = tuple(dict.fromkeys(int(y) for y in re.findall(r"(20\d{2})\s*年", str(question or ""))))
-    if len(years) != 1:
-        return None
-    text = str(question or "")
-    from ekbs.retrieval.table_time import TimeSpec, parse_time_spec
-
-    time_spec = parse_time_spec(text)
-    if time_spec is None:
-        time_spec = TimeSpec("year", 1, 12, False)
-    rows = _rows_for_question(db, chunks)
-    if not rows:
-        return None
+def _citation_context(chunks: Sequence[Any]) -> tuple[dict[int, int], dict[int, int]]:
     chunk_pos = {
         int(getattr(chunk, "chunk_id", 0)): index
         for index, chunk in enumerate(chunks, start=1)
@@ -355,19 +341,28 @@ def compute_table_value(
     for index, chunk in enumerate(chunks, start=1):
         if str(getattr(chunk, "chunk_type", "")) == "table":
             table_pos.setdefault(int(getattr(chunk, "doc_id", 0) or 0), index)
+    return chunk_pos, table_pos
+
+
+def _value_from_tables(
+    rows: Sequence[TableRow],
+    text: str,
+    year: int,
+    time_spec: Any,
+    chunk_pos: dict[int, int],
+    table_pos: dict[int, int],
+) -> TableValue | None:
     matches: list[tuple[CanonicalTable, str]] = []
     for table in canonical_from_rows(rows):
         if not table.unit.strip():
             continue
         for subject in table.subjects():
-            if len(_normalize(subject)) < 2:
-                continue
-            if _normalize(subject) in _normalize(text):
+            if len(_normalize(subject)) >= 2 and _normalize(subject) in _normalize(text):
                 matches.append((table, subject))
     if len({(table.caption, subject, table.unit) for table, subject in matches}) != 1:
         return None
     table, subject = matches[0]
-    calc = evaluate(table, SumExpr(subject=subject, year=years[0], time=time_spec))
+    calc = evaluate(table, SumExpr(subject=subject, year=year, time=time_spec))
     if calc is None:
         return None
     chunk_id = next((cid for cid in calc.chunk_ids if cid is not None), None)
@@ -375,10 +370,65 @@ def compute_table_value(
     if not index:
         return None
     return TableValue(
-        subject=subject,
-        year=years[0],
-        value=calc.value,
-        unit=calc.unit,
-        chunk_index=index,
-        label=time_label(time_spec),
+        subject=subject, year=year, value=calc.value, unit=calc.unit,
+        chunk_index=index, label=time_label(time_spec),
     )
+
+
+def _value_from_cells(
+    chunks: Sequence[Any],
+    text: str,
+    year: int,
+    time_spec: Any,
+    db: Any | None,
+    chunk_pos: dict[int, int],
+    table_pos: dict[int, int],
+) -> TableValue | None:
+    # 宽表（用量日期 | 2026年9月 | ...）没有 TableRow，但可以直查单元格事实。
+    if time_spec.kind not in {"month_range", "quarter"}:
+        return None
+    cells = (
+        load_cell_facts(db, sorted({int(getattr(c, "doc_id", 0) or 0) for c in chunks}))
+        if db is not None
+        else []
+    )
+    if not cells:
+        from ekbs.retrieval.table_struct import parse_cell_facts
+
+        cells = parse_cell_facts(chunks)
+    target = [cell for cell in cells if _normalize(cell.subject) in _normalize(text)]
+    selected = time_spec.month_set()
+    selected_cells = [
+        cell for cell in target if cell.year == year and cell.month in selected
+    ]
+    values = {round(cell.value, 10) for cell in selected_cells}
+    if len(values) != 1:
+        return None
+    first = selected_cells[0]
+    index = chunk_pos.get(first.chunk_id or 0) or table_pos.get(first.doc_id) or 0
+    if not index:
+        return None
+    return TableValue(
+        subject=first.subject, year=first.year, value=first.value,
+        unit=first.unit, chunk_index=index, label=time_label(time_spec),
+    )
+
+
+def compute_table_value(
+    question: str, chunks: Sequence[Any], *, db: Any | None = None
+) -> TableValue | None:
+    """单期数值直查（年度合计/单月/季度；含宽表单元格事实）。"""
+    text = str(question or "")
+    years = tuple(dict.fromkeys(int(y) for y in re.findall(r"(20\d{2})\s*年", text)))
+    if len(years) != 1:
+        return None
+    from ekbs.retrieval.table_time import TimeSpec, parse_time_spec
+
+    time_spec = parse_time_spec(text) or TimeSpec("year", 1, 12, False)
+    chunk_pos, table_pos = _citation_context(chunks)
+    rows = _rows_for_question(db, chunks)
+    if rows:
+        value = _value_from_tables(rows, text, years[0], time_spec, chunk_pos, table_pos)
+        if value is not None:
+            return value
+    return _value_from_cells(chunks, text, years[0], time_spec, db, chunk_pos, table_pos)

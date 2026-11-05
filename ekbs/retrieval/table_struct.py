@@ -255,7 +255,11 @@ def _record_headers(content: str) -> list[str]:
     match = re.search(r"相关表头[:：]\s*(.+)", content or "")
     if not match:
         return []
-    return [part.strip() for part in match.group(1).split("|") if part.strip()]
+    return [
+        re.sub(r"\s+", "", part)
+        for part in match.group(1).split("|")
+        if part.strip()
+    ]
 
 
 def parse_record_facts(chunks: Sequence[Any]) -> list[RecordFact]:
@@ -415,3 +419,116 @@ def parse_nested_rows(chunks: Sequence[Any]) -> list[TableRow]:
                 )
             )
     return rows
+
+
+@dataclass(frozen=True)
+class CellFact:
+    chunk_id: int | None
+    doc_id: int
+    caption: str
+    unit: str
+    subject: str
+    year: int
+    month: int | None
+    value: float
+
+
+_PERIOD_HEADER_RE = re.compile(
+    r"(20\d{2})\s*(?:年|[-/])\s*(\d{1,2})?\s*(?:月|[-/])?\s*(\d{1,2})?"
+)
+
+
+def _header_period(header: str) -> tuple[int | None, int | None]:
+    if not re.search(r"20\d{2}", header or ""):
+        return None, None
+    match = _PERIOD_HEADER_RE.search(header)
+    if not match:
+        return None, None
+    year = int(match.group(1))
+    month = None
+    for raw in (match.group(2), match.group(3)):
+        if raw and 1 <= int(raw) <= 12:
+            month = int(raw)
+            break
+    return year, month
+
+
+def parse_cell_facts(chunks: Sequence[Any]) -> list[CellFact]:
+    """宽表（``用量日期 | 2026年9月 | ...``）→ 日期列单元格事实。"""
+    facts: list[CellFact] = []
+    seen: set[tuple[str, str, int, int | None, float]] = set()
+    for chunk in chunks:
+        content = str(getattr(chunk, "content", "") or "")
+        headers = _record_headers(content)
+        if not headers or any("年月份" in header for header in headers):
+            continue
+        period_headers = {
+            header: _header_period(header) for header in headers[1:]
+        }
+        period_headers = {h: period for h, period in period_headers.items() if period[0] is not None}
+        if not period_headers:
+            continue
+        caption_match = _CAPTION_RE.search(content)
+        caption = caption_match.group(1).strip() if caption_match else str(
+            getattr(chunk, "heading_path", "") or ""
+        )
+        unit = unit_from_text(caption)
+        chunk_id = int(getattr(chunk, "chunk_id", 0) or 0) or None
+        for line in content.splitlines():
+            row = _parse_row(line)
+            if not row:
+                continue
+            subject = str(row.get(headers[0]) or "").strip()
+            if not subject:
+                continue
+            for header, (year, month) in period_headers.items():
+                value = _number(row.get(header, ""))
+                if value is None or year is None:
+                    continue
+                signature = (caption, subject, year, month, value)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                facts.append(
+                    CellFact(
+                        chunk_id=chunk_id,
+                        doc_id=int(getattr(chunk, "doc_id", 0) or 0),
+                        caption=caption,
+                        unit=unit,
+                        subject=subject,
+                        year=year,
+                        month=month,
+                        value=value,
+                    )
+                )
+    return facts
+
+
+def load_cell_facts(db: Any, doc_ids: Sequence[int]) -> list[CellFact]:
+    ids = [int(doc_id) for doc_id in doc_ids if int(doc_id) > 0]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        with db.sync_connect() as conn:
+            records = conn.execute(
+                "SELECT doc_id, chunk_id, caption, unit, subject, year, month, value_num "
+                f"FROM table_cell_index WHERE doc_id IN ({placeholders}) ORDER BY row_id",
+                ids,
+            ).fetchall()
+    except Exception:  # noqa: BLE001
+        return []
+    return [
+        CellFact(
+            chunk_id=int(record["chunk_id"]) if record["chunk_id"] is not None else None,
+            doc_id=int(record["doc_id"]),
+            caption=str(record["caption"] or ""),
+            unit=str(record["unit"] or ""),
+            subject=str(record["subject"] or ""),
+            year=int(record["year"]),
+            month=int(record["month"]) if record["month"] is not None else None,
+            value=float(record["value_num"]),
+        )
+        for record in records
+        if record["value_num"] is not None
+    ]

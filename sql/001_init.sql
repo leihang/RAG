@@ -704,3 +704,20 @@ CREATE INDEX IF NOT EXISTS idx_table_record_doc_subject
     ON table_record_index(doc_id, subject);
 CREATE INDEX IF NOT EXISTS idx_table_record_chunk
     ON table_record_index(chunk_id);
+
+-- 宽表单元格事实索引（日期列/年月列；辅助索引，不计入 01 §5 审计表）
+CREATE TABLE IF NOT EXISTS table_cell_index (
+    row_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id      INTEGER NOT NULL,
+    chunk_id    INTEGER,
+    caption     TEXT NOT NULL DEFAULT '',
+    unit        TEXT NOT NULL DEFAULT '',
+    subject     TEXT NOT NULL,
+    year        INTEGER NOT NULL,
+    month       INTEGER,
+    value_num   REAL,
+    value_text  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_table_cell_doc_subject
+    ON table_cell_index(doc_id, subject, year, month);

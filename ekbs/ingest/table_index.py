@@ -10,7 +10,12 @@ import json
 from types import SimpleNamespace
 
 from ekbs.logging import get_logger
-from ekbs.retrieval.table_struct import parse_nested_rows, parse_record_facts, parse_table_rows
+from ekbs.retrieval.table_struct import (
+    parse_cell_facts,
+    parse_nested_rows,
+    parse_record_facts,
+    parse_table_rows,
+)
 
 log = get_logger(component="ingest.table_index")
 
@@ -37,8 +42,10 @@ def replace_document_table_rows(db, doc_id: int) -> int:
             ]
             parsed = [*parse_table_rows(chunks), *parse_nested_rows(chunks)]
             records = parse_record_facts(chunks)
+            cells = parse_cell_facts(chunks)
             conn.execute("DELETE FROM table_row_index WHERE doc_id = ?", (doc_id,))
             conn.execute("DELETE FROM table_record_index WHERE doc_id = ?", (doc_id,))
+            conn.execute("DELETE FROM table_cell_index WHERE doc_id = ?", (doc_id,))
             for row in parsed:
                 conn.execute(
                     "INSERT INTO table_row_index("
@@ -71,6 +78,16 @@ def replace_document_table_rows(db, doc_id: int) -> int:
                         record.value,
                     ),
                 )
+            for cell in cells:
+                conn.execute(
+                    "INSERT INTO table_cell_index("
+                    "doc_id, chunk_id, caption, unit, subject, year, month, value_num"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        doc_id, cell.chunk_id, cell.caption, cell.unit,
+                        cell.subject, cell.year, cell.month, cell.value,
+                    ),
+                )
             conn.commit()
     except Exception as exc:  # noqa: BLE001 —— 索引失败不能把已成功的分块入库打回 failed
         log.warning("table_row_index_failed", doc_id=doc_id, error=str(exc)[:240])
@@ -84,6 +101,7 @@ def delete_document_table_rows(db, doc_id: int) -> None:
         with db.sync_connect() as conn:
             conn.execute("DELETE FROM table_row_index WHERE doc_id = ?", (doc_id,))
             conn.execute("DELETE FROM table_record_index WHERE doc_id = ?", (doc_id,))
+            conn.execute("DELETE FROM table_cell_index WHERE doc_id = ?", (doc_id,))
             conn.commit()
     except Exception as exc:  # noqa: BLE001
         log.warning("table_row_index_delete_failed", doc_id=doc_id, error=str(exc)[:240])

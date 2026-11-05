@@ -82,6 +82,8 @@ def parse_time_spec(question: str) -> TimeSpec | None:
 
 def time_label(spec: TimeSpec) -> str:
     if spec.kind == "month_range":
+        if spec.start_month == spec.end_month:
+            return f"{spec.start_month}月"
         return f"{spec.start_month}—{spec.end_month}月"
     if spec.kind == "quarter":
         return f"Q{((int(spec.start_month or 1) - 1) // 3) + 1}"
