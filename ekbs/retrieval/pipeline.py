@@ -52,6 +52,7 @@ from ekbs.retrieval.calc_plan import generate_calc_plan
 from ekbs.retrieval.table_query import (
     compute_table_average,
     compute_table_binary,
+    compute_table_filtered,
     compute_table_comparison,
     compute_table_rank,
     compute_table_ratio,
@@ -2943,6 +2944,11 @@ class RetrievalPipeline:
             if calc_plan is not None and calc_plan.operation == "binary"
             else None
         )
+        table_filtered = (
+            compute_table_filtered(question, retrieval.chunks, db=self.db)
+            if calc_plan is not None and calc_plan.operation == "filter"
+            else None
+        )
         table_plan_clarify = (
             calc_plan is not None
             and calc_plan.operation in {"avg", "ratio", "rank", "binary"}
@@ -2952,6 +2958,7 @@ class RetrievalPipeline:
             and table_ratio is None
             and table_rank is None
             and table_binary is None
+            and table_filtered is None
             and any(
                 str(getattr(chunk, "chunk_type", "")) == "table"
                 for chunk in retrieval.chunks
@@ -3057,6 +3064,22 @@ class RetrievalPipeline:
                     "items": list(table_rank.items),
                 },
                 degraded=["deterministic_table_rank"],
+            )
+        elif table_filtered is not None:
+            filtered_text = table_filtered.render()
+            result = AnswerResult(
+                answer=filtered_text,
+                citations=self._post_check_citations(filtered_text, retrieval.chunks, perm),
+                retrieval=retrieval,
+                model="table_filtered",
+                provenance={
+                    "op": "table_filtered",
+                    "year": table_filtered.year,
+                    "subject": table_filtered.subject,
+                    "value": table_filtered.value,
+                    "label": table_filtered.label,
+                },
+                degraded=["deterministic_table_filtered"],
             )
         elif table_binary is not None:
             binary_text = table_binary.render()

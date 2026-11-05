@@ -856,3 +856,140 @@ def _binary_from_cells(
         left_subject=left_subject, right_subject=right_subject, year=year,
         value=value, unit=first.unit, op=op, chunk_index=index, label=time_label(time_spec),
     )
+
+
+def _filter_terms(text: str) -> list[str]:
+    patterns = (
+        r"除(.+?)外",
+        r"排除(.+?)(?:[，,。；;]|$)",
+        r"不含(.+?)(?:[，,。；;]|$)",
+        r"不包括(.+?)(?:[，,。；;]|$)",
+        r"只算(.+?)(?:的|，|,|$)",
+        r"仅(.+?)(?:的|，|,|$)",
+        r"其中(.+?)(?:的|，|,|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return [part.strip() for part in re.split(r"[、和与]", match.group(1)) if part.strip()]
+    return []
+
+
+def _select_subjects(subjects: Sequence[str], terms: Sequence[str], mode: str) -> list[str]:
+    matched = [
+        subject for subject in subjects
+        if any(_normalize(term) in _normalize(subject) for term in terms)
+    ]
+    if not matched:
+        return []
+    if mode == "include":
+        return matched
+    return [subject for subject in subjects if subject not in matched]
+
+
+_METRIC_WORDS = ("电量", "电费", "水费", "水量", "费用", "金额")
+
+
+def _metric_word(text: str) -> str:
+    for word in _METRIC_WORDS:
+        if word in text:
+            return word
+    return ""
+
+
+def _drop_aggregate_subjects(selected: list[str]) -> list[str]:
+    details = [
+        subject for subject in selected
+        if not _normalize(subject).startswith("总") and "合计" not in _normalize(subject)
+    ]
+    return details or selected
+
+
+def compute_table_filtered(  # noqa: C901
+    question: str, chunks: Sequence[Any], *, db: Any | None = None
+) -> TableValue | None:
+    """条件筛选后求和：``除住宅外`` / ``只算住宅`` 等。"""
+    text = str(question or "")
+    years = tuple(dict.fromkeys(int(y) for y in re.findall(r"(20\d{2})\s*年", text)))
+    if len(years) != 1:
+        return None
+    terms = _filter_terms(text)
+    if not terms:
+        return None
+    mode = "include" if any(word in text for word in ("只算", "仅", "其中")) else "exclude"
+    from ekbs.retrieval.table_time import TimeSpec, parse_time_spec
+
+    time_spec = parse_time_spec(text) or TimeSpec("year", 1, 12, False)
+    chunk_pos, table_pos = _citation_context(chunks)
+
+    rows = _rows_for_question(db, chunks)
+    if rows:
+        metric = _metric_word(text)
+        for table in canonical_from_rows(rows):
+            if metric and metric not in table.caption and not any(
+                metric in subject for subject in table.subjects()
+            ):
+                continue
+            selected = _select_subjects(table.subjects(), terms, mode)
+            if mode == "exclude":
+                selected = _drop_aggregate_subjects(selected)
+            if not selected:
+                continue
+            values: list[float] = []
+            chunk_id: int | None = None
+            for subject in selected:
+                calc = evaluate(table, SumExpr(subject=subject, year=years[0], time=time_spec))
+                if calc is None:
+                    values = []
+                    break
+                values.append(calc.value)
+                chunk_id = chunk_id or next((cid for cid in calc.chunk_ids if cid), None)
+            if not values:
+                continue
+            index = chunk_pos.get(chunk_id or 0) or table_pos.get(table.doc_id) or 0
+            if not index:
+                continue
+            label = f"仅{'、'.join(terms)}" if mode == "include" else f"除{'、'.join(terms)}外"
+            return TableValue(
+                subject="合计", year=years[0], value=sum(values), unit=table.unit,
+                chunk_index=index, label=label,
+            )
+
+    cells = (
+        load_cell_facts(db, sorted({int(getattr(c, "doc_id", 0) or 0) for c in chunks}))
+        if db is not None
+        else []
+    )
+    if not cells:
+        from ekbs.retrieval.table_struct import parse_cell_facts
+
+        cells = parse_cell_facts(chunks)
+    metric = _metric_word(text)
+    metric_cells = [cell for cell in cells if not metric or metric in cell.subject]
+    if metric and not metric_cells:
+        metric_cells = [cell for cell in cells if metric in cell.caption]
+    all_subjects = sorted({cell.subject for cell in metric_cells})
+    selected = _select_subjects(all_subjects, terms, mode)
+    if mode == "exclude":
+        selected = _drop_aggregate_subjects(selected)
+    if not selected:
+        return None
+    months = time_spec.month_set()
+    values = [
+        cell.value for cell in metric_cells
+        if cell.subject in selected and cell.year == years[0] and cell.month in months
+    ]
+    if not values:
+        return None
+    first = next(
+        cell for cell in metric_cells
+        if cell.subject in selected and cell.year == years[0] and cell.month in months
+    )
+    index = chunk_pos.get(first.chunk_id or 0) or table_pos.get(first.doc_id) or 0
+    if not index:
+        return None
+    label = f"仅{'、'.join(terms)}" if mode == "include" else f"除{'、'.join(terms)}外"
+    return TableValue(
+        subject="合计", year=years[0], value=sum(values), unit=first.unit,
+        chunk_index=index, label=label,
+    )

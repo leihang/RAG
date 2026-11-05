@@ -232,3 +232,20 @@ def test_binary_add_from_table_rows() -> None:
     chunk.content = content
     result = compute_table_binary("2026年1-2月商铺与住宅合计是多少", [chunk])
     assert result is not None and result.value == 30.0
+
+
+def test_filtered_sum_from_wide_cells() -> None:
+    from ekbs.retrieval.table_query import compute_table_filtered
+
+    content = """表名: 用电分析（KW/h）
+相关表头: 用量日期 | 2026年9月
+用量日期=总电量; 2026年9月=1000
+用量日期=商铺电量; 2026年9月=300
+用量日期=住宅电量; 2026年9月=200
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    result = compute_table_filtered("2026年9月除住宅外的电量合计是多少", [chunk])
+    assert result is not None and result.value == 300.0
