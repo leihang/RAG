@@ -71,7 +71,7 @@ async def discovery_catalog(
     request: Request,
     doc_limit: int = Query(default=20, ge=1, le=100),
     suggestion_limit: int = Query(default=5, ge=1, le=20),
-    mode: str = Query(default="full", pattern="^(full|help|docs)$"),
+    mode: str = Query(default="full", pattern="^(full|help|docs|permissions|examples)$"),
     conversation_type: str = Query(default="1", pattern="^[12]$"),
     authorization: str | None = Header(default=None),
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),

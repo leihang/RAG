@@ -244,6 +244,41 @@ def is_document_list_command(text: str) -> bool:
 _TITLE_CODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:[-_/][A-Za-z0-9]+)+")
 
 
+#: P0 命令集（帮助屏只展示这四个；其余为兼容别名）
+_PERMISSION_COMMANDS = frozenset(
+    {"查询权限", "我的权限", "查看权限", "权限", "我的查询权限"}
+)
+_EXAMPLE_COMMANDS = frozenset(
+    {"问答示例", "示例问答", "示例", "给我示例", "问答例子", "问法示例"}
+)
+_PERSONAL_MANAGE_COMMANDS = frozenset(
+    {"管理个人私有文件", "管理私有文件", "私有文件管理", "个人文件管理", "我的私有文件"}
+)
+_SEND_SOURCE_COMMANDS = frozenset(
+    {"发原文", "我要原文", "怎么发原文", "发原文件", "原文怎么发"}
+)
+
+
+def _compact_command(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "").strip().lower())
+
+
+def is_permission_command(text: str) -> bool:
+    return _compact_command(text) in _PERMISSION_COMMANDS
+
+
+def is_example_command(text: str) -> bool:
+    return _compact_command(text) in _EXAMPLE_COMMANDS
+
+
+def is_personal_manage_command(text: str) -> bool:
+    return _compact_command(text) in _PERSONAL_MANAGE_COMMANDS
+
+
+def is_send_source_command(text: str) -> bool:
+    return _compact_command(text) in _SEND_SOURCE_COMMANDS
+
+
 def friendly_title(title: str | None) -> str:
     """面向聊天的标题：去掉导入路径、开头编号和「- 定稿」装饰。
 
@@ -777,21 +812,64 @@ def format_help_text_short(
     *,
     group_chat: bool = False,
 ) -> str:
-    """P0 帮助：只讲“能问什么”，不列文档、不提私有库/命令。"""
-    # 不再重复问候：首条消息会先发 self_intro（“你好，我是企业知识库助手。”），
-    # 帮助正文从“能做什么”直接开始，避免首屏出现两遍问候。
-    lines = ["我可以帮你查制度、作业指导书里的条款、条件和责任人。"]
+    """P0 帮助：唯一入口；只给四个命令 + 一个直接提问示例。"""
+    lines = [
+        "可用命令（直接发送中文命令）：",
+        "· 查询权限",
+        "· 问答示例 — 按你的权限生成示例问答",
+        "· 管理个人私有文件（仅单聊：直接发文件入库；删除说「删除我的文件 标题」）",
+        "· 发原文（直接说：发我《跑水预案》）",
+        "",
+        "也可以直接提问，例如：跑水事件环境部先做什么？",
+    ]
     if group_chat:
-        lines.append("群聊中我只能基于公开文档回答。")
-    questions = [str(item.get("question") or "").strip() for item in suggestions if item.get("question")]
-    questions = [q for q in questions if q][:3]
-    if questions:
         lines.append("")
-        lines.append("例如：")
-        lines.extend(f"· {question}" for question in questions)
-    lines.append("")
-    lines.append("回复「文档」查看可查文件。")
+        lines.append("群聊中我只能基于公开文档回答。")
     return "\n".join(lines)
+
+
+def format_permission_text(documents: list[dict[str, Any]], clearance: int) -> str:
+    """查询权限：只给文档名称/数量/密级，不返回正文或 ACL 细节。"""
+    if not documents:
+        return "当前没有可查文档。若认为权限有误，请联系管理员。"
+    private_count = sum(
+        1
+        for doc in documents
+        if str(doc.get("kb_code") or "").startswith("personal-")
+    )
+    header = f"可查文档 {len(documents)} 篇"
+    if private_count:
+        header += f"（私有 {private_count} 篇）"
+    titles = "、".join(friendly_title(str(doc.get("title") or "")) for doc in documents)
+    return f"{header}，密级 1~{int(clearance)}：\n{titles}"
+
+
+def format_examples_text(suggestions: list[dict[str, Any]]) -> str:
+    """问答示例：只给问题文字，不给答案/正文。"""
+    questions = [
+        str(item.get("question") or "").strip()
+        for item in suggestions
+        if item.get("question")
+    ]
+    questions = [q for q in questions if q][:3]
+    if not questions:
+        return "暂无问答示例，直接提问即可。"
+    lines = ["问答示例（按你的权限生成）："]
+    lines.extend(f"· {question}" for question in questions)
+    return "\n".join(lines)
+
+
+def format_private_manage_text() -> str:
+    return (
+        "管理个人私有文件（仅单聊）：\n"
+        "· 直接发文件给我 → 入库到你的私有库\n"
+        "· 我的文件 → 查看\n"
+        "· 删除我的文件 标题 → 删除"
+    )
+
+
+def format_send_source_text() -> str:
+    return "直接说：发我《跑水预案》"
 
 
 def format_document_list_text(documents: list[dict[str, Any]]) -> str:
@@ -838,7 +916,7 @@ def build_catalog(
     documents = list_visible_published_docs(
         runtime, perm, limit=doc_limit, admin_bypass=admin_bypass
     )
-    if mode == "docs":
+    if mode in {"docs", "help", "permissions"}:
         suggestions: list[dict[str, Any]] = []
     else:
         suggestions = suggested_questions(
@@ -847,10 +925,14 @@ def build_catalog(
             limit=suggestion_limit,
             admin_bypass=admin_bypass,
             documents=documents,
-            for_help=(mode == "help"),
+            for_help=(mode == "help" or mode == "examples"),
         )
     if mode == "help":
         help_text = format_help_text_short(suggestions, group_chat=group_chat)
+    elif mode == "permissions":
+        help_text = format_permission_text(documents, perm.clearance)
+    elif mode == "examples":
+        help_text = format_examples_text(suggestions)
     elif mode == "docs":
         help_text = format_document_list_text(documents)
     else:

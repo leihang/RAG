@@ -12,10 +12,18 @@ from httpx import ASGITransport, AsyncClient
 from ekbs.api.app import create_app
 from ekbs.discovery import (
     format_document_list_text,
+    format_examples_text,
     format_help_text_short,
+    format_permission_text,
+    format_private_manage_text,
+    format_send_source_text,
     friendly_title,
     is_document_list_command,
+    is_example_command,
     is_greeting_command,
+    is_permission_command,
+    is_personal_manage_command,
+    is_send_source_command,
     display_doc_title,
     file_request_hint,
     format_help_text,
@@ -504,15 +512,39 @@ def test_friendly_title_hides_document_codes() -> None:
     assert friendly_title("XJWY-GCYJ-05跑水突发事件处理预案") == "跑水突发事件处理预案"
 
 
-def test_short_help_has_no_document_list_or_weak_questions() -> None:
-    suggestions = [{"question": "跑水事件里环境部第一时间做什么"}]
-    text = format_help_text_short(suggestions)
-    assert "我可以帮你查制度" in text
-    assert "跑水事件里环境部第一时间做什么" in text
-    assert "回复「文档」" in text
+def test_short_help_lists_exactly_four_commands() -> None:
+    text = format_help_text_short([])
+    assert text.startswith("可用命令")
+    for command in ("查询权限", "问答示例", "管理个人私有文件", "发原文"):
+        assert command in text
+    assert "可用功能" not in text
+    assert "文档清单" not in text
     assert "XJWY-" not in text
     assert "主要讲了什么" not in text
-    assert "私有库" not in text
+
+
+def test_command_predicates() -> None:
+    assert is_permission_command("查询权限")
+    assert is_example_command("问答示例")
+    assert is_personal_manage_command("管理个人私有文件")
+    assert is_send_source_command("发原文")
+    assert not is_permission_command("权限是什么")
+    assert not is_example_command("举个例子说明")
+
+
+def test_command_outputs_are_names_only() -> None:
+    docs = [
+        {"title": "工程部/XJWY-GC-09维修作业指导书", "doc_id": 1, "kb_code": "gongkai"},
+        {"title": "XJWY-GCYJ-05跑水突发事件处理预案", "doc_id": 2, "kb_code": "personal-5"},
+    ]
+    permission = format_permission_text(docs, 3)
+    assert "可查文档 2 篇（私有 1 篇），密级 1~3" in permission
+    assert "维修作业指导书" in permission and "XJWY-" not in permission
+    examples = format_examples_text([{"question": "跑水事件里环境部第一时间做什么"}])
+    assert "跑水事件里环境部第一时间做什么" in examples
+    assert "答案" not in examples
+    assert "私有库" in format_private_manage_text()
+    assert "发我《跑水预案》" in format_send_source_text()
 
 
 def test_document_list_text_uses_friendly_titles() -> None:
@@ -538,10 +570,10 @@ async def test_catalog_help_and_docs_modes(client, seeded) -> None:
     )
     assert help_resp.status_code == 200
     help_text = help_resp.json()["help_text"]
-    assert help_text.startswith("我可以帮你查制度")
-    assert "回复「文档」" in help_text
+    assert help_text.startswith("可用命令")
+    assert "查询权限" in help_text and "问答示例" in help_text
+    assert "文档清单" not in help_text
     assert "当前可见的文档" not in help_text
-    assert "私有库" not in help_text
 
     docs_resp = await client.get(
         "/api/v1/discovery/catalog?mode=docs", headers=headers_for(alice)
@@ -552,3 +584,17 @@ async def test_catalog_help_and_docs_modes(client, seeded) -> None:
     assert "年假管理制度" in docs_text
     assert "XJWY-" not in docs_text
     assert "主要讲了什么" not in docs_text
+
+    perm_resp = await client.get(
+        "/api/v1/discovery/catalog?mode=permissions", headers=headers_for(alice)
+    )
+    assert perm_resp.status_code == 200
+    perm_text = perm_resp.json()["help_text"]
+    assert "可查文档" in perm_text and "密级 1~" in perm_text
+    assert "年假管理制度" in perm_text
+
+    ex_resp = await client.get(
+        "/api/v1/discovery/catalog?mode=examples", headers=headers_for(alice)
+    )
+    assert ex_resp.status_code == 200
+    assert "问答示例" in ex_resp.json()["help_text"]

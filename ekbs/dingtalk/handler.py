@@ -52,9 +52,15 @@ from ekbs.discovery import (
     display_doc_title,
     file_request_hint,
     is_catalog_query,
+    format_private_manage_text,
+    format_send_source_text,
     is_document_list_command,
+    is_example_command,
     is_greeting_command,
     is_help_command,
+    is_permission_command,
+    is_personal_manage_command,
+    is_send_source_command,
     is_personal_list_command,
     personal_delete_title,
 )
@@ -303,6 +309,46 @@ class StreamMessageHandler:
                     )
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="greeting")
+
+            if is_personal_manage_command(message.text):
+                reply = format_private_manage_text()
+                await self._reply_text(message, reply)
+                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                return ReplyResult(True, replied=True, via="text", reason="personal_manage_help", answer=reply)
+
+            if is_send_source_command(message.text):
+                reply = format_send_source_text()
+                await self._reply_text(message, reply)
+                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                return ReplyResult(True, replied=True, via="text", reason="send_source_help", answer=reply)
+
+            if is_permission_command(message.text):
+                status, payload = await self._discovery_catalog(
+                    user_id=user_id,
+                    conversation_type=message.conversation_type,
+                    mode="permissions",
+                )
+                if status == 0 or status >= 500:
+                    await asyncio.to_thread(self.inbox.mark_failed, message.msg_id, f"api_error_{status}")
+                    return ReplyResult(False, reason=f"api_error_{status}")
+                reply = str(payload.get("help_text") or "暂时查不到权限。")
+                await self._reply_text(message, reply)
+                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                return ReplyResult(True, replied=True, via="text", reason="permission", answer=reply)
+
+            if is_example_command(message.text):
+                status, payload = await self._discovery_catalog(
+                    user_id=user_id,
+                    conversation_type=message.conversation_type,
+                    mode="examples",
+                )
+                if status == 0 or status >= 500:
+                    await asyncio.to_thread(self.inbox.mark_failed, message.msg_id, f"api_error_{status}")
+                    return ReplyResult(False, reason=f"api_error_{status}")
+                reply = str(payload.get("help_text") or "暂无问答示例，直接提问即可。")
+                await self._reply_text(message, reply)
+                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                return ReplyResult(True, replied=True, via="text", reason="examples", answer=reply)
 
             if message.download_code:
                 reply = await self._accept_personal_file(message, user_id)

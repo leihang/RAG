@@ -749,3 +749,56 @@ async def test_greeting_returns_only_short_intro(handler) -> None:
         "你好，我是企业知识库助手。\n"
         "你可以直接问制度、合同、表格里的具体条款；也可以发送「帮助」"
     )
+
+
+@respx.mock
+async def test_permission_command_uses_permissions_mode(handler) -> None:
+    routes = mock_dingtalk()
+    catalog = respx.get(
+        f"{API_BASE}/api/v1/discovery/catalog?mode=permissions"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={"help_text": "可查文档 2 篇，密级 1~3：维修作业指导书", "documents": [], "suggestions": []},
+        )
+    )
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    code, _ = await handler.process({"data": payload(msg_id="perm-cmd", text="查询权限")})
+    assert code == ACK_OK
+    assert catalog.call_count == 1
+    assert qa.call_count == 0
+    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
+    assert "可查文档" in sent["content"]
+
+
+@respx.mock
+async def test_example_command_uses_examples_mode(handler) -> None:
+    routes = mock_dingtalk()
+    catalog = respx.get(f"{API_BASE}/api/v1/discovery/catalog?mode=examples").mock(
+        return_value=httpx.Response(
+            200,
+            json={"help_text": "问答示例：\n· 跑水事件里环境部第一时间做什么？", "documents": [], "suggestions": []},
+        )
+    )
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    code, _ = await handler.process({"data": payload(msg_id="ex-cmd", text="问答示例")})
+    assert code == ACK_OK
+    assert catalog.call_count == 1
+    assert qa.call_count == 0
+    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
+    assert "问答示例" in sent["content"]
+
+
+@respx.mock
+async def test_private_manage_and_send_source_commands_are_local(handler) -> None:
+    routes = mock_dingtalk()
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    for msg_id, text, expected in (
+        ("manage-1", "管理个人私有文件", "单聊"),
+        ("source-1", "发原文", "发我《跑水预案》"),
+    ):
+        code, _ = await handler.process({"data": payload(msg_id=msg_id, text=text)})
+        assert code == ACK_OK
+        sent = json.loads(json.loads(routes["oto"].calls[-1].request.content)["msgParam"])
+        assert expected in sent["content"]
+    assert qa.call_count == 0
