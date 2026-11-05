@@ -32,3 +32,28 @@ def test_preview_strips_script(tmp_path: Path) -> None:
     assert "正文" in html
     assert "<script" not in html.lower()
     assert "onclick" not in html.lower()
+
+
+def test_xlsx_preview_preserves_percent_and_merged_cells(tmp_path: Path) -> None:
+    """原件预览也必须按 Excel 显示格式：百分比、金额、合并单元格。"""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "用电分析"
+    ws.merge_cells("A1:D1")
+    ws["A1"] = "熙街2026年9月用电分析表"
+    ws.append(["项目", "2026-09-30", "同比", "环比"])
+    ws.append(["总电量", 4379405, -0.0513530345122631, -0.17188876236521])
+    ws["B3"].number_format = "0.00"
+    ws["C3"].number_format = "0.00%"
+    ws["D3"].number_format = "0.00%"
+    path = tmp_path / "preview.xlsx"
+    wb.save(path)
+
+    html = render_office_preview(path)
+    assert "-5.14%" in html
+    assert "-17.19%" in html
+    assert "4379405.00" in html
+    assert 'colspan="4"' in html
+    assert "0.0513530345122631" not in html

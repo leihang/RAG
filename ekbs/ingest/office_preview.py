@@ -141,18 +141,17 @@ def _xlsx_html(path: Path) -> str:
         import openpyxl
     except Exception as exc:  # pragma: no cover
         raise OfficePreviewError(f"openpyxl 不可用：{exc}") from exc
-    workbook = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
+    # 不用 read_only：合并单元格和 number_format 在只读模式不可靠；原件预览必须
+    # 和解析侧同一套 Excel 显示口径（否则百分比会并排显示成小数）。
+    from ekbs.ingest.parser import xlsx_sheet_html
+
+    workbook = openpyxl.load_workbook(str(path), data_only=True)
     parts: list[str] = []
     try:
         for sheet in workbook.worksheets:
             parts.append(f"<h2>{html.escape(sheet.title)}</h2>")
-            rows = []
-            for row in sheet.iter_rows(values_only=True):
-                if all(cell is None or str(cell).strip() == "" for cell in row):
-                    continue
-                cells = "".join(f"<td>{html.escape(_cell_text(cell))}</td>" for cell in row)
-                rows.append(f"<tr>{cells}</tr>")
-            parts.append("<table>" + "".join(rows) + "</table>" if rows else "<p>（空表）</p>")
+            body = xlsx_sheet_html(sheet)
+            parts.append(body or "<p>（空表）</p>")
     finally:
         workbook.close()
     return _wrap("".join(parts) or "<p>（工作簿是空的）</p>")

@@ -1455,6 +1455,21 @@ def _xlsx_rows_to_html(
     return ("<table>" + "".join(rows_html) + "</table>") if rows_html else ""
 
 
+def xlsx_sheet_html(sheet: Any, *, header_row: int | None = None) -> str:
+    """整张 xlsx 工作表 → HTML（复核页左栏「原件」预览用）。
+
+    和解析侧共用 ``_xlsx_rows_to_html``：合并单元格、number_format（百分比/金额）都
+    按 Excel 显示口径输出。原件预览与解析稿必须同一套显示格式，否则双栏对比会把
+    「原件 -5.14%」和「预览 -0.0513」并排，用户无法判断是哪边错。
+    """
+    rows_with_nums: list[tuple[int, list[str]]] = []
+    for row_number, row in enumerate(sheet.iter_rows(), start=1):
+        values = [_xlsx_cell_text(cell) for cell in row]
+        if any(str(value).strip() for value in values):
+            rows_with_nums.append((row_number, values))
+    return _xlsx_rows_to_html(sheet, rows_with_nums, header_row=header_row)
+
+
 def _xlsx_serialize_blocks(
     sheet: Any,
     merged_blocks: list[list[tuple[int, list[str]]]],
