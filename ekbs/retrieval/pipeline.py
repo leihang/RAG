@@ -52,6 +52,7 @@ from ekbs.retrieval.calc_plan import generate_calc_plan
 from ekbs.retrieval.table_query import (
     compute_table_average,
     compute_table_comparison,
+    compute_table_rank,
     compute_table_ratio,
     compute_table_lookup,
     compute_table_value,
@@ -2922,6 +2923,11 @@ class RetrievalPipeline:
             if calc_plan is not None and calc_plan.operation == "ratio"
             else None
         )
+        table_rank = (
+            compute_table_rank(question, retrieval.chunks, db=self.db)
+            if calc_plan is not None and calc_plan.operation == "rank"
+            else None
+        )
         numeric_unplanned = (
             calc_plan is not None
             and calc_plan.operation == "compare"
@@ -3007,6 +3013,21 @@ class RetrievalPipeline:
                     "percent": table_ratio.percent,
                 },
                 degraded=["deterministic_table_ratio"],
+            )
+        elif table_rank is not None:
+            rank_text = table_rank.render()
+            result = AnswerResult(
+                answer=rank_text,
+                citations=self._post_check_citations(rank_text, retrieval.chunks, perm),
+                retrieval=retrieval,
+                model="table_rank",
+                provenance={
+                    "op": "table_rank",
+                    "year": table_rank.year,
+                    "direction": table_rank.direction,
+                    "items": list(table_rank.items),
+                },
+                degraded=["deterministic_table_rank"],
             )
         elif numeric_unplanned:
             result = AnswerResult(

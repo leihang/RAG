@@ -614,3 +614,120 @@ def _ratio_from_cells(
         chunk_index=index,
         label=time_label(time_spec),
     )
+
+
+@dataclass(frozen=True)
+class TableRank:
+    year: int
+    label: str
+    unit: str
+    direction: str
+    items: tuple[tuple[str, float], ...]
+    chunk_index: int
+
+    def render(self) -> str:
+        mark = f"[{self.chunk_index}]" if self.chunk_index else ""
+        word = "最低" if self.direction == "asc" else "最高"
+        ranking = "；".join(
+            f"{index}. {subject} {value:,.2f} {self.unit}"
+            for index, (subject, value) in enumerate(self.items, start=1)
+        )
+        return f"{self.year}年{self.label}{word}排名：{ranking}{mark}"
+
+
+def _rank_from_cells(
+    cells: Sequence[Any],
+    year: int,
+    time_spec: TimeSpec,
+    direction: str,
+    top: int,
+    chunk_pos: dict[int, int],
+    table_pos: dict[int, int],
+) -> TableRank | None:
+    selected = time_spec.month_set()
+    values: dict[str, float] = {}
+    chunk_ids: dict[str, int | None] = {}
+    units: dict[str, str] = {}
+    for cell in cells:
+        if cell.year != year or cell.month not in selected:
+            continue
+        values[cell.subject] = values.get(cell.subject, 0.0) + float(cell.value)
+        chunk_ids.setdefault(cell.subject, cell.chunk_id)
+        units.setdefault(cell.subject, cell.unit)
+    if len(values) < 2:
+        return None
+    ordered = sorted(values.items(), key=lambda item: (item[1] if direction == "asc" else -item[1], item[0]))
+    first_subject = ordered[0][0]
+    chunk_id = chunk_ids.get(first_subject)
+    first = next(cell for cell in cells if cell.subject == first_subject)
+    index = chunk_pos.get(chunk_id or 0) or table_pos.get(first.doc_id) or 0
+    if not index:
+        return None
+    return TableRank(
+        year=year,
+        label=time_label(time_spec),
+        unit=units.get(first_subject, ""),
+        direction=direction,
+        items=tuple(ordered[: max(1, top)]),
+        chunk_index=index,
+    )
+
+
+def compute_table_rank(
+    question: str, chunks: Sequence[Any], *, db: Any | None = None
+) -> TableRank | None:
+    """单期指标排名（最高/最低/TopN），优先表格行，纯宽表走 cell 事实。"""
+    text = str(question or "")
+    years = tuple(dict.fromkeys(int(y) for y in re.findall(r"(20\d{2})\s*年", text)))
+    if len(years) != 1:
+        return None
+    from ekbs.retrieval.table_time import TimeSpec, parse_time_spec
+
+    time_spec = parse_time_spec(text) or TimeSpec("year", 1, 12, False)
+    chunk_pos, table_pos = _citation_context(chunks)
+    top_match = re.search(r"(?:前|Top|top|TOP)\s*([一二三四五六七八九十\d]+)", text)
+    top = 3
+    if top_match:
+        raw = top_match.group(1)
+        top = int(raw) if raw.isdigit() else {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}.get(raw, 3)
+    direction = "asc" if ("最低" in text or "最少" in text) else "desc"
+
+    # 宽表单元格优先级更高：同一期间通常只有它保留完整指标列。
+    cells = (
+        load_cell_facts(db, sorted({int(getattr(c, "doc_id", 0) or 0) for c in chunks}))
+        if db is not None
+        else []
+    )
+    if not cells:
+        from ekbs.retrieval.table_struct import parse_cell_facts
+
+        cells = parse_cell_facts(chunks)
+    cell_rank = _rank_from_cells(cells, years[0], time_spec, direction, top, chunk_pos, table_pos)
+    if cell_rank is not None:
+        return cell_rank
+
+    rows = _rows_for_question(db, chunks)
+    best: TableRank | None = None
+    if rows:
+        for table in canonical_from_rows(rows):
+            if not table.unit.strip():
+                continue
+            values: list[tuple[str, float]] = []
+            for subject in table.subjects():
+                calc = evaluate(table, SumExpr(subject=subject, year=years[0], time=time_spec))
+                if calc is not None:
+                    values.append((subject, calc.value))
+            if len(values) < 2:
+                continue
+            values.sort(key=lambda item: (item[1] if direction == "asc" else -item[1], item[0]))
+            chunk_id = table.facts[0].chunk_id if table.facts else None
+            index = chunk_pos.get(chunk_id or 0) or table_pos.get(table.doc_id) or 0
+            if not index:
+                continue
+            candidate = TableRank(
+                year=years[0], label=time_label(time_spec), unit=table.unit,
+                direction=direction, items=tuple(values[: max(1, top)]), chunk_index=index,
+            )
+            if best is None or len(candidate.items) > len(best.items):
+                best = candidate
+    return best

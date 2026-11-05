@@ -31,3 +31,8 @@ def test_average_plan() -> None:
 def test_ratio_plan() -> None:
     plan = generate_calc_plan("2026年商铺电量占总电量的比例是多少")
     assert plan is not None and plan.operation == "ratio"
+
+
+def test_rank_plan() -> None:
+    plan = generate_calc_plan("2026年9月电量排名前三")
+    assert plan is not None and plan.operation == "rank" and plan.top == 3

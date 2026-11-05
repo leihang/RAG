@@ -21,6 +21,9 @@ _COMPARE_WORDS = ("增长", "减少", "增加", "下降", "对比", "较", "同�
 _VALUE_WORDS = ("多少", "几", "合计", "总计", "总共", "是多少", "多大", "占多少")
 _AVG_WORDS = ("平均", "均值")
 _RATIO_WORDS = ("占比", "比例", "占")
+_RANK_WORDS = ("排名", "最高", "最低", "最多", "最少", "top", "Top", "TOP")
+_TOP_RE = re.compile(r"(?:前|Top|top|TOP)\s*([一二三四五六七八九十\d]+)")
+_CN_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,8 @@ class CalcPlan:
     years: tuple[int, ...]
     time: TimeSpec
     subject_hint: str = ""
+    top: int = 3
+    direction: str = "desc"
 
 
 def _hint(question: str) -> str:
@@ -48,6 +53,19 @@ def generate_calc_plan(question: str) -> CalcPlan | None:
         if time is None:
             return None
         return CalcPlan("compare", years, time, _hint(text))
+    if len(years) == 1 and any(word in text for word in _RANK_WORDS):
+        top = 3
+        top_match = _TOP_RE.search(text)
+        if top_match:
+            raw = top_match.group(1)
+            top = int(raw) if raw.isdigit() else _CN_DIGITS.get(raw, 3)
+        return CalcPlan(
+            "rank", years,
+            time or TimeSpec("year", 1, 12, require_complete=False),
+            _hint(text),
+            top=top,
+            direction="asc" if ("最低" in text or "最少" in text) else "desc",
+        )
     if len(years) == 1 and any(word in text for word in _RATIO_WORDS):
         return CalcPlan(
             "ratio", years,

@@ -220,6 +220,7 @@ class RankExpr:
     year: int
     time: TimeSpec
     top: int = 3
+    direction: str = "desc"      # desc = 最高；asc = 最低
     kind: str = "rank"
 
 
@@ -266,13 +267,14 @@ def _op_rank(table: CanonicalTable, expr: RankExpr) -> CalcValue | None:
             rows.append((value.value, subject, value))
     if not rows:
         return None
-    rows.sort(key=lambda row: (-row[0], row[1]))
+    rows.sort(key=lambda row: (row[0] if expr.direction == "asc" else -row[0], row[1]))
     top = rows[: max(1, int(expr.top))]
     first_value = top[0][2]
     return CalcValue(
         top[0][0],
         first_value.unit,
         {"op": "rank", "table": table.table_key, "year": expr.year,
+         "direction": expr.direction,
          "ranking": [{"subject": subject, "value": score} for score, subject, _ in top]},
         tuple(first_value.chunk_ids),
     )

@@ -198,3 +198,21 @@ def test_table_ratio_from_wide_cells() -> None:
     result = compute_table_ratio("2026年9月商铺电量占总电量的比例是多少", [chunk])
     assert result is not None
     assert result.percent == 30.0
+
+
+def test_rank_from_wide_cells() -> None:
+    from ekbs.retrieval.table_query import compute_table_rank
+
+    content = """表名: 用电分析（KW/h）
+相关表头: 用量日期 | 2026年9月
+用量日期=总电量; 2026年9月=1000
+用量日期=商铺电量; 2026年9月=300
+用量日期=住宅电量; 2026年9月=200
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    result = compute_table_rank("2026年9月电量排名前三", [chunk])
+    assert result is not None
+    assert [subject for subject, _ in result.items] == ["总电量", "商铺电量", "住宅电量"]
