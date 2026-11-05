@@ -665,3 +665,25 @@ WHEN NEW.session_id       IS NOT OLD.session_id
 BEGIN
   SELECT RAISE(ABORT, 'ekbs_qa_session: only ended_at / message_count may be updated');
 END;
+
+-- =============================================================================
+-- 表格行索引（辅助索引，不属于 01 §5 的审计表计数）
+-- =============================================================================
+-- 目的：把“年份 × 月份 × 指标”的表格行在入库时结构化，查询时不再从 chunk 文本临时解析。
+-- 继承文档 ACL：查询只用已按权限过滤的 chunk 对应 doc_id；不在此表复制权限字段。
+CREATE TABLE IF NOT EXISTS table_row_index (
+    row_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id       INTEGER NOT NULL,
+    chunk_id     INTEGER,
+    caption      TEXT NOT NULL DEFAULT '',
+    unit         TEXT NOT NULL DEFAULT '',
+    subject      TEXT NOT NULL,
+    year         INTEGER NOT NULL,
+    months_json  TEXT NOT NULL DEFAULT '{}',
+    annual_total REAL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_table_row_doc_subject
+    ON table_row_index(doc_id, subject, year);
+CREATE INDEX IF NOT EXISTS idx_table_row_chunk
+    ON table_row_index(chunk_id);

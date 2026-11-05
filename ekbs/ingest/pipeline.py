@@ -36,6 +36,10 @@ from ekbs.ingest.clean import clean_figure_text, clean_markdown, clean_profile_f
 from ekbs.ingest.seal_filter import partition_seal_figures, strip_figure_anchors
 from ekbs.ingest.parser import parse_cn_dates
 from ekbs.ingest.table_merge import merge_continued_tables
+from ekbs.ingest.table_index import (
+    delete_document_table_rows,
+    replace_document_table_rows,
+)
 from ekbs.ingest.chunker import (
     active_token_counter,
     content_coverage,
@@ -413,6 +417,7 @@ class IngestPipeline:
                 )
             await self._apply_contextual_retrieval(title, chunking.nodes)
             self._insert_chunks(doc_id, shard_id, chunking.nodes)
+            replace_document_table_rows(self.db, doc_id)
             child_ids = self._child_chunk_ids(doc_id)
             if defer_vector:
                 # 复核只做到"分块落库"：不调嵌入、不写分片、不发布。
@@ -616,6 +621,7 @@ class IngestPipeline:
             ]
         if not chunk_ids:
             return
+        delete_document_table_rows(self.db, doc_id)
         self.fts.delete_chunk_ids(chunk_ids)
         # 重新解析前把旧向量**真删**（IDMap2 支持 remove_ids），
         # 否则每重跑一次解析就在分片里留一批孤儿向量

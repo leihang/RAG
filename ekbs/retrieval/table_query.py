@@ -12,10 +12,10 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Sequence
 
-from ekbs.retrieval.table_struct import TableIndex, TableRow
+from ekbs.retrieval.table_struct import TableIndex, TableRow, load_table_rows
 
 _PERIOD_RE = re.compile(r"(\d{1,2})\s*[-—–~～至到]\s*(\d{1,2})\s*月")
 _YEAR_RE = re.compile(r"(20\d{2})\s*年")
@@ -76,8 +76,33 @@ def _valid_annual(row: TableRow) -> bool:
     return abs(total - row.annual_total) <= max(abs(row.annual_total) * 1e-6, 0.01)
 
 
+def _index_from_db(db: Any, chunks: Sequence[Any]) -> TableIndex | None:
+    doc_ids = sorted({int(getattr(chunk, "doc_id", 0) or 0) for chunk in chunks})
+    rows = load_table_rows(db, doc_ids)
+    if not rows:
+        return None
+    chunk_pos = {
+        int(getattr(chunk, "chunk_id", 0)): index
+        for index, chunk in enumerate(chunks, start=1)
+    }
+    table_pos: dict[int, int] = {}
+    for index, chunk in enumerate(chunks, start=1):
+        if str(getattr(chunk, "chunk_type", "")) == "table":
+            table_pos.setdefault(int(getattr(chunk, "doc_id", 0) or 0), index)
+    mapped = [
+        replace(
+            row,
+            chunk_index=chunk_pos.get(row.chunk_id or 0)
+            or table_pos.get(row.doc_id)
+            or 0,
+        )
+        for row in rows
+    ]
+    return TableIndex(mapped)
+
+
 def compute_table_comparison(
-    question: str, chunks: Sequence[Any]
+    question: str, chunks: Sequence[Any], *, db: Any | None = None
 ) -> TableComparison | None:
     """能确定性比较则返回结果；否则 None。"""
     period = _PERIOD_RE.search(str(question or ""))
@@ -93,7 +118,7 @@ def compute_table_comparison(
     if len(_normalize(subject)) < 2:
         return None
 
-    index = TableIndex.from_chunks(chunks)
+    index = (_index_from_db(db, chunks) if db is not None else None) or TableIndex.from_chunks(chunks)
     subject_rows = index.find(subject)
     if not subject_rows:
         return None

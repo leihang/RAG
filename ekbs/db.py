@@ -221,6 +221,30 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_doc_recommend_status "
                 "ON ekbs_doc_recommend(status)"
             )
+            # 表格行索引：辅助表（table_row_index），不参与 EXPECTED_TABLES 的 01 §5 审计表计数；
+            # 存量库启动时补建，避免“代码已上线但旧库没表”导致入库失败。
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS table_row_index ("
+                " row_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " doc_id INTEGER NOT NULL,"
+                " chunk_id INTEGER,"
+                " caption TEXT NOT NULL DEFAULT '',"
+                " unit TEXT NOT NULL DEFAULT '',"
+                " subject TEXT NOT NULL,"
+                " year INTEGER NOT NULL,"
+                " months_json TEXT NOT NULL DEFAULT '{}',"
+                " annual_total REAL,"
+                " created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_table_row_doc_subject "
+                "ON table_row_index(doc_id, subject, year)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_table_row_chunk "
+                "ON table_row_index(chunk_id)"
+            )
             conn.commit()
 
     def verify_schema(self) -> SchemaReport:

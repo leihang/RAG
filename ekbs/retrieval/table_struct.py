@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
@@ -54,6 +55,7 @@ class TableRow:
     unit: str
     subject: str
     year: int
+    chunk_id: int | None = None
     months: dict[int, float] = field(default_factory=dict)
     annual_total: float | None = None
 
@@ -131,6 +133,7 @@ def parse_table_rows(chunks: Sequence[Any]) -> list[TableRow]:
                 TableRow(
                     chunk_index=chunk_index,
                     doc_id=int(getattr(chunk, "doc_id", 0) or 0),
+                    chunk_id=int(getattr(chunk, "chunk_id", 0) or 0) or None,
                     caption=caption,
                     unit=unit,
                     subject=subject,
@@ -155,3 +158,47 @@ class TableIndex:
         if not target:
             return []
         return [row for row in self.rows if target in _norm(row.subject)]
+
+
+def load_table_rows(db: Any, doc_ids: Sequence[int]) -> list[TableRow]:
+    """从 ``table_row_index`` 读结构化行（按文档过滤，权限由调用方先过滤 chunk）。"""
+    ids = [int(doc_id) for doc_id in doc_ids if int(doc_id) > 0]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        with db.sync_connect() as conn:
+            records = conn.execute(
+                "SELECT doc_id, chunk_id, caption, unit, subject, year, months_json, annual_total "
+                f"FROM table_row_index WHERE doc_id IN ({placeholders}) ORDER BY row_id",
+                ids,
+            ).fetchall()
+    except Exception:  # noqa: BLE001 —— 旧库/测试库未补表时退回 chunk 解析
+        return []
+    rows: list[TableRow] = []
+    for record in records:
+        try:
+            months = {
+                int(month): float(value)
+                for month, value in json.loads(record["months_json"] or "{}").items()
+            }
+        except (TypeError, ValueError):
+            continue
+        if not months:
+            continue
+        rows.append(
+            TableRow(
+                chunk_index=0,
+                chunk_id=int(record["chunk_id"]) if record["chunk_id"] is not None else None,
+                doc_id=int(record["doc_id"]),
+                caption=str(record["caption"] or ""),
+                unit=str(record["unit"] or ""),
+                subject=str(record["subject"] or ""),
+                year=int(record["year"]),
+                months=months,
+                annual_total=(
+                    float(record["annual_total"]) if record["annual_total"] is not None else None
+                ),
+            )
+        )
+    return rows

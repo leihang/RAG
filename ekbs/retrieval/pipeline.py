@@ -2864,7 +2864,7 @@ class RetrievalPipeline:
             collect_debug=collect_debug,
         )
         table_answer = (
-            compute_table_comparison(question, retrieval.chunks)
+            compute_table_comparison(question, retrieval.chunks, db=self.db)
             if allow_generation and mode_used == MODE_PROSE and not multi_intent
             else None
         )
