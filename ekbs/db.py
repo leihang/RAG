@@ -245,6 +245,26 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_table_row_chunk "
                 "ON table_row_index(chunk_id)"
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS table_record_index ("
+                " row_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " doc_id INTEGER NOT NULL,"
+                " chunk_id INTEGER,"
+                " caption TEXT NOT NULL DEFAULT '',"
+                " subject TEXT NOT NULL,"
+                " field TEXT NOT NULL,"
+                " value TEXT NOT NULL,"
+                " created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_table_record_doc_subject "
+                "ON table_record_index(doc_id, subject)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_table_record_chunk "
+                "ON table_record_index(chunk_id)"
+            )
             conn.commit()
 
     def verify_schema(self) -> SchemaReport:

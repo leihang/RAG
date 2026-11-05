@@ -48,7 +48,7 @@ from ekbs.retrieval.faithfulness import (
     mostly_unsupported,
     supporting_chunk_indices,
 )
-from ekbs.retrieval.table_query import compute_table_comparison
+from ekbs.retrieval.table_query import compute_table_comparison, compute_table_lookup
 from ekbs.retrieval.numeric import (
     MODE_AUTO,
     MODE_NUMERIC,
@@ -2863,12 +2863,26 @@ class RetrievalPipeline:
             overrides=overrides,
             collect_debug=collect_debug,
         )
+        table_lookup = (
+            compute_table_lookup(question, retrieval.chunks, db=self.db)
+            if allow_generation and mode_used == MODE_PROSE and not multi_intent
+            else None
+        )
         table_answer = (
             compute_table_comparison(question, retrieval.chunks, db=self.db)
             if allow_generation and mode_used == MODE_PROSE and not multi_intent
             else None
         )
-        if table_answer is not None:
+        if table_lookup is not None:
+            lookup_text = table_lookup.render()
+            result = AnswerResult(
+                answer=lookup_text,
+                citations=self._post_check_citations(lookup_text, retrieval.chunks, perm),
+                retrieval=retrieval,
+                model="table_lookup",
+                degraded=["deterministic_table_lookup"],
+            )
+        elif table_answer is not None:
             # 部分期间对比：直接按表内月份列求和，禁止模型拿年度合计做算术。
             table_text = table_answer.render()
             result = AnswerResult(

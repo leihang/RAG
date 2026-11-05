@@ -17,7 +17,11 @@ from typing import Any, Sequence
 
 from ekbs.retrieval.table_canonical import CanonicalTable, canonical_from_rows
 from ekbs.retrieval.table_plan import parse_table_plan
-from ekbs.retrieval.table_struct import TableRow, load_table_rows
+from ekbs.retrieval.table_struct import (
+    TableRow,
+    load_record_facts,
+    load_table_rows,
+)
 from ekbs.retrieval.table_time import TimeSpec, time_label
 
 
@@ -233,4 +237,76 @@ def compute_table_comparison(
         percent=percent,
         unit=table.unit,
         label=label,
+    )
+
+
+_LOOKUP_RE = re.compile(
+    r"^(?P<subject>.+?)的(?P<field>.+?)(?:是什么|是多少|有哪些|怎么规定|如何规定|是哪|有哪|？|\?|$)"
+)
+
+
+@dataclass(frozen=True)
+class TableLookup:
+    subject: str
+    field: str
+    value: str
+    chunk_index: int
+    caption: str = ""
+
+    def render(self) -> str:
+        mark = f"[{self.chunk_index}]" if self.chunk_index else ""
+        return f"{self.subject}的{self.field}：{self.value}{mark}"
+
+
+def compute_table_lookup(
+    question: str, chunks: Sequence[Any], *, db: Any | None = None
+) -> TableLookup | None:
+    """记录表/表单的确定性查值（subject + field 唯一时）。"""
+    match = _LOOKUP_RE.match(str(question or "").strip())
+    if not match:
+        return None
+    subject = match.group("subject").strip()
+    field = match.group("field").strip()
+    if len(_normalize(subject)) < 2 or len(_normalize(field)) < 1:
+        return None
+    doc_ids = sorted({int(getattr(chunk, "doc_id", 0) or 0) for chunk in chunks})
+    records = load_record_facts(db, doc_ids) if db is not None else []
+    if not records:
+        from ekbs.retrieval.table_struct import parse_record_facts
+
+        records = parse_record_facts(chunks)
+    target_subject = _normalize(subject)
+    target_field = _normalize(field)
+    chunk_pos = {
+        int(getattr(chunk, "chunk_id", 0)): index
+        for index, chunk in enumerate(chunks, start=1)
+        if int(getattr(chunk, "chunk_id", 0) or 0) > 0
+    }
+    table_pos: dict[int, int] = {}
+    for index, chunk in enumerate(chunks, start=1):
+        if str(getattr(chunk, "chunk_type", "")) == "table":
+            table_pos.setdefault(int(getattr(chunk, "doc_id", 0) or 0), index)
+    matched = [
+        record
+        for record in records
+        if (
+            target_subject in _normalize(record.subject)
+            or _normalize(record.subject) in target_subject
+        )
+        and (
+            target_field in _normalize(record.field)
+            or _normalize(record.field) in target_field
+        )
+    ]
+    values = {record.value.strip() for record in matched if record.value.strip()}
+    if len(values) != 1:
+        return None
+    first = matched[0]
+    index = chunk_pos.get(first.chunk_id or 0) or table_pos.get(first.doc_id) or 0
+    return TableLookup(
+        subject=first.subject,
+        field=first.field,
+        value=next(iter(values)),
+        chunk_index=index,
+        caption=first.caption,
     )

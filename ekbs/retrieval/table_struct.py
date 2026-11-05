@@ -204,3 +204,100 @@ def load_table_rows(db: Any, doc_ids: Sequence[int]) -> list[TableRow]:
             )
         )
     return rows
+
+
+@dataclass(frozen=True)
+class RecordFact:
+    """记录表/表单表的一格：subject + field + value。"""
+
+    chunk_index: int
+    chunk_id: int | None
+    doc_id: int
+    caption: str
+    subject: str
+    field: str
+    value: str
+
+
+def _record_headers(content: str) -> list[str]:
+    match = re.search(r"相关表头[:：]\s*(.+)", content or "")
+    if not match:
+        return []
+    return [part.strip() for part in match.group(1).split("|") if part.strip()]
+
+
+def parse_record_facts(chunks: Sequence[Any]) -> list[RecordFact]:
+    """解析“相关表头 + 每行字段=值”的记录表/表单；跳过月份横表。"""
+    facts: list[RecordFact] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        content = str(getattr(chunk, "content", "") or "")
+        headers = _record_headers(content)
+        if not headers:
+            continue
+        caption_match = _CAPTION_RE.search(content)
+        caption = caption_match.group(1).strip() if caption_match else str(
+            getattr(chunk, "heading_path", "") or ""
+        )
+        for line in content.splitlines():
+            row = _parse_row(line)
+            if not row:
+                continue
+            # 月份横表走 table_row_index，不当记录表重复索引。
+            if any("年月份" in key or "年度合计" in key for key in row):
+                continue
+            ordered = [row[key] for key in headers if key in row]
+            if not ordered:
+                continue
+            subject = ordered[0].strip()
+            if not subject:
+                continue
+            for key in headers:
+                value = str(row.get(key) or "").strip()
+                if not key or not value:
+                    continue
+                signature = (caption, subject, key, value)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                facts.append(
+                    RecordFact(
+                        chunk_index=chunk_index,
+                        chunk_id=int(getattr(chunk, "chunk_id", 0) or 0) or None,
+                        doc_id=int(getattr(chunk, "doc_id", 0) or 0),
+                        caption=caption,
+                        subject=subject,
+                        field=key,
+                        value=value,
+                    )
+                )
+    return facts
+
+
+def load_record_facts(db: Any, doc_ids: Sequence[int]) -> list[RecordFact]:
+    """读 ``table_record_index``；旧库未补表时返回空。"""
+    ids = [int(doc_id) for doc_id in doc_ids if int(doc_id) > 0]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        with db.sync_connect() as conn:
+            records = conn.execute(
+                "SELECT doc_id, chunk_id, caption, subject, field, value "
+                f"FROM table_record_index WHERE doc_id IN ({placeholders}) ORDER BY row_id",
+                ids,
+            ).fetchall()
+    except Exception:  # noqa: BLE001
+        return []
+    return [
+        RecordFact(
+            chunk_index=0,
+            chunk_id=int(record["chunk_id"]) if record["chunk_id"] is not None else None,
+            doc_id=int(record["doc_id"]),
+            caption=str(record["caption"] or ""),
+            subject=str(record["subject"] or ""),
+            field=str(record["field"] or ""),
+            value=str(record["value"] or ""),
+        )
+        for record in records
+    ]

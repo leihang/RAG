@@ -87,3 +87,36 @@ def test_three_years_are_not_fixed_to_two() -> None:
     assert len(result.years) == 3
     assert result.totals[2024] == 9.0
     assert "对比：" in result.render()
+
+
+RECORD_CONTENT = """表名: 表 2 岗位职责
+相关表头: 岗位 | 职责
+岗位=工程经理; 职责=对项目能耗管理情况负责，监督能耗管理工作执行情况。
+岗位=设备主管; 职责=编制年度能耗管理计划并按计划实施。
+"""
+
+
+def test_record_table_lookup_is_deterministic() -> None:
+    from types import SimpleNamespace
+    from ekbs.retrieval.table_query import compute_table_lookup
+
+    chunk = SimpleNamespace(
+        chunk_id=9, doc_id=205, chunk_type="table",
+        content=RECORD_CONTENT, heading_path="岗位职责", doc_title="能耗管理",
+    )
+    result = compute_table_lookup("工程经理的职责是什么", [chunk])
+    assert result is not None
+    assert result.value.startswith("对项目能耗管理情况负责")
+    assert "[1]" in result.render()
+
+
+def test_record_table_lookup_ambiguity_returns_none() -> None:
+    from types import SimpleNamespace
+    from ekbs.retrieval.table_query import compute_table_lookup
+
+    content = RECORD_CONTENT + "岗位=工程经理; 职责=另一个职责。\n"
+    chunk = SimpleNamespace(
+        chunk_id=9, doc_id=205, chunk_type="table",
+        content=content, heading_path="岗位职责", doc_title="能耗管理",
+    )
+    assert compute_table_lookup("工程经理的职责是什么", [chunk]) is None

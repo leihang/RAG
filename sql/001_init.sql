@@ -687,3 +687,19 @@ CREATE INDEX IF NOT EXISTS idx_table_row_doc_subject
     ON table_row_index(doc_id, subject, year);
 CREATE INDEX IF NOT EXISTS idx_table_row_chunk
     ON table_row_index(chunk_id);
+
+-- 记录表/表单表的事实索引（辅助索引，不参与 01 §5 审计表计数）
+CREATE TABLE IF NOT EXISTS table_record_index (
+    row_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id      INTEGER NOT NULL,
+    chunk_id    INTEGER,
+    caption     TEXT NOT NULL DEFAULT '',
+    subject     TEXT NOT NULL,
+    field       TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_table_record_doc_subject
+    ON table_record_index(doc_id, subject);
+CREATE INDEX IF NOT EXISTS idx_table_record_chunk
+    ON table_record_index(chunk_id);
