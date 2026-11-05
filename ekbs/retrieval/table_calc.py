@@ -277,3 +277,35 @@ def _op_rank(table: CanonicalTable, expr: RankExpr) -> CalcValue | None:
 
 
 _REGISTRY.update({"ratio": _op_ratio, "yoy": _op_yoy, "rank": _op_rank})
+
+
+@dataclass(frozen=True)
+class AvgExpr:
+    subject: str
+    year: int
+    time: TimeSpec
+    kind: str = "avg"
+
+
+def _op_avg(table: CanonicalTable, expr: AvgExpr) -> CalcValue | None:
+    facts = _year_facts(table, expr.subject, expr.year)
+    months: dict[int, tuple[float, int | None]] = {}
+    for fact in facts:
+        month = fact.dimensions.get("month")
+        if month is not None:
+            months[month] = (fact.value, fact.chunk_id)
+    selected = expr.time.month_set(max_month=max(months, default=0))
+    if expr.time.require_complete and not selected.issubset(months):
+        return None
+    present = [month for month in selected if month in months]
+    if not present:
+        return None
+    return CalcValue(
+        sum(months[m][0] for m in present) / len(present), table.unit,
+        {"op": "avg", "table": table.table_key, "subject": expr.subject,
+         "year": expr.year, "months": sorted(present)},
+        tuple(months[m][1] for m in present),
+    )
+
+
+_REGISTRY["avg"] = _op_avg

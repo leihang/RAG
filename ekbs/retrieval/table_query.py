@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from ekbs.retrieval.table_calc import SumExpr, evaluate
+from ekbs.retrieval.table_calc import AvgExpr, SumExpr, evaluate
 from ekbs.retrieval.table_canonical import CanonicalTable, canonical_from_rows
 from ekbs.retrieval.table_plan import parse_table_plan
 from ekbs.retrieval.table_struct import (
@@ -432,3 +432,42 @@ def compute_table_value(
         if value is not None:
             return value
     return _value_from_cells(chunks, text, years[0], time_spec, db, chunk_pos, table_pos)
+
+
+def compute_table_average(
+    question: str, chunks: Sequence[Any], *, db: Any | None = None
+) -> TableValue | None:
+    """单期平均值（按所选月份 facts 求平均，不拿年度合计冒充平均）。"""
+    text = str(question or "")
+    years = tuple(dict.fromkeys(int(y) for y in re.findall(r"(20\d{2})\s*年", text)))
+    if len(years) != 1:
+        return None
+    from ekbs.retrieval.table_time import TimeSpec, parse_time_spec
+
+    time_spec = parse_time_spec(text) or TimeSpec("year", 1, 12, False)
+    rows = _rows_for_question(db, chunks)
+    if not rows:
+        return None
+    chunk_pos, table_pos = _citation_context(chunks)
+    matches: list[tuple[CanonicalTable, str]] = []
+    for table in canonical_from_rows(rows):
+        if not table.unit.strip():
+            continue
+        for subject in table.subjects():
+            if len(_normalize(subject)) >= 2 and _normalize(subject) in _normalize(text):
+                matches.append((table, subject))
+    if len({(table.caption, subject, table.unit) for table, subject in matches}) != 1:
+        return None
+    table, subject = matches[0]
+    calc = evaluate(table, AvgExpr(subject=subject, year=years[0], time=time_spec))
+    if calc is None:
+        return None
+    chunk_id = next((cid for cid in calc.chunk_ids if cid is not None), None)
+    index = chunk_pos.get(chunk_id or 0) or table_pos.get(table.doc_id) or 0
+    if not index:
+        return None
+    label = "平均每月" if time_spec.kind == "year" else f"平均{time_label(time_spec)}"
+    return TableValue(
+        subject=subject, year=years[0], value=calc.value, unit=calc.unit,
+        chunk_index=index, label=label,
+    )

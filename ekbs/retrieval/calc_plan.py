@@ -19,6 +19,7 @@ from ekbs.retrieval.table_time import TimeSpec, parse_time_spec
 _YEAR_RE = re.compile(r"(20\d{2})\s*年")
 _COMPARE_WORDS = ("增长", "减少", "增加", "下降", "对比", "较", "同比", "环比")
 _VALUE_WORDS = ("多少", "几", "合计", "总计", "总共", "是多少", "多大", "占多少")
+_AVG_WORDS = ("平均", "均值")
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,12 @@ def generate_calc_plan(question: str) -> CalcPlan | None:
         if time is None:
             return None
         return CalcPlan("compare", years, time, _hint(text))
+    if len(years) == 1 and any(word in text for word in _AVG_WORDS):
+        return CalcPlan(
+            "avg", years,
+            time or TimeSpec("year", 1, 12, require_complete=False),
+            _hint(text),
+        )
     if len(years) == 1 and any(word in text for word in _VALUE_WORDS):
         # 单值问法没写“全年/1-9月”时默认全年；由算子优先读年度 total。
         return CalcPlan(

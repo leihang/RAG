@@ -21,3 +21,8 @@ def test_value_plan() -> None:
 
 def test_non_numeric_returns_none() -> None:
     assert generate_calc_plan("工程经理的职责是什么") is None
+
+
+def test_average_plan() -> None:
+    plan = generate_calc_plan("2026年平均每月水费是多少")
+    assert plan is not None and plan.operation == "avg"

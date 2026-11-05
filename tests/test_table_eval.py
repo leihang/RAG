@@ -153,3 +153,13 @@ def test_wide_table_cell_value() -> None:
     assert result is not None
     assert result.value == 4379405.00
     assert result.unit == "KW/h" or result.unit
+
+
+def test_average_uses_months_not_total() -> None:
+    from ekbs.retrieval.table_query import compute_table_average
+
+    rows = [
+        _row(2026, {1: 10.0, 2: 20.0, 3: 30.0}, annual=60.0),
+    ]
+    result = compute_table_average("测试指标2026年平均每月是多少", [_chunk(rows=rows)])
+    assert result is not None and result.value == 20.0

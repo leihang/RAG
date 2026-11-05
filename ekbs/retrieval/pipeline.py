@@ -50,6 +50,7 @@ from ekbs.retrieval.faithfulness import (
 )
 from ekbs.retrieval.calc_plan import generate_calc_plan
 from ekbs.retrieval.table_query import (
+    compute_table_average,
     compute_table_comparison,
     compute_table_lookup,
     compute_table_value,
@@ -2910,6 +2911,11 @@ class RetrievalPipeline:
             if calc_plan is not None and calc_plan.operation == "value"
             else None
         )
+        table_avg = (
+            compute_table_average(question, retrieval.chunks, db=self.db)
+            if calc_plan is not None and calc_plan.operation == "avg"
+            else None
+        )
         numeric_unplanned = (
             calc_plan is not None
             and calc_plan.operation == "compare"
@@ -2964,6 +2970,21 @@ class RetrievalPipeline:
                     "value": table_value.value,
                 },
                 degraded=["deterministic_table_value"],
+            )
+        elif table_avg is not None:
+            avg_text = table_avg.render()
+            result = AnswerResult(
+                answer=avg_text,
+                citations=self._post_check_citations(avg_text, retrieval.chunks, perm),
+                retrieval=retrieval,
+                model="table_avg",
+                provenance={
+                    "op": "table_avg",
+                    "subject": table_avg.subject,
+                    "year": table_avg.year,
+                    "value": table_avg.value,
+                },
+                degraded=["deterministic_table_avg"],
             )
         elif numeric_unplanned:
             result = AnswerResult(

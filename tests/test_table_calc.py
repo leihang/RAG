@@ -78,3 +78,13 @@ def test_ratio_yoy_rank_operators() -> None:
     rank = evaluate(table, RankExpr(year=2026, time=t, top=2))
     assert rank is not None and rank.provenance["op"] == "rank"
     assert rank.provenance["ranking"][0]["subject"] == "指标"
+
+
+def test_avg_operator() -> None:
+    from ekbs.retrieval.table_calc import AvgExpr
+
+    table = _table()
+    result = evaluate(
+        table, AvgExpr(subject="指标", year=2026, time=TimeSpec("month_range", 1, 2))
+    )
+    assert result is not None and result.value == 17.0
