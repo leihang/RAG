@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4}
 _MONTH_RANGE_RE = re.compile(r"(\d{1,2})\s*[-—–~～至到]\s*(\d{1,2})\s*月")
+_SINGLE_MONTH_RE = re.compile(r"(?<![\d.])(\d{1,2})\s*月")
 _QUARTER_RE = re.compile(r"(?i)(?:第)?([一二三四1-4])\s*(?:季度|季)|Q([1-4])")
 _HALF_RE = re.compile(r"(上|下)\s*半年")
 _YTD_RE = re.compile(r"(?i)YTD|年初至今|年初以来|今年以来")
@@ -53,6 +54,11 @@ def parse_time_spec(question: str) -> TimeSpec | None:
         start, end = int(match.group(1)), int(match.group(2))
         if 1 <= start <= end <= 12:
             return TimeSpec("month_range", start, end, True)
+    match = _SINGLE_MONTH_RE.search(text)
+    if match:
+        month = int(match.group(1))
+        if 1 <= month <= 12:
+            return TimeSpec("month_range", month, month, True)
     match = _QUARTER_RE.search(text)
     if match:
         raw = match.group(1) or match.group(2) or ""

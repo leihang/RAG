@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -226,6 +227,11 @@ def compute_table_comparison(
     diff = totals[common_years[0]] - totals[common_years[1]]
     percent = diff / totals[common_years[1]] * 100.0 if totals[common_years[1]] else None
     label = time_label(spec)
+    # 后置硬校验：没有引用来源/单位/有限数值的结果不接管，避免“算出来但没有依据”。
+    if not indices or not table.unit.strip():
+        return None
+    if any(not math.isfinite(value) for value in totals.values()):
+        return None
     return TableComparison(
         subject=subject,
         start_month=int(spec.start_month or 1),
@@ -303,6 +309,8 @@ def compute_table_lookup(
         return None
     first = matched[0]
     index = chunk_pos.get(first.chunk_id or 0) or table_pos.get(first.doc_id) or 0
+    if not index:
+        return None
     return TableLookup(
         subject=first.subject,
         field=first.field,

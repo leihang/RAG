@@ -14,7 +14,10 @@ CONTENT = """表名: 年用水费统计对比（元）
 
 
 def _chunk(content: str = CONTENT) -> SimpleNamespace:
-    return SimpleNamespace(content=content, doc_id=215, heading_path="用水分析", doc_title="能耗分析")
+    return SimpleNamespace(
+        chunk_id=1, doc_id=215, chunk_type="table",
+        content=content, heading_path="用水分析", doc_title="能耗分析",
+    )
 
 
 def test_jan_sep_comparison_uses_month_columns_and_unit() -> None:
