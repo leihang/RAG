@@ -2,15 +2,11 @@ import { render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const sheetjs = vi.hoisted(() => ({
-  read: vi.fn(),
-  sheetToHtml: vi.fn(),
-}))
-
 const api = vi.hoisted(() => ({
   getDocument: vi.fn(),
   fetchDocumentSource: vi.fn(),
   fetchDocumentSourcePreview: vi.fn(),
+  fetchDocumentSourceRender: vi.fn(),
   getParseDraft: vi.fn(),
   fetchParseDraftFigure: vi.fn(),
   saveParseDraft: vi.fn(),
@@ -22,6 +18,7 @@ vi.mock('@/api/doc', () => ({
   getDocument: api.getDocument,
   fetchDocumentSource: api.fetchDocumentSource,
   fetchDocumentSourcePreview: api.fetchDocumentSourcePreview,
+  fetchDocumentSourceRender: api.fetchDocumentSourceRender,
 }))
 
 vi.mock('@/api/parse', () => ({
@@ -36,11 +33,6 @@ vi.mock('@/components/Auth', () => ({
   default: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }))
 
-vi.mock('xlsx', () => ({
-  read: sheetjs.read,
-  utils: { sheet_to_html: sheetjs.sheetToHtml },
-}))
-
 vi.mock('docx-preview', () => ({
   renderAsync: vi.fn(async (_blob: Blob, el: HTMLElement) => {
     el.textContent = '满足公共设备、设施管理的需要'
@@ -50,13 +42,13 @@ vi.mock('docx-preview', () => ({
 import ReviewCompare from './ReviewCompare'
 
 beforeEach(() => {
-  sheetjs.read.mockReset()
-  sheetjs.sheetToHtml.mockReset()
-  sheetjs.read.mockReturnValue({ SheetNames: ['用电分析'], Sheets: { 用电分析: {} } })
-  sheetjs.sheetToHtml.mockReturnValue('<table><tr><td>-5.14%</td></tr></table>')
   api.getDocument.mockReset()
   api.fetchDocumentSource.mockReset()
   api.fetchDocumentSourcePreview.mockReset()
+  api.fetchDocumentSourceRender.mockReset()
+  api.fetchDocumentSourceRender.mockResolvedValue(
+    new Blob([new Uint8Array([0x25, 0x50, 0x44, 0x46])], { type: 'application/pdf' }),
+  )
   api.getParseDraft.mockReset()
   api.getDocument.mockResolvedValue({
     doc_id: 76,
@@ -172,7 +164,7 @@ describe('双栏复核', () => {
 })
 
 
-it('Excel 原件从原始 xlsx 字节前端渲染，不走后端 source-preview', async () => {
+it('Excel 原件走 LibreOffice PDF 渲染，不再请求 source-preview', async () => {
   api.getDocument.mockResolvedValue({
     doc_id: 214,
     title: '2026年9月能耗分析',
@@ -187,11 +179,6 @@ it('Excel 原件从原始 xlsx 字节前端渲染，不走后端 source-preview'
     tables: [],
     figures: [],
   })
-  const xlsxBlob = new Blob([new Uint8Array([0x50, 0x4b, 0x03, 0x04])], {
-    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  }) as Blob & { arrayBuffer: () => Promise<ArrayBuffer> }
-  xlsxBlob.arrayBuffer = async () => new Uint8Array([0x50, 0x4b, 0x03, 0x04]).buffer
-  api.fetchDocumentSource.mockResolvedValue(xlsxBlob)
 
   render(
     <MemoryRouter initialEntries={['/parse/review/214']}>
@@ -201,8 +188,7 @@ it('Excel 原件从原始 xlsx 字节前端渲染，不走后端 source-preview'
     </MemoryRouter>,
   )
 
-  await waitFor(() => expect(sheetjs.read).toHaveBeenCalled())
-  expect(api.fetchDocumentSource).toHaveBeenCalledWith(214)
+  await waitFor(() => expect(api.fetchDocumentSourceRender).toHaveBeenCalledWith(214))
   expect(api.fetchDocumentSourcePreview).not.toHaveBeenCalled()
-  expect(await screen.findByTitle('原件 Excel')).toBeInTheDocument()
+  expect(await screen.findByTitle('原件 Excel PDF')).toBeInTheDocument()
 })

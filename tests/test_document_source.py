@@ -159,3 +159,40 @@ async def test_source_preview_rejects_pdf(client, seeded) -> None:
 
     resp = await client.get(f"/api/v1/docs/documents/{doc_id}/source-preview", headers=headers)
     assert resp.status_code == 415
+
+
+async def test_source_render_returns_pdf(client, seeded, monkeypatch, tmp_path) -> None:
+    """xlsx 左栏走 LibreOffice 渲染的 PDF；路由只回 PDF，不重画 HTML。"""
+    runtime, _ = seeded
+    admin_id = grant_role(runtime, "demo_alice", "kb_admin")
+    headers = headers_for(admin_id)
+    listing = (await client.get("/api/v1/docs/documents", headers=headers)).json()
+    doc_id = listing["items"][0]["doc_id"]
+    _plant_source(runtime, doc_id, name="分析.xlsx", body=b"xlsx")
+    pdf = tmp_path / "rendered.pdf"
+    pdf.write_bytes(b"%PDF-1.7 rendered")
+
+    monkeypatch.setattr("ekbs.api.admin.render_original_pdf", lambda *a, **k: pdf)
+    resp = await client.get(f"/api/v1/docs/documents/{doc_id}/source-render", headers=headers)
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"%PDF-")
+    assert "pdf" in resp.headers.get("content-type", "").lower()
+
+
+async def test_source_render_without_libreoffice_returns_503(client, seeded, monkeypatch) -> None:
+    from ekbs.ingest.office_render import OfficeRenderError
+
+    runtime, _ = seeded
+    admin_id = grant_role(runtime, "demo_alice", "kb_admin")
+    headers = headers_for(admin_id)
+    listing = (await client.get("/api/v1/docs/documents", headers=headers)).json()
+    doc_id = listing["items"][0]["doc_id"]
+    _plant_source(runtime, doc_id, name="分析.xlsx", body=b"xlsx")
+
+    def boom(*_a, **_k):
+        raise OfficeRenderError("未安装 LibreOffice")
+
+    monkeypatch.setattr("ekbs.api.admin.render_original_pdf", boom)
+    resp = await client.get(f"/api/v1/docs/documents/{doc_id}/source-render", headers=headers)
+    assert resp.status_code == 503
+    assert "LibreOffice" in resp.json()["detail"]

@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import mimetypes
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ from ekbs.api.qa import _authenticate
 from ekbs.authz import SUPER_ADMIN
 from ekbs.errors import PermissionDenied
 from ekbs.ingest.office_preview import OfficePreviewError, render_office_preview
+from ekbs.ingest.office_render import OfficeRenderError, render_original_pdf
 from ekbs.logging import get_logger
 from ekbs.permission.console import is_console_role, widen_for_console
 from ekbs.observability.alerts import ALERT_RULES, evaluate_all
@@ -823,6 +825,36 @@ async def get_document_source(
         candidate,
         media_type=media_type or "application/octet-stream",
         filename=candidate.name,
+        content_disposition_type="inline",
+    )
+
+
+@router.get("/docs/documents/{doc_id}/source-render")
+async def get_document_source_render(
+    doc_id: int,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
+) -> FileResponse:
+    """原件 → PDF（LibreOffice headless），复核左栏用于 Excel 等浏览器不能原生渲染的格式。
+
+    这是**原件渲染**：LibreOffice 读原文件导出 PDF，保留图表/样式；不是后端重画单元格。
+    LibreOffice 未安装时返回 503，前端降级为下载原件。
+    """
+    candidate = await _open_document_source(
+        request, doc_id, _source_headers(authorization, x_internal_token, x_internal_user_id),
+    )
+    runtime = request.app.state.runtime
+    cache_dir = Path(runtime.settings.data_dir) / "render"
+    try:
+        pdf = await asyncio.to_thread(render_original_pdf, candidate, cache_dir, doc_id=doc_id)
+    except OfficeRenderError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return FileResponse(
+        pdf,
+        media_type="application/pdf",
+        filename=f"{candidate.stem}.pdf",
         content_disposition_type="inline",
     )
 

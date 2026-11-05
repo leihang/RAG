@@ -35,9 +35,13 @@ export const getDocument = async (docId: number): Promise<DocumentItem> =>
 export const fetchDocumentSource = (docId: number) =>
   http.get(`/docs/documents/${docId}/source`, { responseType: 'blob' }) as Promise<Blob>
 
-/** Word / Excel / PPT / 文本原件转成的 HTML，嵌进对照左栏。 */
+/** Word / Excel / PPT / 文本原件转成的 HTML（非原件渲染，保留旧路径）。 */
 export const fetchDocumentSourcePreview = (docId: number) =>
   http.get(`/docs/documents/${docId}/source-preview`, { responseType: 'text' }) as Promise<string>
+
+/** 原件 → PDF（LibreOffice headless；Excel 复核左栏用，含图表/样式）。 */
+export const fetchDocumentSourceRender = (docId: number) =>
+  http.get(`/docs/documents/${docId}/source-render`, { responseType: 'blob' }) as Promise<Blob>
 
 export const updateDocument = (docId: number, body: Record<string, unknown>) =>
   http.put(`/docs/documents/${docId}`, body) as Promise<unknown>
