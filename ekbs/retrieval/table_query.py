@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from ekbs.retrieval.table_calc import SumExpr, evaluate
 from ekbs.retrieval.table_canonical import CanonicalTable, canonical_from_rows
 from ekbs.retrieval.table_plan import parse_table_plan
 from ekbs.retrieval.table_struct import (
@@ -127,34 +128,13 @@ def _sum_for_spec(
     *,
     ytd_end: int | None = None,
 ) -> tuple[float, int | None] | None:
-    months = _year_months(table, subject, year)
-    if spec.kind == "quarter":
-        quarter = ((int(spec.start_month or 1) - 1) // 3) + 1
-        direct = [
-            fact
-            for fact in table.facts_for(subject)
-            if fact.dimensions.get("year") == year
-            and fact.dimensions.get("quarter") == quarter
-        ]
-        if direct:
-            return (
-                sum(fact.value for fact in direct),
-                next((fact.chunk_id for fact in direct), None),
-            )
-    if not months:
+    effective = spec
+    if spec.kind == "ytd" and ytd_end is not None:
+        effective = TimeSpec("month_range", 1, ytd_end, require_complete=False)
+    calc = evaluate(table, SumExpr(subject=subject, year=year, time=effective))
+    if calc is None:
         return None
-    if spec.kind == "ytd":
-        selected = spec.month_set(max_month=ytd_end or max(months))
-    else:
-        selected = spec.month_set()
-    if spec.require_complete and not selected.issubset(months):
-        return None
-    present = [month for month in selected if month in months]
-    if not present:
-        return None
-    total = sum(months[month][0] for month in present)
-    chunk_id = next((months[month][1] for month in present if months[month][1] is not None), None)
-    return total, chunk_id
+    return calc.value, next((cid for cid in calc.chunk_ids if cid is not None), None)
 
 
 def _pick_candidate(
