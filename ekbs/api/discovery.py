@@ -46,6 +46,8 @@ def dingtalk_send_limit_message(title: str, size: int) -> str:
 
 class FileRequestBody(BaseModel):
     text: str = Field(min_length=1, max_length=500)
+    #: 群聊（``2``）只允许公开文档；个人库文件必须回单聊处理。
+    conversation_type: str | None = Field(default=None, pattern="^[12]$")
 
 
 def _headers(
@@ -69,6 +71,7 @@ async def discovery_catalog(
     request: Request,
     doc_limit: int = Query(default=20, ge=1, le=100),
     suggestion_limit: int = Query(default=5, ge=1, le=20),
+    conversation_type: str = Query(default="1", pattern="^[12]$"),
     authorization: str | None = Header(default=None),
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),
@@ -96,12 +99,19 @@ async def discovery_catalog(
         and (x_internal_channel or "") != "dingtalk_robot"
     ):
         perm = widen_for_console(perm, runtime.db)
+    if conversation_type == "2":
+        # 群聊公开范围：即使管理员也不能绕过（群回复公开），强制走 ACL 白名单。
+        admin_bypass = False
+        from ekbs.permission.public_scope import public_scope_perm
+
+        perm = public_scope_perm(perm, runtime.db)
     body: dict[str, Any] = build_catalog(
         runtime,
         perm,
         doc_limit=doc_limit,
         suggestion_limit=suggestion_limit,
         admin_bypass=admin_bypass,
+        group_chat=(conversation_type == "2"),
     )
     body["user_id"] = user.user_id
     body["clearance"] = perm.clearance
@@ -159,6 +169,12 @@ async def discovery_file(
         and (x_internal_channel or "") != "dingtalk_robot"
     ):
         perm = widen_for_console(perm, runtime.db)
+    if body.conversation_type == "2":
+        # 群聊公开范围：管理员也不能绕过（文件会发到群里）。
+        admin_bypass = False
+        from ekbs.permission.public_scope import public_scope_perm
+
+        perm = public_scope_perm(perm, runtime.db)
     result = resolve_file_request(
         runtime, perm, body.text, admin_bypass=admin_bypass
     )

@@ -680,3 +680,52 @@ def test_answer_appends_recommended_questions_on_success() -> None:
     assert StreamMessageHandler._with_suggestions(refused, ["y"]) == refused
     # 没有推荐问时原样返回
     assert StreamMessageHandler._with_suggestions("答案。", []) == "答案。"
+
+
+@respx.mock
+async def test_group_personal_list_is_refused_locally(handler) -> None:
+    """群聊里「我的文件」不能调私有库 API，也不能把私有列表发群。"""
+    routes = mock_dingtalk()
+    personal = respx.get(f"{API_BASE}/api/v1/personal/files").mock(
+        return_value=httpx.Response(200, json={"message": "不应调用"})
+    )
+    code, _ = await handler.process(
+        {"data": payload(msg_id="plist-group", text="我的文件", conversation_type="2", conversation="cid-pg")}
+    )
+    assert code == ACK_OK
+    assert personal.call_count == 0
+    sent = json.loads(json.loads(routes["group"].calls[0].request.content)["msgParam"])
+    assert "单聊" in sent["text"]
+
+
+@respx.mock
+async def test_group_help_requests_public_only_catalog(handler) -> None:
+    """群聊帮助必须带 conversation_type=2，让 API 剪掉个人库文档。"""
+    routes = mock_dingtalk()
+    catalog = respx.get(f"{API_BASE}/api/v1/discovery/catalog?conversation_type=2").mock(
+        return_value=httpx.Response(
+            200,
+            json={"help_text": "当前群聊可查询的公开文档：\n1. 年假管理制度", "documents": [], "suggestions": []},
+        )
+    )
+    code, _ = await handler.process(
+        {"data": payload(msg_id="help-group", text="帮助", conversation_type="2", conversation="cid-hg")}
+    )
+    assert code == ACK_OK
+    assert catalog.call_count == 1
+    sent = json.loads(json.loads(routes["group"].calls[0].request.content)["msgParam"])
+    assert "公开文档" in sent["text"]
+
+
+@respx.mock
+async def test_group_qa_sends_conversation_type(handler) -> None:
+    """群聊问答要把 conversation_type=2 传给 API，API 才能按公开范围检索。"""
+    routes = mock_dingtalk()
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    code, _ = await handler.process(
+        {"data": payload(msg_id="qa-group", text="年假有多少天", conversation_type="2", conversation="cid-qg")}
+    )
+    assert code == ACK_OK
+    body = json.loads(qa.calls[0].request.content)
+    assert body["conversation_type"] == "2"
+    assert routes["oto"].call_count == 0

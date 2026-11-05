@@ -633,15 +633,26 @@ def resolve_file_request(
 def format_help_text(
     documents: list[dict[str, Any]],
     suggestions: list[dict[str, Any]],
+    *,
+    group_chat: bool = False,
 ) -> str:
-    """钉钉欢迎/帮助纯文本（可复制或原样发送示例问）。"""
+    """钉钉欢迎/帮助纯文本（可复制或原样发送示例问）。
+
+    ``group_chat=True``：群聊只允许公开文档（个人库已在 API 侧从 perm 剪掉），
+    文案也要明确“群聊/公开”，并去掉个人库上传/删除的引导，避免误导。
+    """
     lines = [
         "你好，我是企业知识库助手。",
         "你可以直接问制度、合同、表格里的具体条款；也可以发送「帮助」随时回来看这份导览。",
         "",
     ]
+    if group_chat:
+        lines[1] = (
+            "群聊中我只能基于公开文档回答；个人私有库/文件请私聊我处理。"
+            "也可以发送「帮助」随时回来看这份导览。"
+        )
     if documents:
-        lines.append("你当前可见的文档：")
+        lines.append("当前群聊可查询的公开文档：" if group_chat else "你当前可见的文档：")
         shown = documents[:40]
         for i, doc in enumerate(shown, 1):
             lines.append(f"{i}. {_short_title(str(doc.get('title') or ''), max_len=40)}")
@@ -658,7 +669,10 @@ def format_help_text(
 
     lines.append("")
     lines.append("要某份原文，直接说「把某某文件发给我」，我会发原文件，而不是摘要。")
-    lines.append("在单聊里直接发文件，会进入只属于你的私有库。说「我的文件」查看，说「删除我的文件 标题」删除。")
+    if group_chat:
+        lines.append("私有库文件与个人文件操作（我的文件/上传/删除）请在单聊里进行。")
+    else:
+        lines.append("在单聊里直接发文件，会进入只属于你的私有库。说「我的文件」查看，说「删除我的文件 标题」删除。")
     lines.append("提示：没有可靠依据时我会拒答，不会编造。")
     return "\n".join(lines)
 
@@ -709,8 +723,13 @@ def build_catalog(
     doc_limit: int = 20,
     suggestion_limit: int = 5,
     admin_bypass: bool = False,
+    group_chat: bool = False,
 ) -> dict[str, Any]:
-    """组装发现层响应体。"""
+    """组装发现层响应体。
+
+    ``group_chat``：群聊只允许公开文档（调用方已把 perm 收窄），帮助文案也要改成
+    “群聊公开文档”口径，不再提示个人库上传/删除。
+    """
     documents = list_visible_published_docs(
         runtime, perm, limit=doc_limit, admin_bypass=admin_bypass
     )
@@ -724,6 +743,6 @@ def build_catalog(
     return {
         "documents": documents,
         "suggestions": suggestions,
-        "help_text": format_help_text(documents, suggestions),
+        "help_text": format_help_text(documents, suggestions, group_chat=group_chat),
         "document_count": len(documents),
     }

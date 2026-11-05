@@ -282,6 +282,16 @@ class StreamMessageHandler:
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="personal_upload", answer=reply)
 
+            if message.is_group and (
+                is_personal_list_command(message.text)
+                or personal_delete_title(message.text) is not None
+            ):
+                # 群聊回复是公开的：个人库列表/删除只允许单聊，避免把私有文件信息发群。
+                reply = "个人文件/私有库仅支持单聊，请私聊我处理。"
+                await self._reply_text(message, reply)
+                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                return ReplyResult(True, replied=True, via="text", reason="personal_group_blocked", answer=reply)
+
             if is_personal_list_command(message.text):
                 status, payload = await self._api_request(
                     "GET", "/api/v1/personal/files", user_id=user_id
@@ -316,7 +326,9 @@ class StreamMessageHandler:
 
             # ③.5 D22-P0：欢迎/帮助短路 —— 可见文档 + 示例问（过 ACL，不进问答）
             if is_help_command(message.text):
-                status, payload = await self._discovery_catalog(user_id=user_id)
+                status, payload = await self._discovery_catalog(
+                    user_id=user_id, conversation_type=message.conversation_type
+                )
                 if status == 0:
                     await asyncio.to_thread(
                         self.inbox.mark_failed, message.msg_id, "api_unreachable"
@@ -333,7 +345,9 @@ class StreamMessageHandler:
                 return ReplyResult(True, replied=True, via="text", reason="help", answer=help_text)
 
             if is_catalog_query(message.text):
-                status, payload = await self._discovery_catalog(user_id=user_id, doc_limit=80)
+                status, payload = await self._discovery_catalog(
+                    user_id=user_id, doc_limit=80, conversation_type=message.conversation_type
+                )
                 if status == 0:
                     await asyncio.to_thread(
                         self.inbox.mark_failed, message.msg_id, "api_unreachable"
@@ -354,7 +368,7 @@ class StreamMessageHandler:
                     "POST",
                     "/api/v1/discovery/file",
                     user_id=user_id,
-                    json_body={"text": message.text},
+                    json_body={"text": message.text, "conversation_type": message.conversation_type},
                 )
                 if status == 0:
                     await asyncio.to_thread(
@@ -554,11 +568,21 @@ class StreamMessageHandler:
         return str(payload.get("message") or "已放入你的私有库。")
 
     async def _discovery_catalog(
-        self, *, user_id: int, doc_limit: int | None = None
+        self,
+        *,
+        user_id: int,
+        doc_limit: int | None = None,
+        conversation_type: str = "1",
     ) -> tuple[int, dict[str, Any]]:
         path = "/api/v1/discovery/catalog"
+        query: list[str] = []
         if doc_limit:
-            path = f"{path}?doc_limit={int(doc_limit)}"
+            query.append(f"doc_limit={int(doc_limit)}")
+        if conversation_type == "2":
+            # 群聊只允许公开文档：API 侧会剪掉个人库；单聊保持原 URL 兼容。
+            query.append("conversation_type=2")
+        if query:
+            path = f"{path}?{'&'.join(query)}"
         return await self._api_request("GET", path, user_id=user_id)
 
     async def _ask_api(self, message: InboundMessage, *, user_id: int) -> tuple[int, dict[str, Any]]:
@@ -569,6 +593,7 @@ class StreamMessageHandler:
             # 钉钉 auto；重复提问时忽略该问题的旧回答，避免修复后仍被旧单值答案带偏
             "mode": "auto",
             "fresh_on_repeat": True,
+            "conversation_type": message.conversation_type,
         }
         return await self._api_request(
             "POST", "/api/v1/qa/chat", user_id=user_id, json_body=body

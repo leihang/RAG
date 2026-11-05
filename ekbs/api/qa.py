@@ -51,6 +51,9 @@ class QaRequest(BaseModel):
     mode: str = Field(default="auto", pattern="^(auto|prose|numeric)$")
     #: 长会话入口（钉钉）重复提问时，忽略历史里该问题的旧回答，避免旧答案污染
     fresh_on_repeat: bool = False
+    #: 钉钉会话类型：``1``=单聊（默认），``2``=群聊。群聊只允许公开文档：
+    #: 回复会公开到群，不能把提问者的个人库/更高权限内容带进群。
+    conversation_type: str | None = Field(default=None, pattern="^[12]$")
 
 
 class RetrieveRequest(BaseModel):
@@ -196,6 +199,17 @@ async def qa_chat(
     trace_id_var.set(trace_id)
     started = time.perf_counter()
     perm = await runtime.perm_context(user.user_id)
+    if payload.conversation_type == "2":
+        # 群聊：回复会公开到群，先剪掉个人私有库（个人分片/KB），只保留公开文档。
+        from ekbs.permission.public_scope import public_scope_perm
+
+        perm = public_scope_perm(perm, runtime.db)
+        log.info(
+            "qa_group_public_scope",
+            user_id=perm.user_id,
+            conversation_id=payload.conversation_id,
+            shards=len(perm.visible_shard_ids),
+        )
     # 内容安全闸门：拦截 / 打码 / 降级（先过闸，再进检索与云端）
     safe_question, allow_generation = _guard_input(runtime, perm, payload.question)
     answer = await runtime.pipeline.answer(
