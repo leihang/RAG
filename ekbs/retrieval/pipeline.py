@@ -49,6 +49,7 @@ from ekbs.retrieval.faithfulness import (
     supporting_chunk_indices,
 )
 from ekbs.retrieval.calc_plan import generate_calc_plan
+from ekbs.retrieval.plan_llm import generate_llm_calc_plan
 from ekbs.retrieval.table_query import (
     compute_table_average,
     compute_table_binary,
@@ -663,6 +664,16 @@ def _numbers_are_copied(answer: str, chunks: Any) -> bool:
         if not any(variant and variant in source for variant in variants):
             return False
     return True
+
+
+
+def _looks_numeric(question: str) -> bool:
+    return bool(
+        __import__("re").search(
+            r"多少|几|合计|总计|增长|减少|增加|下降|占比|比例|平均|排名|最高|最低|前\s*[一二三四五六七八九十\d]|乘|除以|减",
+            str(question or ""),
+        )
+    )
 
 class RetrievalPipeline:
     def __init__(
@@ -2900,6 +2911,16 @@ class RetrievalPipeline:
             if allow_generation and mode_used == MODE_PROSE and not multi_intent
             else None
         )
+        llm_plan_enabled = bool((getattr(self.settings, "qa", None) or {}).get("llm_plan", False))
+        if (
+            calc_plan is None
+            and llm_plan_enabled
+            and allow_generation
+            and mode_used == MODE_PROSE
+            and not multi_intent
+            and _looks_numeric(question)
+        ):
+            calc_plan = await generate_llm_calc_plan(question, self.providers.llm)
         if calc_plan is not None:
             self._augment_table_context(retrieval)
             if not any(
