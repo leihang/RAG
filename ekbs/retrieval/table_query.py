@@ -471,3 +471,146 @@ def compute_table_average(
         subject=subject, year=years[0], value=calc.value, unit=calc.unit,
         chunk_index=index, label=label,
     )
+
+
+@dataclass(frozen=True)
+class TableRatio:
+    subject: str
+    denominator_subject: str
+    year: int
+    percent: float
+    numerator: float
+    denominator: float
+    unit: str
+    chunk_index: int
+    label: str
+
+    def render(self) -> str:
+        mark = f"[{self.chunk_index}]" if self.chunk_index else ""
+        return (
+            f"{self.year}年{self.label}{self.subject}占{self.denominator_subject}："
+            f"{self.percent:.2f}%（{self.numerator:,.2f} / {self.denominator:,.2f} {self.unit}）{mark}"
+        )
+
+
+def compute_table_ratio(
+    question: str, chunks: Sequence[Any], *, db: Any | None = None
+) -> TableRatio | None:
+    """占比/比例：同一表内两个指标在同一期间的比例。"""
+    text = str(question or "")
+    years = tuple(dict.fromkeys(int(y) for y in re.findall(r"(20\d{2})\s*年", text)))
+    if len(years) != 1:
+        return None
+    from ekbs.retrieval.table_time import TimeSpec, parse_time_spec
+
+    time_spec = parse_time_spec(text) or TimeSpec("year", 1, 12, False)
+    rows = _rows_for_question(db, chunks)
+    chunk_pos, table_pos = _citation_context(chunks)
+    if not rows:
+        return _ratio_from_cells(text, years[0], time_spec, chunks, db, chunk_pos, table_pos)
+    candidates: list[tuple[CanonicalTable, list[tuple[int, str]]]] = []
+    normalized_text = _normalize(text)
+    for table in canonical_from_rows(rows):
+        if not table.unit.strip():
+            continue
+        hits: list[tuple[int, str]] = []
+        for subject in table.subjects():
+            norm = _normalize(subject)
+            pos = normalized_text.find(norm)
+            if len(norm) >= 2 and pos >= 0:
+                hits.append((pos, subject))
+        hits.sort()
+        if len({subject for _pos, subject in hits}) >= 2:
+            candidates.append((table, hits))
+    if not candidates:
+        return _ratio_from_cells(text, years[0], time_spec, chunks, db, chunk_pos, table_pos)
+    if len(candidates) != 1:
+        return None
+    table, hits = candidates[0]
+    numerator_subject, denominator_subject = hits[0][1], hits[1][1]
+    numerator = evaluate(table, SumExpr(subject=numerator_subject, year=years[0], time=time_spec))
+    denominator = evaluate(table, SumExpr(subject=denominator_subject, year=years[0], time=time_spec))
+    if numerator is None or denominator is None or denominator.value == 0:
+        return None
+    if numerator.unit != denominator.unit:
+        return None
+    chunk_id = next((cid for cid in numerator.chunk_ids if cid is not None), None)
+    index = chunk_pos.get(chunk_id or 0) or table_pos.get(table.doc_id) or 0
+    if not index:
+        return None
+    return TableRatio(
+        subject=numerator_subject,
+        denominator_subject=denominator_subject,
+        year=years[0],
+        percent=numerator.value / denominator.value * 100.0,
+        numerator=numerator.value,
+        denominator=denominator.value,
+        unit=table.unit,
+        chunk_index=index,
+        label=time_label(time_spec),
+    )
+
+
+def _ratio_from_cells(
+    text: str,
+    year: int,
+    time_spec: TimeSpec,
+    chunks: Sequence[Any],
+    db: Any | None,
+    chunk_pos: dict[int, int],
+    table_pos: dict[int, int],
+) -> TableRatio | None:
+    cells = (
+        load_cell_facts(db, sorted({int(getattr(c, "doc_id", 0) or 0) for c in chunks}))
+        if db is not None
+        else []
+    )
+    if not cells:
+        from ekbs.retrieval.table_struct import parse_cell_facts
+
+        cells = parse_cell_facts(chunks)
+    normalized = _normalize(text)
+    hits: dict[str, int] = {}
+    for cell in cells:
+        norm = _normalize(cell.subject)
+        pos = normalized.find(norm)
+        if len(norm) >= 2 and pos >= 0 and cell.year == year:
+            hits.setdefault(cell.subject, pos)
+    ordered = sorted(hits.items(), key=lambda item: item[1])
+    if len(ordered) < 2:
+        return None
+    numerator_subject, denominator_subject = ordered[0][0], ordered[1][0]
+    selected = time_spec.month_set()
+    results: dict[str, float] = {}
+    first_cells: dict[str, Any] = {}
+    for subject in (numerator_subject, denominator_subject):
+        matching = [
+            cell for cell in cells
+            if cell.subject == subject and cell.year == year and cell.month in selected
+        ]
+        if not matching:
+            return None
+        if time_spec.require_complete and {
+            cell.month for cell in matching
+        } < selected:
+            return None
+        results[subject] = sum(cell.value for cell in matching)
+        first_cells[subject] = matching[0]
+    denominator = results[denominator_subject]
+    if denominator == 0:
+        return None
+    first = first_cells[numerator_subject]
+    index = chunk_pos.get(first.chunk_id or 0) or table_pos.get(first.doc_id) or 0
+    if not index:
+        return None
+    return TableRatio(
+        subject=numerator_subject,
+        denominator_subject=denominator_subject,
+        year=year,
+        percent=results[numerator_subject] / denominator * 100.0,
+        numerator=results[numerator_subject],
+        denominator=denominator,
+        unit=first.unit,
+        chunk_index=index,
+        label=time_label(time_spec),
+    )

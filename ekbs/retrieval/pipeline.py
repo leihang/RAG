@@ -52,6 +52,7 @@ from ekbs.retrieval.calc_plan import generate_calc_plan
 from ekbs.retrieval.table_query import (
     compute_table_average,
     compute_table_comparison,
+    compute_table_ratio,
     compute_table_lookup,
     compute_table_value,
 )
@@ -2800,7 +2801,7 @@ class RetrievalPipeline:
                 return messages[:i]
         return messages
 
-    async def answer(
+    async def answer(  # noqa: C901
         self,
         question: str,
         perm: PermContext,
@@ -2916,6 +2917,11 @@ class RetrievalPipeline:
             if calc_plan is not None and calc_plan.operation == "avg"
             else None
         )
+        table_ratio = (
+            compute_table_ratio(question, retrieval.chunks, db=self.db)
+            if calc_plan is not None and calc_plan.operation == "ratio"
+            else None
+        )
         numeric_unplanned = (
             calc_plan is not None
             and calc_plan.operation == "compare"
@@ -2985,6 +2991,22 @@ class RetrievalPipeline:
                     "value": table_avg.value,
                 },
                 degraded=["deterministic_table_avg"],
+            )
+        elif table_ratio is not None:
+            ratio_text = table_ratio.render()
+            result = AnswerResult(
+                answer=ratio_text,
+                citations=self._post_check_citations(ratio_text, retrieval.chunks, perm),
+                retrieval=retrieval,
+                model="table_ratio",
+                provenance={
+                    "op": "table_ratio",
+                    "subject": table_ratio.subject,
+                    "denominator_subject": table_ratio.denominator_subject,
+                    "year": table_ratio.year,
+                    "percent": table_ratio.percent,
+                },
+                degraded=["deterministic_table_ratio"],
             )
         elif numeric_unplanned:
             result = AnswerResult(

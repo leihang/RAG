@@ -26,3 +26,8 @@ def test_non_numeric_returns_none() -> None:
 def test_average_plan() -> None:
     plan = generate_calc_plan("2026年平均每月水费是多少")
     assert plan is not None and plan.operation == "avg"
+
+
+def test_ratio_plan() -> None:
+    plan = generate_calc_plan("2026年商铺电量占总电量的比例是多少")
+    assert plan is not None and plan.operation == "ratio"

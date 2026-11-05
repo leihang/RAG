@@ -163,3 +163,38 @@ def test_average_uses_months_not_total() -> None:
     ]
     result = compute_table_average("测试指标2026年平均每月是多少", [_chunk(rows=rows)])
     assert result is not None and result.value == 20.0
+
+
+def test_table_ratio_golden() -> None:
+    from ekbs.retrieval.table_query import compute_table_ratio
+
+    # 行 subject 固定为“测试指标”，另加一列无法表达；用两张同表行构造两个 subject。
+    content = """表名: 占比表（元）
+相关表头: 日期 | 年       月份 | 1月 | 2月
+日期=商铺电量; 年       月份=2026; 1月=30; 2月=30
+日期=总电量; 年       月份=2026; 1月=100; 2月=100
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    result = compute_table_ratio("2026年1-2月商铺电量占总电量的比例是多少", [chunk])
+    assert result is not None
+    assert result.percent == 30.0
+
+
+def test_table_ratio_from_wide_cells() -> None:
+    from ekbs.retrieval.table_query import compute_table_ratio
+
+    content = """表名: 用电分析（KW/h）
+相关表头: 用量日期 | 2026年9月 | 2025年9月
+用量日期=总电量; 2026年9月=1000; 2025年9月=900
+用量日期=商铺电量; 2026年9月=300; 2025年9月=200
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    result = compute_table_ratio("2026年9月商铺电量占总电量的比例是多少", [chunk])
+    assert result is not None
+    assert result.percent == 30.0

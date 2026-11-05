@@ -234,7 +234,9 @@ def _op_ratio(table: CanonicalTable, expr: RatioExpr) -> CalcValue | None:
         numerator.value / denominator.value * 100.0,
         "%",
         {"op": "ratio", "table": table.table_key,
-         "numerator": numerator.provenance, "denominator": denominator.provenance},
+         "numerator": numerator.value, "denominator": denominator.value,
+         "numerator_provenance": numerator.provenance,
+         "denominator_provenance": denominator.provenance},
         (*numerator.chunk_ids, *denominator.chunk_ids),
     )
 
