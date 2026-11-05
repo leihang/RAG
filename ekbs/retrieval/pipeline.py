@@ -2898,6 +2898,15 @@ class RetrievalPipeline:
             if allow_generation and mode_used == MODE_PROSE and not multi_intent
             else None
         )
+        if calc_plan is not None:
+            self._augment_table_context(retrieval)
+            if not any(
+                str(getattr(chunk, "chunk_type", "")) == "table"
+                for chunk in retrieval.chunks
+            ):
+                await self._retrieve_table_context(
+                    question, retrieval, perm, overrides=overrides
+                )
         table_lookup = (
             compute_table_lookup(question, retrieval.chunks, db=self.db)
             if calc_plan is None and allow_generation and mode_used == MODE_PROSE and not multi_intent
@@ -3452,6 +3461,78 @@ class RetrievalPipeline:
             per_sub.append((sq.index, result))
         merged, hit_by = self._merge_retrievals(per_sub)
         return merged, hit_by, per_sub
+
+    async def _retrieve_table_context(
+        self,
+        question: str,
+        retrieval: RetrievalResult,
+        perm: PermContext,
+        *,
+        overrides: RetrievalOverrides | None = None,
+    ) -> None:
+        """数值计划专用：正常召回没有表格时，用“表格”语义再召回一次并只并表格块。"""
+        extra = await self.retrieve(
+            f"{question} 表格 数据 分析表", perm, overrides=overrides, collect_debug=False
+        )
+        existing = {chunk.chunk_id for chunk in retrieval.chunks}
+        added = 0
+        for chunk in extra.chunks:
+            if str(chunk.chunk_type) != "table" or chunk.chunk_id in existing:
+                continue
+            retrieval.chunks.append(chunk)
+            existing.add(chunk.chunk_id)
+            added += 1
+        if added:
+            retrieval.degraded.append("table_context_reretrieved")
+
+    def _augment_table_context(self, retrieval: RetrievalResult) -> None:
+        """数值计划用：把已召回文档的表格块补进上下文。
+
+        数值/排名/占比问题常因查询词“表格感”不足而漏召回表格；文档一旦召回，
+        同文档的表格块仍在 ACL 允许范围内，补进来让确定性执行器有表可用。
+        """
+        if any(str(chunk.chunk_type) == "table" for chunk in retrieval.chunks):
+            return
+        doc_ids = sorted({int(chunk.doc_id) for chunk in retrieval.chunks if chunk.doc_id})
+        if not doc_ids:
+            return
+        placeholders = ",".join("?" for _ in doc_ids)
+        with self.db.sync_connect() as conn:
+            rows = conn.execute(
+                "SELECT c.chunk_id, c.doc_id, c.shard_id, c.content, c.heading_path, "
+                "c.page_from, c.page_to, c.chunk_type, d.title AS doc_title, "
+                "d.doc_version "
+                "FROM ekbs_chunk c JOIN ekbs_document d ON d.doc_id = c.doc_id "
+                f"WHERE c.doc_id IN ({placeholders}) AND c.chunk_type = 'table' "
+                "ORDER BY c.doc_id, c.seq",
+                doc_ids,
+            ).fetchall()
+        existing = {chunk.chunk_id for chunk in retrieval.chunks}
+        added = 0
+        for row in rows:
+            if added >= 4:
+                break
+            chunk_id = int(row["chunk_id"])
+            if chunk_id in existing:
+                continue
+            retrieval.chunks.append(
+                RetrievedChunk(
+                    chunk_id=chunk_id,
+                    doc_id=int(row["doc_id"]),
+                    shard_id=str(row["shard_id"]),
+                    content=str(row["content"] or ""),
+                    heading_path=str(row["heading_path"] or ""),
+                    page_from=row["page_from"],
+                    page_to=row["page_to"],
+                    chunk_type=str(row["chunk_type"]),
+                    doc_title=str(row["doc_title"] or ""),
+                    doc_version=str(row["doc_version"] or "v1"),
+                )
+            )
+            existing.add(chunk_id)
+            added += 1
+        if added:
+            retrieval.degraded.append("table_context_injected")
 
     async def _retrieve_for_answer(
         self,
