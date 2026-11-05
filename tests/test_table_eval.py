@@ -267,3 +267,21 @@ def test_binary_mul_div_from_table_rows() -> None:
     assert mul is not None and mul.value == 200.0
     div = compute_table_binary("2026年1-2月商铺除以住宅是多少", [chunk])
     assert div is not None and div.value == 2.0
+
+
+def test_filtered_unit_conversion() -> None:
+    from ekbs.retrieval.table_query import compute_table_filtered
+
+    content = """表名: 费用表（元）
+相关表头: 日期 | 年       月份 | 1月
+日期=商铺; 年       月份=2026; 1月=10000
+日期=住宅; 年       月份=2026; 1月=5000
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    result = compute_table_filtered("2026年1月除住宅外的费用合计是多少万元", [chunk])
+    assert result is not None
+    assert result.unit == "万元"
+    assert abs(result.value - 1.0) < 1e-9

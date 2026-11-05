@@ -935,6 +935,35 @@ def _drop_aggregate_subjects(selected: list[str]) -> list[str]:
     return details or selected
 
 
+_REQUESTED_UNIT_RE = re.compile(r"(万元|元|度|千瓦时|KW/h|kwh|m³|立方米|%)", re.I)
+_UNIT_ALIASES = {
+    "kw/h": "kwh", "kwh": "kwh", "度": "kwh", "千瓦时": "kwh",
+    "m3": "m³", "立方米": "m³", "m³": "m³",
+    "元": "元", "万元": "万元", "%": "%",
+}
+
+
+def _requested_unit(text: str) -> str:
+    match = _REQUESTED_UNIT_RE.search(text or "")
+    return match.group(1) if match else ""
+
+
+def _unit_alias(unit: str) -> str:
+    return _UNIT_ALIASES.get(str(unit or "").strip().lower(), str(unit or "").strip())
+
+
+def _convert_value(value: float, source_unit: str, target_unit: str) -> float | None:
+    source = _unit_alias(source_unit)
+    target = _unit_alias(target_unit)
+    if not target or source == target:
+        return value
+    if source == "元" and target == "万元":
+        return value / 10000.0
+    if source == "万元" and target == "元":
+        return value * 10000.0
+    return None
+
+
 def compute_table_filtered(  # noqa: C901
     question: str, chunks: Sequence[Any], *, db: Any | None = None
 ) -> TableValue | None:
@@ -980,8 +1009,16 @@ def compute_table_filtered(  # noqa: C901
             if not index:
                 continue
             label = f"仅{'、'.join(terms)}" if mode == "include" else f"除{'、'.join(terms)}外"
+            requested = _requested_unit(text)
+            value = sum(values)
+            unit = table.unit
+            if requested:
+                converted = _convert_value(value, table.unit, requested)
+                if converted is None:
+                    continue
+                value, unit = converted, requested
             return TableValue(
-                subject="合计", year=years[0], value=sum(values), unit=table.unit,
+                subject="合计", year=years[0], value=value, unit=unit,
                 chunk_index=index, label=label,
             )
 
@@ -1019,7 +1056,15 @@ def compute_table_filtered(  # noqa: C901
     if not index:
         return None
     label = f"仅{'、'.join(terms)}" if mode == "include" else f"除{'、'.join(terms)}外"
+    requested = _requested_unit(text)
+    value = sum(values)
+    unit = first.unit
+    if requested:
+        converted = _convert_value(value, first.unit, requested)
+        if converted is None:
+            return None
+        value, unit = converted, requested
     return TableValue(
-        subject="合计", year=years[0], value=sum(values), unit=first.unit,
+        subject="合计", year=years[0], value=value, unit=unit,
         chunk_index=index, label=label,
     )
