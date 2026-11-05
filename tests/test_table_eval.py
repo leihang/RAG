@@ -316,3 +316,18 @@ def test_type_row_subject_is_parsed() -> None:
     rows = TableIndex.from_chunks([chunk]).rows
     assert rows and rows[0].subject == "公司承担电费"
     assert rows[0].months == {1: 100.0, 2: 200.0}
+
+
+def test_unitless_average_is_allowed() -> None:
+    from ekbs.retrieval.table_query import compute_table_average
+
+    content = """表名: 电价表
+相关表头: 项目 | 年       月份 | 1月 | 2月 | 3月
+项目=电力公司收费; 年       月份=2026; 1月=0.8; 2月=0.9; 3月=1.0
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    result = compute_table_average("2026年1-3月电力公司收费，平均值是多少", [chunk])
+    assert result is not None and abs(result.value - 0.9) < 1e-9

@@ -325,10 +325,8 @@ class TableValue:
 
     def render(self) -> str:
         mark = f"[{self.chunk_index}]" if self.chunk_index else ""
-        return (
-            f"{self.year}年{self.label}{self.subject}："
-            f"{self.value:,.2f} {self.unit}{mark}"
-        )
+        unit = f" {self.unit}" if self.unit.strip() else ""
+        return f"{self.year}年{self.label}{self.subject}：{self.value:,.2f}{unit}{mark}"
 
 
 def _citation_context(chunks: Sequence[Any]) -> tuple[dict[int, int], dict[int, int]]:
@@ -354,8 +352,6 @@ def _value_from_tables(
 ) -> TableValue | None:
     matches: list[tuple[CanonicalTable, str]] = []
     for table in canonical_from_rows(rows):
-        if not table.unit.strip():
-            continue
         for subject in table.subjects():
             if len(_normalize(subject)) >= 2 and _normalize(subject) in _normalize(text):
                 matches.append((table, subject))
@@ -455,8 +451,6 @@ def compute_table_average(
     chunk_pos, table_pos = _citation_context(chunks)
     matches: list[tuple[CanonicalTable, str]] = []
     for table in canonical_from_rows(rows):
-        if not table.unit.strip():
-            continue
         for subject in table.subjects():
             if len(_normalize(subject)) >= 2 and _normalize(subject) in _normalize(text):
                 matches.append((table, subject))
