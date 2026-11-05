@@ -216,3 +216,19 @@ def test_rank_from_wide_cells() -> None:
     result = compute_table_rank("2026年9月电量排名前三", [chunk])
     assert result is not None
     assert [subject for subject, _ in result.items] == ["总电量", "商铺电量", "住宅电量"]
+
+
+def test_binary_add_from_table_rows() -> None:
+    from ekbs.retrieval.table_query import compute_table_binary
+
+    content = """表名: 合计表（元）
+相关表头: 日期 | 年       月份 | 1月 | 2月
+日期=商铺; 年       月份=2026; 1月=10; 2月=10
+日期=住宅; 年       月份=2026; 1月=5; 2月=5
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    result = compute_table_binary("2026年1-2月商铺与住宅合计是多少", [chunk])
+    assert result is not None and result.value == 30.0

@@ -313,3 +313,29 @@ def _op_avg(table: CanonicalTable, expr: AvgExpr) -> CalcValue | None:
 
 
 _REGISTRY["avg"] = _op_avg
+
+
+@dataclass(frozen=True)
+class BinaryExpr:
+    left: SumExpr | LookupExpr
+    right: SumExpr | LookupExpr
+    op: str = "add"          # add | sub
+    kind: str = "binary"
+
+
+def _op_binary(table: CanonicalTable, expr: BinaryExpr) -> CalcValue | None:
+    left = evaluate(table, expr.left)
+    right = evaluate(table, expr.right)
+    if left is None or right is None or left.unit != right.unit:
+        return None
+    value = left.value + right.value if expr.op == "add" else left.value - right.value
+    return CalcValue(
+        value, left.unit,
+        {"op": "binary", "table": table.table_key, "binary_op": expr.op,
+         "left": left.value, "right": right.value,
+         "left_provenance": left.provenance, "right_provenance": right.provenance},
+        (*left.chunk_ids, *right.chunk_ids),
+    )
+
+
+_REGISTRY["binary"] = _op_binary

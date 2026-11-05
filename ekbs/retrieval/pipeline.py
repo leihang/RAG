@@ -51,6 +51,7 @@ from ekbs.retrieval.faithfulness import (
 from ekbs.retrieval.calc_plan import generate_calc_plan
 from ekbs.retrieval.table_query import (
     compute_table_average,
+    compute_table_binary,
     compute_table_comparison,
     compute_table_rank,
     compute_table_ratio,
@@ -2937,6 +2938,11 @@ class RetrievalPipeline:
             if calc_plan is not None and calc_plan.operation == "rank"
             else None
         )
+        table_binary = (
+            compute_table_binary(question, retrieval.chunks, db=self.db)
+            if calc_plan is not None and calc_plan.operation == "binary"
+            else None
+        )
         numeric_unplanned = (
             calc_plan is not None
             and calc_plan.operation == "compare"
@@ -3037,6 +3043,22 @@ class RetrievalPipeline:
                     "items": list(table_rank.items),
                 },
                 degraded=["deterministic_table_rank"],
+            )
+        elif table_binary is not None:
+            binary_text = table_binary.render()
+            result = AnswerResult(
+                answer=binary_text,
+                citations=self._post_check_citations(binary_text, retrieval.chunks, perm),
+                retrieval=retrieval,
+                model="table_binary",
+                provenance={
+                    "op": "table_binary",
+                    "left": table_binary.left_subject,
+                    "right": table_binary.right_subject,
+                    "year": table_binary.year,
+                    "value": table_binary.value,
+                },
+                degraded=["deterministic_table_binary"],
             )
         elif numeric_unplanned:
             result = AnswerResult(

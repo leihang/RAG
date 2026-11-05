@@ -36,3 +36,8 @@ def test_ratio_plan() -> None:
 def test_rank_plan() -> None:
     plan = generate_calc_plan("2026年9月电量排名前三")
     assert plan is not None and plan.operation == "rank" and plan.top == 3
+
+
+def test_binary_plan() -> None:
+    plan = generate_calc_plan("2026年商铺与住宅电量合计是多少")
+    assert plan is not None and plan.operation == "binary" and plan.binary_op == "add"

@@ -731,3 +731,128 @@ def compute_table_rank(
             if best is None or len(candidate.items) > len(best.items):
                 best = candidate
     return best
+
+
+@dataclass(frozen=True)
+class TableBinary:
+    left_subject: str
+    right_subject: str
+    year: int
+    value: float
+    unit: str
+    op: str
+    chunk_index: int
+    label: str
+
+    def render(self) -> str:
+        mark = f"[{self.chunk_index}]" if self.chunk_index else ""
+        word = "合计" if self.op == "add" else "差额"
+        return (
+            f"{self.year}年{self.label}{self.left_subject}与{self.right_subject}{word}："
+            f"{self.value:,.2f} {self.unit}{mark}"
+        )
+
+
+def compute_table_binary(
+    question: str, chunks: Sequence[Any], *, db: Any | None = None
+) -> TableBinary | None:
+    """同表两个指标的加/减（表格行；宽表后续再接）。"""
+    text = str(question or "")
+    years = tuple(dict.fromkeys(int(y) for y in re.findall(r"(20\d{2})\s*年", text)))
+    if len(years) != 1:
+        return None
+    from ekbs.retrieval.table_time import TimeSpec, parse_time_spec
+
+    time_spec = parse_time_spec(text) or TimeSpec("year", 1, 12, False)
+    rows = _rows_for_question(db, chunks)
+    chunk_pos, table_pos = _citation_context(chunks)
+    normalized = _normalize(text)
+    if not rows:
+        return _binary_from_cells(text, years[0], time_spec, chunks, db, chunk_pos, table_pos)
+    candidates: list[tuple[CanonicalTable, list[tuple[int, str]]]] = []
+    for table in canonical_from_rows(rows):
+        if not table.unit.strip():
+            continue
+        hits = [
+            (normalized.find(_normalize(subject)), subject)
+            for subject in table.subjects()
+            if len(_normalize(subject)) >= 2 and _normalize(subject) in normalized
+        ]
+        hits.sort()
+        if len({subject for _pos, subject in hits}) >= 2:
+            candidates.append((table, hits))
+    if not candidates:
+        return _binary_from_cells(text, years[0], time_spec, chunks, db, chunk_pos, table_pos)
+    if len(candidates) != 1:
+        return None
+    table, hits = candidates[0]
+    left_subject, right_subject = hits[0][1], hits[1][1]
+    op = "sub" if any(word in text for word in ("减", "差额", "相差", "多多少", "少多少")) else "add"
+    left = evaluate(table, SumExpr(subject=left_subject, year=years[0], time=time_spec))
+    right = evaluate(table, SumExpr(subject=right_subject, year=years[0], time=time_spec))
+    if left is None or right is None or left.unit != right.unit:
+        return None
+    chunk_id = next((cid for cid in left.chunk_ids if cid is not None), None)
+    index = chunk_pos.get(chunk_id or 0) or table_pos.get(table.doc_id) or 0
+    if not index:
+        return None
+    return TableBinary(
+        left_subject=left_subject, right_subject=right_subject, year=years[0],
+        value=left.value + right.value if op == "add" else left.value - right.value,
+        unit=left.unit, op=op, chunk_index=index, label=time_label(time_spec),
+    )
+
+
+def _binary_from_cells(
+    text: str,
+    year: int,
+    time_spec: TimeSpec,
+    chunks: Sequence[Any],
+    db: Any | None,
+    chunk_pos: dict[int, int],
+    table_pos: dict[int, int],
+) -> TableBinary | None:
+    cells = (
+        load_cell_facts(db, sorted({int(getattr(c, "doc_id", 0) or 0) for c in chunks}))
+        if db is not None
+        else []
+    )
+    if not cells:
+        from ekbs.retrieval.table_struct import parse_cell_facts
+
+        cells = parse_cell_facts(chunks)
+    normalized = _normalize(text)
+    hits: dict[str, int] = {}
+    for cell in cells:
+        norm = _normalize(cell.subject)
+        pos = normalized.find(norm)
+        if len(norm) >= 2 and pos >= 0 and cell.year == year:
+            hits.setdefault(cell.subject, pos)
+    ordered = sorted(hits.items(), key=lambda item: item[1])
+    if len(ordered) < 2:
+        return None
+    left_subject, right_subject = ordered[0][0], ordered[1][0]
+    selected = time_spec.month_set()
+    values: dict[str, float] = {}
+    first_cells: dict[str, Any] = {}
+    for subject in (left_subject, right_subject):
+        matching = [
+            cell for cell in cells
+            if cell.subject == subject and cell.year == year and cell.month in selected
+        ]
+        if not matching:
+            return None
+        if time_spec.require_complete and {cell.month for cell in matching} < selected:
+            return None
+        values[subject] = sum(cell.value for cell in matching)
+        first_cells[subject] = matching[0]
+    first = first_cells[left_subject]
+    index = chunk_pos.get(first.chunk_id or 0) or table_pos.get(first.doc_id) or 0
+    if not index:
+        return None
+    op = "sub" if any(word in text for word in ("减", "差额", "相差", "多多少", "少多少")) else "add"
+    value = values[left_subject] + values[right_subject] if op == "add" else values[left_subject] - values[right_subject]
+    return TableBinary(
+        left_subject=left_subject, right_subject=right_subject, year=year,
+        value=value, unit=first.unit, op=op, chunk_index=index, label=time_label(time_spec),
+    )
