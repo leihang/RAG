@@ -51,3 +51,10 @@ def test_single_subject_total_is_value_not_binary() -> None:
 def test_filter_plan() -> None:
     plan = generate_calc_plan("2026年9月除住宅外的电量合计是多少")
     assert plan is not None and plan.operation == "filter" and plan.filter_mode == "exclude"
+
+
+def test_mul_div_plans() -> None:
+    mul = generate_calc_plan("2026年商铺电量乘以单价是多少")
+    assert mul is not None and mul.operation == "binary" and mul.binary_op == "mul"
+    div = generate_calc_plan("2026年商铺电量除以总电量是多少")
+    assert div is not None and div.operation == "binary" and div.binary_op == "div"

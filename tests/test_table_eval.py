@@ -249,3 +249,21 @@ def test_filtered_sum_from_wide_cells() -> None:
     chunk.content = content
     result = compute_table_filtered("2026年9月除住宅外的电量合计是多少", [chunk])
     assert result is not None and result.value == 300.0
+
+
+def test_binary_mul_div_from_table_rows() -> None:
+    from ekbs.retrieval.table_query import compute_table_binary
+
+    content = """表名: 乘除表（元）
+相关表头: 日期 | 年       月份 | 1月 | 2月
+日期=商铺; 年       月份=2026; 1月=10; 2月=10
+日期=住宅; 年       月份=2026; 1月=5; 2月=5
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    mul = compute_table_binary("2026年1-2月商铺乘以住宅是多少", [chunk])
+    assert mul is not None and mul.value == 200.0
+    div = compute_table_binary("2026年1-2月商铺除以住宅是多少", [chunk])
+    assert div is not None and div.value == 2.0

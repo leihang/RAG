@@ -746,11 +746,23 @@ class TableBinary:
 
     def render(self) -> str:
         mark = f"[{self.chunk_index}]" if self.chunk_index else ""
-        word = "合计" if self.op == "add" else "差额"
+        word = {
+            "add": "合计", "sub": "差额", "mul": "乘积", "div": "商",
+        }.get(self.op, "结果")
         return (
             f"{self.year}年{self.label}{self.left_subject}与{self.right_subject}{word}："
             f"{self.value:,.2f} {self.unit}{mark}"
         )
+
+
+def _binary_op_from_text(text: str) -> str:
+    if any(word in text for word in ("乘以", "乘", "×", "*", "倍")):
+        return "mul"
+    if any(word in text for word in ("除以", "除", "/")):
+        return "div"
+    if any(word in text for word in ("减", "差额", "相差", "多多少", "少多少")):
+        return "sub"
+    return "add"
 
 
 def compute_table_binary(
@@ -787,7 +799,7 @@ def compute_table_binary(
         return None
     table, hits = candidates[0]
     left_subject, right_subject = hits[0][1], hits[1][1]
-    op = "sub" if any(word in text for word in ("减", "差额", "相差", "多多少", "少多少")) else "add"
+    op = _binary_op_from_text(text)
     left = evaluate(table, SumExpr(subject=left_subject, year=years[0], time=time_spec))
     right = evaluate(table, SumExpr(subject=right_subject, year=years[0], time=time_spec))
     if left is None or right is None or left.unit != right.unit:
@@ -796,10 +808,19 @@ def compute_table_binary(
     index = chunk_pos.get(chunk_id or 0) or table_pos.get(table.doc_id) or 0
     if not index:
         return None
+    if op == "add":
+        value = left.value + right.value
+    elif op == "sub":
+        value = left.value - right.value
+    elif op == "mul":
+        value = left.value * right.value
+    else:
+        if right.value == 0:
+            return None
+        value = left.value / right.value
     return TableBinary(
         left_subject=left_subject, right_subject=right_subject, year=years[0],
-        value=left.value + right.value if op == "add" else left.value - right.value,
-        unit=left.unit, op=op, chunk_index=index, label=time_label(time_spec),
+        value=value, unit=left.unit, op=op, chunk_index=index, label=time_label(time_spec),
     )
 
 
@@ -850,8 +871,17 @@ def _binary_from_cells(
     index = chunk_pos.get(first.chunk_id or 0) or table_pos.get(first.doc_id) or 0
     if not index:
         return None
-    op = "sub" if any(word in text for word in ("减", "差额", "相差", "多多少", "少多少")) else "add"
-    value = values[left_subject] + values[right_subject] if op == "add" else values[left_subject] - values[right_subject]
+    op = _binary_op_from_text(text)
+    if op == "add":
+        value = values[left_subject] + values[right_subject]
+    elif op == "sub":
+        value = values[left_subject] - values[right_subject]
+    elif op == "mul":
+        value = values[left_subject] * values[right_subject]
+    else:
+        if values[right_subject] == 0:
+            return None
+        value = values[left_subject] / values[right_subject]
     return TableBinary(
         left_subject=left_subject, right_subject=right_subject, year=year,
         value=value, unit=first.unit, op=op, chunk_index=index, label=time_label(time_spec),

@@ -328,7 +328,18 @@ def _op_binary(table: CanonicalTable, expr: BinaryExpr) -> CalcValue | None:
     right = evaluate(table, expr.right)
     if left is None or right is None or left.unit != right.unit:
         return None
-    value = left.value + right.value if expr.op == "add" else left.value - right.value
+    if expr.op == "add":
+        value = left.value + right.value
+    elif expr.op == "sub":
+        value = left.value - right.value
+    elif expr.op == "mul":
+        value = left.value * right.value
+    elif expr.op == "div":
+        if right.value == 0:
+            return None
+        value = left.value / right.value
+    else:
+        return None
     return CalcValue(
         value, left.unit,
         {"op": "binary", "table": table.table_key, "binary_op": expr.op,

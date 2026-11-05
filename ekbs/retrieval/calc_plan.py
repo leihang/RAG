@@ -25,7 +25,9 @@ _RANK_WORDS = ("排名", "最高", "最低", "最多", "最少", "top", "Top", "
 _ADD_WORDS = ("合计", "总和", "之和", "相加", "加总")
 _SUB_WORDS = ("减", "差额", "相差", "多多少", "少多少")
 _CONNECTIVES = ("和", "与", "、", "及", "+", "加")
-_FILTER_WORDS = ("除", "排除", "不含", "不包括", "只算", "仅", "其中")
+_FILTER_WORDS = ("排除", "不含", "不包括", "只算", "仅", "其中")
+_MUL_WORDS = ("乘以", "乘", "×", "*", "倍")
+_DIV_WORDS = ("除以", "除", "/")
 _TOP_RE = re.compile(r"(?:前|Top|top|TOP)\s*([一二三四五六七八九十\d]+)")
 _CN_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
@@ -105,7 +107,24 @@ def generate_calc_plan(question: str) -> CalcPlan | None:
             time or TimeSpec("year", 1, 12, require_complete=False),
             _hint(text),
         )
-    if len(years) == 1 and any(word in text for word in _FILTER_WORDS):
+    if len(years) == 1 and any(word in text for word in _MUL_WORDS):
+        return CalcPlan(
+            "binary", years,
+            time or TimeSpec("year", 1, 12, require_complete=False),
+            _hint(text), binary_op="mul",
+        )
+    if len(years) == 1 and (
+        "除以" in text or "/" in text or ("除" in text and "外" not in text)
+    ):
+        return CalcPlan(
+            "binary", years,
+            time or TimeSpec("year", 1, 12, require_complete=False),
+            _hint(text), binary_op="div",
+        )
+    if len(years) == 1 and (
+        any(word in text for word in _FILTER_WORDS)
+        or ("除" in text and "外" in text)
+    ):
         mode = "include" if any(word in text for word in ("只算", "仅", "其中")) else "exclude"
         return CalcPlan(
             "filter", years,
