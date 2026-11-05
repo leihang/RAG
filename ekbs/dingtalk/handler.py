@@ -295,7 +295,11 @@ class StreamMessageHandler:
                 if not intro:
                     await self._reply_text(
                         message,
-                        str(self.settings.adapter.self_intro or "你好，我是企业知识库助手。"),
+                        str(
+                            self.settings.adapter.self_intro
+                            or "你好，我是企业知识库助手。\n"
+                            "你可以直接问制度、合同、表格里的具体条款；也可以发送「帮助」"
+                        ),
                     )
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="greeting")

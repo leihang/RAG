@@ -731,7 +731,10 @@ async def test_group_qa_never_calls_qa_api(handler) -> None:
 async def test_greeting_returns_only_short_intro(handler) -> None:
     """P0：纯问候只回一句介绍，不拉帮助/文档，也不进问答。"""
     routes = mock_dingtalk()
-    handler.settings.adapter.self_intro = "你好，我是企业知识库助手。"
+    handler.settings.adapter.self_intro = (
+        "你好，我是企业知识库助手。\n"
+        "你可以直接问制度、合同、表格里的具体条款；也可以发送「帮助」"
+    )
     catalog = respx.get(f"{API_BASE}/api/v1/discovery/catalog?mode=help").mock(
         return_value=httpx.Response(200, json={"help_text": "不应调用", "documents": [], "suggestions": []})
     )
@@ -742,4 +745,7 @@ async def test_greeting_returns_only_short_intro(handler) -> None:
     assert qa.call_count == 0
     assert routes["oto"].call_count == 1
     sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
-    assert sent["content"] == "你好，我是企业知识库助手。"
+    assert sent["content"] == (
+        "你好，我是企业知识库助手。\n"
+        "你可以直接问制度、合同、表格里的具体条款；也可以发送「帮助」"
+    )
