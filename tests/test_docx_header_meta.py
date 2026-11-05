@@ -240,6 +240,14 @@ def test_system_prompt_handles_missing_expire_date() -> None:
     assert "未标注截止日期" in SYSTEM_PROMPT
 
 
+def test_system_prompt_asks_full_steps_for_process_questions() -> None:
+    """流程/步骤类问题不能被「简洁」策略过度摘要（doc 208 实测只答 5 条）。"""
+    from ekbs.retrieval.pipeline import SYSTEM_PROMPT
+
+    assert "流程/步骤/怎么办" in SYSTEM_PROMPT or "流程" in SYSTEM_PROMPT
+    assert "全部覆盖" in SYSTEM_PROMPT or "不要只给摘要" in SYSTEM_PROMPT
+
+
 async def test_ingest_without_dates_keeps_columns_null(seeded) -> None:
     runtime, summary = seeded
     result = await _pipeline(runtime).ingest_markdown(

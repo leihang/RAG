@@ -972,3 +972,25 @@ def test_doc_metadata_line_only_injects_context_containers() -> None:
     assert leaves
     assert all("【文档信息】" not in node.content for node in leaves)
 
+
+
+def test_empty_heading_container_does_not_leak_into_document_tail() -> None:
+    """单行句式小节（``2.1适用于各部门。``）不能把父标题挤到文档末尾。
+
+    实测 doc 208：``## 2．范围`` 下只有一行 ``2.1适用于各部门。``，这行曾被当成
+    嵌套标题，导致 ``2．范围`` 空壳经兜底追加到 ``8.4`` 之后，正文里还残留
+    ``## 2．范围`` / ``## 9．支持文件。``。本用例钉住：顺序不变、正文不出现 ``##``。
+    """
+    md = (
+        "# 跑水预案\n\n## 1．目的\n\n目的正文。\n\n"
+        "## 2．范围\n\n2.1适用于各部门。\n\n"
+        "## 3．定义\n\n3.1定义正文。\n\n"
+        "## 9．支持文件。\n\n9.1《工程部工作手册》\n\n"
+        "## 10.记录表格\n\n10.1.9《突发事件报告》\n"
+    )
+    result = chunk_markdown(md, doc_title="跑水预案")
+    texts = "\n".join(node.content for node in result.nodes)
+    assert "##" not in texts
+    assert texts.find("2.1适用于各部门") < texts.find("3．定义")
+    assert texts.find("9.1《工程部工作手册》") > texts.find("3.1定义正文")
+    assert texts.find("10.1.9《突发事件报告》") > texts.find("9.1《工程部工作手册》")

@@ -72,6 +72,16 @@ _CLAUSE_LIKE_RE = re.compile(
 #: 「标题行同时也是正文」的判据：短标题（如 `第一条 年假天数`）只当标题，
 #: 而"整条就是内容"的行（带句读/很长）必须**同时**进正文，否则整行文字会消失。
 _CONTENT_PUNCT = "。；！？：，,;"
+#: 句末标点：无 Markdown 标记、且以句末标点收尾的行**就是正文**（不是标题）。
+#: 实测 ``2.1适用于各部门。`` 只有 10 字、短于 ``_HEADING_BODY_MIN_CHARS``，被当成
+#: 嵌套标题 → ``2．范围`` 空壳被塞到文档末尾。标题行（``## 9．支持文件。``）带 ``#``
+#: 不适用本规则。
+_SENTENCE_END_PUNCT = "。！？；"
+
+
+def _is_unmarked_sentence(line: str) -> bool:
+    stripped = (line or "").strip()
+    return bool(stripped) and not stripped.startswith("#") and stripped[-1] in _SENTENCE_END_PUNCT
 _HEADING_BODY_MIN_CHARS = 12
 _HEADING_BODY_LONG_CHARS = 40
 
@@ -367,6 +377,9 @@ class Section:
     text: str
     page_from: int | None = None
     page_to: int | None = None
+    #: 该节在原文中的字符起点：兜底补出的标题节要插回**原文顺序**（而不是一律追加到末尾，
+    #: 否则 ``2．范围`` 会跑到 ``8.4`` 之后，用户实测「范围跑到第 8 条」）。
+    start_offset: int = 0
 
 
 #: 嵌套点分小节：末级形如 ``4.1 …`` / ``4.1.2 …``（至少两段数字），可并入所属大节。
@@ -979,8 +992,14 @@ def _emit_heading_fallbacks(sections: list[Section], heading_log: list, page_map
     """
     emitted_paths = [section.heading_path for section in sections]
     emitted_text = _strip_md_marks("".join(section.text for section in sections))
+    log_paths = [path for _title, path, _source, _offset in heading_log]
     for title, path, source, head_off in heading_log:
         if not source.strip() or title in " ".join(emitted_paths):
+            continue
+        # 这行标题下面还有子标题（如 ``2．范围 > 2.1 …``）：它的文字已经作为子节
+        # heading_path 的前缀保留，不能再用原文 ``## 2．范围`` 兜底 —— 旧实现会把
+        # 空壳父标题追加到文档末尾，用户会看到「范围」跑到最后、正文里还带 ``##``。
+        if any(other.startswith(f"{path} > ") for other in log_paths if other != path):
             continue
         if _strip_md_marks(source) in emitted_text:
             continue
@@ -988,11 +1007,14 @@ def _emit_heading_fallbacks(sections: list[Section], heading_log: list, page_map
         sections.append(
             Section(
                 heading_path=path or title,
-                text=source.strip(),
+                text=_strip_md_marks(source),
                 page_from=page_from,
                 page_to=page_to,
+                start_offset=head_off,
             )
         )
+    # 兜底节按**原文字符偏移**插回文档顺序（正常节本身已是有序的，sort 保持稳定）。
+    sections.sort(key=lambda section: section.start_offset)
 
 
 def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | None = None) -> list[Section]:
@@ -1024,7 +1046,11 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
             page_from, page_to = _pages_for(current_start, end_offset, page_map)
             sections.append(
                 Section(
-                    heading_path=current_heading, text=text, page_from=page_from, page_to=page_to
+                    heading_path=current_heading,
+                    text=text,
+                    page_from=page_from,
+                    page_to=page_to,
+                    start_offset=current_start,
                 )
             )
             heading_emitted = True
@@ -1049,7 +1075,9 @@ def split_sections(markdown: str, *, page_map: Sequence[tuple[int, int, int]] | 
         if source_line is not None:
             heading_log.append((title, current_heading, source_line, offset))
         heading_emitted = False
-        if source_line and _looks_like_content(source_line.strip()):
+        if source_line and (
+            _looks_like_content(source_line.strip()) or _is_unmarked_sentence(source_line)
+        ):
             buffer.append(source_line)
             current_start = offset  # 本行就是正文首行 → 小节起点就是它
         else:
