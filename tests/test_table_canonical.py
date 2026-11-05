@@ -40,3 +40,9 @@ def test_cross_tab_adapter_emits_long_facts_and_columns() -> None:
     assert any(
         fact.dimensions.get("total") == 1 and fact.value == 30.0 for fact in table.facts
     )
+
+
+def test_chinese_parentheses_negative_is_parsed() -> None:
+    from ekbs.retrieval.table_struct import _number
+
+    assert _number("（123.45）") == -123.45

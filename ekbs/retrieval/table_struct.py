@@ -26,7 +26,9 @@ def _norm(text: str) -> str:
 
 
 def _number(text: str) -> float | None:
-    match = _NUMBER_RE.search(str(text or ""))
+    # 中文括号负数常见于 Excel 财务表：``（123）`` = -123。
+    normalized = str(text or "").replace("（", "(").replace("）", ")")
+    match = _NUMBER_RE.search(normalized)
     if not match:
         return None
     raw = match.group(0).replace(",", "")

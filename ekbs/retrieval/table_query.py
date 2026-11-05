@@ -16,21 +16,14 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from ekbs.retrieval.table_canonical import CanonicalTable, canonical_from_rows
+from ekbs.retrieval.table_plan import parse_table_plan
 from ekbs.retrieval.table_struct import TableRow, load_table_rows
-from ekbs.retrieval.table_time import TimeSpec, parse_time_spec, time_label
+from ekbs.retrieval.table_time import TimeSpec, time_label
 
-_YEAR_RE = re.compile(r"(20\d{2})\s*年")
-_COMPARE_WORDS = ("增长", "减少", "对比", "较", "同比", "增加", "下降")
 
 
 def _normalize(text: str) -> str:
     return re.sub(r"[\s，,。；;：:、]+", "", str(text or ""))
-
-
-def _subject_from_question(question: str) -> str:
-    head = re.split(r"[，,。；;：:。]", str(question or ""), maxsplit=1)[0]
-    head = re.sub(r"20\d{2}\s*年.*$", "", head)
-    return head.strip()
 
 
 @dataclass(frozen=True)
@@ -179,7 +172,10 @@ def _pick_candidate(
             candidates.append((table, sums))
     if not candidates:
         return None
+    # 多候选：单位不同，或表名不同且问题没有点名 → 不静默选第一个。
     if len({table.unit for table, _ in candidates}) > 1:
+        return None
+    if len({(table.caption, table.unit) for table, _ in candidates}) > 1:
         return None
     table, sums = candidates[0]
     common_years = tuple(year for year in years if year in sums)
@@ -199,15 +195,12 @@ def compute_table_comparison(
     question: str, chunks: Sequence[Any], *, db: Any | None = None
 ) -> TableComparison | None:
     """能确定性比较则返回结果；否则 None。"""
-    spec = parse_time_spec(question)
-    years = tuple(dict.fromkeys(int(y) for y in _YEAR_RE.findall(str(question or ""))))
-    if spec is None or len(years) < 2:
+    plan = parse_table_plan(question)
+    if plan is None:
         return None
-    if not any(word in str(question or "") for word in _COMPARE_WORDS):
-        return None
-    subject = _subject_from_question(question)
-    if len(_normalize(subject)) < 2:
-        return None
+    spec = plan.time
+    years = plan.years
+    subject = plan.subject
 
     rows = _rows_for_question(db, chunks)
     if not rows:
