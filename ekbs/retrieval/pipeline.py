@@ -1069,6 +1069,12 @@ class RetrievalPipeline:
             )
             return result
 
+        # ⑤ 单块精排阈值：低于 min_score 的候选不得进上下文。
+        # 此前 min_score 只用于 top_score 拒答：UI 把低分块标成「低于阈值」，但 keep 仍
+        # 会选中它，父块/整表扩展还会把它放大后送进 prompt（用户实测 35382=0.6025 ✖
+        # 仍被展开成整表 35380）。过滤放在扩展之前，低分块及其容器都不会出现。
+        survivors = self._filter_below_threshold(survivors, params, result, collect_debug)
+
         # ⑤ 父块扩展（扩展后的父块**仍需过 C5**，00 §2.1 / C5）
         selected = survivors[: params["rerank_keep"]]
         if collect_debug:
@@ -1184,6 +1190,44 @@ class RetrievalPipeline:
         except Exception as exc:  # noqa: BLE001 - 多模态旁路失败不拖垮检索
             log.warning("figure_mm_recall_failed", error=str(exc)[:160])
             return [], [], True, ["figure_mm_unavailable"]
+
+    def _filter_below_threshold(
+        self,
+        survivors: list[RetrievedChunk],
+        params: dict[str, Any],
+        result: Any,
+        collect_debug: bool,
+    ) -> list[RetrievedChunk]:
+        """丢掉单块精排分低于阈值的候选（与 UI 的「低于阈值 ✖」对齐）。
+
+        为什么现在才加：``min_score`` 之前只参与「top_score 拒答」判定，不看单块；
+        UI 逐行标 ✖ 只是展示。于是低分块既不会被拒答淘汰，又会被 keep/父块扩展带进
+        prompt（实测表格叶子 35382=0.6025 被展开成 2048 token 整表给 LLM）。
+        元数据兜底块 ``rerank_score is None`` 不参与精排，必须保留。
+        """
+        min_score = float(params["rerank_min_score"])
+        kept: list[RetrievedChunk] = []
+        dropped: list[int] = []
+        for chunk in survivors:
+            score = chunk.rerank_score
+            if score is not None and float(score) < min_score:
+                dropped.append(chunk.chunk_id)
+            else:
+                kept.append(chunk)
+        if dropped:
+            result.degraded.append("below_threshold_dropped")
+            log.info(
+                "retrieval_below_threshold_dropped",
+                min_score=min_score,
+                count=len(dropped),
+                chunk_ids=dropped,
+            )
+            if collect_debug:
+                result.stage_debug["threshold_filter"] = {
+                    "min_score": min_score,
+                    "dropped_chunk_ids": dropped,
+                }
+        return kept
 
     def _record_title_debug(
         self, result: RetrievalResult, debug: dict[str, Any], collect_debug: bool
@@ -3417,6 +3461,8 @@ class RetrievalPipeline:
             # 不在这里留版本位，上线后同一问句会继续命中改动前的答案缓存（最长 1 小时），
             # 表现为「代码已修但用户仍看到旧结果」。改行为时把这里的序号 +1。
             "title_priority=1",
+            # 单块阈值过滤（⑤）同样会改变上下文块集合；无配置开关能表达，改行为 +1。
+            "chunk_threshold=1",
         ]
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
 

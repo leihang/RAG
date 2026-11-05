@@ -786,3 +786,45 @@ def test_build_context_includes_doc_title_and_heading() -> None:
     assert "XJWY-GC-02设备编号作业指导书" in text
     assert "1. 目的" in text
     assert "满足公共设备管理需要。" in text
+
+
+async def test_below_threshold_chunks_never_reach_context(seeded) -> None:
+    """**UI 标「低于阈值」的块不得进上下文**（用户实测表格叶子 35382=0.6025 仍被展开）。
+
+    之前 ``min_score`` 只用于 top_score 拒答；keep=5 仍会取低分块，父块/整表扩展再把它
+    放大后送 prompt。本用例：rerank 只给 1 个高分块，其余 0.05 → 上下文只能有高分块。
+    """
+    from ekbs.provider.base import RerankResult
+
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+    original = runtime.pipeline.providers.rerank
+
+    class _PokeyRerank:
+        ref = original.ref
+
+        async def rerank(self, query, docs, top_n):  # noqa: ANN001, ANN202
+            results = [
+                RerankResult(chunk_id=docs[0].chunk_id, score=0.9, shard_id=docs[0].shard_id)
+            ]
+            results.extend(
+                RerankResult(chunk_id=doc.chunk_id, score=0.05, shard_id=doc.shard_id)
+                for doc in docs[1:]
+            )
+            return results
+
+    runtime.pipeline.providers.rerank = _PokeyRerank()  # type: ignore[assignment]
+    try:
+        result = await runtime.pipeline.retrieve("年假有多少天", alice, collect_debug=True)
+    finally:
+        runtime.pipeline.providers.rerank = original  # type: ignore[assignment]
+
+    min_score = float(runtime.pipeline.settings.retrieval.rerank.min_score)
+    assert result.refused is False, result.refusal_reason
+    assert result.chunks
+    assert all(
+        chunk.rerank_score is None or float(chunk.rerank_score) >= min_score
+        for chunk in result.chunks
+    ), [(c.chunk_id, c.rerank_score) for c in result.chunks]
+    dropped = (result.stage_debug.get("threshold_filter") or {}).get("dropped_chunk_ids") or []
+    assert dropped, "低分块应被单块阈值过滤并记录在调试信息里"
