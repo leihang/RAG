@@ -12,10 +12,11 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Sequence
 
-from ekbs.retrieval.table_struct import TableIndex, TableRow, load_table_rows
+from ekbs.retrieval.table_canonical import CanonicalTable, canonical_from_rows
+from ekbs.retrieval.table_struct import TableRow, load_table_rows
 
 _PERIOD_RE = re.compile(r"(\d{1,2})\s*[-—–~～至到]\s*(\d{1,2})\s*月")
 _YEAR_RE = re.compile(r"(20\d{2})\s*年")
@@ -76,29 +77,30 @@ def _valid_annual(row: TableRow) -> bool:
     return abs(total - row.annual_total) <= max(abs(row.annual_total) * 1e-6, 0.01)
 
 
-def _index_from_db(db: Any, chunks: Sequence[Any]) -> TableIndex | None:
-    doc_ids = sorted({int(getattr(chunk, "doc_id", 0) or 0) for chunk in chunks})
-    rows = load_table_rows(db, doc_ids)
-    if not rows:
-        return None
-    chunk_pos = {
-        int(getattr(chunk, "chunk_id", 0)): index
-        for index, chunk in enumerate(chunks, start=1)
-    }
-    table_pos: dict[int, int] = {}
-    for index, chunk in enumerate(chunks, start=1):
-        if str(getattr(chunk, "chunk_type", "")) == "table":
-            table_pos.setdefault(int(getattr(chunk, "doc_id", 0) or 0), index)
-    mapped = [
-        replace(
-            row,
-            chunk_index=chunk_pos.get(row.chunk_id or 0)
-            or table_pos.get(row.doc_id)
-            or 0,
-        )
-        for row in rows
-    ]
-    return TableIndex(mapped)
+def _rows_for_question(db: Any | None, chunks: Sequence[Any]) -> list[TableRow]:
+    if db is not None:
+        doc_ids = sorted({int(getattr(chunk, "doc_id", 0) or 0) for chunk in chunks})
+        rows = load_table_rows(db, doc_ids)
+        if rows:
+            return [row for row in rows if _valid_annual(row)]
+    # 过渡兜底：尚未回填索引/旧测试直接传 chunk 时，仍从文本解析。
+    from ekbs.retrieval.table_struct import TableIndex
+
+    return [row for row in TableIndex.from_chunks(chunks).rows if _valid_annual(row)]
+
+
+def _candidate_tables(rows: Sequence[TableRow], subject: str) -> list[CanonicalTable]:
+    tables = canonical_from_rows(rows)
+    target = _normalize(subject)
+    out: list[CanonicalTable] = []
+    for table in tables:
+        if not table.unit.strip():
+            continue
+        facts = [fact for fact in table.facts if target in _normalize(fact.subject)]
+        if facts:
+            table.facts = facts
+            out.append(table)
+    return out
 
 
 def compute_table_comparison(
@@ -118,47 +120,57 @@ def compute_table_comparison(
     if len(_normalize(subject)) < 2:
         return None
 
-    index = (_index_from_db(db, chunks) if db is not None else None) or TableIndex.from_chunks(chunks)
-    subject_rows = index.find(subject)
-    if not subject_rows:
+    rows = _rows_for_question(db, chunks)
+    if not rows:
         return None
-
-    # 按 (表格, 单位) 分组，优先选能同时覆盖目标年份、且单位明确的表。
-    groups: dict[tuple[str, str], list[TableRow]] = {}
-    for row in subject_rows:
-        if row.unit and row.unit.strip():
-            groups.setdefault((row.caption, row.unit), []).append(row)
-    candidates: list[tuple[tuple[str, str], dict[int, TableRow]]] = []
-    for key, rows in groups.items():
-        picked: dict[int, TableRow] = {}
-        for year in years:
-            year_rows = [row for row in rows if row.year == year and _valid_annual(row)]
-            best = _best_row(year_rows, start, end)
-            if best is not None:
-                picked[year] = best
-        if len(picked) >= 2:
-            candidates.append((key, picked))
-    if not candidates:
-        return None
-    # 选择第一张能覆盖最早两个年份的表；多表时保持稳定（按捕获顺序）。
-    (_caption, unit), picked = candidates[0]
-    year_a, year_b = years[0], years[1]
-    if year_a not in picked or year_b not in picked:
-        return None
-    totals = {
-        year: sum(picked[year].months[month] for month in range(start, end + 1))
-        for year in (year_a, year_b)
+    chunk_pos = {
+        int(getattr(chunk, "chunk_id", 0)): index
+        for index, chunk in enumerate(chunks, start=1)
+        if int(getattr(chunk, "chunk_id", 0) or 0) > 0
     }
-    diff = totals[year_a] - totals[year_b]
-    percent = diff / totals[year_b] * 100.0 if totals[year_b] else None
-    return TableComparison(
-        subject=subject,
-        start_month=start,
-        end_month=end,
-        years=(year_a, year_b),
-        totals=totals,
-        chunk_indices={year: picked[year].chunk_index for year in (year_a, year_b)},
-        diff=diff,
-        percent=percent,
-        unit=unit,
-    )
+    table_pos: dict[int, int] = {}
+    for index, chunk in enumerate(chunks, start=1):
+        if str(getattr(chunk, "chunk_type", "")) == "table":
+            table_pos.setdefault(int(getattr(chunk, "doc_id", 0) or 0), index)
+
+    for table in _candidate_tables(rows, subject):
+        totals: dict[int, tuple[float, int | None]] = {}
+        valid = True
+        for year in years:
+            year_facts = [
+                fact
+                for fact in table.facts_for(subject)
+                if fact.dimensions.get("year") == year
+                and fact.dimensions.get("month") is not None
+            ]
+            present = {fact.dimensions["month"] for fact in year_facts}
+            if not all(month in present for month in range(start, end + 1)):
+                valid = False
+                break
+            total = sum(fact.value for fact in year_facts if start <= fact.dimensions["month"] <= end)
+            chunk_id = next((fact.chunk_id for fact in year_facts), None)
+            totals[year] = (total, chunk_id)
+        if not valid or len(totals) < 2:
+            continue
+        year_a, year_b = years[0], years[1]
+        a, b = totals[year_a][0], totals[year_b][0]
+        diff = a - b
+        percent = diff / b * 100.0 if b else None
+        indices: dict[int, int] = {}
+        for year in (year_a, year_b):
+            chunk_id = totals[year][1]
+            index = chunk_pos.get(chunk_id or 0) or table_pos.get(table.doc_id) or 0
+            if index:
+                indices[year] = index
+        return TableComparison(
+            subject=subject,
+            start_month=start,
+            end_month=end,
+            years=(year_a, year_b),
+            totals={year_a: a, year_b: b},
+            chunk_indices=indices,
+            diff=diff,
+            percent=percent,
+            unit=table.unit,
+        )
+    return None
