@@ -199,3 +199,81 @@ def make_compare_plan(
         left=SumExpr(subject=subject, year=years[0], time=time),
         right=SumExpr(subject=subject, year=years[1], time=time),
     )
+
+
+@dataclass(frozen=True)
+class RatioExpr:
+    numerator: LookupExpr | SumExpr
+    denominator: LookupExpr | SumExpr
+    kind: str = "ratio"
+
+
+@dataclass(frozen=True)
+class YoyExpr:
+    current: LookupExpr | SumExpr
+    previous: LookupExpr | SumExpr
+    kind: str = "yoy"
+
+
+@dataclass(frozen=True)
+class RankExpr:
+    year: int
+    time: TimeSpec
+    top: int = 3
+    kind: str = "rank"
+
+
+def _op_ratio(table: CanonicalTable, expr: RatioExpr) -> CalcValue | None:
+    numerator = evaluate(table, expr.numerator)
+    denominator = evaluate(table, expr.denominator)
+    if numerator is None or denominator is None or denominator.value == 0:
+        return None
+    if numerator.unit != denominator.unit:
+        return None
+    return CalcValue(
+        numerator.value / denominator.value * 100.0,
+        "%",
+        {"op": "ratio", "table": table.table_key,
+         "numerator": numerator.provenance, "denominator": denominator.provenance},
+        (*numerator.chunk_ids, *denominator.chunk_ids),
+    )
+
+
+def _op_yoy(table: CanonicalTable, expr: YoyExpr) -> CalcValue | None:
+    current = evaluate(table, expr.current)
+    previous = evaluate(table, expr.previous)
+    if current is None or previous is None or previous.value == 0:
+        return None
+    if current.unit != previous.unit:
+        return None
+    return CalcValue(
+        (current.value - previous.value) / previous.value * 100.0,
+        "%",
+        {"op": "yoy", "table": table.table_key,
+         "current": current.value, "previous": previous.value,
+         "current_provenance": current.provenance, "previous_provenance": previous.provenance},
+        (*current.chunk_ids, *previous.chunk_ids),
+    )
+
+
+def _op_rank(table: CanonicalTable, expr: RankExpr) -> CalcValue | None:
+    rows: list[tuple[float, str, Any]] = []
+    for subject in table.subjects():
+        value = evaluate(table, SumExpr(subject=subject, year=expr.year, time=expr.time))
+        if value is not None:
+            rows.append((value.value, subject, value))
+    if not rows:
+        return None
+    rows.sort(key=lambda row: (-row[0], row[1]))
+    top = rows[: max(1, int(expr.top))]
+    first_value = top[0][2]
+    return CalcValue(
+        top[0][0],
+        first_value.unit,
+        {"op": "rank", "table": table.table_key, "year": expr.year,
+         "ranking": [{"subject": subject, "value": score} for score, subject, _ in top]},
+        tuple(first_value.chunk_ids),
+    )
+
+
+_REGISTRY.update({"ratio": _op_ratio, "yoy": _op_yoy, "rank": _op_rank})

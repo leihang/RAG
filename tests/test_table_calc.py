@@ -50,3 +50,31 @@ def test_compare_operator_provenance() -> None:
     assert result.value == 4.0
     assert result.provenance["op"] == "compare"
     assert result.provenance["left"] == 34.0
+
+
+def test_ratio_yoy_rank_operators() -> None:
+    from ekbs.retrieval.table_calc import RankExpr, RatioExpr, YoyExpr
+
+    table = _table()
+    t = TimeSpec("month_range", 1, 2)
+    ratio = evaluate(
+        table,
+        RatioExpr(
+            numerator=SumExpr(subject="指标", year=2026, time=t),
+            denominator=SumExpr(subject="指标", year=2026, time=t),
+        ),
+    )
+    assert ratio is not None and abs(ratio.value - 100.0) < 1e-9
+
+    yoy = evaluate(
+        table,
+        YoyExpr(
+            current=SumExpr(subject="指标", year=2026, time=t),
+            previous=SumExpr(subject="指标", year=2025, time=t),
+        ),
+    )
+    assert yoy is not None and abs(yoy.value - (4.0 / 30.0 * 100.0)) < 1e-9
+
+    rank = evaluate(table, RankExpr(year=2026, time=t, top=2))
+    assert rank is not None and rank.provenance["op"] == "rank"
+    assert rank.provenance["ranking"][0]["subject"] == "指标"

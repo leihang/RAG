@@ -311,3 +311,74 @@ def compute_table_lookup(
         chunk_index=index,
         caption=first.caption,
     )
+
+
+@dataclass(frozen=True)
+class TableValue:
+    subject: str
+    year: int
+    value: float
+    unit: str
+    chunk_index: int
+    label: str
+
+    def render(self) -> str:
+        mark = f"[{self.chunk_index}]" if self.chunk_index else ""
+        return (
+            f"{self.year}年{self.label}{self.subject}："
+            f"{self.value:,.2f} {self.unit}{mark}"
+        )
+
+
+def compute_table_value(
+    question: str, chunks: Sequence[Any], *, db: Any | None = None
+) -> TableValue | None:
+    """单期数值直查（含年度合计/单月/季度）。"""
+    years = tuple(dict.fromkeys(int(y) for y in re.findall(r"(20\d{2})\s*年", str(question or ""))))
+    if len(years) != 1:
+        return None
+    text = str(question or "")
+    from ekbs.retrieval.table_time import TimeSpec, parse_time_spec
+
+    time_spec = parse_time_spec(text)
+    if time_spec is None:
+        time_spec = TimeSpec("year", 1, 12, False)
+    rows = _rows_for_question(db, chunks)
+    if not rows:
+        return None
+    chunk_pos = {
+        int(getattr(chunk, "chunk_id", 0)): index
+        for index, chunk in enumerate(chunks, start=1)
+        if int(getattr(chunk, "chunk_id", 0) or 0) > 0
+    }
+    table_pos: dict[int, int] = {}
+    for index, chunk in enumerate(chunks, start=1):
+        if str(getattr(chunk, "chunk_type", "")) == "table":
+            table_pos.setdefault(int(getattr(chunk, "doc_id", 0) or 0), index)
+    matches: list[tuple[CanonicalTable, str]] = []
+    for table in canonical_from_rows(rows):
+        if not table.unit.strip():
+            continue
+        for subject in table.subjects():
+            if len(_normalize(subject)) < 2:
+                continue
+            if _normalize(subject) in _normalize(text):
+                matches.append((table, subject))
+    if len({(table.caption, subject, table.unit) for table, subject in matches}) != 1:
+        return None
+    table, subject = matches[0]
+    calc = evaluate(table, SumExpr(subject=subject, year=years[0], time=time_spec))
+    if calc is None:
+        return None
+    chunk_id = next((cid for cid in calc.chunk_ids if cid is not None), None)
+    index = chunk_pos.get(chunk_id or 0) or table_pos.get(table.doc_id) or 0
+    if not index:
+        return None
+    return TableValue(
+        subject=subject,
+        year=years[0],
+        value=calc.value,
+        unit=calc.unit,
+        chunk_index=index,
+        label=time_label(time_spec),
+    )

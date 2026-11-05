@@ -122,3 +122,17 @@ def test_direct_quarter_columns_are_used_without_month_derivation() -> None:
     )
     assert result is not None
     assert result.totals == {2026: 12.0, 2025: 10.0}
+
+
+def test_single_period_value_uses_total_or_months() -> None:
+    from ekbs.retrieval.table_query import compute_table_value
+
+    rows = [
+        _row(2025, {m: 10.0 for m in range(1, 13)}, annual=120.0),
+        _row(2026, {m: 20.0 for m in range(1, 13)}, annual=240.0),
+    ]
+    chunk = _chunk(rows=rows)
+    annual = compute_table_value("测试指标2026年全年总费用是多少", [chunk])
+    assert annual is not None and annual.value == 240.0
+    partial = compute_table_value("测试指标2026年1-9月总费用是多少", [chunk])
+    assert partial is not None and partial.value == 180.0

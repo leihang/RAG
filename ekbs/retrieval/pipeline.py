@@ -48,7 +48,11 @@ from ekbs.retrieval.faithfulness import (
     mostly_unsupported,
     supporting_chunk_indices,
 )
-from ekbs.retrieval.table_query import compute_table_comparison, compute_table_lookup
+from ekbs.retrieval.table_query import (
+    compute_table_comparison,
+    compute_table_lookup,
+    compute_table_value,
+)
 from ekbs.retrieval.numeric import (
     MODE_AUTO,
     MODE_NUMERIC,
@@ -631,6 +635,25 @@ TRUNCATION_NOTICE = "（提示：回答已达长度上限被截断，未显示�
 #: 否则旧提示词生成的答案会继续从缓存里被服务。
 PROMPT_REVISION = "v9"
 
+
+
+
+_NUMERIC_INTENT_RE = __import__("re").compile(
+    r"增长|减少|增加|下降|对比|较|同比|环比"
+)
+
+
+def _is_numeric_intent(question: str) -> bool:
+    """只对“期间比较型数值问题”做无计划门禁。
+
+    单值问法（``2026年总电量是多少``）当前索引/算子覆盖不足，若也门禁会
+    把本来能由 LLM 从表格里读出的答案误杀；先只拦截明确要求比较计算的问法。
+    """
+    from ekbs.retrieval.table_time import parse_time_spec
+
+    return bool(_NUMERIC_INTENT_RE.search(str(question or ""))) and parse_time_spec(
+        str(question or "")
+    ) is not None
 
 class RetrievalPipeline:
     def __init__(
@@ -2873,6 +2896,24 @@ class RetrievalPipeline:
             if allow_generation and mode_used == MODE_PROSE and not multi_intent
             else None
         )
+        table_value = (
+            compute_table_value(question, retrieval.chunks, db=self.db)
+            if allow_generation and mode_used == MODE_PROSE and not multi_intent
+            else None
+        )
+        numeric_unplanned = (
+            allow_generation
+            and mode_used == MODE_PROSE
+            and not multi_intent
+            and table_lookup is None
+            and table_answer is None
+            and table_value is None
+            and _is_numeric_intent(question)
+            and any(
+                str(getattr(chunk, "chunk_type", "")) == "table"
+                for chunk in retrieval.chunks
+            )
+        )
         if table_lookup is not None:
             lookup_text = table_lookup.render()
             result = AnswerResult(
@@ -2891,6 +2932,28 @@ class RetrievalPipeline:
                 retrieval=retrieval,
                 model="table_query",
                 degraded=["deterministic_table_query"],
+            )
+        elif table_value is not None:
+            value_text = table_value.render()
+            result = AnswerResult(
+                answer=value_text,
+                citations=self._post_check_citations(value_text, retrieval.chunks, perm),
+                retrieval=retrieval,
+                model="table_value",
+                degraded=["deterministic_table_value"],
+            )
+        elif numeric_unplanned:
+            result = AnswerResult(
+                answer=(
+                    "资料里有相关表格，但这个问题需要计算，当前未能从表内确定性解析。"
+                    "请明确指标、年份和期间（如“2026年1-9月”），我再按表计算。"
+                ),
+                citations=[],
+                retrieval=retrieval,
+                model="table_numeric_gate",
+                refused=True,
+                refusal_reason="table_numeric_unplanned",
+                degraded=["table_numeric_unplanned"],
             )
         elif allow_generation and mode_used == MODE_NUMERIC:
             result = await self._answer_numeric(question, retrieval, perm)
