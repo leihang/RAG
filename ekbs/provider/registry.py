@@ -98,6 +98,7 @@ def build_query_expand_llm(settings: Settings, secrets: Secrets) -> LLMProvider 
     cfg = parent.model_copy(update={
         "model": model,
         "max_tokens": int(raw.get("expand_max_tokens") or 64),
+        "reasoning_effort": "",
         "timeout_s": int(raw.get("expand_timeout_s") or 8),
         "max_retries": 0,
         "temperature": 0.3,
@@ -139,6 +140,7 @@ def _build_compatible_llm(cfg, secrets: Secrets, *, what: str) -> LLMProvider:
             temperature=cfg.temperature,
             top_p=cfg.top_p,
             max_tokens=cfg.max_tokens,
+            reasoning_effort=getattr(cfg, "reasoning_effort", ""),
             timeout_s=cfg.timeout_s,
             max_retries=cfg.max_retries,
             fallback=fallback,

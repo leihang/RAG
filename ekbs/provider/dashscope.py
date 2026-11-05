@@ -352,6 +352,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         temperature: float = 0.1,
         top_p: float = 0.8,
         max_tokens: int = 2048,
+        reasoning_effort: str = "",
         timeout_s: float = 120.0,
         max_retries: int = 2,
         retry_base_delay: float = 1.0,
@@ -364,6 +365,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         self.temperature = temperature
         self.top_p = top_p
         self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort.strip()
         self.timeout_s = timeout_s
         self.max_retries = max(0, int(max_retries))
         self.retry_base_delay = retry_base_delay
@@ -396,6 +398,8 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         }
         if response_format is not None:
             body["response_format"] = dict(response_format)
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
         return body
 
     async def generate(self, messages: Sequence[dict[str, str]], **kwargs: Any) -> LLMResult:

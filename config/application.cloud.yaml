@@ -150,7 +150,11 @@ models:
     timeout_s: 60
   llm:
     provider: dashscope
-    model: qwen-max
+    # 2026-11-06 切换：DeepSeek V4.1 Flash（DashScope 兼容端点）。
+    # A/B 实测 p50 ~1.97s vs qwen-max ~4.19s；生产 key 用 DASHSCOPE_API_KEY。
+    model: deepseek-v4.1-flash
+    # 关闭思考：默认思考模式会显著拉长首 token，且长答案易撞 max_tokens 被截断。
+    reasoning_effort: none
     temperature: 0.1
     top_p: 0.8
     max_tokens: 2048

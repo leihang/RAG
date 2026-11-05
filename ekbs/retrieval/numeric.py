@@ -272,7 +272,10 @@ def _normalize_for_match(text: str) -> str:
     ``单价（元） 3.456``（空格）或 ``单价（元）：3.456``（冒号）。
     这些是同一段原文的排版差异，不应判成“编造”。
     """
-    return re.sub(r"[\s=:：|]+", "", str(text or ""))
+    # 模型有时会把表格 HTML 片段（</td><td>）抄进 quote；标签不是原文内容，
+    # 先剥掉再比对，否则 DeepSeek 的取数结果会被误判成“编造”。
+    cleaned = re.sub(r"<[^>]+>", "", str(text or ""))
+    return re.sub(r"[\s=:：|]+", "", cleaned)
 
 
 def _quote_matches_chunk(
@@ -512,11 +515,17 @@ def render_answer(answer: NumericAnswer, cite_index: int | None) -> str:
     return f"{head}{text}{tail}{marker}"
 
 
+def _clean_quote(text: str) -> str:
+    """展示用 quote：模型可能把表格 HTML 标签抄进来，标签不是原文，展示前剥掉。"""
+    return re.sub(r"<[^>]+>", "", text or "").strip()
+
+
 def format_numeric_user_reply(answer: NumericAnswer, cite_index: int | None) -> str:
     """取数成功时的用户可见文案（含依据片段，供钉钉/API 直接展示）。"""
     lines = [render_answer(answer, cite_index)]
-    if answer.quote:
-        lines.append(f"依据：{answer.quote}")
+    quote = _clean_quote(answer.quote)
+    if quote:
+        lines.append(f"依据：{quote}")
     return "\n".join(lines)
 
 

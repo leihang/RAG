@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -376,18 +377,64 @@ async def qa_chat_stream(
     _check_question_length(runtime, payload.question)
     perm = await runtime.perm_context(user.user_id)
     safe_question, allow_generation = _guard_input(runtime, perm, payload.question)
-    answer = await runtime.pipeline.answer(
-        safe_question, perm, conversation_id=payload.conversation_id, use_cache=False,
-        allow_generation=allow_generation, fresh_on_repeat=payload.fresh_on_repeat,
-    )
+    queue: asyncio.Queue[str] = asyncio.Queue()
+
+    def _on_token(piece: str) -> None:
+        queue.put_nowait(piece)
+
+    async def _run_answer() -> Any:
+        return await runtime.pipeline.answer(
+            safe_question,
+            perm,
+            conversation_id=payload.conversation_id,
+            use_cache=False,
+            allow_generation=allow_generation,
+            fresh_on_repeat=payload.fresh_on_repeat,
+            mode=payload.mode,
+            token_callback=_on_token,
+        )
 
     async def event_stream() -> Any:
-        yield f"event: meta\ndata: {json.dumps({'citations': _citation_payload(answer.citations), 'refused': answer.refused, 'refusal_reason': answer.refusal_reason, 'perm_fingerprint': perm.fingerprint}, ensure_ascii=False)}\n\n"
-        text = answer.answer or ""
-        step = 24
-        for index in range(0, len(text), step):
-            chunk = text[index : index + step]
-            yield f"event: delta\ndata: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+        # 先发 meta（兼容旧客户端）；最终 meta 再带 citations/refused。
+        yield "event: meta\ndata: " + json.dumps({"status": "started"}, ensure_ascii=False) + "\n\n"
+        task = asyncio.create_task(_run_answer())
+        streamed = ""
+        try:
+            while True:
+                if task.done() and queue.empty():
+                    break
+                try:
+                    piece = await asyncio.wait_for(queue.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    continue
+                if piece:
+                    streamed += piece
+                    yield f"event: delta\ndata: {json.dumps({'text': piece}, ensure_ascii=False)}\n\n"
+            answer = await task
+        except Exception as exc:  # noqa: BLE001 —— SSE 不能把异常变成连接静默断开
+            log.error("qa_stream_failed", error=str(exc)[:300])
+            yield "event: error\ndata: " + json.dumps({"message": "流式回答失败"}, ensure_ascii=False) + "\n\n"
+            return
+        finally:
+            if not task.done():
+                task.cancel()
+        final_text = answer.answer or ""
+        # 生成后置门禁可能改写/拒答已流的 token：发 replace，客户端应以最终文本为准。
+        if streamed and final_text != streamed:
+            yield f"event: replace\ndata: {json.dumps({'text': final_text}, ensure_ascii=False)}\n\n"
+        yield "event: final\ndata: " + json.dumps(
+            {
+                "answer": final_text,
+                "citations": _citation_payload(answer.citations),
+                "refused": answer.refused,
+                "refusal_reason": answer.refusal_reason,
+                "perm_fingerprint": perm.fingerprint,
+                "timings_ms": answer.retrieval.timings_ms if answer.retrieval else {},
+                "numeric": answer.numeric,
+                "model": answer.model,
+            },
+            ensure_ascii=False,
+        ) + "\n\n"
         yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

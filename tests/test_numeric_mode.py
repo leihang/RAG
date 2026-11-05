@@ -644,3 +644,55 @@ def test_repeated_question_drops_old_answer_from_history() -> None:
     assert trimmed == []
     trimmed2 = RetrievalPipeline._drop_repeated_question_history(messages, "别的")
     assert len(trimmed2) == 2
+
+
+def test_reasoning_effort_only_when_configured() -> None:
+    """DeepSeek V4.1 关闭思考：只有显式配置才透传 reasoning_effort，默认请求体不变。"""
+    from ekbs.provider.base import ModelRef
+    from ekbs.provider.dashscope import OpenAICompatibleLLMProvider
+
+    base = dict(
+        ref=ModelRef(provider="dashscope", model="deepseek-v4.1-flash"),
+        api_key="k", base_url="https://example.invalid",
+        temperature=0.1, top_p=0.8, max_tokens=16, timeout_s=5, max_retries=0, fallback=None,
+    )
+    plain = OpenAICompatibleLLMProvider(**base)
+    body = plain._body([{"role": "user", "content": "hi"}], stream=False, model="deepseek-v4.1-flash")
+    assert "reasoning_effort" not in body
+    provider = OpenAICompatibleLLMProvider(**base, reasoning_effort="none")
+    body = provider._body([{"role": "user", "content": "hi"}], stream=False, model="deepseek-v4.1-flash")
+    assert body["reasoning_effort"] == "none"
+
+
+def test_quote_with_html_tags_is_still_verified() -> None:
+    """DeepSeek 有时把表格 HTML 标签抄进 quote；标签不是原文，剥掉后仍应可校验。"""
+    from types import SimpleNamespace
+    from ekbs.retrieval.numeric import NumericAnswer, verify_copied
+
+    chunk = SimpleNamespace(
+        content="用量   日期=总电量; 2026年9月=4379405.00; 同比=-5.14%",
+        doc_title="2026年9月能耗分析",
+        heading_path="用电分析",
+    )
+    answer = NumericAnswer(
+        value=4379405.0,
+        unit="KW/h",
+        quote="总电量</td><td>4379405.00",
+        indicator="总电量",
+        scope="2026年9月",
+    )
+    ok, index = verify_copied(answer, [chunk])
+    assert ok is True and index == 1
+    assert answer.surface == "4379405.00"
+
+
+def test_numeric_user_reply_strips_html_from_evidence() -> None:
+    from ekbs.retrieval.numeric import NumericAnswer, format_numeric_user_reply
+
+    answer = NumericAnswer(
+        value=4379405.0, unit="KW/h", quote="总电量</td><td>4379405.00",
+        indicator="总电量", scope="2026年9月", surface="4379405.00", page=1,
+    )
+    text = format_numeric_user_reply(answer, 1)
+    assert "依据：总电量4379405.00" in text
+    assert "</td>" not in text

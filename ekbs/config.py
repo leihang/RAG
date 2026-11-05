@@ -224,6 +224,9 @@ class LLMCfg(_Section):
     temperature: float = 0.1
     top_p: float = 0.8
     max_tokens: int = 2048
+    #: 思考强度（DeepSeek V4.1 等支持）：空=不发送；none=关闭思考，降低首 token 延迟。
+    #: 只对主模型/fallback 生效，不污染取数/视觉；DashScope 兼容端点按需透传。
+    reasoning_effort: str = ""
     #: **输入**（prompt）token 上限：0 = 不限制。为什么必须有它：资料块 + 多轮记忆 +
     #: 问题是一起塞给模型的，而模型窗口有限（qwen-max 最大输入 30,720）。实测最坏情况
     #: （5 个表格块 × 2048 + 10 轮 × (答 2048 + 问 2000)）≈ 40k+ ⇒ 不设上限会直接超窗。

@@ -183,6 +183,8 @@ async def test_qa_stream_emits_events(client: AsyncClient, internal_headers) -> 
         async for chunk in response.aiter_text():
             text += chunk
     assert "event: meta" in text
+    assert "event: delta" in text
+    assert "event: final" in text
     assert "event: done" in text
 
 

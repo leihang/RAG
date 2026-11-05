@@ -23,7 +23,7 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from ekbs.cache.store import CacheStore
 from ekbs.config import Settings
@@ -36,7 +36,7 @@ from ekbs.ingest.chunker import count_tokens, retrieval_text
 from ekbs.logging import get_logger
 from ekbs.permission.acl import DocumentGate
 from ekbs.permission.context import PermContext
-from ekbs.provider.base import RerankDoc
+from ekbs.provider.base import LLMResult, RerankDoc
 from ekbs.provider.registry import Providers
 from ekbs.retrieval.answer_verify import AnswerVerifier, VerifyResult
 from ekbs.retrieval.faithfulness import (
@@ -2144,6 +2144,44 @@ class RetrievalPipeline:
             log.warning("prompt_budget_trimmed", **stats)
         return kept_chunks, kept_history, stats
 
+    async def _run_generation(
+        self,
+        messages: Sequence[dict[str, str]],
+        token_callback: Callable[[str], None] | None,
+    ) -> LLMResult | None:
+        """流式优先、失败回退非流式；返回 None = 模型不可用。"""
+        if token_callback is not None and hasattr(self.providers.llm, "generate_stream"):
+            parts: list[str] = []
+            try:
+                async for piece in self.providers.llm.generate_stream(messages):
+                    if not piece:
+                        continue
+                    parts.append(piece)
+                    token_callback(piece)
+                text = "".join(parts)
+                return LLMResult(
+                    text=text,
+                    model=self.providers.llm.ref.ident,
+                    prompt_tokens=sum(
+                        count_tokens(str(message.get("content") or "")) for message in messages
+                    ),
+                    completion_tokens=count_tokens(text),
+                    finish_reason="stop",
+                )
+            except ModelUnavailable as exc:
+                log.warning("llm_stream_failed", error=str(exc)[:160])
+            except Exception as exc:  # noqa: BLE001 —— 流式解析失败也要有非流式兜底
+                log.warning("llm_stream_error", error=str(exc)[:160])
+        try:
+            result = await self.providers.llm.generate(messages)
+        except ModelUnavailable as exc:
+            log.error("llm_failed", error=str(exc))
+            return None
+        if token_callback is not None and result.text:
+            # provider 无流式能力/流式失败：至少把完整答案作为一次 delta 推给前端
+            token_callback(result.text)
+        return result
+
     async def generate(
         self,
         question: str,
@@ -2151,6 +2189,7 @@ class RetrievalPipeline:
         perm: PermContext,
         *,
         history: Sequence[dict[str, str]] = (),
+        token_callback: Callable[[str], None] | None = None,
     ) -> AnswerResult:
         started = time.perf_counter()
         chunks = retrieval.chunks
@@ -2185,10 +2224,9 @@ class RetrievalPipeline:
         messages.append({"role": "user", "content": question})
 
         llm_started = time.perf_counter()
-        try:
-            llm_result = await self.providers.llm.generate(messages)
-        except ModelUnavailable as exc:
-            log.error("llm_failed", error=str(exc))
+        llm_result = await self._run_generation(messages, token_callback)
+        llm_done = time.perf_counter()
+        if llm_result is None:
             return AnswerResult(
                 answer="生成服务暂时不可用，请稍后重试。",
                 citations=[],
@@ -2198,7 +2236,7 @@ class RetrievalPipeline:
                 refusal_reason="llm_unavailable",
                 **context_kw,
             )
-        llm_done = time.perf_counter()
+        llm_first_token = None  # 流式 first-token 由 API 侧记录；这里保守用完成时刻
         finish_reason = str(getattr(llm_result, "finish_reason", "") or "")
 
         answer_text, hallucinated = self._drop_hallucinated(llm_result.text, len(chunks))
@@ -2214,7 +2252,7 @@ class RetrievalPipeline:
 
         total = _ms(started)
         timing_kw = dict(
-            ttft_ms=int(_ms(llm_started, llm_done)),
+            ttft_ms=int(_ms(llm_started, llm_first_token or llm_done)),
             total_ms=total,
             prompt_tokens=llm_result.prompt_tokens,
             completion_tokens=llm_result.completion_tokens,
@@ -2740,6 +2778,7 @@ class RetrievalPipeline:
         collect_debug: bool = False,
         mode: str = MODE_AUTO,
         fresh_on_repeat: bool = False,
+        token_callback: Callable[[str], None] | None = None,
     ) -> AnswerResult:
         """检索 + 生成的一条龙（供 API 与钉钉适配器调用）。
 
@@ -2823,7 +2862,7 @@ class RetrievalPipeline:
             # 多问题：逐子问生成再拼接（共享 2048 输出上限会让后面的问题被略过）
             result = await self._answer_multi_intent(sub_questions, per_sub, retrieval, perm)
         elif allow_generation:
-            result = await self.generate(question, retrieval, perm)
+            result = await self.generate(question, retrieval, perm, token_callback=token_callback)
         else:
             result = self._retrieval_only_answer(question, retrieval, perm)
         self._annotate_result(
