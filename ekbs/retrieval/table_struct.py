@@ -59,6 +59,7 @@ class TableRow:
     year: int
     chunk_id: int | None = None
     months: dict[int, float] = field(default_factory=dict)
+    quarters: dict[int, float] = field(default_factory=dict)
     annual_total: float | None = None
 
 
@@ -82,6 +83,20 @@ def _row_subject(row: dict[str, str]) -> str:
     return ""
 
 
+_QUARTER_KEY_RE = re.compile(r"(?i)^(?:Q([1-4])|第?([一二三四1234])季度?)$")
+_CN_QUARTER = {"一": 1, "二": 2, "三": 3, "四": 4}
+
+
+def _quarter_key(key: str) -> int | None:
+    match = _QUARTER_KEY_RE.fullmatch(str(key or "").strip())
+    if not match:
+        return None
+    raw = match.group(1) or match.group(2) or ""
+    if raw.isdigit():
+        return int(raw)
+    return _CN_QUARTER.get(raw)
+
+
 def _row_year(row: dict[str, str]) -> int | None:
     for key in _YEAR_KEYS:
         value = row.get(key)
@@ -96,7 +111,7 @@ def _row_year(row: dict[str, str]) -> int | None:
 def parse_table_rows(chunks: Sequence[Any]) -> list[TableRow]:
     """从检索命中的分片里抽出年份×月份行；无法识别的分片跳过。"""
     rows: list[TableRow] = []
-    seen: set[tuple[str, str, int, tuple[tuple[int, float], ...]]] = set()
+    seen: set[tuple[object, ...]] = set()
     for chunk_index, chunk in enumerate(chunks, start=1):
         content = str(getattr(chunk, "content", "") or "")
         heading = " ".join(
@@ -114,20 +129,29 @@ def parse_table_rows(chunks: Sequence[Any]) -> list[TableRow]:
             if not subject or year is None:
                 continue
             months: dict[int, float] = {}
+            quarters: dict[int, float] = {}
             annual: float | None = None
             for key, value in row.items():
                 if key == "年度合计":
                     annual = _number(value)
                     continue
                 month_match = re.fullmatch(r"(\d{1,2})月", key)
-                if not month_match:
+                if month_match:
+                    number = _number(value)
+                    if number is not None:
+                        months[int(month_match.group(1))] = number
                     continue
-                number = _number(value)
-                if number is not None:
-                    months[int(month_match.group(1))] = number
-            if not months:
+                quarter = _quarter_key(key)
+                if quarter is not None:
+                    number = _number(value)
+                    if number is not None:
+                        quarters[quarter] = number
+            if not months and not quarters:
                 continue
-            signature = (caption, subject, year, tuple(sorted(months.items())))
+            signature = (
+                caption, subject, year,
+                tuple(sorted(months.items())), tuple(sorted(quarters.items())),
+            )
             if signature in seen:
                 continue  # 同一行可能同时出现在父块/分段里，避免重复累加
             seen.add(signature)
@@ -141,6 +165,7 @@ def parse_table_rows(chunks: Sequence[Any]) -> list[TableRow]:
                     subject=subject,
                     year=year,
                     months=months,
+                    quarters=quarters,
                     annual_total=annual,
                 )
             )
@@ -172,7 +197,8 @@ def load_table_rows(db: Any, doc_ids: Sequence[int]) -> list[TableRow]:
     try:
         with db.sync_connect() as conn:
             records = conn.execute(
-                "SELECT doc_id, chunk_id, caption, unit, subject, year, months_json, annual_total "
+                "SELECT doc_id, chunk_id, caption, unit, subject, year, months_json, "
+                "quarters_json, annual_total "
                 f"FROM table_row_index WHERE doc_id IN ({placeholders}) ORDER BY row_id",
                 ids,
             ).fetchall()
@@ -185,9 +211,13 @@ def load_table_rows(db: Any, doc_ids: Sequence[int]) -> list[TableRow]:
                 int(month): float(value)
                 for month, value in json.loads(record["months_json"] or "{}").items()
             }
+            quarters = {
+                int(quarter): float(value)
+                for quarter, value in json.loads(record["quarters_json"] or "{}").items()
+            }
         except (TypeError, ValueError):
             continue
-        if not months:
+        if not months and not quarters:
             continue
         rows.append(
             TableRow(
@@ -199,6 +229,7 @@ def load_table_rows(db: Any, doc_ids: Sequence[int]) -> list[TableRow]:
                 subject=str(record["subject"] or ""),
                 year=int(record["year"]),
                 months=months,
+                quarters=quarters,
                 annual_total=(
                     float(record["annual_total"]) if record["annual_total"] is not None else None
                 ),

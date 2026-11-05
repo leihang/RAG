@@ -233,6 +233,7 @@ class Database:
                 " subject TEXT NOT NULL,"
                 " year INTEGER NOT NULL,"
                 " months_json TEXT NOT NULL DEFAULT '{}',"
+                " quarters_json TEXT NOT NULL DEFAULT '{}',"
                 " annual_total REAL,"
                 " created_at TEXT NOT NULL DEFAULT (datetime('now'))"
                 ")"
@@ -265,6 +266,13 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_table_record_chunk "
                 "ON table_record_index(chunk_id)"
             )
+            table_cols = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(table_row_index)").fetchall()
+            }
+            if "quarters_json" not in table_cols:
+                conn.execute(
+                    "ALTER TABLE table_row_index ADD COLUMN quarters_json TEXT NOT NULL DEFAULT '{}'"
+                )
             conn.commit()
 
     def verify_schema(self) -> SchemaReport:

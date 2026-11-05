@@ -680,6 +680,7 @@ CREATE TABLE IF NOT EXISTS table_row_index (
     subject      TEXT NOT NULL,
     year         INTEGER NOT NULL,
     months_json  TEXT NOT NULL DEFAULT '{}',
+    quarters_json TEXT NOT NULL DEFAULT '{}',
     annual_total REAL,
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );

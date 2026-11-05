@@ -42,8 +42,9 @@ def replace_document_table_rows(db, doc_id: int) -> int:
             for row in parsed:
                 conn.execute(
                     "INSERT INTO table_row_index("
-                    "doc_id, chunk_id, caption, unit, subject, year, months_json, annual_total"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "doc_id, chunk_id, caption, unit, subject, year, months_json, "
+                    "quarters_json, annual_total"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         doc_id,
                         row.chunk_id,
@@ -52,6 +53,7 @@ def replace_document_table_rows(db, doc_id: int) -> int:
                         row.subject,
                         row.year,
                         json.dumps({str(k): v for k, v in sorted(row.months.items())}),
+                        json.dumps({str(k): v for k, v in sorted(row.quarters.items())}),
                         row.annual_total,
                     ),
                 )

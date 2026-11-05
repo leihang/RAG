@@ -128,6 +128,19 @@ def _sum_for_spec(
     ytd_end: int | None = None,
 ) -> tuple[float, int | None] | None:
     months = _year_months(table, subject, year)
+    if spec.kind == "quarter":
+        quarter = ((int(spec.start_month or 1) - 1) // 3) + 1
+        direct = [
+            fact
+            for fact in table.facts_for(subject)
+            if fact.dimensions.get("year") == year
+            and fact.dimensions.get("quarter") == quarter
+        ]
+        if direct:
+            return (
+                sum(fact.value for fact in direct),
+                next((fact.chunk_id for fact in direct), None),
+            )
     if not months:
         return None
     if spec.kind == "ytd":

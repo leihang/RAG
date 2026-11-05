@@ -116,6 +116,19 @@ class CrossTabAdapter:
                         table_key=table.table_key,
                     )
                 )
+            for quarter, value in row.quarters.items():
+                table.facts.append(
+                    TableFact(
+                        subject=row.subject,
+                        dimensions={"year": row.year, "quarter": quarter},
+                        value=float(value),
+                        unit=row.unit,
+                        doc_id=row.doc_id,
+                        chunk_id=row.chunk_id,
+                        caption=row.caption,
+                        table_key=table.table_key,
+                    )
+                )
             if row.annual_total is not None:
                 table.facts.append(
                     TableFact(

@@ -105,3 +105,20 @@ def test_record_lookup_golden() -> None:
     )
     result = compute_table_lookup("工程经理的职责是什么", [chunk])
     assert result is not None and result.value == "负责项目能耗管理。"
+
+
+def test_direct_quarter_columns_are_used_without_month_derivation() -> None:
+    content = """表名: 季度表（元）
+相关表头: 日期 | 年       月份 | Q1 | Q2 | Q3 | Q4
+日期=测试指标; 年       月份=2025; Q1=10; Q2=20; Q3=30; Q4=40
+日期=测试指标; 年       月份=2026; Q1=12; Q2=22; Q3=32; Q4=42
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    result = compute_table_comparison(
+        "测试指标，2026年Q1较2025年Q1是增长还是减少", [chunk]
+    )
+    assert result is not None
+    assert result.totals == {2026: 12.0, 2025: 10.0}
