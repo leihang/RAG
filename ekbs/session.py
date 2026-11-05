@@ -278,9 +278,9 @@ class QueryRewriter:
             result = RewriteResult(question, question, "llm_failed", used_history=False)
             return self._fill_variants(result)
 
-        # 启发式：仅在「问题本身不自足」时才并入上一轮，避免污染语义明确的查询
-        if _needs_context(question):
-            merged = f"{previous_question} {question}".strip()
+        # 启发式：期间追问做槽位合并；其它上下文依赖才并入上一轮。
+        merged = _merge_followup(previous_question, question, _history_year(history))
+        if merged != question:
             result = RewriteResult(question, merged, "heuristic", used_history=True)
             return self._fill_variants(result)
         result = RewriteResult(question, question, "heuristic", used_history=False)
@@ -536,6 +536,52 @@ def _is_standalone_lookup(text: str) -> bool:
     return any(flag == "nr" for _word, flag in content) and bool(
         _NAME_QUESTION_RE.search(stripped)
     )
+
+
+_PERIOD_FOLLOW_RE = re.compile(
+    r"(?:20\d{2}\s*年\s*)?(?:\d{1,2}\s*[-—–~～至到]\s*\d{1,2}\s*月|\d{1,2}\s*月|"
+    r"Q[1-4]|第?[一二三四]季度|上半年|下半年|YTD|年初至今|全年)"
+)
+_QUESTION_TAIL_RE = re.compile(r"(是多少|多少|几|合计|总计|总共|多大|呢|啦|吗|？|\?)+$")
+_YEAR_RE = re.compile(r"20\d{2}\s*年")
+
+
+def _period_of(text: str) -> str:
+    match = _PERIOD_FOLLOW_RE.search(text or "")
+    return match.group(0).strip() if match else ""
+
+
+def _history_year(history: Sequence[dict[str, str]]) -> str:
+    for message in reversed(list(history)):
+        match = _YEAR_RE.search(str(message.get("content", "") or ""))
+        if match:
+            return match.group(0)
+    return ""
+
+
+def _merge_followup(previous: str, question: str, fallback_year: str = "") -> str:
+    """把「那 1-5 月啦」这类期间追问合并成可独立检索的一句话。
+
+    旧逻辑直接把上一问和追问用空格拼起来，产出
+    ``2026年公司承担电费是多少 那1-5月啦``；检索/计划都不可用。
+    """
+    if not previous:
+        return question
+    current_period = _period_of(question)
+    previous_year_match = _YEAR_RE.search(previous)
+    previous_year_text = previous_year_match.group(0) if previous_year_match else fallback_year
+    current_has_year = bool(_YEAR_RE.search(question))
+    # 只补期间、没有主题：用上一问的主体 + 当前期间。
+    if _needs_context(question) and current_period and not current_has_year:
+        base = _QUESTION_TAIL_RE.sub("", previous).strip()
+        if base:
+            return f"{base}{current_period}是多少"
+    # 自包含但漏了年份：只对带期间的追问补上一轮年份。
+    if current_period and not current_has_year and previous_year_text:
+        return f"{previous_year_text}{question}"
+    if _needs_context(question):
+        return f"{previous} {question}"
+    return question
 
 
 def _needs_context(question: str) -> bool:

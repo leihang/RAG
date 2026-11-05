@@ -2858,6 +2858,8 @@ class RetrievalPipeline:
 
         # ② 查询改写（00 §2.1 的第一步）；改写后的查询才是检索输入
         rewrite = await self._rewrite(question, messages)
+        # 计划/确定性计算用改写后的自包含查询；生成仍用用户原问题。
+        plan_question = str(getattr(rewrite, "rewritten", "") or question)
         intent = str(getattr(rewrite, "intent", "factual") or "factual")
         auto_numeric = bool((getattr(self.settings, "qa", None) or {}).get("auto_numeric", True))
         mode_used = resolve_answer_mode(mode, intent, auto_numeric=auto_numeric)
@@ -2907,7 +2909,7 @@ class RetrievalPipeline:
             collect_debug=collect_debug,
         )
         calc_plan = (
-            generate_calc_plan(question)
+            generate_calc_plan(plan_question)
             if allow_generation and mode_used == MODE_PROSE and not multi_intent
             else None
         )
@@ -2920,7 +2922,7 @@ class RetrievalPipeline:
             and not multi_intent
             and _looks_numeric(question)
         ):
-            calc_plan = await generate_llm_calc_plan(question, self.providers.llm)
+            calc_plan = await generate_llm_calc_plan(plan_question, self.providers.llm)
         if calc_plan is not None:
             self._augment_table_context(retrieval)
             if not any(
@@ -2928,45 +2930,45 @@ class RetrievalPipeline:
                 for chunk in retrieval.chunks
             ):
                 await self._retrieve_table_context(
-                    question, retrieval, perm, overrides=overrides
+                    plan_question, retrieval, perm, overrides=overrides
                 )
         table_lookup = (
-            compute_table_lookup(question, retrieval.chunks, db=self.db)
+            compute_table_lookup(plan_question, retrieval.chunks, db=self.db)
             if calc_plan is None and allow_generation and mode_used == MODE_PROSE and not multi_intent
             else None
         )
         table_answer = (
-            compute_table_comparison(question, retrieval.chunks, db=self.db)
+            compute_table_comparison(plan_question, retrieval.chunks, db=self.db)
             if calc_plan is not None and calc_plan.operation == "compare"
             else None
         )
         table_value = (
-            compute_table_value(question, retrieval.chunks, db=self.db)
+            compute_table_value(plan_question, retrieval.chunks, db=self.db)
             if calc_plan is not None and calc_plan.operation == "value"
             else None
         )
         table_avg = (
-            compute_table_average(question, retrieval.chunks, db=self.db)
+            compute_table_average(plan_question, retrieval.chunks, db=self.db)
             if calc_plan is not None and calc_plan.operation == "avg"
             else None
         )
         table_ratio = (
-            compute_table_ratio(question, retrieval.chunks, db=self.db)
+            compute_table_ratio(plan_question, retrieval.chunks, db=self.db)
             if calc_plan is not None and calc_plan.operation == "ratio"
             else None
         )
         table_rank = (
-            compute_table_rank(question, retrieval.chunks, db=self.db)
+            compute_table_rank(plan_question, retrieval.chunks, db=self.db)
             if calc_plan is not None and calc_plan.operation == "rank"
             else None
         )
         table_binary = (
-            compute_table_binary(question, retrieval.chunks, db=self.db)
+            compute_table_binary(plan_question, retrieval.chunks, db=self.db)
             if calc_plan is not None and calc_plan.operation == "binary"
             else None
         )
         table_filtered = (
-            compute_table_filtered(question, retrieval.chunks, db=self.db)
+            compute_table_filtered(plan_question, retrieval.chunks, db=self.db)
             if calc_plan is not None and calc_plan.operation == "filter"
             else None
         )

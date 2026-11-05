@@ -430,3 +430,33 @@ async def test_same_conversation_reuses_one_audit_session(seeded) -> None:
     assert len(sessions) == 1, "同一会话只能有一个 qa_session"
     assert int(sessions[0]["message_count"]) == 4  # 两轮 × (user+assistant)
     assert turns == [1, 2]
+
+
+async def test_rewriter_merges_period_followup_without_previous_question_noise(runtime) -> None:
+    rewriter = QueryRewriter(settings=runtime.settings)
+    history = [
+        {"role": "user", "content": "2026年公司承担电费是多少"},
+        {"role": "assistant", "content": "1,921,171.03 元 [1]"},
+    ]
+    result = await rewriter.rewrite("那1-5月啦", history)
+    assert result.used_history is True
+    assert result.rewritten == "2026年公司承担电费1-5月是多少"
+
+
+async def test_rewriter_carries_year_for_period_question(runtime) -> None:
+    rewriter = QueryRewriter(settings=runtime.settings)
+    history = [{"role": "user", "content": "2026年公司承担电费是多少"}]
+    result = await rewriter.rewrite("公司承担电费1-5月是多少", history)
+    assert result.rewritten == "2026年公司承担电费1-5月是多少"
+
+
+async def test_rewriter_carries_year_from_older_turn(runtime) -> None:
+    rewriter = QueryRewriter(settings=runtime.settings)
+    history = [
+        {"role": "user", "content": "2026年公司承担电费是多少"},
+        {"role": "assistant", "content": "1,921,171.03 元 [1]"},
+        {"role": "user", "content": "那1-5月啦"},
+        {"role": "assistant", "content": "789,663.63 元 [1]"},
+    ]
+    result = await rewriter.rewrite("公司承担电费1-5月是多少", history)
+    assert result.rewritten == "2026年公司承担电费1-5月是多少"

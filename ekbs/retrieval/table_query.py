@@ -401,15 +401,19 @@ def _value_from_cells(
     selected_cells = [
         cell for cell in target if cell.year == year and cell.month in selected
     ]
-    values = {round(cell.value, 10) for cell in selected_cells}
-    if len(values) != 1:
+    if not selected_cells:
+        return None
+    if time_spec.require_complete and {
+        cell.month for cell in selected_cells
+    } < selected:
         return None
     first = selected_cells[0]
     index = chunk_pos.get(first.chunk_id or 0) or table_pos.get(first.doc_id) or 0
     if not index:
         return None
     return TableValue(
-        subject=first.subject, year=first.year, value=first.value,
+        subject=first.subject, year=first.year,
+        value=sum(cell.value for cell in selected_cells),
         unit=first.unit, chunk_index=index, label=time_label(time_spec),
     )
 

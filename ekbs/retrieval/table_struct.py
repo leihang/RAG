@@ -17,7 +17,7 @@ from typing import Any, Sequence
 _NUMBER_RE = re.compile(r"\(?-?\d[\d,]*(?:\.\d+)?\)?")
 _CAPTION_RE = re.compile(r"表名[:：]\s*(.+)")
 _UNIT_RE = re.compile(r"[（(]([^（）()]{1,16})[）)]")
-_SUBJECT_KEYS = ("日期", "项目", "类别", "指标", "名称")
+_SUBJECT_KEYS = ("日期", "项目", "类别", "指标", "名称", "类型")
 _YEAR_KEYS = ("年月份", "年份", "年")
 
 

@@ -285,3 +285,34 @@ def test_filtered_unit_conversion() -> None:
     assert result is not None
     assert result.unit == "万元"
     assert abs(result.value - 1.0) < 1e-9
+
+
+def test_wide_cell_month_range_sum() -> None:
+    from ekbs.retrieval.table_query import compute_table_value
+
+    content = """表名: 用电分析（KW/h）
+相关表头: 用量日期 | 2026年1月 | 2026年2月
+用量日期=公司承担电费; 2026年1月=100; 2026年2月=200
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    result = compute_table_value("2026年公司承担电费1-2月是多少", [chunk])
+    assert result is not None and result.value == 300.0
+
+
+def test_type_row_subject_is_parsed() -> None:
+    from ekbs.retrieval.table_struct import TableIndex
+
+    content = """表名: 年电费（元）
+相关表头: 类型 | 年       月份 | 1月 | 2月 | 合计
+类型=公司承担电费; 年       月份=2026; 1月=100; 2月=200; 合计=300
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    rows = TableIndex.from_chunks([chunk]).rows
+    assert rows and rows[0].subject == "公司承担电费"
+    assert rows[0].months == {1: 100.0, 2: 200.0}
