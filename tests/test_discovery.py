@@ -11,6 +11,11 @@ from httpx import ASGITransport, AsyncClient
 
 from ekbs.api.app import create_app
 from ekbs.discovery import (
+    format_document_list_text,
+    format_help_text_short,
+    friendly_title,
+    is_document_list_command,
+    is_greeting_command,
     display_doc_title,
     file_request_hint,
     format_help_text,
@@ -303,7 +308,7 @@ async def test_dingtalk_help_uses_catalog_not_qa(seeded) -> None:
         cards=cards,
     )
     routes = mock_dingtalk(card_ok=False)
-    catalog = respx.get(CATALOG_URL).mock(
+    catalog = respx.get(f"{CATALOG_URL}?mode=help").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -349,7 +354,7 @@ async def test_permission_question_lists_docs_not_retrieval(seeded) -> None:
         cards=cards,
     )
     routes = mock_dingtalk(card_ok=False)
-    catalog = respx.get(f"{CATALOG_URL}?doc_limit=80").mock(
+    catalog = respx.get(f"{CATALOG_URL}?doc_limit=80&mode=docs").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -481,3 +486,69 @@ async def test_dingtalk_refusal_appends_suggestions_if_missing(seeded) -> None:
     content = json.loads(sent["msgParam"])["content"]
     assert "你可以试试问" in content
     assert "年假有多少天" in content
+
+
+def test_greeting_and_doc_commands_are_separate() -> None:
+    assert is_greeting_command("你好")
+    assert is_greeting_command("您好呀")
+    assert is_greeting_command("hello~")
+    assert not is_greeting_command("你好，请问年假有多少天")
+    assert is_document_list_command("文档")
+    assert is_document_list_command("有哪些文档")
+    assert not is_document_list_command("维修作业指导书里日常小修多久完成")
+
+
+def test_friendly_title_hides_document_codes() -> None:
+    assert friendly_title("工程部/XJWY-GC-09维修作业指导书") == "维修作业指导书"
+    assert friendly_title("XJWY-GC-12能耗管理作业指导书 - 定稿") == "能耗管理作业指导书（定稿）"
+    assert friendly_title("XJWY-GCYJ-05跑水突发事件处理预案") == "跑水突发事件处理预案"
+
+
+def test_short_help_has_no_document_list_or_weak_questions() -> None:
+    suggestions = [{"question": "跑水事件里环境部第一时间做什么"}]
+    text = format_help_text_short(suggestions)
+    assert "我可以帮你查制度" in text
+    assert "跑水事件里环境部第一时间做什么" in text
+    assert "回复「文档」" in text
+    assert "XJWY-" not in text
+    assert "主要讲了什么" not in text
+    assert "私有库" not in text
+
+
+def test_document_list_text_uses_friendly_titles() -> None:
+    text = format_document_list_text(
+        [
+            {"title": "工程部/XJWY-GC-09维修作业指导书", "doc_id": 1},
+            {"title": "XJWY-GC-12能耗管理作业指导书 - 定稿", "doc_id": 2},
+        ]
+    )
+    assert "可查文档（2）" in text
+    assert "维修作业指导书" in text
+    assert "能耗管理作业指导书（定稿）" in text
+    assert "XJWY-" not in text
+
+
+async def test_catalog_help_and_docs_modes(client, seeded) -> None:
+    """P0：帮助只给短示例；文档清单只给去掉编号的标题。"""
+    runtime, _ = seeded
+    alice = user_id_of(runtime.db, "demo_alice")
+
+    help_resp = await client.get(
+        "/api/v1/discovery/catalog?mode=help", headers=headers_for(alice)
+    )
+    assert help_resp.status_code == 200
+    help_text = help_resp.json()["help_text"]
+    assert help_text.startswith("我可以帮你查制度")
+    assert "回复「文档」" in help_text
+    assert "当前可见的文档" not in help_text
+    assert "私有库" not in help_text
+
+    docs_resp = await client.get(
+        "/api/v1/discovery/catalog?mode=docs", headers=headers_for(alice)
+    )
+    assert docs_resp.status_code == 200
+    docs_text = docs_resp.json()["help_text"]
+    assert "可查文档（" in docs_text
+    assert "年假管理制度" in docs_text
+    assert "XJWY-" not in docs_text
+    assert "主要讲了什么" not in docs_text

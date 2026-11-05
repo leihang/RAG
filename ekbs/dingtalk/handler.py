@@ -52,6 +52,8 @@ from ekbs.discovery import (
     display_doc_title,
     file_request_hint,
     is_catalog_query,
+    is_document_list_command,
+    is_greeting_command,
     is_help_command,
     is_personal_list_command,
     personal_delete_title,
@@ -288,6 +290,16 @@ class StreamMessageHandler:
             if intro:
                 await self._reply_text(message, intro)
 
+            if is_greeting_command(message.text):
+                # P0：纯问候只回一句介绍；帮助/文档另行触发，不在首屏堆清单。
+                if not intro:
+                    await self._reply_text(
+                        message,
+                        str(self.settings.adapter.self_intro or "你好，我是企业知识库助手。"),
+                    )
+                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                return ReplyResult(True, replied=True, via="text", reason="greeting")
+
             if message.download_code:
                 reply = await self._accept_personal_file(message, user_id)
                 await self._reply_text(message, reply)
@@ -339,7 +351,9 @@ class StreamMessageHandler:
             # ③.5 D22-P0：欢迎/帮助短路 —— 可见文档 + 示例问（过 ACL，不进问答）
             if is_help_command(message.text):
                 status, payload = await self._discovery_catalog(
-                    user_id=user_id, conversation_type=message.conversation_type
+                    user_id=user_id,
+                    conversation_type=message.conversation_type,
+                    mode="help",
                 )
                 if status == 0:
                     await asyncio.to_thread(
@@ -356,9 +370,12 @@ class StreamMessageHandler:
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="help", answer=help_text)
 
-            if is_catalog_query(message.text):
+            if is_document_list_command(message.text) or is_catalog_query(message.text):
                 status, payload = await self._discovery_catalog(
-                    user_id=user_id, doc_limit=80, conversation_type=message.conversation_type
+                    user_id=user_id,
+                    doc_limit=80,
+                    conversation_type=message.conversation_type,
+                    mode="docs",
                 )
                 if status == 0:
                     await asyncio.to_thread(
@@ -585,11 +602,14 @@ class StreamMessageHandler:
         user_id: int,
         doc_limit: int | None = None,
         conversation_type: str = "1",
+        mode: str = "full",
     ) -> tuple[int, dict[str, Any]]:
         path = "/api/v1/discovery/catalog"
         query: list[str] = []
         if doc_limit:
             query.append(f"doc_limit={int(doc_limit)}")
+        if mode != "full":
+            query.append(f"mode={mode}")
         if conversation_type == "2":
             # 群聊只允许公开文档：API 侧会剪掉个人库；单聊保持原 URL 兼容。
             query.append("conversation_type=2")

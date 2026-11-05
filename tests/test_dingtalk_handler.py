@@ -585,7 +585,7 @@ async def test_personal_list_command_does_not_enter_qa(handler) -> None:
 async def test_accessible_doc_list_uses_catalog_not_qa_or_file(handler) -> None:
     """「列出我可以查询/查阅的文件清单」回可见文档，不进问答，也不发原文。"""
     mock_dingtalk()
-    catalog = respx.get(f"{API_BASE}/api/v1/discovery/catalog?doc_limit=80").mock(
+    catalog = respx.get(f"{API_BASE}/api/v1/discovery/catalog?doc_limit=80&mode=docs").mock(
         return_value=httpx.Response(
             200,
             json={"help_text": "你当前可见的文档：\n1. 年假管理制度", "documents": [], "suggestions": []},
@@ -725,3 +725,21 @@ async def test_group_qa_never_calls_qa_api(handler) -> None:
     assert code == ACK_OK
     assert qa.call_count == 0
     assert routes["group"].call_count == 0
+
+
+@respx.mock
+async def test_greeting_returns_only_short_intro(handler) -> None:
+    """P0：纯问候只回一句介绍，不拉帮助/文档，也不进问答。"""
+    routes = mock_dingtalk()
+    handler.settings.adapter.self_intro = "你好，我是企业知识库助手。"
+    catalog = respx.get(f"{API_BASE}/api/v1/discovery/catalog?mode=help").mock(
+        return_value=httpx.Response(200, json={"help_text": "不应调用", "documents": [], "suggestions": []})
+    )
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    code, _ = await handler.process({"data": payload(msg_id="greet-1", text="你好")})
+    assert code == ACK_OK
+    assert catalog.call_count == 0
+    assert qa.call_count == 0
+    assert routes["oto"].call_count == 1
+    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
+    assert sent["content"] == "你好，我是企业知识库助手。"

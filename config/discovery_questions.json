@@ -3,63 +3,161 @@
   "questions": [
     {
       "question": "年假有多少天",
-      "title_keywords": ["年假"]
+      "title_keywords": [
+        "年假"
+      ]
     },
     {
       "question": "熙物联APP怎么下载和登录",
-      "title_keywords": ["熙物联", "物联网"]
+      "title_keywords": [
+        "熙物联",
+        "物联网"
+      ]
     },
     {
       "question": "把熙物联使用教程里的下载二维码发我",
-      "title_keywords": ["熙物联", "物联网"]
+      "title_keywords": [
+        "熙物联",
+        "物联网"
+      ]
     },
     {
       "question": "员工手册里有哪些总则",
-      "title_keywords": ["员工手册"]
+      "title_keywords": [
+        "员工手册"
+      ]
     },
     {
       "question": "中央空调循环水处理合同的工程总价是多少钱",
-      "title_keywords": ["中央空调", "循环水"]
+      "title_keywords": [
+        "中央空调",
+        "循环水"
+      ]
     },
     {
       "question": "中央空调循环水处理合同的有效期是多久",
-      "title_keywords": ["中央空调", "循环水"]
+      "title_keywords": [
+        "中央空调",
+        "循环水"
+      ]
     },
     {
       "question": "电梯维护保养每台每月多少钱",
-      "title_keywords": ["电梯"]
+      "title_keywords": [
+        "电梯"
+      ]
     },
     {
       "question": "电梯维保考核不合格几次甲方可以解除合同",
-      "title_keywords": ["电梯"]
+      "title_keywords": [
+        "电梯"
+      ]
     },
     {
       "question": "空调保养合同的总价是多少",
-      "title_keywords": ["空调保养", "空调"]
+      "title_keywords": [
+        "空调保养",
+        "空调"
+      ]
     },
     {
       "question": "设备编号是怎么组成的",
-      "title_keywords": ["设备"]
+      "title_keywords": [
+        "设备"
+      ]
     },
     {
       "question": "设备管理等级用什么符号表示",
-      "title_keywords": ["设备"]
+      "title_keywords": [
+        "设备"
+      ]
     },
     {
       "question": "交接班管理制度的目的",
-      "title_keywords": ["交接班"]
+      "title_keywords": [
+        "交接班"
+      ]
     },
     {
       "question": "设施设备统计表的表格编号是多少",
-      "title_keywords": ["设施设备", "统计"]
+      "title_keywords": [
+        "设施设备",
+        "统计"
+      ]
     },
     {
       "question": "2026年7月的用电分析表",
-      "title_keywords": ["用电", "能源", "分析"]
+      "title_keywords": [
+        "用电",
+        "能源",
+        "分析"
+      ]
     },
     {
       "question": "2026年度预算填报模板的表头有哪些项目",
-      "title_keywords": ["预算"]
+      "title_keywords": [
+        "预算"
+      ]
+    },
+    {
+      "question": "跑水事件里环境部第一时间做什么",
+      "title_keywords": [
+        "跑水"
+      ]
+    },
+    {
+      "question": "有限空间作业票由谁审批",
+      "title_keywords": [
+        "有限空间"
+      ]
+    },
+    {
+      "question": "日常小修接报后多久完成",
+      "title_keywords": [
+        "维修作业指导书"
+      ]
+    },
+    {
+      "question": "能耗A/B/C分级依据是什么",
+      "title_keywords": [
+        "能耗管理"
+      ]
+    },
+    {
+      "question": "装饰拆除作业有哪些安全要求",
+      "title_keywords": [
+        "装饰拆除"
+      ]
+    },
+    {
+      "question": "电力增容作业的验收要求是什么",
+      "title_keywords": [
+        "电力增容"
+      ]
+    },
+    {
+      "question": "爆管时工程部负责哪些工作",
+      "title_keywords": [
+        "跑水"
+      ]
+    },
+    {
+      "question": "有限空间作业监护人有哪些职责",
+      "title_keywords": [
+        "有限空间"
+      ]
+    },
+    {
+      "question": "维修墙内水管的质量标准是什么",
+      "title_keywords": [
+        "维修作业指导书"
+      ]
+    },
+    {
+      "question": "年度能耗管理计划由谁提报",
+      "title_keywords": [
+        "能耗管理"
+      ]
     }
   ]
 }

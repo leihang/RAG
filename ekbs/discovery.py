@@ -37,6 +37,28 @@ HELP_TRIGGERS = frozenset(
     }
 )
 
+#: 纯问候（与「帮助」区分）：只回一句介绍，不展开帮助/文档。
+_GREETING_PREFIXES = ("你好", "您好", "hi", "hello", "在吗")
+_GREETING_REST_OK = frozenset(
+    {"", "呀", "啊", "哈", "您好", "早", "早上好", "~", "～", "！", "!"}
+)
+
+#: 「文档/文档清单」短口令：只回可查标题清单（P0：帮助与清单分开）
+_DOC_LIST_COMMANDS = frozenset(
+    {
+        "文档",
+        "可查文档",
+        "文档列表",
+        "文档目录",
+        "有哪些文档",
+        "能查哪些文档",
+        "查文档",
+        "看看文档",
+        "看文档",
+        "文件清单",
+    }
+)
+
 #: 短问候/帮助前缀：允许「你好啊」「帮助一下」等语气词，但仍限制总长，避免吞掉真实提问
 _HELP_PREFIXES = ("你好", "hello", "hi", "帮助", "help", "菜单")
 _HELP_PREFIX_MAX_LEN = 12
@@ -192,6 +214,48 @@ def is_help_command(text: str) -> bool:
             if rest in _HELP_PREFIX_REST_OK:
                 return True
     return False
+
+
+def is_greeting_command(text: str) -> bool:
+    """纯问候（你好/您好/hi/hello/在吗）——只回一句介绍，不展开帮助。"""
+    normalized = (text or "").strip().lower()
+    if normalized.startswith("@"):
+        parts = normalized.split(None, 1)
+        normalized = parts[1].strip() if len(parts) > 1 else ""
+    if not normalized or len(normalized) > 12:
+        return False
+    for prefix in _GREETING_PREFIXES:
+        if normalized == prefix:
+            return True
+        if normalized.startswith(prefix):
+            rest = normalized[len(prefix) :].strip(" \t，,。.!！?？~～")
+            if rest in _GREETING_REST_OK:
+                return True
+    return False
+
+
+def is_document_list_command(text: str) -> bool:
+    """短口令「文档 / 文档清单 / 有哪些文档」——只列可查标题。"""
+    normalized = re.sub(r"\s+", "", (text or "").strip().lower())
+    return normalized in _DOC_LIST_COMMANDS
+
+
+#: 文档标题里开头的编号（``XJWY-GC-09`` / ``XJWY-GCYJ-05`` / ``XJ-01-11-1F02``）
+_TITLE_CODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:[-_/][A-Za-z0-9]+)+")
+
+
+def friendly_title(title: str | None) -> str:
+    """面向聊天的标题：去掉导入路径、开头编号和「- 定稿」装饰。
+
+    用户反馈 ``XJWY-GCYJ-05`` 对物业/工程同事是噪音，标题才是入口；编号只在
+    引用详情/管理台出现。``能耗管理作业指导书 - 定稿`` → ``能耗管理作业指导书（定稿）``。
+    """
+    text = display_doc_title(title)
+    if text == "未知文档":
+        return "未命名文档"
+    text = _TITLE_CODE_RE.sub("", text).strip()
+    text = re.sub(r"\s*[-—－]\s*定稿$", "（定稿）", text).strip()
+    return text or display_doc_title(title)
 
 
 def display_doc_title(title: str | None) -> str:
@@ -480,6 +544,7 @@ def suggested_questions(
     documents: list[dict[str, Any]] | None = None,
     query: str | None = None,
     for_refusal: bool = False,
+    for_help: bool = False,
 ) -> list[dict[str, Any]]:
     """示例问：标题派生（ACL 安全）+ 运营种子（按标题关键词过滤）。
 
@@ -506,6 +571,9 @@ def suggested_questions(
         return out[:limit]
     _suggest_by_seeds(out, seen, seeds, titles, limit)
     if len(out) >= limit:
+        return out[:limit]
+    if for_help:
+        # P0：帮助只给人工/种子问法；不再退回「「标题」主要讲了什么？」的弱示例。
         return out[:limit]
     _suggest_by_titles(out, seen, docs, limit)
     return out[:limit]
@@ -704,6 +772,40 @@ def personal_delete_title(text: str) -> str | None:
     return match.group("title").strip()
 
 
+def format_help_text_short(
+    suggestions: list[dict[str, Any]],
+    *,
+    group_chat: bool = False,
+) -> str:
+    """P0 帮助：只讲“能问什么”，不列文档、不提私有库/命令。"""
+    # 不再重复问候：首条消息会先发 self_intro（“你好，我是企业知识库助手。”），
+    # 帮助正文从“能做什么”直接开始，避免首屏出现两遍问候。
+    lines = ["我可以帮你查制度、作业指导书里的条款、条件和责任人。"]
+    if group_chat:
+        lines.append("群聊中我只能基于公开文档回答。")
+    questions = [str(item.get("question") or "").strip() for item in suggestions if item.get("question")]
+    questions = [q for q in questions if q][:3]
+    if questions:
+        lines.append("")
+        lines.append("例如：")
+        lines.extend(f"· {question}" for question in questions)
+    lines.append("")
+    lines.append("回复「文档」查看可查文件。")
+    return "\n".join(lines)
+
+
+def format_document_list_text(documents: list[dict[str, Any]]) -> str:
+    """P0 文档清单：只列可读标题，隐藏编号；没有文档时给出权限提示。"""
+    if not documents:
+        return "当前没有可查的已发布文档。若认为权限有误，请联系管理员。"
+    lines = [f"可查文档（{len(documents)}）："]
+    for doc in documents:
+        lines.append(f"· {friendly_title(str(doc.get('title') or ''))}")
+    lines.append("")
+    lines.append("直接问标题或具体条款即可。")
+    return "\n".join(lines)
+
+
 def format_refusal_hints(suggestions: list[dict[str, Any]]) -> str:
     """拒答时附在答案后的 2～3 条相关示例问。"""
     qs = [str(s.get("question") or "").strip() for s in suggestions if s.get("question")]
@@ -724,25 +826,38 @@ def build_catalog(
     suggestion_limit: int = 5,
     admin_bypass: bool = False,
     group_chat: bool = False,
+    mode: str = "full",
 ) -> dict[str, Any]:
     """组装发现层响应体。
 
-    ``group_chat``：群聊只允许公开文档（调用方已把 perm 收窄），帮助文案也要改成
-    “群聊公开文档”口径，不再提示个人库上传/删除。
+    ``mode``：
+    * ``help``（P0 钉钉“帮助”）——只给 3 条业务示例 + 提示「回复文档」，不列清单；
+    * ``docs``（P0 钉钉“文档”）——只列可读标题，隐藏编号；
+    * ``full``（管理台/旧调用）——沿用原来的“清单+示例+私有库说明”长文。
     """
     documents = list_visible_published_docs(
         runtime, perm, limit=doc_limit, admin_bypass=admin_bypass
     )
-    suggestions = suggested_questions(
-        runtime,
-        perm,
-        limit=suggestion_limit,
-        admin_bypass=admin_bypass,
-        documents=documents,
-    )
+    if mode == "docs":
+        suggestions: list[dict[str, Any]] = []
+    else:
+        suggestions = suggested_questions(
+            runtime,
+            perm,
+            limit=suggestion_limit,
+            admin_bypass=admin_bypass,
+            documents=documents,
+            for_help=(mode == "help"),
+        )
+    if mode == "help":
+        help_text = format_help_text_short(suggestions, group_chat=group_chat)
+    elif mode == "docs":
+        help_text = format_document_list_text(documents)
+    else:
+        help_text = format_help_text(documents, suggestions, group_chat=group_chat)
     return {
         "documents": documents,
         "suggestions": suggestions,
-        "help_text": format_help_text(documents, suggestions, group_chat=group_chat),
+        "help_text": help_text,
         "document_count": len(documents),
     }
