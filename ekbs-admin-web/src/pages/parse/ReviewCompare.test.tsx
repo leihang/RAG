@@ -2,6 +2,11 @@ import { render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+const sheetjs = vi.hoisted(() => ({
+  read: vi.fn(),
+  sheetToHtml: vi.fn(),
+}))
+
 const api = vi.hoisted(() => ({
   getDocument: vi.fn(),
   fetchDocumentSource: vi.fn(),
@@ -31,6 +36,11 @@ vi.mock('@/components/Auth', () => ({
   default: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }))
 
+vi.mock('xlsx', () => ({
+  read: sheetjs.read,
+  utils: { sheet_to_html: sheetjs.sheetToHtml },
+}))
+
 vi.mock('docx-preview', () => ({
   renderAsync: vi.fn(async (_blob: Blob, el: HTMLElement) => {
     el.textContent = '满足公共设备、设施管理的需要'
@@ -40,6 +50,10 @@ vi.mock('docx-preview', () => ({
 import ReviewCompare from './ReviewCompare'
 
 beforeEach(() => {
+  sheetjs.read.mockReset()
+  sheetjs.sheetToHtml.mockReset()
+  sheetjs.read.mockReturnValue({ SheetNames: ['用电分析'], Sheets: { 用电分析: {} } })
+  sheetjs.sheetToHtml.mockReturnValue('<table><tr><td>-5.14%</td></tr></table>')
   api.getDocument.mockReset()
   api.fetchDocumentSource.mockReset()
   api.fetchDocumentSourcePreview.mockReset()
@@ -155,4 +169,40 @@ describe('双栏复核', () => {
     expect(screen.queryByRole('button', { name: /确认通过/ })).toBeNull()
     expect(screen.getByText('仅查看')).toBeInTheDocument()
   })
+})
+
+
+it('Excel 原件从原始 xlsx 字节前端渲染，不走后端 source-preview', async () => {
+  api.getDocument.mockResolvedValue({
+    doc_id: 214,
+    title: '2026年9月能耗分析',
+    source_path: '/data/raw/工程部/2026年9月能耗分析.xlsx',
+    status: 'review',
+  })
+  api.getParseDraft.mockResolvedValue({
+    task_id: 214,
+    status: 'review',
+    markdown: '## 用电分析\n[表格 1]\n',
+    engine: 'xlsx',
+    tables: [],
+    figures: [],
+  })
+  const xlsxBlob = new Blob([new Uint8Array([0x50, 0x4b, 0x03, 0x04])], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  }) as Blob & { arrayBuffer: () => Promise<ArrayBuffer> }
+  xlsxBlob.arrayBuffer = async () => new Uint8Array([0x50, 0x4b, 0x03, 0x04]).buffer
+  api.fetchDocumentSource.mockResolvedValue(xlsxBlob)
+
+  render(
+    <MemoryRouter initialEntries={['/parse/review/214']}>
+      <Routes>
+        <Route path="/parse/review/:docId" element={<ReviewCompare />} />
+      </Routes>
+    </MemoryRouter>,
+  )
+
+  await waitFor(() => expect(sheetjs.read).toHaveBeenCalled())
+  expect(api.fetchDocumentSource).toHaveBeenCalledWith(214)
+  expect(api.fetchDocumentSourcePreview).not.toHaveBeenCalled()
+  expect(await screen.findByTitle('原件 Excel')).toBeInTheDocument()
 })

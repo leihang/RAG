@@ -3,8 +3,9 @@
  * 正文里的 ``[表格 N]`` 只是占位，完整表在 tables[].body_html。
  */
 import { useEffect, useRef, useState } from 'react'
-import { Button, Card, Empty, Image, Input, Modal, Popconfirm, Space, Spin, Tag, Typography, message } from 'antd'
+import { Button, Card, Empty, Image, Input, Modal, Popconfirm, Select, Space, Spin, Tag, Typography, message } from 'antd'
 import { renderAsync } from 'docx-preview'
+import * as XLSX from 'xlsx'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import Auth from '@/components/Auth'
 import { fetchDocumentSource, fetchDocumentSourcePreview, getDocument } from '@/api/doc'
@@ -71,11 +72,13 @@ const EDITOR_SRCDOC = `<!DOCTYPE html>
 
 const OFFICE_EXT = /\.(docx?|rtf|odt|xlsx?|pptx?|txt|md|csv|html?)$/i
 
-function kindOf(name: string, mime: string): 'pdf' | 'image' | 'docx' | 'office' | 'other' {
+function kindOf(name: string, mime: string): 'pdf' | 'image' | 'docx' | 'xlsx' | 'office' | 'other' {
   const file = name.toLowerCase()
   const lower = `${file} ${mime}`.toLowerCase()
   if (file.endsWith('.pdf') || mime.includes('pdf')) return 'pdf'
   if (/\.(png|jpe?g|gif|webp|bmp)$/i.test(file) || mime.startsWith('image/')) return 'image'
+  // Excel 必须像 docx 一样用原件字节在浏览器里渲染；不能走后端 openpyxl 重画。
+  if (/\.(xlsx?|xlsm)$/i.test(file)) return 'xlsx'
   // .docx 用原件字节排版（含图和表格）。textutil 转 HTML 会丢掉图片、改掉版式。
   if (file.endsWith('.docx')) return 'docx'
   if (OFFICE_EXT.test(file)) return 'office'
@@ -115,6 +118,88 @@ function DocxOriginal({ blob }: { blob: Blob }) {
     )
   }
   return <div ref={host} style={{ height: '100%', overflow: 'auto', background: '#f0f0f0' }} />
+}
+
+function XlsxOriginal({ blob }: { blob: Blob }) {
+  const [workbook, setWorkbook] = useState<XLSX.WorkBook | null>(null)
+  const [active, setActive] = useState(0)
+  const [failed, setFailed] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setWorkbook(null)
+    setFailed(null)
+    setActive(0)
+    void blob
+      .arrayBuffer()
+      .then((buffer) => {
+        if (cancelled) return
+        // cellNF/cellStyles：保留 Excel 的显示格式（百分比/金额）与合并信息，
+        // 这是“原件渲染”而不是后端重画的关键。
+        const wb = XLSX.read(new Uint8Array(buffer), {
+          type: 'array',
+          cellNF: true,
+          cellStyles: true,
+          cellDates: true,
+        })
+        setWorkbook(wb)
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setFailed(err instanceof Error ? err.message : 'Excel 原件无法解析')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [blob])
+
+  if (failed) {
+    return (
+      <Typography.Paragraph type="danger" style={{ padding: 16 }}>
+        {failed}
+      </Typography.Paragraph>
+    )
+  }
+  if (!workbook) {
+    return (
+      <div style={{ padding: 16 }}>
+        <Spin />
+      </div>
+    )
+  }
+
+  const names = workbook.SheetNames
+  const sheet = workbook.Sheets[names[active]]
+  const body = sheet
+    ? XLSX.utils.sheet_to_html(sheet, { editable: false, header: '', footer: '' })
+    : '<p>（空工作表）</p>'
+  const srcDoc = `<!DOCTYPE html><html><head><meta charset="utf-8"/><style>
+    html,body{margin:0;background:#fff;}
+    body{padding:8px;font:12px/1.5 -apple-system,PingFang SC,sans-serif;color:#222;}
+    table{border-collapse:collapse;max-width:100%;}
+    td,th{border:1px solid #d9d9d9;padding:4px 8px;vertical-align:top;white-space:pre-wrap;}
+  </style></head><body>${body}</body></html>`
+
+  return (
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      {names.length > 1 ? (
+        <div style={{ padding: '6px 8px', borderBottom: '1px solid #f0f0f0', flex: '0 0 auto' }}>
+          <Select
+            size="small"
+            value={active}
+            style={{ minWidth: 180 }}
+            options={names.map((name, index) => ({ label: name, value: index }))}
+            onChange={setActive}
+          />
+        </div>
+      ) : null}
+      <iframe
+        title="原件 Excel"
+        sandbox=""
+        srcDoc={srcDoc}
+        style={{ flex: 1, width: '100%', minHeight: 0, border: 0, background: '#fff' }}
+      />
+    </div>
+  )
 }
 
 function DraftFigureThumb({
@@ -197,6 +282,7 @@ export default function ReviewCompare() {
   const [figures, setFigures] = useState<ParseDraftFigure[]>([])
   const [blobUrl, setBlobUrl] = useState<string | null>(null)
   const [officeBlob, setOfficeBlob] = useState<Blob | null>(null)
+  const [sheetBlob, setSheetBlob] = useState<Blob | null>(null)
   const [previewHtml, setPreviewHtml] = useState<string | null>(null)
   const [mime, setMime] = useState('')
   const [loading, setLoading] = useState(true)
@@ -235,6 +321,7 @@ export default function ReviewCompare() {
     setSourceError(null)
     setPreviewHtml(null)
     setOfficeBlob(null)
+    setSheetBlob(null)
 
     void (async () => {
       try {
@@ -258,7 +345,15 @@ export default function ReviewCompare() {
 
       try {
         const sourceKind = kindOf(sourceFile, '')
-        if (sourceKind === 'docx') {
+        if (sourceKind === 'xlsx') {
+          // 和 docx 同口径：拿原始 xlsx 字节，前端渲染；不请求后端 source-preview。
+          const blob = await fetchDocumentSource(docId)
+          if (cancelled) return
+          setSheetBlob(blob)
+          setBlobUrl(null)
+          setOfficeBlob(null)
+          setPreviewHtml(null)
+        } else if (sourceKind === 'docx') {
           const blob = await fetchDocumentSource(docId)
           if (cancelled) return
           setOfficeBlob(blob)
@@ -512,6 +607,8 @@ export default function ReviewCompare() {
                   <Typography.Paragraph type="danger" style={{ padding: 16 }}>
                     {sourceError}
                   </Typography.Paragraph>
+                ) : kind === 'xlsx' && sheetBlob ? (
+                  <XlsxOriginal blob={sheetBlob} />
                 ) : kind === 'docx' && officeBlob ? (
                   <DocxOriginal blob={officeBlob} />
                 ) : kind === 'office' && previewHtml ? (
