@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import hashlib
 import json
@@ -417,7 +418,9 @@ class IngestPipeline:
                 )
             await self._apply_contextual_retrieval(title, chunking.nodes)
             self._insert_chunks(doc_id, shard_id, chunking.nodes)
+            table_index_started = time.perf_counter()
             replace_document_table_rows(self.db, doc_id)
+            table_index_ms = (time.perf_counter() - table_index_started) * 1000.0
             child_ids = self._child_chunk_ids(doc_id)
             if defer_vector:
                 # 复核只做到"分块落库"：不调嵌入、不写分片、不发布。
@@ -447,17 +450,37 @@ class IngestPipeline:
             vectors, embed_stats = await self._embed_children(doc_id, child_ids)
             cloud_tokens = int(embed_stats.get("cloud_tokens") or 0)
             local_tokens = int(embed_stats.get("local_tokens") or 0)
+            append_started = time.perf_counter()
             if vectors is not None and len(vectors):
                 self.shards.append(shard_id, child_ids, vectors, personal=personal)
+            faiss_append_ms = (time.perf_counter() - append_started) * 1000.0
+            figures_started = time.perf_counter()
             figure_vector_count, figure_vectors_failed = (
                 await self._embed_figures_multimodal(doc_id)
             )
+            figures_ms = (time.perf_counter() - figures_started) * 1000.0
+            fts_started = time.perf_counter()
             self._index_fts(doc_id, shard_id, chunking.nodes)
+            fts_ms = (time.perf_counter() - fts_started) * 1000.0
             self._grant_extra_depts(doc_id, placement.extra_grants, level)
+            publish_started = time.perf_counter()
             self._publish(
                 doc_id,
                 page_count=page_count or _page_count(page_map),
                 status="published",
+            )
+            publish_ms = (time.perf_counter() - publish_started) * 1000.0
+            log.info(
+                "ingest_stage_timing",
+                doc_id=doc_id,
+                chunks=len(child_ids),
+                embed_ms=embed_stats.get("embed_ms", 0.0),
+                embed_batches=embed_stats.get("embed_batches", 0),
+                table_index_ms=round(table_index_ms, 1),
+                faiss_append_ms=round(faiss_append_ms, 1),
+                figure_embed_ms=round(figures_ms, 1),
+                fts_ms=round(fts_ms, 1),
+                publish_ms=round(publish_ms, 1),
             )
         except Exception as exc:  # 失败必须落状态，不能静默停在中途态
             log.error("ingest_failed", doc_id=doc_id, error=str(exc))
@@ -537,6 +560,7 @@ class IngestPipeline:
         vectors, embed_stats = await self._embed_children(doc_id, child_ids)
         figure_vector_count = 0
         figure_vectors_failed = 0
+        append_started = time.perf_counter()
         if vectors is not None and len(vectors):
             # 分块阶段用户可能在分块预览里改过块并触发过单块重嵌入；
             # 这里按 chunk_id 先清掉旧向量再统一 append，避免重复向量。
@@ -545,8 +569,13 @@ class IngestPipeline:
             except Exception as exc:  # noqa: BLE001 - 清理旧向量失败不应阻断入库
                 log.warning("vector_cleanup_before_append_failed", doc_id=doc_id, error=str(exc)[:200])
             self.shards.append(shard_id, child_ids, vectors, personal=False)
+        faiss_append_ms = (time.perf_counter() - append_started) * 1000.0
+        figures_started = time.perf_counter()
         figure_vector_count, figure_vectors_failed = await self._embed_figures_multimodal(doc_id)
+        figures_ms = (time.perf_counter() - figures_started) * 1000.0
+        fts_started = time.perf_counter()
         self._index_fts(doc_id, shard_id, ())
+        fts_ms = (time.perf_counter() - fts_started) * 1000.0
         self._grant_extra_depts(doc_id, placement.extra_grants, int(doc["level"]))
         with self.db.sync_connect() as conn:
             parent_count = int(
@@ -555,7 +584,21 @@ class IngestPipeline:
                     (doc_id,),
                 ).fetchone()["c"]
             )
+        publish_started = time.perf_counter()
         self._publish(doc_id, page_count=doc["page_count"], status="published")
+        publish_ms = (time.perf_counter() - publish_started) * 1000.0
+        log.info(
+            "ingest_stage_timing",
+            doc_id=doc_id,
+            chunks=len(child_ids),
+            embed_ms=embed_stats.get("embed_ms", 0.0),
+            embed_batches=embed_stats.get("embed_batches", 0),
+            table_index_ms=0.0,
+            faiss_append_ms=round(faiss_append_ms, 1),
+            figure_embed_ms=round(figures_ms, 1),
+            fts_ms=round(fts_ms, 1),
+            publish_ms=round(publish_ms, 1),
+        )
         result = IngestResult(
             doc_id=doc_id,
             shard_id=shard_id,
@@ -773,10 +816,21 @@ class IngestPipeline:
             pop_usage()
         batch_size = max(1, int(self.settings.models.embed.batch_size))
         vectors: list[list[float]] = []
+        batch_times_ms: list[float] = []
         for start in range(0, len(texts), batch_size):
             batch = texts[start : start + batch_size]
+            batch_started = time.perf_counter()
             vectors.extend(await self.providers.embed.embed(batch))
-        stats: dict[str, int] = {"local_tokens": local_tokens}
+            batch_times_ms.append((time.perf_counter() - batch_started) * 1000.0)
+        stats: dict[str, Any] = {
+            "local_tokens": local_tokens,
+            "embed_batches": len(batch_times_ms),
+            "embed_ms": round(sum(batch_times_ms), 1),
+            "embed_avg_batch_ms": round(
+                sum(batch_times_ms) / len(batch_times_ms), 1
+            ) if batch_times_ms else 0.0,
+            "embed_max_batch_ms": round(max(batch_times_ms), 1) if batch_times_ms else 0.0,
+        }
         if callable(pop_usage):
             cloud_tokens, calls = pop_usage()
             stats["cloud_tokens"] = int(cloud_tokens)
@@ -793,6 +847,15 @@ class IngestPipeline:
             )
             if calibration:
                 stats["ratio"] = int(round(calibration["ratio"] * 1000))
+        log.info(
+            "embedding_timing",
+            doc_id=doc_id,
+            chunks=len(texts),
+            batches=int(stats.get("embed_batches") or 0),
+            total_ms=stats.get("embed_ms", 0.0),
+            avg_batch_ms=stats.get("embed_avg_batch_ms", 0.0),
+            max_batch_ms=stats.get("embed_max_batch_ms", 0.0),
+        )
         array = np.asarray(vectors, dtype="float32")
         expected_dim = int(self.providers.embed.ref.dim or 0)
         if expected_dim and array.shape[1] != expected_dim:
