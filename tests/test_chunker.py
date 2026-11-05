@@ -952,8 +952,9 @@ def test_doc_metadata_line_injects_containers_and_first_leaf() -> None:
         "| 序号 | 项目 | 说明 |\n| --- | --- | --- |\n"
         + "\n".join(f"| {i} | 项目{i} | {'说明文字' * 8}{i} |" for i in range(30))
     )
+    body = "正文内容说明。" * 60
     result = chunk_markdown(
-        "# 制度\n\n## 1. 目的\n\n" + "正文内容说明。" * 400 + "\n",
+        "# 制度\n\n## 1. 目的\n\n" + body + "\n\n## 2. 范围\n\n" + body + "\n",
         doc_title="测试制度",
         tables=[TableInput(body=big_table, table_id="1")],
         doc_metadata_line=line,
@@ -968,6 +969,8 @@ def test_doc_metadata_line_injects_containers_and_first_leaf() -> None:
     assert leaves
     # 第一个检索叶子带元数据（元数据问句需要能命中它），其余叶子保持纯净
     assert leaves[0].content.startswith("【文档信息】")
+    # 元数据作为第一个小节参与装箱，不能把第一个叶子撑出 child_max
+    assert leaves[0].token_count <= 384, leaves[0].token_count
     assert all("【文档信息】" not in node.content for node in leaves[1:])
 
 

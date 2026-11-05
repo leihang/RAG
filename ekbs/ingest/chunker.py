@@ -1353,6 +1353,8 @@ def _inject_doc_metadata_line(nodes: list["ChunkNode"], line: str) -> None:
         node = nodes[index]
         if node.chunk_type not in {"parent", "table"}:
             continue
+        if node.content.startswith(line):
+            continue
         content = f"{line}\n\n{node.content}"
         tokens = count_tokens(content)
         # 表格容器有硬上限：加元数据后若越界，就放弃这一张表的注入（不破坏 2048 不变量）。
@@ -1378,6 +1380,8 @@ def _inject_doc_metadata_line(nodes: list["ChunkNode"], line: str) -> None:
     if first_leaf is None:
         return
     node = nodes[first_leaf]
+    if node.content.startswith(line):
+        return
     content = f"{line}\n\n{node.content}"
     tokens = count_tokens(content)
     if tokens > CHILD_MAX_TOKENS * 2:
@@ -1459,7 +1463,19 @@ def chunk_markdown(
         for table_id in _placeholder_table_ids(section.text):
             table_section_path.setdefault(table_id, section.heading_path)
     sections = merge_short_sections_into_next(raw_sections)
+    # 文档元数据行作为**第一个小节**参与子块装箱：这样它计入 child_max 预算，
+    # 第一个子块不会因为后置注入而越界（实测后置注入 370~422 > 384）。
+    metadata_heading = sections[0].heading_path if sections else ""
+    if doc_metadata_line and sections:
+        sections = [
+            Section(heading_path="", text=doc_metadata_line, start_offset=0),
+            *sections,
+        ]
     drafts = _build_child_drafts(sections, child_min=child_min, child_max=child_max)
+    if doc_metadata_line and drafts and not drafts[0].heading_path:
+        # 元数据小节没有自己的 heading；第一个子块的 heading_path 仍取原来的第一小节，
+        # 引用卡片才显示「1.目的」而不是文档名。
+        drafts[0].heading_path = metadata_heading
     _merge_small_tail_child(drafts, child_min=child_min, child_max=child_max)
     _apply_draft_overlap(drafts, overlap_tokens=int(child_max * OVERLAP_MIN_RATIO))
     table_container: dict[str, int] = {}
