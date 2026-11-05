@@ -1334,11 +1334,13 @@ def _append_table_nodes(
 
 
 def _inject_doc_metadata_line(nodes: list["ChunkNode"], line: str) -> None:
-    """把一行文档元数据注入**上下文容器**（有子块的 parent / table）。
+    """文档元数据行：注入上下文容器 + **每篇文档的第一个检索叶子**。
 
-    为什么只给容器：容器不进向量/FTS（`retrievable.py` 的叶子规则），不会制造
-    跨文档同质检索块；而它会在命中子块后由 ``parent_expand`` 带进 prompt。
-    叶子块保持纯净（检索文本里不出现日期/编号等元数据）。
+    只在父块里放元数据不够：文档第一个子块（正文 1.目的/第一张表等）才是多数
+    问句命中的检索单元，元数据问句（编制人/批准人/生效日期）若只命中表格叶子，
+    ``parent_expand`` 不会把正文父块带进来 → LLM 看不到元数据（doc 206 实测）。
+    所以额外只给**第一个叶子**加一行（不是每个叶子）：既让元数据可检索，又避免
+    100 篇文档 × 每块重复同值元数据、制造大量同质检索块。
     """
     if not line:
         return
@@ -1363,6 +1365,30 @@ def _inject_doc_metadata_line(nodes: list["ChunkNode"], line: str) -> None:
             continue
         node.content = content
         node.token_count = tokens
+
+    # 第一个检索叶子也带元数据：它通常是「1.目的/第一张表」，是元数据问句最该命中的块。
+    first_leaf = next(
+        (
+            index
+            for index, node in enumerate(nodes)
+            if index not in container_indexes and node.chunk_type in {"child", "table"}
+        ),
+        None,
+    )
+    if first_leaf is None:
+        return
+    node = nodes[first_leaf]
+    content = f"{line}\n\n{node.content}"
+    tokens = count_tokens(content)
+    if tokens > CHILD_MAX_TOKENS * 2:
+        log.warning(
+            "doc_metadata_first_leaf_too_long",
+            chunk_id=node.chunk_id if hasattr(node, "chunk_id") else None,
+            tokens=tokens,
+            child_max=CHILD_MAX_TOKENS,
+        )
+    node.content = content
+    node.token_count = tokens
 
 
 def chunk_markdown(

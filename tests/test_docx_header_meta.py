@@ -165,7 +165,9 @@ async def test_ingest_writes_document_dates_and_no_header_chunk(seeded) -> None:
     parents = [item for item in rows if item["chunk_type"] == "parent"]
     leaves = [item for item in rows if item["chunk_type"] in {"child", "table"}]
     assert parents and all(str(item["content"]).startswith("【文档信息】") for item in parents)
-    assert leaves and all("【文档信息】" not in str(item["content"]) for item in leaves)
+    # 第一个检索叶子带元数据；其余叶子不重复（避免同质检索块）
+    assert leaves and str(leaves[0]["content"]).startswith("【文档信息】")
+    assert all("【文档信息】" not in str(item["content"]) for item in leaves[1:])
 
 
 async def test_people_metadata_stored_and_answerable(seeded) -> None:

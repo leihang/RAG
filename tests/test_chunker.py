@@ -945,8 +945,8 @@ def test_is_spreadsheet_source_only_spreadsheets(path: str, expected: bool) -> N
 
     assert is_spreadsheet_source(path) is expected
 
-def test_doc_metadata_line_only_injects_context_containers() -> None:
-    """文档元数据只进上下文容器（父块/表格父容器），不进叶子检索单元。"""
+def test_doc_metadata_line_injects_containers_and_first_leaf() -> None:
+    """文档元数据进上下文容器 + 第一个检索叶子；其余叶子保持纯净。"""
     line = "【文档信息】文件编号：XJWY-GC-09；生效日期：2025-01-01；截止日期：未标注"
     big_table = (
         "| 序号 | 项目 | 说明 |\n| --- | --- | --- |\n"
@@ -964,13 +964,11 @@ def test_doc_metadata_line_only_injects_context_containers() -> None:
     container_nodes = [result.nodes[i] for i in sorted(containers)]
     assert container_nodes, "应有父块/表格父容器"
     assert all(node.content.startswith("【文档信息】") for node in container_nodes)
-    leaves = [
-        node
-        for index, node in enumerate(result.nodes)
-        if index not in containers
-    ]
+    leaves = [node for index, node in enumerate(result.nodes) if index not in containers]
     assert leaves
-    assert all("【文档信息】" not in node.content for node in leaves)
+    # 第一个检索叶子带元数据（元数据问句需要能命中它），其余叶子保持纯净
+    assert leaves[0].content.startswith("【文档信息】")
+    assert all("【文档信息】" not in node.content for node in leaves[1:])
 
 
 
