@@ -193,6 +193,17 @@ def parse_file(
     raise ParserUnavailable(f"未知解析引擎：{engine}")
 
 
+def _rows_to_html(rows: list[list[str]]) -> str:
+    """二维单元格 → HTML 表格（图表数据等无合并语义的表用）。"""
+    if not rows:
+        return ""
+    body = "".join(
+        "<tr>" + "".join(f"<td>{html.escape(str(cell or ''))}</td>" for cell in row) + "</tr>"
+        for row in rows
+    )
+    return f"<table>{body}</table>"
+
+
 def _rows_to_pipe_markdown(rows: list[list[str]]) -> str:
     """二维单元格 → Markdown 管道表（供 ``ParsedTable.body`` / 确定性序列化）。"""
     if not rows:
@@ -1551,7 +1562,7 @@ def _xlsx_collect_sheet_images(sheet: Any, state: _XlsxState, sheet_index: int) 
 
 def _xlsx_collect_chart_tables(sheet: Any, state: _XlsxState, sheet_index: int) -> None:
     for chart_rows, caption in _xlsx_sheet_chart_tables(sheet):
-        body = _rows_to_pipe_markdown(chart_rows)
+        body = _rows_to_html(chart_rows)
         if not body:
             continue
         state.table_seq += 1
@@ -1625,12 +1636,30 @@ def _chart_title(chart: Any) -> str:
     return title
 
 
+def _chart_cached_points(source: Any) -> list[Any]:
+    """取图表引用里的缓存点：``numRef.numCache.pt`` / ``strRef.strCache.pt``。
+
+    旧实现取 ``numRef.pt``，但 openpyxl 把缓存放在 ``numCache.pt`` / ``strCache.pt``，
+    导致带缓存的饼图被当成“没有数据”整张跳过（实测 2026-09 用电分析）。
+    """
+    if source is None:
+        return []
+    for cache_attr in ("numCache", "strCache"):
+        cache = getattr(source, cache_attr, None)
+        pts = getattr(cache, "pt", None) if cache is not None else None
+        if pts:
+            return list(pts)
+    pts = getattr(source, "pt", None)
+    return list(pts) if pts else []
+
+
 def _chart_series_values(series: Any) -> list[str]:
     try:
         val = series.val
         nums = getattr(val, "numRef", None) or getattr(val, "numLit", None)
-        if nums is not None and getattr(nums, "pt", None):
-            return ["" if pt.v is None else str(pt.v) for pt in nums.pt]
+        pts = _chart_cached_points(nums)
+        if pts:
+            return ["" if pt.v is None else str(pt.v) for pt in pts]
         if hasattr(series, "values"):
             return ["" if v is None else str(v) for v in (series.values or [])]
     except Exception:
@@ -1642,10 +1671,11 @@ def _chart_categories(series: Any) -> list[str]:
     try:
         cat_ref = getattr(series, "cat", None)
         if cat_ref is not None:
-            strref = getattr(cat_ref, "strRef", None) or getattr(cat_ref, "numRef", None)
-            pts = getattr(strref, "pt", None) if strref is not None else None
-            if pts:
-                return ["" if pt.v is None else str(pt.v) for pt in pts]
+            for attr in ("strRef", "numRef", "strLit", "numLit"):
+                source = getattr(cat_ref, attr, None)
+                pts = _chart_cached_points(source)
+                if pts:
+                    return ["" if pt.v is None else str(pt.v) for pt in pts]
     except Exception:
         pass
     return []
@@ -1686,7 +1716,7 @@ def _xlsx_sheet_chart_tables(sheet: Any) -> Iterator[tuple[list[list[str]], str]
                 for _, vals in series_cols:
                     row.append(vals[row_index] if row_index < len(vals) else "")
                 rows.append(row)
-            yield rows, _chart_title(chart)
+            yield rows, _chart_title(chart) or f"{sheet.title} 图表"
         except Exception as exc:
             log.warning("xlsx_chart_unreadable", error=str(exc)[:80])
             continue

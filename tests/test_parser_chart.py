@@ -7,7 +7,12 @@
 
 from __future__ import annotations
 
-from ekbs.ingest.parser import _chart_title, _parse_xlsx
+from ekbs.ingest.parser import (
+    _chart_categories,
+    _chart_series_values,
+    _chart_title,
+    _parse_xlsx,
+)
 
 
 class _Chart:
@@ -59,3 +64,29 @@ def test_xlsx_chart_without_cache_is_safe(tmp_path) -> None:
     doc = _parse_xlsx(path)
     assert all("月度销量" not in (table.caption or "") for table in doc.tables)
     assert any("月份" in table.body for table in doc.tables), "普通工作表表格不能被图表逻辑吞掉"
+
+
+def test_chart_cache_points_are_read_from_numCache_and_strCache() -> None:
+    """图表缓存点在 numRef.numCache / strRef.strCache，旧实现读 numRef.pt 会整张跳过。"""
+    from types import SimpleNamespace
+    from openpyxl.chart.data_source import (
+        AxDataSource,
+        NumData,
+        NumDataSource,
+        NumRef,
+        NumVal,
+        StrData,
+        StrRef,
+        StrVal,
+    )
+
+    series = SimpleNamespace(
+        val=NumDataSource(
+            numRef=NumRef(numCache=NumData(pt=[NumVal(idx=0, v=2999814.8), NumVal(idx=1, v=695972.77)]))
+        ),
+        cat=AxDataSource(
+            strRef=StrRef(strCache=StrData(pt=[StrVal(idx=0, v="商铺电量"), StrVal(idx=1, v="住宅电量")]))
+        ),
+    )
+    assert _chart_series_values(series) == ["2999814.8", "695972.77"]
+    assert _chart_categories(series) == ["商铺电量", "住宅电量"]
