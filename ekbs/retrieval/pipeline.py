@@ -48,6 +48,7 @@ from ekbs.retrieval.faithfulness import (
     mostly_unsupported,
     supporting_chunk_indices,
 )
+from ekbs.retrieval.calc_plan import generate_calc_plan
 from ekbs.retrieval.table_query import (
     compute_table_comparison,
     compute_table_lookup,
@@ -637,23 +638,6 @@ PROMPT_REVISION = "v9"
 
 
 
-
-_NUMERIC_INTENT_RE = __import__("re").compile(
-    r"增长|减少|增加|下降|对比|较|同比|环比"
-)
-
-
-def _is_numeric_intent(question: str) -> bool:
-    """只对“期间比较型数值问题”做无计划门禁。
-
-    单值问法（``2026年总电量是多少``）当前索引/算子覆盖不足，若也门禁会
-    把本来能由 LLM 从表格里读出的答案误杀；先只拦截明确要求比较计算的问法。
-    """
-    from ekbs.retrieval.table_time import parse_time_spec
-
-    return bool(_NUMERIC_INTENT_RE.search(str(question or ""))) and parse_time_spec(
-        str(question or "")
-    ) is not None
 
 class RetrievalPipeline:
     def __init__(
@@ -2886,29 +2870,30 @@ class RetrievalPipeline:
             overrides=overrides,
             collect_debug=collect_debug,
         )
+        calc_plan = (
+            generate_calc_plan(question)
+            if allow_generation and mode_used == MODE_PROSE and not multi_intent
+            else None
+        )
         table_lookup = (
             compute_table_lookup(question, retrieval.chunks, db=self.db)
-            if allow_generation and mode_used == MODE_PROSE and not multi_intent
+            if calc_plan is None and allow_generation and mode_used == MODE_PROSE and not multi_intent
             else None
         )
         table_answer = (
             compute_table_comparison(question, retrieval.chunks, db=self.db)
-            if allow_generation and mode_used == MODE_PROSE and not multi_intent
+            if calc_plan is not None and calc_plan.operation == "compare"
             else None
         )
         table_value = (
             compute_table_value(question, retrieval.chunks, db=self.db)
-            if allow_generation and mode_used == MODE_PROSE and not multi_intent
+            if calc_plan is not None and calc_plan.operation == "value"
             else None
         )
         numeric_unplanned = (
-            allow_generation
-            and mode_used == MODE_PROSE
-            and not multi_intent
-            and table_lookup is None
+            calc_plan is not None
+            and calc_plan.operation == "compare"
             and table_answer is None
-            and table_value is None
-            and _is_numeric_intent(question)
             and any(
                 str(getattr(chunk, "chunk_type", "")) == "table"
                 for chunk in retrieval.chunks
