@@ -120,3 +120,25 @@ def test_record_table_lookup_ambiguity_returns_none() -> None:
         content=content, heading_path="岗位职责", doc_title="能耗管理",
     )
     assert compute_table_lookup("工程经理的职责是什么", [chunk]) is None
+
+
+NESTED_CONTENT = """表名: 年用水费统计对比（元）
+相关表头: 日期 | 2026年/1月 | 2026年/2月 | 2025年/1月 | 2025年/2月
+日期=公司承担水费; 2026年/1月=10.00; 2026年/2月=20.00; 2025年/1月=5.00; 2025年/2月=6.00
+"""
+
+
+def test_nested_header_paths_are_normalized() -> None:
+    from types import SimpleNamespace
+
+    chunk = SimpleNamespace(
+        chunk_id=11, doc_id=1, chunk_type="table",
+        content=NESTED_CONTENT, heading_path="用水分析", doc_title="能耗分析",
+    )
+    result = compute_table_comparison(
+        "公司承担水费，2026年1-2月较2025年1-2月是增长还是减少", [chunk]
+    )
+    assert result is not None
+    assert result.totals[2026] == 30.0
+    assert result.totals[2025] == 11.0
+    assert result.diff == 19.0

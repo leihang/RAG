@@ -10,7 +10,7 @@ import json
 from types import SimpleNamespace
 
 from ekbs.logging import get_logger
-from ekbs.retrieval.table_struct import parse_record_facts, parse_table_rows
+from ekbs.retrieval.table_struct import parse_nested_rows, parse_record_facts, parse_table_rows
 
 log = get_logger(component="ingest.table_index")
 
@@ -35,7 +35,7 @@ def replace_document_table_rows(db, doc_id: int) -> int:
                 )
                 for row in records
             ]
-            parsed = parse_table_rows(chunks)
+            parsed = [*parse_table_rows(chunks), *parse_nested_rows(chunks)]
             records = parse_record_facts(chunks)
             conn.execute("DELETE FROM table_row_index WHERE doc_id = ?", (doc_id,))
             conn.execute("DELETE FROM table_record_index WHERE doc_id = ?", (doc_id,))

@@ -153,7 +153,8 @@ class TableIndex:
 
     @classmethod
     def from_chunks(cls, chunks: Sequence[Any]) -> "TableIndex":
-        return cls(parse_table_rows(chunks))
+        # 简单横表 + 多层表头路径（2026年/1月）都归一到 TableRow。
+        return cls([*parse_table_rows(chunks), *parse_nested_rows(chunks)])
 
     def find(self, subject: str) -> list[TableRow]:
         target = _norm(subject)
@@ -301,3 +302,85 @@ def load_record_facts(db: Any, doc_ids: Sequence[int]) -> list[RecordFact]:
         )
         for record in records
     ]
+
+
+_NESTED_YEAR_RE = re.compile(r"(20\d{2})\s*年?")
+_NESTED_MONTH_RE = re.compile(r"(\d{1,2})\s*月")
+_NESTED_QUARTER_RE = re.compile(r"(?i)Q([1-4])|第?([一二三四])季度")
+
+
+def _nested_time_path(header: str) -> tuple[int | None, int | None]:
+    """从 ``2026年/1月`` 这类嵌套表头取 (year, month)；季度暂不展开为月份。"""
+    parts = re.split(r"[/／>\s]+", str(header or ""))
+    year: int | None = None
+    month: int | None = None
+    for part in parts:
+        if year is None:
+            ym = _NESTED_YEAR_RE.search(part)
+            if ym:
+                year = int(ym.group(1))
+        if month is None:
+            mm = _NESTED_MONTH_RE.search(part)
+            if mm:
+                month = int(mm.group(1))
+    return year, month
+
+
+def parse_nested_rows(chunks: Sequence[Any]) -> list[TableRow]:
+    """多层表头（``2026年 / 1月`` 路径）→ 同一 TableRow 模型。
+
+    只处理能明确解析出 year+month 的列；季度/累计列不硬拆月份，继续走原链路。
+    """
+    rows: list[TableRow] = []
+    seen: set[tuple[str, str, int, tuple[tuple[int, float], ...]]] = set()
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        content = str(getattr(chunk, "content", "") or "")
+        headers = _record_headers(content)
+        if not headers:
+            continue
+        mapped: dict[str, tuple[int, int]] = {}
+        for header in headers:
+            year, month = _nested_time_path(header)
+            if year is not None and month is not None:
+                mapped[header] = (year, month)
+        if not mapped:
+            continue
+        caption_match = _CAPTION_RE.search(content)
+        caption = caption_match.group(1).strip() if caption_match else str(
+            getattr(chunk, "heading_path", "") or ""
+        )
+        unit = unit_from_text(caption) or unit_from_text(
+            " ".join(str(getattr(chunk, attr, "") or "") for attr in ("heading_path", "doc_title"))
+        )
+        grouped: dict[tuple[str, int], dict[int, float]] = {}
+        chunk_id = int(getattr(chunk, "chunk_id", 0) or 0) or None
+        for line in content.splitlines():
+            row = _parse_row(line)
+            if not row:
+                continue
+            subject = _row_subject(row)
+            if not subject:
+                continue
+            for header, (year, month) in mapped.items():
+                number = _number(row.get(header, ""))
+                if number is None:
+                    continue
+                grouped.setdefault((subject, year), {}).setdefault(month, number)
+        for (subject, year), months in grouped.items():
+            signature = (caption, subject, year, tuple(sorted(months.items())))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            rows.append(
+                TableRow(
+                    chunk_index=chunk_index,
+                    doc_id=int(getattr(chunk, "doc_id", 0) or 0),
+                    caption=caption,
+                    unit=unit,
+                    subject=subject,
+                    year=year,
+                    months=months,
+                    chunk_id=chunk_id,
+                )
+            )
+    return rows
