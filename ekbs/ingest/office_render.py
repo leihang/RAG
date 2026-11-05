@@ -25,6 +25,8 @@ log = get_logger(component="ingest.office_render")
 
 _RENDER_LOCK = threading.Lock()
 _TIMEOUT_SECONDS = 240
+#: 缓存版本：渲染参数变化（如单页导出）后旧 PDF 必须失效。
+_RENDER_VERSION = 2
 
 
 class OfficeRenderError(RuntimeError):
@@ -63,7 +65,10 @@ def _convert_to_pdf(source: Path, output_dir: Path, *, timeout: int = _TIMEOUT_S
         "--headless",
         "--norestore",
         "--convert-to",
-        "pdf",
+        # Calc 默认按打印区域/分页导出，宽表会把「图表」列切到后续页；SinglePageSheets
+        # 让每张 sheet 完整落在一页，保住原表样式和饼图。旧版 LO 不支持该 filter data
+        # 时下面会回退普通 pdf。
+        'pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":"true"}}',
         "--outdir",
         str(output_dir),
         f"-env:UserInstallation=file://{profile_dir}",
@@ -83,6 +88,17 @@ def _convert_to_pdf(source: Path, output_dir: Path, *, timeout: int = _TIMEOUT_S
         shutil.rmtree(profile_dir, ignore_errors=True)
     candidate = output_dir / f"{source.stem}.pdf"
     if completed.returncode != 0 or not candidate.is_file():
+        # 老版本 LibreOffice 不认 SinglePageSheets filter data：回退普通 pdf。
+        fallback = list(command)
+        fallback[fallback.index(next(part for part in fallback if part.startswith("pdf:")))] = "pdf"
+        try:
+            completed = subprocess.run(
+                fallback, capture_output=True, text=True, timeout=timeout, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise OfficeRenderError(f"LibreOffice 转换失败：{exc}") from exc
+        candidate = output_dir / f"{source.stem}.pdf"
+    if completed.returncode != 0 or not candidate.is_file():
         tail = ((completed.stderr or "") + (completed.stdout or "")).strip()[-500:]
         raise OfficeRenderError(f"LibreOffice 转换失败（exit {completed.returncode}）：{tail}")
     if candidate.read_bytes()[:5] != b"%PDF-":
@@ -96,7 +112,11 @@ def render_original_pdf(source: Path, cache_dir: Path, *, doc_id: int) -> Path:
     target = cache_dir / f"{doc_id}.pdf"
     stamp = cache_dir / f"{doc_id}.json"
     source_stat = source.stat()
-    expected = {"mtime_ns": source_stat.st_mtime_ns, "size": source_stat.st_size}
+    expected = {
+        "mtime_ns": source_stat.st_mtime_ns,
+        "size": source_stat.st_size,
+        "renderer": _RENDER_VERSION,
+    }
     try:
         if target.is_file() and json.loads(stamp.read_text(encoding="utf-8")) == expected:
             return target

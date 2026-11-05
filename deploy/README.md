@@ -143,6 +143,7 @@ export EKBS_SOFFICE_BIN="/Applications/LibreOffice.app/Contents/MacOS/soffice"
 ### 行为
 
 - 首次请求把原件渲染为 PDF，缓存在 `<data_dir>/render/<doc_id>.pdf`；
+- 使用 Calc `SinglePageSheets` PDF filter：宽表/图表不会被打印分页切到后续页（旧版 LO 自动回退普通 pdf）；
 - 源文件 mtime/size 变化自动重建；
 - LibreOffice 未安装/转换失败：接口返回 **503**，前端降级为“下载原件”，不会退回伪 HTML；
 - 转换在子进程执行，独立 UserInstallation，超时 240s，避免并发 profile 锁；
