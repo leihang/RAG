@@ -41,3 +41,8 @@ def test_rank_plan() -> None:
 def test_binary_plan() -> None:
     plan = generate_calc_plan("2026年商铺与住宅电量合计是多少")
     assert plan is not None and plan.operation == "binary" and plan.binary_op == "add"
+
+
+def test_single_subject_total_is_value_not_binary() -> None:
+    plan = generate_calc_plan("2026年公司承担水费合计是多少")
+    assert plan is not None and plan.operation == "value"

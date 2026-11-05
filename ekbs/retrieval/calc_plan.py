@@ -24,6 +24,7 @@ _RATIO_WORDS = ("占比", "比例", "占")
 _RANK_WORDS = ("排名", "最高", "最低", "最多", "最少", "top", "Top", "TOP")
 _ADD_WORDS = ("合计", "总和", "之和", "相加", "加总")
 _SUB_WORDS = ("减", "差额", "相差", "多多少", "少多少")
+_CONNECTIVES = ("和", "与", "、", "及", "+", "加")
 _TOP_RE = re.compile(r"(?:前|Top|top|TOP)\s*([一二三四五六七八九十\d]+)")
 _CN_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
@@ -56,13 +57,22 @@ def generate_calc_plan(question: str) -> CalcPlan | None:
         if time is None:
             return None
         return CalcPlan("compare", years, time, _hint(text))
-    if len(years) == 1 and any(word in text for word in _SUB_WORDS):
+    has_two_subject_connective = any(token in text for token in _CONNECTIVES)
+    if (
+        len(years) == 1
+        and has_two_subject_connective
+        and any(word in text for word in _SUB_WORDS)
+    ):
         return CalcPlan(
             "binary", years,
             time or TimeSpec("year", 1, 12, require_complete=False),
             _hint(text), binary_op="sub",
         )
-    if len(years) == 1 and any(word in text for word in _ADD_WORDS):
+    if (
+        len(years) == 1
+        and has_two_subject_connective
+        and any(word in text for word in _ADD_WORDS)
+    ):
         return CalcPlan(
             "binary", years,
             time or TimeSpec("year", 1, 12, require_complete=False),

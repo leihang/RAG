@@ -2943,6 +2943,20 @@ class RetrievalPipeline:
             if calc_plan is not None and calc_plan.operation == "binary"
             else None
         )
+        table_plan_clarify = (
+            calc_plan is not None
+            and calc_plan.operation in {"avg", "ratio", "rank", "binary"}
+            and table_answer is None
+            and table_value is None
+            and table_avg is None
+            and table_ratio is None
+            and table_rank is None
+            and table_binary is None
+            and any(
+                str(getattr(chunk, "chunk_type", "")) == "table"
+                for chunk in retrieval.chunks
+            )
+        )
         numeric_unplanned = (
             calc_plan is not None
             and calc_plan.operation == "compare"
@@ -3059,6 +3073,19 @@ class RetrievalPipeline:
                     "value": table_binary.value,
                 },
                 degraded=["deterministic_table_binary"],
+            )
+        elif table_plan_clarify:
+            result = AnswerResult(
+                answer=(
+                    "资料里有相关表格，但当前问题涉及的指标/口径未能从表内唯一确定。"
+                    "请明确指标名称和期间（如“2026年1-9月”），我再按表计算。"
+                ),
+                citations=[],
+                retrieval=retrieval,
+                model="table_plan_clarify",
+                refused=True,
+                refusal_reason="table_plan_clarify",
+                degraded=["table_plan_clarify"],
             )
         elif numeric_unplanned:
             result = AnswerResult(
