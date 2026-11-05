@@ -316,6 +316,44 @@ def _resolve_headers_and_data(
     return False, headers, data_rows
 
 
+def _drop_empty_columns(
+    headers: list[str], data_rows: list[list[str]]
+) -> tuple[list[str], list[list[str]]]:
+    """丢掉**整列都没有数据**的列。
+
+    xlsx/docx 的合并标题行会把表头展开成几十列（``列15…列39``），每个数据行都写成
+    ``列N=`` 的空键值；LLM 在噪声里容易漏掉真正的行（实测 2026-09 用电分析表 39 列，
+    2 段切分后漏了「经营用电」）。这里按数据行判断，统整列空的才丢；表头有含义但
+    全空也丢——检索/回答都不需要它。
+    """
+    if not headers or not data_rows:
+        return headers, data_rows
+    width = len(headers)
+    normalized = [
+        [str(row[i]).strip() if i < len(row) else "" for i in range(width)]
+        for row in data_rows
+    ]
+    def _placeholder(header: str) -> bool:
+        text = str(header or "").strip()
+        return not text or bool(re.fullmatch(r"列\d+", text))
+
+    keep = [
+        i
+        for i in range(width)
+        # 只丢「整列无数据 + 表头是占位符/空」的列；有业务含义的表头即使暂时无值也保留
+        # （测试钉住「用量日期」这种首列标签不能被误删）。
+        if any(row[i] for row in normalized) or not _placeholder(headers[i])
+    ]
+    if not keep:  # 只有表头、没有数据：保留原样
+        return headers, data_rows
+    if len(keep) == width:
+        return headers, data_rows
+    return (
+        [headers[i] for i in keep],
+        [[row[i] for i in keep] for row in normalized],
+    )
+
+
 def _build_preamble(caption: str, table_id: str, headers: list[str], form_like: bool) -> list[str]:
     subject = caption.strip() or (table_id.strip() and f"表 {table_id}") or headers[0]
     preamble = [
@@ -382,6 +420,7 @@ def _prepare_information_blocks(
         base = caption.strip()
         caption = f"{base}（{title_text}）" if base else title_text
     form_like, headers, data_rows = _resolve_headers_and_data(matrix)
+    headers, data_rows = _drop_empty_columns(headers, data_rows)
     preamble = _build_preamble(caption, table_id, headers, form_like)
     return caption, preamble, form_like, headers, data_rows
 

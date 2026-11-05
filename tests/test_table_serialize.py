@@ -441,3 +441,21 @@ def test_rowspan_grid_width_stays_rectangular() -> None:
     )
     assert len({len(r) for r in rows}) == 1, rows
     assert rows[2] == ["D", "E", "F"], rows
+
+
+def test_empty_placeholder_columns_are_dropped() -> None:
+    """合并标题行会展开出几十个 ``列N`` 空列；整列空且表头是占位符的列必须丢掉。
+
+    实测 2026-09 用电分析表 39 列、其中 25 个 ``列N`` 全空，切分后 LLM 漏了
+    「经营用电」行；紧凑化后整表 1432 token、不再分段，所有行都在同一容器。
+    """
+    from ekbs.ingest.table_serialize import _drop_empty_columns
+
+    headers = ["用量日期", "2026-09-30", "列3", "列4", "无数据标签"]
+    rows = [
+        ["总电量", "4379405", "", "", ""],
+        ["经营用电", "186726", "", "", ""],
+    ]
+    kept_headers, kept_rows = _drop_empty_columns(headers, rows)
+    assert kept_headers == ["用量日期", "2026-09-30", "无数据标签"]
+    assert kept_rows == [["总电量", "4379405", ""], ["经营用电", "186726", ""]]
