@@ -3167,6 +3167,9 @@ class RetrievalPipeline:
             intent=intent,
             numeric_overridden=numeric_overridden,
         )
+        # 确定性表格路径不调用模型，但审计仍要能追溯“用了哪些来源块”。
+        if not result.context_chunk_ids and str(result.model).startswith("table_"):
+            result.context_chunk_ids = [cite.chunk_id for cite in result.citations]
         self._apply_figure_adjustments(result, retrieval, intent=intent, question=question)
 
         # ③ 写回上下文（群聊按用户隔离，见 session.py 的说明）
