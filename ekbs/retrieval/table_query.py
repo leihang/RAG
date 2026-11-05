@@ -24,6 +24,8 @@ from ekbs.retrieval.table_struct import (
     load_cell_facts,
     load_record_facts,
     load_table_rows,
+    parse_record_facts,
+    unit_from_text,
 )
 from ekbs.retrieval.table_time import TimeSpec, time_label
 
@@ -633,6 +635,94 @@ class TableRank:
         return f"{self.year}年{self.label}{word}排名：{ranking}{mark}"
 
 
+_USER_HINTS = ("用户", "谁", "大户", "铺号")
+
+
+def _rank_users_from_records(  # noqa: C901
+    question: str,
+    chunks: Sequence[Any],
+    db: Any | None,
+    year: int,
+    time_spec: TimeSpec,
+    direction: str,
+    top: int,
+    chunk_pos: dict[int, int],
+    table_pos: dict[int, int],
+) -> TableRank | None:
+    """按“用户名”行排名（大户用电监视/账单类记录表）。
+
+    与 ``_rank_from_cells`` 的区别：后者排的是指标列（总电量/商铺电量），
+    这里排的是表格里的**行主体**（用户），这才是“谁最高”的语义。
+    """
+    if not any(hint in question for hint in _USER_HINTS):
+        return None
+    records = (
+        load_record_facts(db, sorted({int(getattr(c, "doc_id", 0) or 0) for c in chunks}))
+        if db is not None
+        else []
+    )
+    if not records:
+        records = parse_record_facts(chunks)
+    groups: dict[tuple[str, str], dict[str, str]] = {}
+    chunk_ids: dict[tuple[str, str], int | None] = {}
+    for record in records:
+        key = (record.caption, record.subject)
+        groups.setdefault(key, {})[record.field] = record.value
+        chunk_ids.setdefault(key, record.chunk_id)
+
+    wants_fee = any(word in question for word in ("费用", "电费", "金额"))
+    selected_months = time_spec.month_set()
+    candidates: list[tuple[float, str, str, str, int | None]] = []
+    for (caption, _subject), fields in groups.items():
+        username = str(fields.get("用户名") or fields.get("用户") or "").strip()
+        if not username:
+            continue
+        row_year = 0
+        year_match = re.search(r"(20\d{2})", str(fields.get("年度") or ""))
+        if year_match:
+            row_year = int(year_match.group(1))
+        if row_year and row_year != year:
+            continue
+        if wants_fee:
+            fee_keys = [key for key in fields if any(word in key for word in ("费用", "电费", "金额"))]
+            if not fee_keys:
+                return None
+            measure_keys = fee_keys
+        else:
+            measure_keys = [key for key in fields if re.fullmatch(r"\d{1,2}月", key)]
+        total = 0.0
+        found = False
+        for key in measure_keys:
+            month_match = re.fullmatch(r"(\d{1,2})月", key)
+            month = int(month_match.group(1)) if month_match else None
+            if month is not None and month not in selected_months:
+                continue
+            try:
+                total += float(str(fields[key]).replace(",", ""))
+                found = True
+            except (TypeError, ValueError):
+                continue
+        if found:
+            unit = unit_from_text(caption)
+            candidates.append((total, username, caption, unit, chunk_ids.get((caption, _subject))))
+    if len(candidates) < 2:
+        return None
+    candidates.sort(key=lambda row: (row[0] if direction == "asc" else -row[0], row[1]))
+    first = candidates[0]
+    index = chunk_pos.get(first[4] or 0) or next(iter(table_pos.values()), 0) or 0
+    if not index:
+        return None
+    label = f"{time_label(time_spec)}用户{'费用' if wants_fee else '用电量'}"
+    return TableRank(
+        year=year,
+        label=label,
+        unit=first[3],
+        direction=direction,
+        items=tuple((username, value) for value, username, _caption, _unit, _cid in candidates[: max(1, top)]),
+        chunk_index=index,
+    )
+
+
 def _rank_from_cells(
     cells: Sequence[Any],
     year: int,
@@ -689,6 +779,15 @@ def compute_table_rank(
         raw = top_match.group(1)
         top = int(raw) if raw.isdigit() else {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}.get(raw, 3)
     direction = "asc" if ("最低" in text or "最少" in text) else "desc"
+
+    user_rank = _rank_users_from_records(
+        text, chunks, db, years[0], time_spec, direction, top, chunk_pos, table_pos
+    )
+    if user_rank is not None:
+        return user_rank
+    if any(hint in text for hint in _USER_HINTS):
+        # 行主体问题（谁/用户）不能退化成“总电量/商铺电量”指标排名。
+        return None
 
     # 宽表单元格优先级更高：同一期间通常只有它保留完整指标列。
     cells = (

@@ -331,3 +331,37 @@ def test_unitless_average_is_allowed() -> None:
     chunk.content = content
     result = compute_table_average("2026年1-3月电力公司收费，平均值是多少", [chunk])
     assert result is not None and abs(result.value - 0.9) < 1e-9
+
+
+def test_rank_users_by_month_usage() -> None:
+    from ekbs.retrieval.table_query import compute_table_rank
+
+    content = """表名: 大户用电监视（用电大户用量监视（度））
+相关表头: 铺号 | 用户名 | 年度 | 9月
+铺号=A; 用户名=甲; 年度=2026年; 9月=100
+铺号=B; 用户名=乙; 年度=2026年; 9月=300
+铺号=C; 用户名=丙; 年度=2026年; 9月=200
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    result = compute_table_rank("2026年9月电量最高的用户是谁", [chunk])
+    assert result is not None
+    assert result.items[0] == ("乙", 300.0)
+    assert "用户" in result.label
+
+
+def test_rank_users_rejects_missing_fee_metric() -> None:
+    from ekbs.retrieval.table_query import compute_table_rank
+
+    content = """表名: 大户用电监视（用电大户用量监视（度））
+相关表头: 铺号 | 用户名 | 年度 | 9月
+铺号=A; 用户名=甲; 年度=2026年; 9月=100
+铺号=B; 用户名=乙; 年度=2026年; 9月=300
+"""
+    import tests.test_table_eval as eval_mod
+
+    chunk = eval_mod._chunk(rows=[])
+    chunk.content = content
+    assert compute_table_rank("2026年9月费用最高的用户是谁", [chunk]) is None
