@@ -343,9 +343,9 @@ async def test_metadata_scan_answers_unnamed_year_query(seeded) -> None:
     assert matched_contents and "2025-01-01" in matched_contents[0]
 
 
-def test_period_limited_question_must_not_use_annual_total() -> None:
+def test_prompt_forbids_model_calculation() -> None:
     from ekbs.retrieval.pipeline import SYSTEM_PROMPT
 
-    assert "1-9月" in SYSTEM_PROMPT
-    assert "年度合计" in SYSTEM_PROMPT
-    assert "禁止用年度合计代替" in SYSTEM_PROMPT
+    assert "不得自行计算或汇总" in SYSTEM_PROMPT
+    assert "不要累加月份" in SYSTEM_PROMPT
+    assert "不要用年度合计代替部分期间" in SYSTEM_PROMPT

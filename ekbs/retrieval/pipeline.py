@@ -627,12 +627,10 @@ SYSTEM_PROMPT = (
     # 8.1.4–8.4 全丢）。这里只对操作性问法要求覆盖全部步骤，其他问题仍保持简洁。
     "如果用户问的是「流程/步骤/怎么办/如何处理」这类操作性问题，资料里列出的相关步骤"
     "要尽量全部覆盖（可按部门/阶段分组列出），不要只给摘要或省略中间步骤。\n"
-    # 实测 DingTalk「公司承担水费 2026年1-9月 vs 2025年1-9月」：模型把 2025 全年
-    # 「年度合计」当成 1-9 月合计，结论从“减少 66,271.62”变成“减少 52,837.60”。
-    # 表格同时有分月列和年度合计，必须明确禁止用全年数代替部分期间。
-    "如果问题限定月份区间（如「1-9月」「1—9月」「前9个月」），只能累加/使用对应"
-    "月份列的数据；表格里同时出现「年度合计/全年」时，禁止用年度合计代替不足一年"
-    "的区间合计，并要说明你累加的是哪几个月。\n"
+    # 新架构：模型不做任何计算；资料没有现成口径时宁可说明没有，也不要累加/换算。
+    "不得自行计算或汇总。资料没有直接给出问题所需的现成数字/结论时，"
+    "不要累加月份、不要用年度合计代替部分期间、不要做换算或推算；"
+    "只说明资料未直接提供该口径。\n"
     "若资料完全不足以回答，才直接回复「未找到可靠依据」。\n\n"
     "资料：\n{context}"
 )
@@ -642,7 +640,7 @@ TRUNCATION_NOTICE = "（提示：回答已达长度上限被截断，未显示�
 
 #: 提示词版本（进答案缓存键）：**改动 SYSTEM_PROMPT 必须同步 +1**，
 #: 否则旧提示词生成的答案会继续从缓存里被服务。
-PROMPT_REVISION = "v9"
+PROMPT_REVISION = "v10"
 
 _ANSWER_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
 _CITATION_MARK_RE = re.compile(r"\[\d+\]")
@@ -2712,8 +2710,10 @@ class RetrievalPipeline:
             )
         if hit is None:
             return None
-        if hit.is_na and hit.reason in {"no_rows", "not_found", "no_entity"}:
-            # 降级：让 numeric/prose 再试
+        if hit.is_na and hit.reason in {
+            "no_rows", "not_found", "no_entity", "underspecified",
+        }:
+            # 降级：让 numeric/prose 再试（underspecified=缺实体/指标的裸合计，禁止扫库）
             return None
         if hit.is_na and hit.reason == "no_visible_shard":
             return AnswerResult(
