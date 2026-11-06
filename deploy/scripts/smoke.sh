@@ -28,7 +28,7 @@ DB="$DATA/index/ekbs.db"
 VENV=/opt/ekbs/venv
 ETC=/opt/ekbs/etc
 SECRETS="$HOME/.ekbs/secrets.env"
-EXPECTED_TABLES=33
+EXPECTED_TABLES=34
 
 WITH_DEPS=0; WITH_QA=0
 for a in "$@"; do

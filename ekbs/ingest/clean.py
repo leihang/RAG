@@ -414,6 +414,97 @@ def clean_profile_for_path(source_path: str) -> str:
     return OFFICE_PROFILE if suffix in OFFICE_SUFFIXES else SCAN_PROFILE
 
 
+#: 水印相机 / 巡检水印模板常见壳子。成片出现时说明图注是「拍照元数据」而非正文。
+_FIGURE_WATERMARK_MARKERS: tuple[str, ...] = (
+    "水印相机",
+    "今日水印",
+    "自定义水印",
+    "物业巡检水印",
+    "水印枢机",
+    "防伪",
+    "相机真实可验",
+    "真实时间",
+    "巡检人：请输入",
+    "请输入巡检人",
+)
+
+#: 水印模板里的空字段行（无实质内容）。
+_FIGURE_WATERMARK_EMPTY_FIELDS: tuple[str, ...] = (
+    "问题备注",
+    "巡检人",
+    "拍摄人",
+    "备注",
+)
+
+#: 手写表格式视觉抄录常见重复噪声（实测 PPT 漏保检查表：「正常正常是」连片）。
+_HANDWRITE_OCR_MARKERS: tuple[str, ...] = (
+    "正常正常是",
+    "正常正常",
+)
+
+
+def _is_handwrite_ocr_caption(blob: str) -> bool:
+    if any(mark in blob for mark in _HANDWRITE_OCR_MARKERS):
+        return True
+    if blob.count("正常") >= 5:
+        return True
+    tokens = re.findall(r"[\u4e00-\u9fff]{2,4}", blob)
+    if not tokens:
+        return False
+    from collections import Counter
+
+    _token, freq = Counter(tokens).most_common(1)[0]
+    return freq >= 8 and freq / max(len(tokens), 1) >= 0.35
+
+
+def _is_watermark_boilerplate_line(line: str) -> bool:
+    if any(m in line for m in _FIGURE_WATERMARK_MARKERS):
+        return True
+    if re.search(r"请输入", line):
+        return True
+    bare = re.sub(r"[\s:：\-—_]+$", "", line)
+    if bare in _FIGURE_WATERMARK_EMPTY_FIELDS:
+        return True
+    if re.fullmatch(
+        r"(?:\d{1,2}:\d{2}.*|\d{4}[./年-]\d{1,2}[./月-]\d{1,2}.*|"
+        r".*?(?:晴|多云|阴)\s*\d{1,2}\s*℃?.*|经纬度[:：].*)",
+        line,
+    ):
+        return True
+    return bool(re.fullmatch(r"(?:地点[:：].*|\d{1,6}|…+.*?…+)", line))
+
+
+def is_low_quality_figure_caption(text: str) -> bool:
+    """图注是否不适合作为**文本检索单元**（仍可多模态回源）。
+
+    两类实测会淹没 PPT 正文召回：
+    1. 手写表 OCR：短词连片重复（「正常正常是…」），语义接近「做了检查」却无工作要点；
+    2. 水印相机壳：大半行是天气/防伪/「请输入巡检人」，正文只有地名型号碎片。
+    """
+    blob = (text or "").strip()
+    if not blob:
+        return False
+    if _is_handwrite_ocr_caption(blob):
+        return True
+    lines = [ln.strip() for ln in blob.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    mark_hits = sum(1 for m in _FIGURE_WATERMARK_MARKERS if m in blob)
+    if mark_hits == 0:
+        return False
+    boilerplate = sum(1 for line in lines if _is_watermark_boilerplate_line(line))
+    ratio = boilerplate / len(lines)
+    if len(blob) <= 280 and ratio >= 0.45:
+        return True
+    if mark_hits >= 2 and ratio >= 0.5:
+        return True
+    if mark_hits >= 2 and (len(lines) - boilerplate) <= 3 and len(blob) <= 280:
+        return True
+    if "物业巡检水印" in blob and len(blob) <= 120:
+        return True
+    return False
+
+
 def clean_figure_text(text: str) -> str:
     """图题注 / OCR 专用清洗（印章页视觉描述不得进检索）。"""
     if not text:
@@ -444,6 +535,12 @@ def clean_figure_text(text: str) -> str:
     if cleaned and len(cleaned) < 60 and re.search(r"市棉|股份有限\s*$|理工程技术", cleaned):
         if "甲方" not in cleaned and "乙方" not in cleaned:
             cleaned = "[签署/盖章区]"
+    # 手写表 / 水印相机壳：降成短占位，避免进稠密/BM25 后抢走幻灯正文
+    if cleaned and is_low_quality_figure_caption(cleaned):
+        if any(m in cleaned for m in _HANDWRITE_OCR_MARKERS) or cleaned.count("正常") >= 5:
+            cleaned = "[手写表格照片]"
+        else:
+            cleaned = "[现场照片]"
     return cleaned
 
 

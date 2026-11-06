@@ -745,8 +745,8 @@ async def test_shard_index_reloads_after_external_writer(seeded, settings, tmp_p
     )
 
 
-def test_build_context_marks_figure_chunks() -> None:
-    """索图问答依赖上下文里的【图片】标记，提示词才能指引模型去引用。"""
+def test_build_context_skips_figure_chunks() -> None:
+    """图片不进 LLM 上下文：只保留文字块编号，避免题注/占位污染答案。"""
     from ekbs.retrieval.pipeline import RetrievalPipeline, RetrievedChunk
 
     chunks = [
@@ -755,15 +755,17 @@ def test_build_context_marks_figure_chunks() -> None:
             chunk_type="parent", doc_title="工程汇报", page_from=8, page_to=9,
         ),
         RetrievedChunk(
-            chunk_id=2, doc_id=1, shard_id="kb_all_L1", content="DT862 电能表",
+            chunk_id=2, doc_id=1, shard_id="kb_all_L1", content="[图片]",
             chunk_type="figure", doc_title="工程汇报", page_from=8, page_to=8,
             image_path="parse/1/images/a.png",
         ),
     ]
     ctx = RetrievalPipeline.build_context(chunks)
-    assert "【图片】" in ctx
-    assert "[1]" in ctx and "[2]" in ctx
-    assert "DT862" in ctx
+    assert "【图片】" not in ctx
+    assert "计量表更换说明" in ctx
+    assert "[1]" in ctx
+    assert "[2]" not in ctx
+    assert "[图片]" not in ctx
 
 
 def test_build_context_includes_doc_title_and_heading() -> None:

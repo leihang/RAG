@@ -231,7 +231,7 @@ def test_smoke_probed_routes_are_registered() -> None:
 
 
 def test_schema_path_matches_install_and_smoke_expectations() -> None:
-    """`install.sh` 从 `$APP_DIR/sql/001_init.sql` 建库；smoke 期望 33 张表。"""
+    """`install.sh` 从 `$APP_DIR/sql/001_init.sql` 建库；smoke 期望 34 张表。"""
     from ekbs.db import EXPECTED_TABLES, EXPECTED_TRIGGERS
     from tests.conftest import DEV_CONFIG
     from ekbs.config import load_settings
@@ -239,7 +239,7 @@ def test_schema_path_matches_install_and_smoke_expectations() -> None:
     settings = load_settings(DEV_CONFIG)
     assert settings.schema_sql_path == REPO / "sql" / "001_init.sql"
     assert settings.schema_sql_path.is_file()
-    assert EXPECTED_TABLES == 33
+    assert EXPECTED_TABLES == 34
     assert EXPECTED_TRIGGERS == 12
 
     deploy_copy = REPO / "deploy" / "sql" / "001_init.sql"
@@ -402,7 +402,7 @@ def test_dev_smoke_mirrors_deploy_smoke_assertions() -> None:
 
     # 与生产冒烟一致的检查项
     for marker in (
-        "EXPECTED_TABLES=33",
+        "EXPECTED_TABLES=34",
         "EXPECTED_TRIGGERS=12",
         "integrity_check",
         "journal_mode",

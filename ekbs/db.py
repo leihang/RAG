@@ -27,7 +27,8 @@ from ekbs.config import Settings
 from ekbs.errors import SchemaError
 
 #: `01` §5 的权威表数（含 FTS5 虚拟表 ``ekbs_chunk_fts``，不含 5 张 FTS5 影子表）
-EXPECTED_TABLES = 33
+#: + ``ekbs_table_observation``（电子表格结构化观测双写）
+EXPECTED_TABLES = 34
 
 #: `01` §5.6 的审计触发器数（5 张表 × UPDATE+DELETE + ``ekbs_qa_session`` 的 UPDATE 守卫 = 12）
 EXPECTED_TRIGGERS = 12
@@ -220,6 +221,39 @@ class Database:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_doc_recommend_status "
                 "ON ekbs_doc_recommend(status)"
+            )
+            # 电子表格结构化观测（存量库补建；新库由 001_init.sql 建好）。
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS ekbs_table_observation ("
+                " obs_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " doc_id INTEGER NOT NULL REFERENCES ekbs_document(doc_id) ON DELETE CASCADE,"
+                " shard_id TEXT NOT NULL,"
+                " table_id TEXT NOT NULL DEFAULT '',"
+                " table_type TEXT NOT NULL,"
+                " entity_key TEXT NOT NULL DEFAULT '',"
+                " entity_label TEXT NOT NULL DEFAULT '',"
+                " period TEXT NOT NULL DEFAULT '',"
+                " metric TEXT NOT NULL DEFAULT '',"
+                " value REAL,"
+                " value_surface TEXT NOT NULL DEFAULT '',"
+                " line_role TEXT NOT NULL DEFAULT 'normal',"
+                " source_row INTEGER,"
+                " chunk_id INTEGER,"
+                " attrs_json TEXT NOT NULL DEFAULT '{}',"
+                " created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_obs_shard_type_period "
+                "ON ekbs_table_observation(shard_id, table_type, period)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_obs_doc_table "
+                "ON ekbs_table_observation(doc_id, table_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_obs_entity "
+                "ON ekbs_table_observation(entity_key)"
             )
             conn.commit()
 

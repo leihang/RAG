@@ -89,6 +89,12 @@ def build_numeric_prompt(context: str) -> str:
 MODE_NUMERIC = "numeric"
 MODE_PROSE = "prose"
 MODE_AUTO = "auto"
+#: 受限结构化聚合/查找（观测表）；进答案缓存键，避免与 prose/numeric/rank 串味
+MODE_STRUCTURED = "structured_query"
+#: 表格比较排名（约束 max/min）；缓存键与 prose 区分开
+MODE_TABLE_RANK = "table_rank"
+
+_EXPLICIT_MODES = {MODE_PROSE, MODE_NUMERIC, MODE_STRUCTURED, MODE_TABLE_RANK}
 
 
 def resolve_answer_mode(
@@ -97,13 +103,16 @@ def resolve_answer_mode(
     *,
     auto_numeric: bool = True,
 ) -> str:
-    """把请求 mode + 意图解析成实际作答模式（``prose`` | ``numeric``）。
+    """把请求 mode + 意图解析成实际作答模式。
 
-    * 显式 ``prose`` / ``numeric`` → 原样（管理台手动切换）；
+    返回值：``prose`` | ``numeric`` | ``structured_query`` | ``table_rank``。
+
+    * 显式 mode → 原样（管理台手动切换）；
     * ``auto``（默认）：``auto_numeric`` 开启且意图为 numeric → 取数，否则业务问答。
+      比较/结构化路由在 ``answer()`` 里于本函数之后按问句意图覆盖（仍写入 ``mode_used``）。
     """
     req = (requested or MODE_AUTO).strip().lower()
-    if req in {MODE_PROSE, MODE_NUMERIC}:
+    if req in _EXPLICIT_MODES:
         return req
     if auto_numeric and (intent or "").strip().lower() == MODE_NUMERIC:
         return MODE_NUMERIC

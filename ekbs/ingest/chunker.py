@@ -359,7 +359,7 @@ class ChunkNode:
     page_to: int | None = None
     figure_id: str | None = None
     image_path: str | None = None
-    #: 该块所属父块在结果列表中的下标（``chunk_type == 'child'`` 时非空）
+    #: 该块所属父块在结果列表中的下标（``child`` / 绑图 ``figure`` 时非空）
     parent_index: int | None = None
     #: 表格父容器**分段组**（``t<文档内表 id>``）：同表所有分段共用一个组 id，
     #: 检索命中任一叶子时按组一次展开回全表；未分段（≤2048）的表块为 ``None``。
@@ -545,8 +545,43 @@ def _table_parent_content(
     return "\n\n".join(parts)
 
 
+def _resolve_leaf_sample_max(
+    table: TableInput,
+    *,
+    row_chunks: bool,
+    leaf_policy: str,
+    sample_max: int,
+    sample_min_rows: int,
+) -> int | None:
+    """B 型大表明细：返回叶子抽样上限；其它表型 / 关抽样 → ``None``（全量）。"""
+    if not row_chunks:
+        return None
+    policy = (leaf_policy or "auto").strip().lower()
+    if policy == "full":
+        return None
+    from ekbs.ingest.table_serialize import coerce_rows_with_headers
+    from ekbs.ingest.table_types import classify_table_type
+
+    rows, _header_n = coerce_rows_with_headers(table.body)
+    # 含表头
+    data_n = max(0, len(rows) - 1)
+    ttype = classify_table_type(caption=table.caption, body=table.body)
+    if ttype != "B":
+        return None
+    if policy == "sample" or (policy == "auto" and data_n >= sample_min_rows):
+        return max(1, int(sample_max))
+    return None
+
+
 def _table_leaf_blocks(
-    table: TableInput, full_blocks: Sequence[str], *, row_chunks: bool
+    table: TableInput,
+    full_blocks: Sequence[str],
+    *,
+    row_chunks: bool,
+    default_year: str | None = None,
+    leaf_policy: str = "auto",
+    leaf_sample_max: int = 64,
+    leaf_sample_min_rows: int = 200,
 ) -> Sequence[str]:
     """表格叶子块：≤``TABLE_LEAF_TOKENS`` 用整表一块；超过就按行组拆（每叶重复表头）。
 
@@ -554,18 +589,35 @@ def _table_leaf_blocks(
     及实施要求」查「A级能耗普查」检索不中）。``row_chunks=True`` 时退化为一行一块
     （``retrieval.table_row_chunks``）—— 但**只有电子表格**能走到这里，来源判定在
     :func:`chunk_markdown`（Word/PDF 的表行不是记录，逐行切会碎成 55~115 token 的块）。
+
+    月份宽表（``row_chunks`` 且可识别）：即使整表 ≤384 也强制走 tidy 长叶子，否则
+    「9 月谁最高」只能靠散文模型在宽行上猜，全局排序不稳。
+
+    B 型收费明细大表：按 ``leaf_policy`` 抽样进 FAISS（全量行仍写观测表）。
     """
     # 延迟导入：table_serialize 反向依赖本模块的 count_tokens，模块级导入会成环
-    from ekbs.ingest.table_serialize import serialize_table_body
+    from ekbs.ingest.table_serialize import serialize_table_body, table_body_is_month_series
 
-    if sum(count_tokens(block) for block in full_blocks) <= TABLE_LEAF_TOKENS:
+    melt = bool(row_chunks) and table_body_is_month_series(
+        caption=table.caption, body=table.body, default_year=default_year
+    )
+    if not melt and sum(count_tokens(block) for block in full_blocks) <= TABLE_LEAF_TOKENS:
         return full_blocks
+    sample_max = _resolve_leaf_sample_max(
+        table,
+        row_chunks=row_chunks,
+        leaf_policy=leaf_policy,
+        sample_max=leaf_sample_max,
+        sample_min_rows=leaf_sample_min_rows,
+    )
     return serialize_table_body(
         caption=table.caption,
         body=table.body,
         table_id=table.table_id,
-        row_chunks=row_chunks,
+        row_chunks=True if melt else row_chunks,
         max_tokens=TABLE_LEAF_TOKENS,
+        default_year=default_year,
+        leaf_sample_max=sample_max,
     )
 
 
@@ -900,8 +952,9 @@ def merge_short_sections_into_next(sections: Sequence[Section]) -> list[Section]
 
 @dataclass
 class FigureInput:
-    """文档里抽出的图片（**已落盘**），供分块器生成可检索的 figure 块。
+    """文档里抽出的图片（**已落盘**），供分块器生成**附件型** figure 块。
 
+    图片不入向量/FTS：只挂到对应标题/章节 parent 下，文字命中后再回源。
     ``image_path`` 是**相对 ``data_dir``** 的路径 —— ``GET /assets/figure/{chunk_id}``
     正是按 data_dir 解析 ``ekbs_chunk.image_path``，必须同一基准；解析层报回的是相对
     ``assets_dir`` 的路径，换算由调用方（worker / import）负责。
@@ -941,8 +994,8 @@ class ChunkingResult:
 
     @property
     def figures(self) -> list[ChunkNode]:
-        """图片块：**与 child 一样可检索**（向量化 + 进 FTS），但保留自己的类型，
-        以便 `/assets/figure/{chunk_id}` 能回源出图、前端把引用渲染成图。"""
+        """图片块：资产行（``image_path`` / ``figure_id``），经 ``parent_id`` 挂在
+        章节文字下；**不入向量/FTS**，由 `/assets/figure/{chunk_id}` 回源。"""
         return [n for n in self.nodes if n.chunk_type == "figure"]
 
     @property
@@ -1156,6 +1209,75 @@ def _table_heading_and_section(
     return heading, section_path
 
 
+def _relevant_header_line(text: str) -> str:
+    """序列化块里的 ``相关表头:`` 行；宽表按指标组切分后用它把父块与叶子对齐。"""
+    for line in (text or "").splitlines():
+        if line.startswith("相关表头:"):
+            return line.strip()
+    return ""
+
+
+def _segments_by_relevant_header(
+    *,
+    full_blocks: Sequence[str],
+    leaf_blocks: Sequence[str],
+    section_path: str,
+    above: str,
+    below: str,
+) -> list[_TableContainerSegment]:
+    """宽表/多块回退：按「相关表头」分组建父容器，叶子挂到同组。
+
+    行向 ``_segment_table_container`` 在指标组切分后会让同一行号跨月重复出现，
+    ``row_range`` 叶子会串组；这里改用表头对齐，父容器天然 ≤ 单块打包预算。
+    """
+    from collections import OrderedDict
+
+    groups: OrderedDict[str, list[str]] = OrderedDict()
+    for block in full_blocks:
+        key = _relevant_header_line(block) or f"#{len(groups)}"
+        groups.setdefault(key, []).append(str(block))
+    leaf_map: dict[str, list[str]] = {}
+    for leaf in leaf_blocks:
+        key = _relevant_header_line(leaf) or ""
+        leaf_map.setdefault(key, []).append(str(leaf))
+
+    keys = list(groups.keys())
+    segments: list[_TableContainerSegment] = []
+    for key_index, key in enumerate(keys):
+        blocks = groups[key]
+        leaves = list(leaf_map.get(key) or [])
+        # 同组多个行批：尽量并进一个父容器；超硬上限再拆，叶子轮转挂靠
+        batches: list[list[str]] = [[]]
+        for block in blocks:
+            trial = batches[-1] + [block]
+            wrapped = _table_parent_content(
+                section_path=section_path,
+                above="",
+                full_table="\n\n".join(trial),
+                below="",
+            )
+            if batches[-1] and count_tokens(wrapped) > TABLE_CONTAINER_MAX_TOKENS:
+                batches.append([block])
+            else:
+                batches[-1] = trial
+        n_batch = len(batches)
+        for batch_index, batch in enumerate(batches):
+            is_first = key_index == 0 and batch_index == 0
+            is_last = key_index == len(keys) - 1 and batch_index == n_batch - 1
+            content = _table_parent_content(
+                section_path=section_path,
+                above=above if is_first else "",
+                full_table="\n\n".join(batch),
+                below=below if is_last else "",
+            )
+            if n_batch == 1:
+                part_leaves = leaves or list(batch)
+            else:
+                part_leaves = leaves[batch_index::n_batch] or list(batch)
+            segments.append(_TableContainerSegment(content=content, leaves=part_leaves))
+    return segments
+
+
 def _append_table_segments(
     result: ChunkingResult,
     seq: int,
@@ -1213,6 +1335,10 @@ def _append_table_nodes(
     raw_sections: Sequence[Section],
     table_container: dict[str, int],
     row_chunks: bool,
+    default_year: str | None = None,
+    leaf_policy: str = "auto",
+    leaf_sample_max: int = 64,
+    leaf_sample_min_rows: int = 200,
 ) -> int:
     """把一张表落成节点，返回新的 ``seq``。
 
@@ -1237,7 +1363,15 @@ def _append_table_nodes(
     # 叶子预算：整表超过 384 token 就拆「行组叶子」。
     # 920 token 的表（十几行数据）塞进同一个向量会被互相稀释 —— 查某一行
     # 的语义（如「A级能耗普查」）时整表向量对不上，检索直接落空。
-    leaf_blocks = _table_leaf_blocks(table, full_blocks, row_chunks=row_chunks)
+    leaf_blocks = _table_leaf_blocks(
+        table,
+        full_blocks,
+        row_chunks=row_chunks,
+        default_year=default_year,
+        leaf_policy=leaf_policy,
+        leaf_sample_max=leaf_sample_max,
+        leaf_sample_min_rows=leaf_sample_min_rows,
+    )
 
     if len(full_blocks) == 1 and len(leaf_blocks) <= 1:
         # 小表（整表一块；或单行就超预算、拆不出第二块）：上下文折进叶子，
@@ -1276,21 +1410,43 @@ def _append_table_nodes(
     # 用户已拍板「容器 2048 + 超限分段展开」）。未超限 / 不可分段时保持原单容器行为。
     segments: list[_TableContainerSegment] | None = None
     if count_tokens(container_content) > TABLE_CONTAINER_MAX_TOKENS:
-        segments = _segment_table_container(
-            table=table,
-            section_path=section_path,
-            above=above,
-            below=below,
-            row_chunks=row_chunks,
-        )
-        if segments is None:
-            log.warning(
-                "table_container_unsplittable",
-                table_id=str(table.table_id),
-                caption=(table.caption or "")[:80],
-                container_tokens=count_tokens(container_content),
-                hint="单行即超分段预算，回退为单容器（不丢内容）",
+        distinct_headers = {
+            h for b in full_blocks if (h := _relevant_header_line(b))
+        }
+        # 指标组宽表：多段「相关表头」→ 按表头分组建父容器（避免行号跨月串组）
+        if len(distinct_headers) > 1:
+            segments = _segments_by_relevant_header(
+                full_blocks=full_blocks,
+                leaf_blocks=leaf_blocks,
+                section_path=section_path,
+                above=above,
+                below=below,
             )
+        else:
+            segments = _segment_table_container(
+                table=table,
+                section_path=section_path,
+                above=above,
+                below=below,
+                row_chunks=row_chunks,
+            )
+        if segments is None:
+            if len(full_blocks) > 1:
+                segments = _segments_by_relevant_header(
+                    full_blocks=full_blocks,
+                    leaf_blocks=leaf_blocks,
+                    section_path=section_path,
+                    above=above,
+                    below=below,
+                )
+            else:
+                log.warning(
+                    "table_container_unsplittable",
+                    table_id=str(table.table_id),
+                    caption=(table.caption or "")[:80],
+                    container_tokens=count_tokens(container_content),
+                    hint="单行即超分段预算，回退为单容器（不丢内容）",
+                )
     if segments:
         return _append_table_segments(
             result,
@@ -1395,6 +1551,19 @@ def _inject_doc_metadata_line(nodes: list["ChunkNode"], line: str) -> None:
     node.token_count = tokens
 
 
+def _default_year_for_month_series(
+    *,
+    source_path: str,
+    infer_from_filename: bool,
+) -> str | None:
+    """仅在显式开关打开时从文件名推年；默认关，避免跨年错位。"""
+    if not infer_from_filename or not source_path:
+        return None
+    from ekbs.ingest.table_types import infer_year_from_source
+
+    return infer_year_from_source(source_path=source_path)
+
+
 def chunk_markdown(
     markdown: str,
     *,
@@ -1409,12 +1578,16 @@ def chunk_markdown(
     source_path: str = "",
     table_row_chunks: bool = False,
     doc_metadata_line: str = "",
+    month_series_infer_year_from_filename: bool = False,
+    table_leaf_policy: str = "auto",
+    table_leaf_sample_max: int = 64,
+    table_leaf_sample_min_rows: int = 200,
 ) -> ChunkingResult:
     """Markdown → 父块 + 子块 + 图片块 + 表格块（`06` §3 的口径）。
 
-    ``figures`` 由解析层给出（图片已落盘）。**只有"有文本"的图片才建索引块**：
-    题注与 OCR 都为空时，图片仍留在磁盘上可被浏览，但不进向量/FTS ——
-    给一堆无文字的图造近似重复的块，只会污染检索。
+    ``figures`` 由解析层给出（图片已落盘）。每张图建一条 ``chunk_type=figure``
+    **资产行**（占位正文 ``[图片]``），``parent_index`` 绑到同页/同节 parent；
+    **不入向量/FTS**（见 :mod:`ekbs.ingest.retrievable`）。不做题注/OCR 检索文。
 
     ``tables`` 走确定性 ``information_block`` 序列化，整表独立成 ``chunk_type=table``，
     不与正文 parent/child 重复索引。
@@ -1451,6 +1624,10 @@ def chunk_markdown(
     from ekbs.ingest.parser import is_spreadsheet_source
 
     row_chunks = bool(table_row_chunks) and is_spreadsheet_source(source_path)
+    default_year = _default_year_for_month_series(
+        source_path=source_path,
+        infer_from_filename=month_series_infer_year_from_filename,
+    )
 
     result = ChunkingResult()
     seq = 0
@@ -1515,25 +1692,37 @@ def chunk_markdown(
                 )
             )
 
-    for fig_index, figure in enumerate(figures, start=1):
-        content = _figure_search_text(
-            figure, doc_title=doc_title, figure_index=fig_index
-        )
-        if not content:
-            log.debug("figure_skipped_no_text", image_path=figure.image_path)
+    for figure in figures:
+        if not str(figure.image_path or "").strip():
+            log.debug("figure_skipped_no_path", figure_id=figure.figure_id or "")
             continue
+        parent_index = _parent_index_for_figure(result.nodes, page=figure.page)
+        # 无同页 parent 时挂最后一个 parent（docx 无页码常见）；再没有则仍落资产行。
+        if parent_index is None:
+            for idx in range(len(result.nodes) - 1, -1, -1):
+                if result.nodes[idx].chunk_type == "parent":
+                    parent_index = idx
+                    break
         seq += 1
-        fig_heading = ensure_heading_path(figure.caption or doc_title, doc_title=doc_title)
+        parent_heading = (
+            result.nodes[parent_index].heading_path
+            if parent_index is not None
+            else ""
+        )
+        fig_heading = ensure_heading_path(
+            parent_heading or doc_title, doc_title=doc_title
+        )
         result.nodes.append(
             ChunkNode(
                 chunk_type="figure",
                 seq=seq,
-                content=content,
+                content="[图片]",
                 heading_path=fig_heading,
                 page_from=figure.page,
                 page_to=figure.page,
                 figure_id=figure.figure_id or None,
                 image_path=figure.image_path,
+                parent_index=parent_index,
             )
         )
 
@@ -1547,10 +1736,37 @@ def chunk_markdown(
             raw_sections=raw_sections,
             table_container=table_container,
             row_chunks=row_chunks,
+            default_year=default_year,
+            leaf_policy=table_leaf_policy,
+            leaf_sample_max=table_leaf_sample_max,
+            leaf_sample_min_rows=table_leaf_sample_min_rows,
         )
     # 一行文档元数据只进上下文容器（不制造可检索的同质块，见 _inject_doc_metadata_line）
     _inject_doc_metadata_line(result.nodes, doc_metadata_line)
     return result
+
+
+def _parent_index_for_figure(
+    nodes: Sequence[ChunkNode], *, page: int | None
+) -> int | None:
+    """按页码把图挂到覆盖该页的 parent；多候选时取页距最窄的（更贴章节）。"""
+    if page is None:
+        return None
+    best: tuple[int, int] | None = None  # (span, index)
+    for idx, node in enumerate(nodes):
+        if node.chunk_type != "parent":
+            continue
+        start = node.page_from
+        end = node.page_to if node.page_to is not None else node.page_from
+        if start is None:
+            continue
+        if end is None:
+            end = start
+        if int(start) <= int(page) <= int(end):
+            span = int(end) - int(start)
+            if best is None or span < best[0]:
+                best = (span, idx)
+    return best[1] if best is not None else None
 
 
 def _figure_search_text(
@@ -1559,26 +1775,9 @@ def _figure_search_text(
     doc_title: str = "",
     figure_index: int = 0,
 ) -> str:
-    """图片的可检索文本 = 题注 + 图中文字（OCR）。
-
-    两者都空时：若有 ``doc_title`` 则用 ``[图片] 文档名 · 图N`` 兜底（OCR 默认关闭时
-    教程截图常见无字，仍须建块以便多模态检索与钉钉回源）；连文档名也没有才跳过。
-    """
-    parts: list[str] = []
-    if figure.caption.strip():
-        parts.append(f"[图片] {figure.caption.strip()}")
-    if figure.ocr_text.strip():
-        if not parts:
-            parts.append("[图片]")
-        parts.append(figure.ocr_text.strip())
-    if parts:
-        return "\n".join(parts).strip()
-    title = (doc_title or "").strip()
-    if not title:
-        return ""
-    if figure_index > 0:
-        return f"[图片] {title} · 图{figure_index}"
-    return f"[图片] {title}"
+    """兼容旧调用：图片不再用题注/OCR 做检索文，一律占位 ``[图片]``。"""
+    del figure, doc_title, figure_index
+    return "[图片]"
 
 
 def _pack(text: str, min_tokens: int, max_tokens: int, *, overlap: int = 0) -> list[str]:

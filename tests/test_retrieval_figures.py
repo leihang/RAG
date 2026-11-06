@@ -96,3 +96,66 @@ async def test_figure_intent_cleans_junk_citation(seeded) -> None:
     )
     assert [cite.chunk_id for cite in result.citations] == [11]
     assert result.citations[0].cite_index == 1
+
+
+def test_prefer_prose_drops_all_recalled_figures(seeded) -> None:
+    """figure 不应进召回；若旧索引混入，一律丢掉，只留 prose。"""
+    from types import SimpleNamespace
+
+    runtime, _ = seeded
+    prose = _body(
+        chunk_id=43108,
+        content="2. 设备运维（安防、工程）\n1、按季节调整：照明、中央空调运行",
+    )
+    prose.rerank_score = 0.70
+    handwrite = _figure(
+        chunk_id=43125,
+        content=(
+            "[图片] 正常正常是 2026.10.26 已更换\n"
+            "正常正常是 2026.10.26 未更换漏保已告知家长盛琼"
+        ),
+    )
+    handwrite.rerank_score = 0.74
+    watermark = _figure(
+        chunk_id=43139,
+        content=(
+            "[图片] 物业巡检水印\n2026.10.13 星期二 15:39\n天气：晴 26℃\n"
+            "巡检人：请输入巡检人\n今日水印\n防伪 TUEZAP"
+        ),
+    )
+    watermark.rerank_score = 0.68
+    useful = _figure(chunk_id=43122, content="[图片] 空调设备统计表 分体空调 制冷量")
+    useful.rerank_score = 0.66
+
+    result = SimpleNamespace(degraded=[], stage_debug={})
+    ordered = runtime.pipeline._prefer_prose_over_figures(
+        [handwrite, watermark, useful, prose], result, collect_debug=True
+    )
+    assert [c.chunk_id for c in ordered] == [43108]
+    assert "figure_recall_dropped" in result.degraded
+    assert result.stage_debug["figure_demote"]["prose_first"] is True
+    assert result.stage_debug["figure_demote"]["figure_kept"] == []
+
+
+def test_figure_is_junk_detects_ppt_photo_captions() -> None:
+    from ekbs.retrieval.pipeline import RetrievalPipeline
+
+    assert RetrievalPipeline._figure_is_junk(
+        "正常正常是 2026.10.26 已更换·是决\n正常正常是\n正常是 孙纳"
+    )
+    assert RetrievalPipeline._figure_is_junk(
+        "物业巡检水印\n巡检人：请输入巡检人\n今日水印\n防伪 ABC\n天气：晴 26℃"
+    )
+    assert not RetrievalPipeline._figure_is_junk("电表照片 DT862 读数 10544.9 kWh")
+
+
+async def test_factual_intent_attaches_bound_figures(seeded) -> None:
+    """非找图意图：文字命中后展开的绑定 figure 仍进入 figure_attachments。"""
+    runtime, _ = seeded
+    result = _result([_body(), _figure()], [], refused=False)
+    result.intent = "factual"
+    runtime.pipeline._apply_figure_adjustments(
+        result, result.retrieval, intent="factual", question="设备运维干了什么"
+    )
+    assert result.figure_attachments
+    assert result.figure_attachments[0]["chunk_id"] == 11

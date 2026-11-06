@@ -13,7 +13,8 @@
 * 代码：``parent`` 就是**符号本身**（顶层 class/def 没有子块）→ 必须入向量，
   否则整个代码知识库「存了但搜不到」；超长符号被切成 ``child`` 后，
   它的 ``parent`` 才退化成纯容器 → 由子块入向量；
-* 图片：``figure`` 没有子块 → 入向量，图上的文字才检索得到；
+* 图片：``figure`` **不入向量** —— 只作标题/章节文字下的附件（``parent_id`` 绑定），
+  由文字命中后再展开回源；题注/OCR 不再参与检索；
 * ``table``：有子块时是容器，无子块时是内容 —— 同一条规则自然覆盖。
 
 调用方一律用 :data:`RETRIEVABLE_PREDICATE`（表别名必须是 ``c``），不要再手写
@@ -22,9 +23,9 @@
 
 from __future__ import annotations
 
-#: 参与检索的块类型白名单。``summary`` 故意不在其中：文档摘要块是展示用的，
-#: 让它进向量会在语义检索里与正文抢名额。
-RETRIEVABLE_TYPES: tuple[str, ...] = ("parent", "child", "table", "figure")
+#: 参与检索的块类型白名单。``summary`` / ``figure`` 故意不在其中：
+#: 摘要是展示用；图片是文字分片的附件，像素与题注都不进召回。
+RETRIEVABLE_TYPES: tuple[str, ...] = ("parent", "child", "table")
 
 _TYPES_SQL = ", ".join(f"'{t}'" for t in RETRIEVABLE_TYPES)
 

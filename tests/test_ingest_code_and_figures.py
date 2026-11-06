@@ -160,15 +160,14 @@ async def test_markdown_without_source_path_keeps_heading_chunker(seeded) -> Non
     assert not any(p.startswith("普通制度 > ") for p in paths), paths
 
 
-async def test_figure_becomes_searchable_chunk(seeded) -> None:
-    """``figures=`` → ``chunk_type='figure'``：入向量、入 FTS、记得住回源路径。"""
+async def test_figure_becomes_bound_asset_not_retrievable(seeded) -> None:
+    """``figures=`` → 资产行挂 parent；不入向量/FTS；保留回源路径。"""
     runtime, summary = seeded
     image_rel = "parse/testfig/images/fig1.png"
     image_abs = runtime.settings.data_dir / image_rel
     image_abs.parent.mkdir(parents=True, exist_ok=True)
     image_abs.write_bytes(_PNG)
 
-    ocr_text = "组织架构图 总经理 下辖财务部与人力资源部"
     result = await _pipeline(runtime).ingest_markdown(
         title="带图文档",
         markdown="# 组织架构\n\n如图所示，公司设两个部门。\n",
@@ -180,7 +179,7 @@ async def test_figure_becomes_searchable_chunk(seeded) -> None:
             FigureInput(
                 image_path=image_rel,
                 caption="图 1 组织架构",
-                ocr_text=ocr_text,
+                ocr_text="组织架构图 总经理 下辖财务部与人力资源部",
                 page=3,
                 figure_id="图 1",
             ),
@@ -190,7 +189,7 @@ async def test_figure_becomes_searchable_chunk(seeded) -> None:
 
     with runtime.db.sync_connect() as conn:
         figs = conn.execute(
-            "SELECT chunk_id, content, figure_id, image_path, page_from, faiss_row "
+            "SELECT chunk_id, content, figure_id, image_path, page_from, faiss_row, parent_id "
             "FROM ekbs_chunk WHERE doc_id = ? AND chunk_type = 'figure'",
             (result.doc_id,),
         ).fetchall()
@@ -200,27 +199,28 @@ async def test_figure_becomes_searchable_chunk(seeded) -> None:
             "WHERE c.doc_id = ? AND c.chunk_type = 'figure'",
             (result.doc_id,),
         ).fetchone()["n"]
-        fts_raw = conn.execute(
-            "SELECT COUNT(*) AS n FROM ekbs_chunk_fts f JOIN ekbs_chunk c "
-            "ON c.chunk_id = CAST(f.chunk_id AS INTEGER) "
-            "WHERE c.doc_id = ? AND c.chunk_type = 'figure'",
-            (result.doc_id,),
-        ).fetchone()["n"]
+        parents = {
+            int(r["chunk_id"])
+            for r in conn.execute(
+                "SELECT chunk_id FROM ekbs_chunk WHERE doc_id = ? AND chunk_type = 'parent'",
+                (result.doc_id,),
+            ).fetchall()
+        }
 
     assert len(figs) == 1, f"期望 1 个 figure 块，实得 {len(figs)}"
     fig = figs[0]
     assert fig["figure_id"] == "图 1"
     assert fig["image_path"] == image_rel, "回源路径必须是相对 data_dir 的路径"
     assert fig["page_from"] == 3
-    assert fig["faiss_row"] is not None, "figure 块没进向量分片，图上文字就检索不到"
-    assert ocr_text.split()[0] in (fig["content"] or ""), fig["content"]
-    assert fts_rows == 1, "figure 块没进 FTS，关键词检索会漏图"
-    assert fts_raw >= 1, "Doc2Query 后 FTS 至少保留原文行"
+    assert fig["content"] == "[图片]", "图块正文只占位，不写 OCR/题注"
+    assert fig["faiss_row"] is None, "figure 不得进文本向量分片"
+    assert fts_rows == 0, "figure 不得进 FTS"
+    assert fig["parent_id"] in parents, "figure 必须挂到章节 parent"
     assert image_abs.exists(), "图片文件应当仍留在磁盘上（否则引用打不开）"
 
 
-async def test_figure_without_any_text_uses_doc_title_fallback(seeded) -> None:
-    """无题注/OCR 时用文档名兜底建块（OCR 默认关，教程截图常见无字）。"""
+async def test_figure_without_caption_still_bound_asset(seeded) -> None:
+    """无题注/OCR 仍建资产行并绑定 parent（不做识别、不入检索）。"""
     runtime, summary = seeded
     image_rel = "parse/testfig/images/blank.png"
     image_abs = runtime.settings.data_dir / image_rel
@@ -238,23 +238,24 @@ async def test_figure_without_any_text_uses_doc_title_fallback(seeded) -> None:
     )
     with runtime.db.sync_connect() as conn:
         figs = conn.execute(
-            "SELECT content, image_path FROM ekbs_chunk "
+            "SELECT content, image_path, parent_id FROM ekbs_chunk "
             "WHERE doc_id = ? AND chunk_type = 'figure'",
             (result.doc_id,),
         ).fetchall()
-    assert len(figs) == 1, "有文档名时应兜底建 figure 块"
-    assert "空图文档" in (figs[0]["content"] or "")
+    assert len(figs) == 1, "有路径即建 figure 资产行"
+    assert figs[0]["content"] == "[图片]"
     assert figs[0]["image_path"] == image_rel
+    assert figs[0]["parent_id"] is not None
 
 
-async def test_figure_without_text_or_title_is_dropped() -> None:
-    """连文档名都没有时，无字图仍不建块。"""
+async def test_figure_without_image_path_is_dropped() -> None:
+    """没有落盘路径的图不建块。"""
     from ekbs.ingest.chunker import chunk_markdown
 
     result = chunk_markdown(
         "# 正文\n\n有图。\n",
-        figures=(FigureInput(image_path="parse/x.png"),),
-        doc_title="",
+        figures=(FigureInput(image_path=""),),
+        doc_title="有标题",
     )
     assert result.figures == []
 
@@ -339,12 +340,13 @@ def test_retrievable_predicate_matches_leaf_rule() -> None:
     from ekbs.ingest.retrievable import RETRIEVABLE_TYPES, is_retrievable
 
     assert is_retrievable("child", has_children=False) is True
-    assert is_retrievable("figure", has_children=False) is True
+    assert is_retrievable("figure", has_children=False) is False, "图片只作附件，不入检索"
     assert is_retrievable("table", has_children=False) is True
     assert is_retrievable("parent", has_children=False) is True, "代码符号块必须可检索"
     assert is_retrievable("parent", has_children=True) is False, "Markdown 父容器不入向量"
     assert is_retrievable("summary", has_children=False) is False, "摘要块不抢检索名额"
     assert "summary" not in RETRIEVABLE_TYPES
+    assert "figure" not in RETRIEVABLE_TYPES
 
 
 # ---------------------------------------------------------------------------

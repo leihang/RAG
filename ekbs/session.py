@@ -82,6 +82,7 @@ INTENT_FACTUAL = "factual"
 INTENT_NUMERIC = "numeric"
 INTENT_FIGURE = "figure"
 INTENT_PROCEDURE = "procedure"
+INTENT_COMPARE = "compare"
 
 _NUMERIC_HINTS = (
     "多少", "多少钱", "是多少", "金额", "总价", "单价", "合计", "总计",
@@ -390,10 +391,17 @@ class QueryRewriter:
 
         只做**保守**判断：命中明确的取数/找图/流程词才给标签，否则一律 `factual` ——
         误判比不判更糟（取数路径有独立提示词与更严的校验）。
+
+        比较/排名（「谁更高」「最高」）优先于 numeric：否则「9月用电量谁更高」会因
+        「用量」命中取数路径，而取数铁律禁止计算，全局排序永远做不成。
         """
+        from ekbs.retrieval.table_rank import is_compare_rank_intent
+
         text = (question or "").strip()
         if any(hint in text for hint in _FIGURE_HINTS):
             return INTENT_FIGURE
+        if is_compare_rank_intent(text):
+            return INTENT_COMPARE
         if any(hint in text for hint in _NUMERIC_HINTS):
             return INTENT_NUMERIC
         if any(hint in text for hint in _PROCEDURE_HINTS):

@@ -89,6 +89,10 @@ retrieval:
   # （RAGFlow spreadsheet 口径）。Word/PDF/PPT 的表行不是记录，一律按 384 token
   # 行组叶子切（避免 55~115 token 的碎块，实测 doc 205）；来源判定在 ingest/chunker.py。
   table_row_chunks: true
+  month_series_infer_year_from_filename: false
+  table_leaf_policy: auto
+  table_leaf_sample_max: 64
+  table_leaf_sample_min_rows: 200
   # 确定性 Doc2Query：假设问句进 FTS（口语召回）；不写 FAISS、不调 LLM
   doc2query_enabled: true
   doc2query_max: 4
@@ -96,8 +100,8 @@ retrieval:
   multi_query: 3
   # 稠密侧多查询数（1=关）。本机联调：开启以便 A/B（向量与稀疏各 3）
   dense_multi_query: 3
-  # figure 多模态旁路（课程 17 / tongyi-embedding-vision-plus）：与文本 embed 分索引
-  figure_multimodal: true
+  # figure 多模态旁路：默认关。图片只作文字分片附件（parent 绑定），不进向量召回。
+  figure_multimodal: false
   # 多意图拆分（P0）：一次问多个问题时拆成子问，每子问独立召回 + 配额精排
   # rules=确定性规则（离线可测）；llm 在 batch 1 暂按 rules 兜底（待接线）
   intent_split:
@@ -187,9 +191,8 @@ parse:
   timeout_s: 1800
   worker_concurrency: 1
   keep_tmp_days: 7
-  # 给文档里的图片生成描述（走 models.vision）。打开后每张图一次调用；
-  # 描述按**图片内容哈希**缓存，重复解析/重复上传不会二次计费。
-  figure_caption: true
+  # 图片不做识别/题注：只提取落盘并绑定到标题下文字；回源不依赖 caption。
+  figure_caption: false
   # 未缓存图的视觉调用并发（与 MinerU 串行无关；限流靠云端 RPM）
   figure_caption_concurrency: 8
 

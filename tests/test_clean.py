@@ -138,6 +138,43 @@ def test_seal_and_signature_noise_stripped() -> None:
     assert "开户银行" in account.text
 
 
+def test_figure_handwrite_and_watermark_captions_demoted() -> None:
+    """PPT 现场照图注：手写误识 / 水印相机壳不得原样进检索（doc 221）。"""
+    from ekbs.ingest.clean import clean_figure_text, is_low_quality_figure_caption
+
+    handwrite = (
+        "正常正常是 2026.10.26 已更换·是决\n"
+        "正常正常是\n正常正常是 2026.10.26 黄伟\n"
+        "正常是 2026.10.26 未更换漏保已告知家长·孙纳\n"
+        "正常是 2026.10.26 未更换漏保已告知家长·杨梦\n"
+    )
+    assert is_low_quality_figure_caption(handwrite)
+    assert clean_figure_text(handwrite) == "[手写表格照片]"
+
+    watermark = (
+        "[图片] 物业巡检水印\n2026.10.13 星期二 15:39\n天气：晴 26℃\n"
+        "巡检人：请输入巡检人\n问题备注：\n地点：重庆市沙坪坝区虎溪街道美丽时光\n"
+        "DIY型多用户电表\n03 000000\n长兴街\n…马克…\n水印枢机\n真实时间\n"
+        "防伪 TUEZAP559QHM2"
+    )
+    assert is_low_quality_figure_caption(watermark)
+    assert clean_figure_text(watermark) == "[现场照片]"
+
+    # 长告知牌：含水印壳但正文足够 → 保留
+    plaque = (
+        "重庆·熙街\n生化池有限空间安全风险告知牌\n"
+        "主要危险有害因素：缺氧、有毒气体、易燃易爆\n"
+        "安全防范措施：（一）严格履行作业审批\n"
+        "（二）作业前必须进行通风换气和气体检测\n"
+        "应急处置措施：发现异常立即停止作业\n"
+        "报警急救电话：119、120\n"
+        + ("措施细则补充。\n" * 8)
+        + "今日水印\n防伪 ABC123"
+    )
+    assert not is_low_quality_figure_caption(plaque)
+    assert "生化池" in clean_figure_text(plaque)
+
+
 def test_cjk_ocr_gaps_and_typos() -> None:
     raw = "项目名 称=油过滤 器；委托方：有限责仕公司；公司庆两路支行"
     result = clean_markdown(raw)

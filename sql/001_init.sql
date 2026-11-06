@@ -583,6 +583,33 @@ CREATE TABLE IF NOT EXISTS ekbs_doc_recommend (
 );
 CREATE INDEX IF NOT EXISTS idx_doc_recommend_status ON ekbs_doc_recommend(status);
 
+-- 电子表格结构化观测（双写：chunks 负责定位/ACL，本表只服务受限聚合/查找）
+-- 表型 A–E 见 ekbs/ingest/table_types.py；unknown 不写本表。
+CREATE TABLE IF NOT EXISTS ekbs_table_observation (
+    obs_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id         INTEGER NOT NULL REFERENCES ekbs_document(doc_id) ON DELETE CASCADE,
+    shard_id       TEXT    NOT NULL,
+    table_id       TEXT    NOT NULL DEFAULT '',
+    table_type     TEXT    NOT NULL,                 -- A|B|C|D|E
+    entity_key     TEXT    NOT NULL DEFAULT '',
+    entity_label   TEXT    NOT NULL DEFAULT '',
+    period         TEXT    NOT NULL DEFAULT '',
+    metric         TEXT    NOT NULL DEFAULT '',
+    value          REAL,
+    value_surface  TEXT    NOT NULL DEFAULT '',
+    line_role      TEXT    NOT NULL DEFAULT 'normal', -- normal|subtotal|total
+    source_row     INTEGER,
+    chunk_id       INTEGER,
+    attrs_json     TEXT    NOT NULL DEFAULT '{}',
+    created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_obs_shard_type_period
+    ON ekbs_table_observation(shard_id, table_type, period);
+CREATE INDEX IF NOT EXISTS idx_obs_doc_table
+    ON ekbs_table_observation(doc_id, table_id);
+CREATE INDEX IF NOT EXISTS idx_obs_entity
+    ON ekbs_table_observation(entity_key);
+
 -- =============================================================================
 -- 初始化标记：应用层据此判断 Schema 是否已建立
 -- =============================================================================

@@ -152,7 +152,10 @@ def test_page_title_fallback_gives_textless_figures_search_text(sample_pptx: Pat
     )
     figure_nodes = [n for n in result.nodes if n.chunk_type == "figure"]
     assert len(figure_nodes) == 2, [(n.chunk_type, n.content) for n in result.nodes]
-    assert all("图片" in n.content for n in figure_nodes)
+    assert all(n.content == "[图片]" for n in figure_nodes)
+    parents = [i for i, n in enumerate(result.nodes) if n.chunk_type == "parent"]
+    assert parents, "PPT 应有页级 parent"
+    assert all(n.parent_index in parents for n in figure_nodes), "图应挂到同页 parent"
 
 
 def test_only_largest_textless_figure_per_page_gets_title(tmp_path: Path) -> None:

@@ -1136,13 +1136,35 @@ def _is_section_title_row(values: list[str]) -> bool:
     return len(nonempty) == 1 and len(nonempty[0]) <= 40 and len(str(values)) >= 1
 
 
-def _convert_date_serials_in_header(values: list[str]) -> list[str]:
-    """无日期格式的 Excel 日期序列号：仅当本行含“日期/date”时按日期转换。
+def _excel_serials_look_like_calendar(serials: list[int]) -> bool:
+    """多个 Excel 序列号是否像「按月铺开的日期表头」（相邻差约 28–31 天）。
 
-    实测《2026年9月能耗分析》表头 B3:D3 = 46295/45930/46265，单元格格式是 General，
-    openpyxl 不会标记为日期；不转换会让模型把三列当成三个无名字段。
+    抄表读数也会落在 20000–80000，但相邻差是用量（成百上千），不会整行都是 ~30。
     """
-    if not any(("日期" in v) or ("date" in v.lower()) for v in values):
+    uniq = sorted(set(serials))
+    if len(uniq) < 2:
+        return False
+    diffs = [b - a for a, b in zip(uniq, uniq[1:])]
+    monthish = sum(1 for d in diffs if 27 <= d <= 32)
+    return monthish >= max(1, (len(diffs) + 1) // 2)
+
+
+def _convert_date_serials_in_header(values: list[str]) -> list[str]:
+    """无日期格式的 Excel 日期序列号 → ``YYYY-MM-DD``。
+
+    触发条件（任一）：
+    * 本行含“日期/date”（原口径，用电分析「金额 日期」行）；
+    * 或本行 ≥2 个序列号呈按月间隔（水费/熙丰：日期在上一行、字段名在下一行，
+      日期行本身没有「日期」二字，旧逻辑会把 45292 当成「上月起度」的值）。
+    """
+    serial_nums = [
+        int(str(v).strip())
+        for v in values
+        if str(v).strip().isdigit() and 20000 <= int(str(v).strip()) <= 80000
+    ]
+    has_date_word = any(("日期" in str(v)) or ("date" in str(v).lower()) for v in values)
+    calendar_like = len(serial_nums) >= 2 and _excel_serials_look_like_calendar(serial_nums)
+    if not has_date_word and not calendar_like:
         return values
     out = list(values)
     for i, value in enumerate(out):
@@ -1150,7 +1172,7 @@ def _convert_date_serials_in_header(values: list[str]) -> list[str]:
         if not text.isdigit():
             continue
         n = int(text)
-        # Excel 日期序列：约 1954-2119 年；只在该行明确是日期行时启用
+        # Excel 日期序列：约 1954-2119 年
         if not (20000 <= n <= 80000):
             continue
         try:
@@ -1403,11 +1425,42 @@ def _xlsx_span_maps(
     return masters, covered
 
 
+def _xlsx_collect_header_rows(
+    rows_with_nums: list[tuple[int, list[str]]],
+    header_abs: int | None,
+) -> list[int]:
+    """字段名行 + 紧邻上方的日期子表头 → 显式多行表头（均标 ``<th>``）。
+
+    水费/熙丰：日期行在字段名行之上；气费：``抄表日期`` 行在 ``起度`` 行之上。
+    解析阶段钉死，序列化只消费 ``<th>``，避免二次猜测把读数并进表头。
+    """
+    from ekbs.ingest.table_serialize import _row_looks_like_date_header
+
+    if header_abs is None:
+        return []
+    row_nums = [n for n, _v in rows_with_nums]
+    if header_abs not in row_nums:
+        return [header_abs]
+    header_rows = [header_abs]
+    hi = row_nums.index(header_abs)
+    for look in range(hi - 1, -1, -1):
+        _n, values = rows_with_nums[look]
+        converted = _convert_date_serials_in_header(list(values))
+        if _row_looks_like_date_header(converted):
+            header_rows.insert(0, _n)
+            # 写回转换后的日期，后面 HTML 用 rows 文本时与 sheet 口径一致
+            rows_with_nums[look] = (_n, converted)
+        else:
+            break
+    return header_rows
+
+
 def _xlsx_rows_to_html(
     sheet: Any,
     rows_with_nums: list[tuple[int, list[str]]],
     *,
     header_row: int | None = None,
+    header_rows: Sequence[int] | None = None,
 ) -> str:
     """把 Excel 数据块还原成带 colspan/rowspan 的 HTML 表格（复核页对照用）。
 
@@ -1415,6 +1468,9 @@ def _xlsx_rows_to_html(
     ``sheet`` 上。之前这里输出 Markdown 管道表，复核页 iframe 里显示的是 ``| a | b |``
     文本，和原件表格对不上；改成 HTML 后复核页可逐格对照，检索侧仍由
     ``parse_table_html`` 摊平单元格。
+
+    ``header_rows``：多级表头（日期行 + 字段名行）全部标 ``<th>``；兼容旧参数
+    ``header_row``（单行）。
     """
     if not rows_with_nums:
         return ""
@@ -1427,30 +1483,62 @@ def _xlsx_rows_to_html(
     if width <= 0:
         return ""
 
+    header_set = {int(n) for n in (header_rows or ())}
+    if header_row is not None:
+        header_set.add(int(header_row))
+
     masters, covered = _xlsx_span_maps(sheet, row_numbers, width)
-    # 表头里的 General 日期序列号（46295）也要转成可读日期；与行文本口径一致。
-    header_text: dict[int, str] = {}
-    if header_row is not None and header_row in row_numbers:
-        raw_header = [
-            _xlsx_cell_text(sheet.cell(header_row, col)) for col in range(1, width + 1)
-        ]
-        header_text = {
-            col: text for col, text in enumerate(_convert_date_serials_in_header(raw_header), 1)
-        }
+    # 预计算的块内文本（含日期序列转换）；表头行优先用它，避免 sheet 再读丢转换。
+    preset: dict[int, list[str]] = {
+        n: list(vals) for n, vals in rows_with_nums if n in header_set
+    }
+    row_texts: dict[int, list[str]] = {}
+    for row_number in row_numbers:
+        if row_number in preset:
+            raw = list(preset[row_number])
+            if len(raw) < width:
+                raw.extend(
+                    _xlsx_cell_text(sheet.cell(row_number, col))
+                    for col in range(len(raw) + 1, width + 1)
+                )
+            row_texts[row_number] = _convert_date_serials_in_header(raw[:width])
+        else:
+            raw = [_xlsx_cell_text(sheet.cell(row_number, col)) for col in range(1, width + 1)]
+            row_texts[row_number] = _convert_date_serials_in_header(raw)
     rows_html: list[str] = []
     for row_number in row_numbers:
-        cells: list[str] = []
-        for col in range(1, width + 1):
-            if (row_number, col) in covered:
-                continue
-            cell = sheet.cell(row_number, col)
-            text = (
-                header_text.get(col, "")
-                if row_number == header_row
-                else _xlsx_cell_text(cell)
-            ).replace("\n", "<br>")
-            tag = "th" if header_row is not None and row_number == header_row else "td"
-            attrs = ""
+        row_html = _xlsx_emit_html_row(
+            row_number=row_number,
+            width=width,
+            texts=row_texts[row_number],
+            is_header=row_number in header_set,
+            covered=covered,
+            masters=masters,
+        )
+        if row_html:
+            rows_html.append(row_html)
+    return ("<table>" + "".join(rows_html) + "</table>") if rows_html else ""
+
+
+def _xlsx_emit_html_row(
+    *,
+    row_number: int,
+    width: int,
+    texts: list[str],
+    is_header: bool,
+    covered: set[tuple[int, int]],
+    masters: dict[tuple[int, int], tuple[int, int, int, int]],
+) -> str:
+    """单行 → ``<tr>…</tr>``；表头行平坦输出（合并文字已灌格），数据行保留 span。"""
+    cells: list[str] = []
+    for col in range(1, width + 1):
+        # 表头行：合并区已由 `_fill_xlsx_merged_header` 灌进每格，避免 colspan 从格变空 → `列2`
+        if not is_header and (row_number, col) in covered:
+            continue
+        text = (texts[col - 1] if col - 1 < len(texts) else "").replace("\n", "<br>")
+        tag = "th" if is_header else "td"
+        attrs = ""
+        if not is_header:
             master = masters.get((row_number, col))
             if master is not None:
                 _min_r, _min_c, max_r, max_c = master
@@ -1460,10 +1548,8 @@ def _xlsx_rows_to_html(
                     attrs += f' rowspan="{rowspan}"'
                 if colspan > 1:
                     attrs += f' colspan="{colspan}"'
-            cells.append(f"<{tag}{attrs}>{html.escape(text)}</{tag}>")
-        if cells:
-            rows_html.append("<tr>" + "".join(cells) + "</tr>")
-    return ("<table>" + "".join(rows_html) + "</table>") if rows_html else ""
+        cells.append(f"<{tag}{attrs}>{html.escape(text)}</{tag}>")
+    return ("<tr>" + "".join(cells) + "</tr>") if cells else ""
 
 
 def xlsx_sheet_html(sheet: Any, *, header_row: int | None = None) -> str:
@@ -1508,14 +1594,24 @@ def _xlsx_serialize_blocks(
         if header_abs is not None:
             _fill_xlsx_merged_header(sheet, rows_with_nums, header_abs)
             rows_with_nums = [(n, list(v)) for n, v in rows_with_nums]
+        header_abs_list = _xlsx_collect_header_rows(rows_with_nums, header_abs)
+        for hr in header_abs_list:
+            if hr != header_abs:
+                _fill_xlsx_merged_header(sheet, rows_with_nums, hr)
+        if header_abs_list:
+            rows_with_nums = [(n, list(v)) for n, v in rows_with_nums]
         header_idx = row_nums.index(header_abs) if header_abs in row_nums else 0
         if not form_like and header_abs is not None:
             parts = _split_rows_at_image_anchors(rows_with_nums, header_idx, anchor_rows)
         else:
             parts = [rows_with_nums]
         for part_index, part in enumerate(parts, start=1):
-            part_header = header_abs if any(n == header_abs for n, _v in part) else None
-            body = _xlsx_rows_to_html(sheet, part, header_row=part_header)
+            part_nums = {n for n, _v in part}
+            part_headers = [n for n in header_abs_list if n in part_nums]
+            part_header = header_abs if header_abs in part_nums else None
+            body = _xlsx_rows_to_html(
+                sheet, part, header_row=part_header, header_rows=part_headers or None
+            )
             if not body:
                 continue
             state.table_seq += 1

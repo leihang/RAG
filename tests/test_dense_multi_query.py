@@ -96,6 +96,7 @@ def test_dense_variant_count_one_means_disabled(settings) -> None:
         ("有没有现场照片", INTENT_FIGURE),
         ("交接班要怎么处理接班人迟到", INTENT_PROCEDURE),
         ("公司名称是什么", INTENT_FACTUAL),
+        ("大户用电分析，9月用电量谁更高", "compare"),
     ],
 )
 def test_intent_detection_is_conservative(settings, question: str, intent: str) -> None:

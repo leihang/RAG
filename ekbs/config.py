@@ -167,11 +167,24 @@ class RetrievalCfg(_Section):
     #: 稠密要语义变体（自然语言改写）。分开才能独立 A/B，且默认不改变生产行为。
     dense_multi_query: int = 1
     #: figure 图片进多模态旁路索引，检索时作为 RRF 第三路（课程 17）
-    figure_multimodal: bool = True
+    #: 图片多模态旁路召回。默认关：图片只作文字分片附件，不进向量检索。
+    figure_multimodal: bool = False
     #: 表格按"一行一个块"切（RAGFlow spreadsheet 口径）。**只对电子表格生效**
     #: （xlsx/xls/xlsm）；Word/PDF/PPT 与未知来源一律走 384 token 行组叶子
     #: （``chunker.TABLE_LEAF_TOKENS``），来源判定在 ``chunk_markdown``。
+    #: 开发/生产均应显式写 ``true``（dev 缺键曾导致月份宽表不熔）；默认 False 仅兜底。
     table_row_chunks: bool = False
+    #: 月份宽表无显式年列时，是否允许从文件名/题注推断年份再熔成长叶子。
+    #: **默认关**（安全默认：缺年列则不熔，避免跨年错位）；产品要「文件名含 2026」再熔时再开。
+    month_series_infer_year_from_filename: bool = False
+    #: 电子表格叶子嵌入策略：``auto``（B 型大表明细抽样进 FAISS，全量写观测表）|
+    #: ``full``（所有可检索叶子都嵌）| ``sample``（强制抽样）。
+    table_leaf_policy: str = "auto"
+    #: ``table_leaf_policy=auto/sample`` 时，B 型表明细最多嵌入多少叶子
+    #: （1 条摘要叶 + 头尾/均匀抽样行；合计 ≤ 本值）。全量行仍写观测表。
+    table_leaf_sample_max: int = 64
+    #: B 型表超过该行数才启用抽样（否则仍全量叶子，便于小表明细定位）。
+    table_leaf_sample_min_rows: int = 200
 
 
 class EmbedCfg(_Section):

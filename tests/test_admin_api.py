@@ -199,7 +199,7 @@ async def test_system_health_and_shards_expose_gates(client, seeded) -> None:
     admin_id = grant_role(runtime, "demo_carol", "kb_admin")
     headers = headers_for(admin_id)
     health = (await client.get("/api/v1/system/health", headers=headers)).json()
-    assert health["schema"]["ok"] is True and health["schema"]["tables"] == 33
+    assert health["schema"]["ok"] is True and health["schema"]["tables"] == 34
     assert health["embedding"]["fingerprint_match"] is True
     assert health["gates"] == {
         "corpus_egress_ack": False, "l3_ingest_enabled": False, "l4_enabled": False,

@@ -1,12 +1,18 @@
-"""确定性表格序列化 —— 产出可检索的 ``information_block`` 文本（`docs/spec/20` §3.4）。
+"""确定性表格序列化 —— 产出可检索的 ``information_block`` 文本。
 
-**不走云端 LLM**：同表同输出、无出网、可单测。复杂合并单元格的语义补全留给后续
-可选 LLM 开关；本模块先保证数值/档次类问答能独立召回整表块。
+**不走云端 LLM**：同表同输出、无出网、可单测。
+
+口径（与 chunker 父/叶子配合，已偏离旧「整表一个 LLM chunk」规格）：
+
+* 解析层可给出连续 ``<th>`` 多级表头（日期行+字段名）；本模块优先消费，启发式仅兜底；
+* 宽抄表按「身份列 + 单个指标组」切开，相关表头只带本组列；
+* 电子表格 ``row_chunks`` 时一行一块（仍超预算则列窗）；父容器超 2048 由 chunker 分段。
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Sequence
 
@@ -33,6 +39,7 @@ class _TableHTMLParser(HTMLParser):
         self._in_cell = False
         self._colspan = 1
         self._rowspan = 1
+        self._cell_tag = "td"
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         name = tag.lower()
@@ -42,6 +49,7 @@ class _TableHTMLParser(HTMLParser):
         if name in {"td", "th"} and self._row is not None:
             self._cell = []
             self._in_cell = True
+            self._cell_tag = name
             self._colspan = 1
             self._rowspan = 1
             for key, value in attrs:
@@ -58,12 +66,14 @@ class _TableHTMLParser(HTMLParser):
                     "text": "".join(self._cell).strip(),
                     "colspan": self._colspan,
                     "rowspan": self._rowspan,
+                    "tag": self._cell_tag,
                 }
             )
             self._cell = None
             self._in_cell = False
             self._colspan = 1
             self._rowspan = 1
+            self._cell_tag = "td"
         elif name == "tr" and self._row is not None:
             if self._row:
                 self.raw_rows.append(self._row)
@@ -125,17 +135,38 @@ def _expand_spans(raw_rows: Sequence[Sequence[dict[str, Any]]]) -> list[list[str
     return grid
 
 
+def _leading_th_row_count(raw_rows: Sequence[Sequence[dict[str, Any]]]) -> int:
+    """开头连续「整行都是 th」的行数；xlsx 多级表头靠这个传到序列化，不再二次猜。"""
+    count = 0
+    for raw in raw_rows:
+        if not raw:
+            break
+        tags = {str(cell.get("tag") or "td").lower() for cell in raw}
+        if tags == {"th"}:
+            count += 1
+        else:
+            break
+    return count
+
+
 def parse_table_html(html: str) -> list[list[str]]:
     """HTML → 二维单元格（``colspan``/``rowspan`` 已展开成等宽网格）；失败返回空表。"""
+    rows, _header_n = parse_table_html_with_headers(html)
+    return rows
+
+
+def parse_table_html_with_headers(html: str) -> tuple[list[list[str]], int]:
+    """同 :func:`parse_table_html`，额外返回开头连续 ``<th>`` 行数（0=无显式表头）。"""
     if not (html or "").strip():
-        return []
+        return [], 0
     parser = _TableHTMLParser()
     try:
         parser.feed(html)
         parser.close()
     except Exception:
-        return []
-    return _expand_spans(parser.raw_rows)
+        return [], 0
+    header_n = _leading_th_row_count(parser.raw_rows)
+    return _expand_spans(parser.raw_rows), header_n
 
 
 def parse_table_markdown(text: str) -> list[list[str]]:
@@ -155,17 +186,23 @@ def parse_table_markdown(text: str) -> list[list[str]]:
 
 def coerce_rows(body: str) -> list[list[str]]:
     """优先当 HTML 解析；否则尝试 Markdown 管道表；再否则整段当单行。"""
+    rows, _header_n = coerce_rows_with_headers(body)
+    return rows
+
+
+def coerce_rows_with_headers(body: str) -> tuple[list[list[str]], int]:
+    """同 :func:`coerce_rows`，附带显式 ``<th>`` 表头行数。"""
     text = (body or "").strip()
     if not text:
-        return []
+        return [], 0
     if "<table" in text.lower() or "<tr" in text.lower():
-        rows = parse_table_html(text)
+        rows, header_n = parse_table_html_with_headers(text)
         if rows:
-            return rows
+            return rows, header_n
     rows = parse_table_markdown(text)
     if rows:
-        return rows
-    return [[text]]
+        return rows, 0
+    return [[text]], 0
 
 
 def _is_title_row(row: Sequence[str]) -> bool:
@@ -265,6 +302,91 @@ def _strip_title_rows(matrix: list[list[str]]) -> tuple[list[str], list[list[str
     return titles, matrix
 
 
+_DATE_CELL_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _row_mostly_numeric(row: Sequence[str]) -> bool:
+    """行内非空格半数以上是数字 → 数据行，不能当子表头合并。"""
+    nonempty = [str(c).strip() for c in row if str(c).strip()]
+    if len(nonempty) < 2:
+        return False
+    numeric = sum(1 for c in nonempty if _is_numeric_cell(c))
+    return numeric * 2 >= len(nonempty)
+
+
+def _is_excel_date_serial_text(text: str) -> bool:
+    raw = str(text or "").strip()
+    return bool(raw.isdigit() and 20000 <= int(raw) <= 80000)
+
+
+def _excel_serials_look_like_calendar(serials: list[int]) -> bool:
+    """与 parser 同口径：相邻差约 28–31 → 按月日期表头，不是抄表读数。"""
+    uniq = sorted(set(serials))
+    if len(uniq) < 2:
+        return False
+    diffs = [b - a for a, b in zip(uniq, uniq[1:])]
+    monthish = sum(1 for d in diffs if 27 <= d <= 32)
+    return monthish >= max(1, (len(diffs) + 1) // 2)
+
+
+def _row_looks_like_date_header(row: Sequence[str]) -> bool:
+    """日期子表头：已是 YYYY-MM-DD，或 General 序列号呈按月间隔。"""
+    cells = [str(c).strip() for c in row]
+    dates = [c for c in cells if _DATE_CELL_RE.match(c)]
+    if len(dates) >= 2:
+        return True
+    serials = [int(c) for c in cells if _is_excel_date_serial_text(c)]
+    return len(serials) >= 2 and _excel_serials_look_like_calendar(serials)
+
+
+def _coerce_date_cell(text: str) -> str:
+    raw = str(text or "").strip()
+    if _DATE_CELL_RE.match(raw):
+        return raw
+    if _is_excel_date_serial_text(raw):
+        try:
+            from openpyxl.utils.datetime import from_excel
+
+            return from_excel(int(raw)).strftime("%Y-%m-%d")
+        except Exception:
+            return raw
+    return ""
+
+
+def _forward_fill_date_row(row: Sequence[str], width: int) -> list[str]:
+    """把稀疏日期行（合并单元格留下的空格）按列前向填充。
+
+    非日期的标签格（序号/户号）会打断填充，避免把日期灌进身份列。
+    """
+    out = [""] * width
+    last = ""
+    for i in range(width):
+        cell = str(row[i]).strip() if i < len(row) else ""
+        dated = _coerce_date_cell(cell)
+        if dated:
+            last = dated
+            out[i] = last
+        elif cell:
+            last = ""
+            out[i] = ""
+        else:
+            out[i] = last
+    return out
+
+
+def _apply_date_row_to_headers(headers: list[str], date_row: Sequence[str]) -> list[str]:
+    """字段名行 + 上方日期行 → ``上月起度/2024-01-01``。"""
+    filled = _forward_fill_date_row(date_row, len(headers))
+    out: list[str] = []
+    for i, header in enumerate(headers):
+        date = filled[i] if i < len(filled) else ""
+        if date and header and date not in header:
+            out.append(f"{header}/{date}")
+        else:
+            out.append(header)
+    return out
+
+
 def _split_header_rows(
     rows: Sequence[Sequence[str]],
 ) -> tuple[list[str], list[list[str]]]:
@@ -279,6 +401,10 @@ def _split_header_rows(
     # 仅当第一行有空列、第二行恰好补上这些列时，才认为是两行表头
     filled = [i for i, c in enumerate(sub) if c]
     if not top or not any(not top[i] and sub[i] for i in filled):
+        return [h or f"列{i+1}" for i, h in enumerate(top)], list(rows[1:])
+    # 气费账单事故：顶行 `"" | 起度 | 止度…`，下一行已是 `锅炉 | 379749 | …`。
+    # 空首列触发合并后「相关表头」变成读数。子行半数以上数字 → 当作数据，不合并。
+    if _row_mostly_numeric(sub):
         return [h or f"列{i+1}" for i, h in enumerate(top)], list(rows[1:])
     headers: list[str] = []
     #: 上一列的主表头。横向合并（colspan）的从格在矩阵里是空串，若不继承，
@@ -298,17 +424,71 @@ def _split_header_rows(
 
 def _resolve_headers_and_data(
     matrix: list[list[str]],
+    *,
+    header_row_count: int = 0,
 ) -> tuple[bool, list[str], list[list[str]]]:
-    """确定 (form_like, headers, data_rows)。"""
+    """确定 (form_like, headers, data_rows)。
+
+    ``header_row_count``：解析层写入的连续 ``<th>`` 行数（日期行+字段名行）。>0 时
+    直接消费，不再 `_pick_header_index` 二次猜测。
+    """
     form_like = _looks_like_form(matrix)
     if form_like:
         # 表单不伪造表头：保留所有行，列名用列序号，行内仍是原值（标签在值里）。
         headers = [f"列{i + 1}" for i in range(max(len(r) for r in matrix))]
         return True, headers, matrix
-    header_index = _pick_header_index(matrix)
-    before_header = matrix[:header_index]
-    headers, data_rows = _split_header_rows(matrix[header_index:])
-    data_rows = [*before_header, *data_rows]
+
+    date_rows: list[list[str]] = []
+    if header_row_count > 0:
+        n = min(int(header_row_count), len(matrix))
+        header_block = matrix[:n]
+        data_rows = [list(r) for r in matrix[n:]]
+        # 多行 th：日期行并进字段名；字段行走父子合并。
+        # Word 式 rowspan 表头常是「一行 th + 下一行 td 子表头」—— th 计数只有 1，
+        # 仍要把紧邻的非数字行交给 `_split_header_rows` 合并。
+        field_rows: list[list[str]] = []
+        for row in header_block:
+            if _row_looks_like_date_header(row):
+                date_rows.append(list(row))
+            else:
+                field_rows.append(list(row))
+        if (
+            len(field_rows) == 1
+            and data_rows
+            and not _row_mostly_numeric(data_rows[0])
+        ):
+            # Word rowspan：一行 th + 下一行 td 子表头
+            headers, rest = _split_header_rows([field_rows[0], data_rows[0]])
+            if not rest:  # 合并成功，子表头行已吃掉
+                data_rows = list(data_rows[1:])
+            else:
+                headers, rest2 = _split_header_rows(field_rows)
+                data_rows = [*rest2, *data_rows]
+        elif field_rows:
+            headers, rest = _split_header_rows(field_rows)
+            data_rows = [*rest, *data_rows]
+        elif date_rows:
+            headers = [str(c).strip() or f"列{i+1}" for i, c in enumerate(date_rows[0])]
+            date_rows = date_rows[1:]
+        else:
+            headers = [f"列{i + 1}" for i in range(max(len(r) for r in matrix))]
+    else:
+        header_index = _pick_header_index(matrix)
+        before_header = matrix[:header_index]
+        headers, data_rows = _split_header_rows(matrix[header_index:])
+        # 兜底：无显式 th 时仍把 before_header 里的日期行并进列名（旧 HTML / Markdown）。
+        kept_before: list[list[str]] = []
+        for row in before_header:
+            if _row_looks_like_date_header(row):
+                date_rows.append(list(row))
+            else:
+                kept_before.append(list(row))
+        while data_rows and _row_looks_like_date_header(data_rows[0]):
+            date_rows.append(list(data_rows.pop(0)))
+        data_rows = [*kept_before, *data_rows]
+
+    for date_row in date_rows:
+        headers = _apply_date_row_to_headers(headers, date_row)
     # 无表头只有一行时：整行当数据，用列序号作表头
     if not data_rows:
         data_rows = [matrix[0]]
@@ -377,11 +557,400 @@ def _format_row(cells: Sequence[str], headers: Sequence[str]) -> str:
     return "; ".join(f"{header}={values[i]}" for i, header in enumerate(headers))
 
 
+#: 宽月份表 → tidy 长叶子（一行一个「实体×年×月」观测）。比较/排名题靠它做同行集合召回。
+_MONTH_HEADER_RE = re.compile(r"^(\d{1,2})\s*月$")
+_YEAR_VALUE_RE = re.compile(r"^(20\d{2})\s*年?$")
+_YEAR_HEADER_RE = re.compile(r"^(年度|年份|年)$")
+#: 排名摘要块默认 TopN
+_MONTH_RANK_TOP_N = 10
+
+
+@dataclass(frozen=True)
+class _MonthSeriesLayout:
+    """宽月份表布局：身份列 + 年度列 + 1–12 月列。"""
+
+    identity: tuple[tuple[int, str], ...]  # (col_idx, header)
+    year_col: int
+    year_header: str
+    months: tuple[tuple[int, int], ...]  # (col_idx, month 1-12)
+    category: str
+    metric: str
+    #: 无物理年列时由文件名/题注推断的年份（仅开关开启时使用）
+    default_year: str | None = None
+
+
+def _metric_name_from_caption(caption: str) -> str:
+    text = caption or ""
+    if "用电" in text:
+        return "用电量"
+    if "用水" in text:
+        return "用水量"
+    if "用气" in text or "燃气" in text:
+        return "用气量"
+    return "数值"
+
+
+def _category_from_caption(caption: str) -> str:
+    """``大户用电监视（第1段）（… / 餐饮）`` → ``餐饮``。"""
+    match = re.search(r"/\s*([^/）\)]+?)\s*[）)]\s*$", caption or "")
+    return match.group(1).strip() if match else ""
+
+
+def _normalize_year_value(raw: str) -> str:
+    match = _YEAR_VALUE_RE.match((raw or "").strip())
+    return match.group(1) if match else (raw or "").strip()
+
+
+def _headers_uniform_label(headers: Sequence[str]) -> str | None:
+    """全列同标签（分节后伪表头，如整行「娱乐」）→ 返回该标签；否则 None。"""
+    labels = [str(h).strip() for h in headers if str(h).strip()]
+    if len(labels) < 4:
+        return None
+    first = labels[0]
+    if _MONTH_HEADER_RE.match(first) or _YEAR_HEADER_RE.match(first):
+        return None
+    if all(label == first for label in labels):
+        return first
+    return None
+
+
+def _find_year_column(data_rows: Sequence[Sequence[str]], width: int) -> int | None:
+    """数据里哪一列多数是 ``2024年`` / ``2026`` 这种年份。"""
+    if not data_rows or width <= 0:
+        return None
+    best_col, best_hits = None, 0
+    for col in range(width):
+        hits = 0
+        for row in data_rows:
+            cell = str(row[col]).strip() if col < len(row) else ""
+            if cell and _YEAR_VALUE_RE.match(cell):
+                hits += 1
+        if hits > best_hits:
+            best_col, best_hits = col, hits
+    if best_col is None or best_hits < max(1, len(data_rows) // 3):
+        return None
+    return best_col
+
+
+def _identity_header_names(count: int) -> list[str]:
+    """无可靠表头时的身份列命名：两列默认铺号/用户名（大户监视表口径）。"""
+    if count <= 0:
+        return []
+    if count == 1:
+        return ["名称"]
+    if count == 2:
+        return ["铺号", "用户名"]
+    return ["铺号", "用户名", *[f"列{i + 1}" for i in range(2, count)]]
+
+
+def _month_cols_from_headers(headers: Sequence[str]) -> list[tuple[int, int]]:
+    found: list[tuple[int, int]] = []
+    for idx, header in enumerate(headers):
+        match = _MONTH_HEADER_RE.match(str(header).strip())
+        if not match:
+            continue
+        month = int(match.group(1))
+        if 1 <= month <= 12:
+            found.append((idx, month))
+    return found
+
+
+def _resolve_year_col_for_months(
+    headers: Sequence[str],
+    data_rows: Sequence[Sequence[str]],
+    width: int,
+    synthetic_year: str | None,
+) -> int | None:
+    """表头/数据年列；缺年且无 synthetic → None（不熔）。"""
+    year_col = next(
+        (i for i, h in enumerate(headers) if _YEAR_HEADER_RE.match(str(h).strip())),
+        None,
+    )
+    if year_col is None:
+        year_col = _find_year_column(data_rows, width)
+    if year_col is not None:
+        return year_col
+    if synthetic_year is None:
+        # Phase A 安全默认（单测钉死）：铺号|用户名|1月… 且无年列 → **不熔**。
+        # 缺年无法同行跨月对齐；禁止静默用文件名猜年（须显式传 default_year，
+        # 对应 retrieval.month_series_infer_year_from_filename，默认关）。
+        return None
+    return width  # 虚拟年列：熔时读 default_year
+
+
+def _identity_before_year(
+    headers: Sequence[str],
+    *,
+    width: int,
+    year_col: int,
+    months: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, str], ...]:
+    month_idxs = {m[0] for m in months}
+    identity = tuple(
+        (i, str(headers[i]).strip() or f"列{i + 1}")
+        for i in range(width)
+        if i != year_col and i not in month_idxs
+    )
+    if year_col < width:
+        return tuple((i, name) for i, name in identity if i < year_col)
+    first_month = min(m[0] for m in months)
+    return tuple((i, name) for i, name in identity if i < first_month)
+
+
+def _layout_from_month_headers(
+    headers: Sequence[str],
+    data_rows: Sequence[Sequence[str]],
+    *,
+    months: Sequence[tuple[int, int]],
+    category: str,
+    metric: str,
+    synthetic_year: str | None,
+) -> _MonthSeriesLayout | None:
+    width = len(headers)
+    year_col = _resolve_year_col_for_months(headers, data_rows, width, synthetic_year)
+    if year_col is None:
+        return None
+    identity = _identity_before_year(
+        headers, width=width, year_col=year_col, months=months
+    )
+    if not identity:
+        return None
+    return _MonthSeriesLayout(
+        identity=identity,
+        year_col=year_col,
+        year_header=(
+            str(headers[year_col]).strip() or "年度" if year_col < width else "年度"
+        ),
+        months=tuple(months),
+        category=category,
+        metric=metric,
+        default_year=synthetic_year if year_col >= width else None,
+    )
+
+
+def _infer_months_after_year(
+    data_rows: Sequence[Sequence[str]], *, year_col: int, width: int
+) -> list[tuple[int, int]]:
+    """年份列后连续数值列推断为 1..N 月（至少要 6 列才算系列）。"""
+    inferred: list[tuple[int, int]] = []
+    for offset, col in enumerate(range(year_col + 1, min(width, year_col + 1 + 12))):
+        numeric_hits = 0
+        nonempty = 0
+        for row in data_rows:
+            cell = str(row[col]).strip() if col < len(row) else ""
+            if not cell:
+                continue
+            nonempty += 1
+            try:
+                float(cell.replace(",", ""))
+                numeric_hits += 1
+            except ValueError:
+                pass
+        if nonempty == 0 or numeric_hits >= max(1, nonempty // 2):
+            inferred.append((col, offset + 1))
+        else:
+            break
+    return inferred
+
+
+def detect_month_series_layout(
+    headers: Sequence[str],
+    data_rows: Sequence[Sequence[str]],
+    *,
+    caption: str = "",
+    default_year: str | None = None,
+) -> _MonthSeriesLayout | None:
+    """识别「身份 + 年度 + 1–12 月」宽表；分节伪表头也走数据形态兜底。
+
+    ``default_year``：仅当配置 ``month_series_infer_year_from_filename=true`` 时由调用方
+    传入（文件名/题注推断）。**默认 ``None`` = 缺年列则不熔**（安全默认，避免跨年错位）。
+    """
+    if not headers or not data_rows:
+        return None
+    width = len(headers)
+    months = _month_cols_from_headers(headers)
+    category = _category_from_caption(caption)
+    metric = _metric_name_from_caption(caption)
+    synthetic_year = (default_year or "").strip() or None
+
+    if len(months) >= 6:
+        return _layout_from_month_headers(
+            headers,
+            data_rows,
+            months=months,
+            category=category,
+            metric=metric,
+            synthetic_year=synthetic_year,
+        )
+
+    # 分节后伪表头：全列同标签 + 数据里有年份列 + 其后多为月读数
+    uniform = _headers_uniform_label(headers)
+    year_col = _find_year_column(data_rows, width)
+    if year_col is None or year_col < 1:
+        return None
+    inferred = _infer_months_after_year(data_rows, year_col=year_col, width=width)
+    if len(inferred) < 6:
+        return None
+    id_names = _identity_header_names(year_col)
+    identity = tuple((i, id_names[i]) for i in range(year_col))
+    if uniform and not category:
+        category = uniform
+    return _MonthSeriesLayout(
+        identity=identity,
+        year_col=year_col,
+        year_header="年度",
+        months=tuple(inferred),
+        category=category,
+        metric=metric,
+        default_year=None,
+    )
+
+
+def table_body_is_month_series(
+    *,
+    caption: str = "",
+    body: str = "",
+    default_year: str | None = None,
+) -> bool:
+    """电子表格叶子路径：是否应按月份熔成长叶子。"""
+    rows, header_n = coerce_rows_with_headers(body)
+    prepared = _prepare_information_blocks(
+        caption=caption, rows=rows, table_id="", header_row_count=header_n
+    )
+    if prepared is None:
+        return False
+    _cap, _pre, _fl, headers, data_rows = prepared
+    return (
+        detect_month_series_layout(
+            headers, data_rows, caption=caption, default_year=default_year
+        )
+        is not None
+    )
+
+
+def _parse_metric_number(raw: str) -> float | None:
+    text = (raw or "").strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _tidy_out_headers(layout: _MonthSeriesLayout) -> list[str]:
+    headers = [name for _i, name in layout.identity]
+    if layout.category:
+        headers.append("类别")
+    headers.extend([layout.year_header or "年度", "月份", layout.metric])
+    return [
+        "年度" if (_YEAR_HEADER_RE.match(name) or name in {"年份", "年"}) else name
+        for name in headers
+    ]
+
+
+def _rank_summary_spans(
+    *,
+    caption: str,
+    table_id: str,
+    form_like: bool,
+    layout: _MonthSeriesLayout,
+    buckets: dict[tuple[str, int], list[tuple[str, str, float, int]]],
+) -> list[tuple[str, int, int]]:
+    """按 (年,月) 生成 TopN 排名摘要块。"""
+    spans: list[tuple[str, int, int]] = []
+    summary_headers = ["排名摘要", "年度", "月份", "指标"]
+    preamble = _build_preamble(caption, table_id, summary_headers, form_like)
+    for (year, month), entries in sorted(buckets.items()):
+        ranked = sorted(entries, key=lambda item: item[2], reverse=True)[:_MONTH_RANK_TOP_N]
+        if not ranked:
+            continue
+        parts = [
+            f"排名类型=Top{_MONTH_RANK_TOP_N}",
+            f"年度={year}",
+            f"月份={month}",
+            f"指标={layout.metric}",
+        ]
+        if layout.category:
+            parts.append(f"类别={layout.category}")
+        rank_bits = [
+            f"{idx}. {entity}={surface}"
+            for idx, (entity, surface, _num, _row) in enumerate(ranked, start=1)
+        ]
+        line = "; ".join(parts) + "\n" + "; ".join(rank_bits)
+        spans.append(("\n".join([*preamble, line]), ranked[0][3], ranked[0][3]))
+    return spans
+
+
+def _melt_month_series_blocks(
+    *,
+    caption: str,
+    table_id: str,
+    form_like: bool,
+    layout: _MonthSeriesLayout,
+    data_rows: Sequence[Sequence[str]],
+    row_range: tuple[int, int] | None = None,
+) -> list[tuple[str, int, int]]:
+    """熔成 tidy 长叶子，并按 (年,月) 追加 TopN 排名摘要块。"""
+    out_headers = _tidy_out_headers(layout)
+    preamble = _build_preamble(caption, table_id, out_headers, form_like)
+    start, end = 0, len(data_rows) - 1
+    if row_range is not None:
+        start, end = int(row_range[0]), int(row_range[1])
+
+    buckets: dict[tuple[str, int], list[tuple[str, str, float, int]]] = {}
+    spans: list[tuple[str, int, int]] = []
+    for row_idx in range(start, end + 1):
+        row = data_rows[row_idx]
+        if layout.default_year and layout.year_col >= len(row):
+            year = _normalize_year_value(layout.default_year)
+        else:
+            year_raw = (
+                str(row[layout.year_col]).strip() if layout.year_col < len(row) else ""
+            )
+            year = _normalize_year_value(year_raw)
+        if not year:
+            continue
+        id_values = [
+            str(row[col]).strip() if col < len(row) else ""
+            for col, _name in layout.identity
+        ]
+        if not any(id_values):
+            continue
+        entity = next((v for v in reversed(id_values) if v), id_values[0])
+        for col, month in layout.months:
+            raw = str(row[col]).strip() if col < len(row) else ""
+            if not raw:
+                continue
+            cells = list(id_values)
+            if layout.category:
+                cells.append(layout.category)
+            cells.extend([year, str(month), raw])
+            spans.append(("\n".join([*preamble, _format_row(cells, out_headers)]), row_idx, row_idx))
+            number = _parse_metric_number(raw)
+            if number is not None:
+                buckets.setdefault((year, month), []).append((entity, raw, number, row_idx))
+    spans.extend(
+        _rank_summary_spans(
+            caption=caption,
+            table_id=table_id,
+            form_like=form_like,
+            layout=layout,
+            buckets=buckets,
+        )
+    )
+    return spans
+
+
 def _chunk_by_budget(
     preamble: list[str], data_rows: list[list[str]], headers: list[str],
     *, max_tokens: int = TABLE_MAX_TOKENS,
 ) -> list[str]:
-    """按 token 预算把数据行分批，每批重复 preamble。"""
+    """按 token 预算把数据行分批，每批重复 preamble。
+
+    宽表单行超预算时**不**在这里按列拆——列窗只给 ``row_chunks`` 叶子用；父容器
+    仍按行打包，单行超限走原有 preamble 退化块口径（与 span 版对齐）。
+    """
     blocks: list[str] = []
     current_lines = list(preamble)
     for cells in data_rows:
@@ -400,7 +969,11 @@ def _chunk_by_budget(
 
 
 def _prepare_information_blocks(
-    *, caption: str, rows: Sequence[Sequence[str]], table_id: str
+    *,
+    caption: str,
+    rows: Sequence[Sequence[str]],
+    table_id: str,
+    header_row_count: int = 0,
 ) -> tuple[str, list[str], bool, list[str], list[list[str]]] | None:
     """矩阵预处理：规整 → 剥标题行 → 定表头 → 拼 preamble。
 
@@ -419,10 +992,235 @@ def _prepare_information_blocks(
         title_text = " / ".join(dict.fromkeys(titles))
         base = caption.strip()
         caption = f"{base}（{title_text}）" if base else title_text
-    form_like, headers, data_rows = _resolve_headers_and_data(matrix)
+    # 剥掉标题行后，显式 th 计数要扣掉已剥行数（标题常被标成合并单元格 td，一般是 0）。
+    form_like, headers, data_rows = _resolve_headers_and_data(
+        matrix, header_row_count=header_row_count
+    )
     headers, data_rows = _drop_empty_columns(headers, data_rows)
     preamble = _build_preamble(caption, table_id, headers, form_like)
     return caption, preamble, form_like, headers, data_rows
+
+
+def _leading_identity_width(headers: Sequence[str]) -> int:
+    """宽表身份列宽度：截止到第一个「后面还会再出现」的字段名之前。
+
+    水费表头是 ``序号|水卡号|水表号|用途|上月起度/…|…|上月起度/…`` —— 身份列是前 4 列，
+    不能把第一个月的指标组算进身份（否则每窗都带着一整月，叶子很容易 >384）。
+    """
+    bases = [str(h).split("/", 1)[0].strip() for h in headers]
+    for i, base in enumerate(bases):
+        if base and base in bases[i + 1 :]:
+            return i if i > 0 else 1
+    return min(4, len(headers)) or 1
+
+
+def _metric_group_width(headers: Sequence[str], id_n: int) -> int:
+    """重复指标组宽度（水费：上月起度…金额 = 5；找不到则 8）。"""
+    rest = [str(h).split("/", 1)[0].strip() for h in headers[id_n:]]
+    if not rest:
+        return 1
+    first = rest[0]
+    for i in range(1, len(rest)):
+        if rest[i] == first:
+            return i
+    return min(8, len(rest)) or 1
+
+
+def _is_wide_metric_table(headers: Sequence[str]) -> bool:
+    """是否应按指标组切开：身份列后至少两组重复指标（抄表宽表）。"""
+    id_n = _leading_identity_width(headers)
+    rest = len(headers) - id_n
+    if rest < 4:
+        return False
+    group = _metric_group_width(headers, id_n)
+    return group >= 2 and rest >= group * 2
+
+
+def _iter_metric_group_slices(
+    headers: Sequence[str],
+    data_rows: Sequence[Sequence[str]],
+) -> list[tuple[list[str], list[list[str]]]]:
+    """把宽表拆成「身份列 + 单个指标组」子表；非宽表返回整表一份。
+
+    每片 preamble 只带本组表头，避免 169 列「相关表头」吃光叶子预算。
+    """
+    headers_l = [str(h) for h in headers]
+    rows_l = [
+        [str(row[i]) if i < len(row) else "" for i in range(len(headers_l))]
+        for row in data_rows
+    ]
+    if not _is_wide_metric_table(headers_l):
+        return [(headers_l, rows_l)]
+    id_n = _leading_identity_width(headers_l)
+    group = _metric_group_width(headers_l, id_n)
+    id_h = headers_l[:id_n]
+    rest_h = headers_l[id_n:]
+    slices: list[tuple[list[str], list[list[str]]]] = []
+    for start in range(0, len(rest_h), group):
+        win_h = id_h + rest_h[start : start + group]
+        win_rows = [
+            row[:id_n] + row[id_n + start : id_n + start + group] for row in rows_l
+        ]
+        slices.append((win_h, win_rows))
+    return slices or [(headers_l, rows_l)]
+
+
+def _format_row_column_windows(
+    preamble: list[str],
+    headers: Sequence[str],
+    cells: Sequence[str],
+    *,
+    max_tokens: int,
+) -> list[str]:
+    """单行仍超预算时按列窗拆（宽抄表：169/233 列，一行就能上千 token）。
+
+    每窗重复身份列 + 若干「指标组」；按组推进并用二分找能装下的最大组数，
+    避免按列线性收缩导致 O(列²) 次 ``count_tokens``（实测会卡死分块）。
+    """
+    full = "\n".join([*preamble, _format_row(cells, headers)])
+    if count_tokens(full) <= max_tokens:
+        return [full]
+    id_n = _leading_identity_width(headers)
+    id_headers = list(headers[:id_n])
+    id_cells = [str(cells[i]) if i < len(cells) else "" for i in range(id_n)]
+    rest_headers = list(headers[id_n:])
+    rest_cells = [str(cells[i]) if i < len(cells) else "" for i in range(id_n, len(headers))]
+    if not rest_headers:
+        return [full]
+    group = _metric_group_width(headers, id_n)
+    n = len(rest_headers)
+    n_groups = (n + group - 1) // group
+
+    def _window_text(g0: int, g1: int) -> str:
+        c0, c1 = g0 * group, min(n, g1 * group)
+        win_h = id_headers + rest_headers[c0:c1]
+        win_c = id_cells + rest_cells[c0:c1]
+        win_preamble = [
+            preamble[0] if preamble else "表名: 表",
+            preamble[1] if len(preamble) > 1 else "核心实体: 表",
+            f"相关表头: {' | '.join(win_h)}",
+            *preamble[3:],
+        ]
+        return "\n".join([*win_preamble, _format_row(win_c, win_h)])
+
+    blocks: list[str] = []
+    g_start = 0
+    while g_start < n_groups:
+        lo, hi, best = 1, n_groups - g_start, 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            text = _window_text(g_start, g_start + mid)
+            if count_tokens(text) <= max_tokens:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        text = _window_text(g_start, g_start + best)
+        # 单组仍超预算：退化为按组硬切（至少前进，内容不丢）
+        if count_tokens(text) > max_tokens and best == 1:
+            text = _window_text(g_start, g_start + 1)
+        blocks.append(text)
+        g_start += best
+    return blocks or [full]
+
+
+def _sample_row_indices(n_rows: int, sample_max: int) -> list[int]:
+    """头尾 + 均匀抽样，保证定位用叶子覆盖表首尾与中间段。"""
+    if n_rows <= sample_max or sample_max <= 0:
+        return list(range(n_rows))
+    if sample_max == 1:
+        return [0]
+    # 保留首尾各约 10%，其余均匀
+    head = max(1, sample_max // 10)
+    tail = max(1, sample_max // 10)
+    mid_budget = sample_max - head - tail
+    chosen: set[int] = set(range(head))
+    chosen.update(range(n_rows - tail, n_rows))
+    if mid_budget > 0 and n_rows > head + tail:
+        span = n_rows - head - tail
+        for i in range(mid_budget):
+            offset = head + int((i + 0.5) * span / mid_budget)
+            chosen.add(min(n_rows - 1, offset))
+    return sorted(chosen)
+
+
+def _serialize_prepared_slices(
+    *,
+    caption: str,
+    table_id: str,
+    form_like: bool,
+    headers: list[str],
+    data_rows: list[list[str]],
+    row_chunks: bool,
+    max_tokens: int,
+    default_year: str | None = None,
+    leaf_sample_max: int | None = None,
+) -> list[str]:
+    """宽表先按指标组切（窄 preamble），再按行/行块打包。
+
+    电子表格 ``row_chunks`` 且识别为月份宽表时：只发 tidy 长叶子（+ 按月 TopN），
+    避免宽行与长观测双倍噪声。
+
+    ``leaf_sample_max``：B 型大表明细叶子抽样上限（``None`` = 全量）；观测表仍全量双写。
+    """
+    if row_chunks:
+        layout = detect_month_series_layout(
+            headers, data_rows, caption=caption, default_year=default_year
+        )
+        if layout is not None:
+            return [
+                text
+                for text, _first, _last in _melt_month_series_blocks(
+                    caption=caption,
+                    table_id=table_id,
+                    form_like=form_like,
+                    layout=layout,
+                    data_rows=data_rows,
+                )
+            ]
+    blocks: list[str] = []
+    for slice_headers, slice_rows in _iter_metric_group_slices(headers, data_rows):
+        preamble = _build_preamble(caption, table_id, slice_headers, form_like)
+        if row_chunks:
+            if not slice_rows:
+                blocks.append("\n".join(preamble))
+                continue
+            sampling = (
+                leaf_sample_max is not None and len(slice_rows) > int(leaf_sample_max)
+            )
+            # 摘要叶占 1 个预算槽，行样本用剩余额度，保证总叶子 ≤ leaf_sample_max
+            row_budget = (
+                max(1, int(leaf_sample_max) - 1)
+                if sampling and leaf_sample_max is not None
+                else leaf_sample_max
+            )
+            indices = (
+                _sample_row_indices(len(slice_rows), int(row_budget))
+                if leaf_sample_max is not None
+                else list(range(len(slice_rows)))
+            )
+            # B 型大表抽样时先塞一条「摘要叶」：列名 + 行数，便于 FAISS 定位到表，
+            # 全量合计仍走观测表 structured_query（本函数只负责向量侧叶子）。
+            if sampling:
+                summary = list(preamble) + [
+                    f"数据行数={len(slice_rows)}",
+                    f"向量叶子=抽样{len(indices)}行（头尾+均匀）",
+                    "完整行已写入结构化观测表，合计/笔数请走聚合查询",
+                ]
+                blocks.append("\n".join(summary))
+            for idx in indices:
+                cells = slice_rows[idx]
+                # 组切后通常一行已 ≤ 预算；仍超则列窗兜底
+                blocks.extend(
+                    _format_row_column_windows(
+                        preamble, slice_headers, cells, max_tokens=max_tokens
+                    )
+                )
+        else:
+            blocks.extend(
+                _chunk_by_budget(preamble, slice_rows, slice_headers, max_tokens=max_tokens)
+            )
+    return blocks
 
 
 def serialize_information_blocks(
@@ -432,22 +1230,37 @@ def serialize_information_blocks(
     table_id: str = "",
     row_chunks: bool = False,
     max_tokens: int = TABLE_MAX_TOKENS,
+    header_row_count: int = 0,
+    default_year: str | None = None,
+    leaf_sample_max: int | None = None,
 ) -> list[str]:
     """把二维表打成一段或多段自解释文本（超长按行批拆）。
 
     ``max_tokens``：每段预算。默认 2048（整表父容器用）；行组叶子传更小的值
     （见 ``chunker.TABLE_LEAF_TOKENS=384``），避免十几行挤进同一个向量被稀释。
+
+    宽抄表（重复指标组）会先按「身份列+单月指标」切开，相关表头只带本组列。
     """
-    prepared = _prepare_information_blocks(caption=caption, rows=rows, table_id=table_id)
+    prepared = _prepare_information_blocks(
+        caption=caption,
+        rows=rows,
+        table_id=table_id,
+        header_row_count=header_row_count,
+    )
     if prepared is None:
         return []
-    _caption, preamble, _form_like, headers, data_rows = prepared
-    if row_chunks:
-        # RAGFlow spreadsheet 口径：一行一个块，每块重复表头；header-only 保留表头。
-        if not data_rows:
-            return ["\n".join(preamble)]
-        return ["\n".join([*preamble, _format_row(cells, headers)]) for cells in data_rows]
-    return _chunk_by_budget(preamble, data_rows, headers, max_tokens=max_tokens)
+    cap, _preamble, form_like, headers, data_rows = prepared
+    return _serialize_prepared_slices(
+        caption=cap,
+        table_id=table_id,
+        form_like=form_like,
+        headers=headers,
+        data_rows=data_rows,
+        row_chunks=row_chunks,
+        max_tokens=max_tokens,
+        default_year=default_year,
+        leaf_sample_max=leaf_sample_max,
+    )
 
 
 def serialize_table_body(
@@ -457,14 +1270,20 @@ def serialize_table_body(
     table_id: str = "",
     row_chunks: bool = False,
     max_tokens: int = TABLE_MAX_TOKENS,
+    default_year: str | None = None,
+    leaf_sample_max: int | None = None,
 ) -> list[str]:
     """从 MinerU ``table_body`` / 题注直接序列化。"""
+    rows, header_n = coerce_rows_with_headers(body)
     return serialize_information_blocks(
         caption=caption,
-        rows=coerce_rows(body),
+        rows=rows,
         table_id=table_id,
         row_chunks=row_chunks,
+        default_year=default_year,
+        leaf_sample_max=leaf_sample_max,
         max_tokens=max_tokens,
+        header_row_count=header_n,
     )
 
 
@@ -521,6 +1340,7 @@ def serialize_information_blocks_spans(
     row_chunks: bool = False,
     max_tokens: int = TABLE_MAX_TOKENS,
     row_range: tuple[int, int] | None = None,
+    header_row_count: int = 0,
 ) -> list[tuple[str, int, int]]:
     """同 :func:`serialize_information_blocks`，但返回 ``(block_text, first_row, last_row)``。
 
@@ -530,24 +1350,55 @@ def serialize_information_blocks_spans(
 
     对同一组行 / 同一 ``max_tokens``，本函数的文本与 :func:`serialize_information_blocks`
     逐字节一致 —— 分段只是换个"打包单位"，不改序列化口径。
+
+    宽表按指标组切开后，同一行号可能在多个 span 中出现（每月一片）；行号仍是整表绝对下标。
     """
-    prepared = _prepare_information_blocks(caption=caption, rows=rows, table_id=table_id)
+    prepared = _prepare_information_blocks(
+        caption=caption,
+        rows=rows,
+        table_id=table_id,
+        header_row_count=header_row_count,
+    )
     if prepared is None:
         return []
-    _caption, preamble, _form_like, headers, data_rows = prepared
+    cap, _preamble, form_like, headers, data_rows = prepared
     start, end = 0, len(data_rows) - 1
     if row_range is not None:
         start, end = int(row_range[0]), int(row_range[1])
         if start < 0 or end < start or end >= len(data_rows):
             raise ValueError(f"row_range 越界：{row_range}（数据行 0..{len(data_rows) - 1}）")
     if row_chunks:
-        return [
-            ("\n".join([*preamble, _format_row(data_rows[row], headers)]), row, row)
-            for row in range(start, end + 1)
-        ]
-    return _chunk_spans_by_budget(
-        preamble, data_rows, headers, max_tokens=max_tokens, start_row=start, end_row=end
-    )
+        layout = detect_month_series_layout(headers, data_rows, caption=cap)
+        if layout is not None:
+            return _melt_month_series_blocks(
+                caption=cap,
+                table_id=table_id,
+                form_like=form_like,
+                layout=layout,
+                data_rows=data_rows,
+                row_range=(start, end),
+            )
+    spans: list[tuple[str, int, int]] = []
+    for slice_headers, slice_rows in _iter_metric_group_slices(headers, data_rows):
+        preamble = _build_preamble(cap, table_id, slice_headers, form_like)
+        if row_chunks:
+            for row in range(start, end + 1):
+                for text in _format_row_column_windows(
+                    preamble, slice_headers, slice_rows[row], max_tokens=max_tokens
+                ):
+                    spans.append((text, row, row))
+        else:
+            spans.extend(
+                _chunk_spans_by_budget(
+                    preamble,
+                    slice_rows,
+                    slice_headers,
+                    max_tokens=max_tokens,
+                    start_row=start,
+                    end_row=end,
+                )
+            )
+    return spans
 
 
 def serialize_table_body_spans(
@@ -560,13 +1411,15 @@ def serialize_table_body_spans(
     row_range: tuple[int, int] | None = None,
 ) -> list[tuple[str, int, int]]:
     """从 MinerU ``table_body`` / 题注做 span 序列化（见 :func:`serialize_information_blocks_spans`）。"""
+    rows, header_n = coerce_rows_with_headers(body)
     return serialize_information_blocks_spans(
         caption=caption,
-        rows=coerce_rows(body),
+        rows=rows,
         table_id=table_id,
         row_chunks=row_chunks,
         max_tokens=max_tokens,
         row_range=row_range,
+        header_row_count=header_n,
     )
 
 

@@ -52,6 +52,8 @@ from ekbs.retrieval.numeric import (
     MODE_AUTO,
     MODE_NUMERIC,
     MODE_PROSE,
+    MODE_STRUCTURED,
+    MODE_TABLE_RANK,
     build_numeric_prompt,
     find_scope_alternatives,
     format_numeric_user_reply,
@@ -64,6 +66,15 @@ from ekbs.retrieval.numeric import (
 )
 from ekbs.retrieval.intent import IntentSplitter, SubQuestion
 from ekbs.retrieval.rrf import alpha_fuse, ranks_of, rrf_fuse, wrrf_fuse
+from ekbs.retrieval.structured_query import (
+    is_structured_query_intent,
+    try_structured_query,
+)
+from ekbs.retrieval.table_rank import (
+    is_compare_rank_intent,
+    peer_keys_from_chunks,
+    try_constrained_rank,
+)
 
 log = get_logger(component="retrieval")
 
@@ -78,6 +89,9 @@ _BUDGET_MIN_CHUNK_TOKENS = 128
 #: 会挤掉其它资料；超过上限时按 seq 截断，并在最后一段正文末尾注明「共 N 段展开 M 段」。
 #: 截断只影响"同一命中"，命中另一分段时仍会把那张表的全部分段展开一遍。
 TABLE_EXPAND_MAX_TOKENS = 8192
+#: 比较/排名意图下，按 (doc, 年, 月) 补齐 tidy 同行叶子的预算。
+PEER_EXPAND_MAX_LEAVES = 120
+PEER_EXPAND_MAX_TOKENS = 12000
 
 REFUSE_ALL_DENIED = "all_denied_by_c5"
 REFUSE_EMPTY_ANSWER = "empty_answer"
@@ -587,7 +601,7 @@ class RetrievalOverrides:
                 else self.dense_multi_query
             ),
             "figure_multimodal": (
-                bool(getattr(cfg, "figure_multimodal", True))
+                bool(getattr(cfg, "figure_multimodal", False))
                 if self.figure_multimodal is None
                 else bool(self.figure_multimodal)
             ),
@@ -1114,6 +1128,8 @@ class RetrievalPipeline:
         # 会选中它，父块/整表扩展还会把它放大后送进 prompt（用户实测 35382=0.6025 ✖
         # 仍被展开成整表 35380）。过滤放在扩展之前，低分块及其容器都不会出现。
         survivors = self._filter_below_threshold(survivors, params, result, collect_debug)
+        # ⑤.1 figure 已不入召回白名单；保留薄封装，兼容旧索引里偶发混入的 figure。
+        survivors = self._prefer_prose_over_figures(survivors, result, collect_debug)
 
         # ⑤ 父块扩展（扩展后的父块**仍需过 C5**，00 §2.1 / C5）
         selected = survivors[: params["rerank_keep"]]
@@ -1122,14 +1138,9 @@ class RetrievalPipeline:
                 "kept": [chunk_id for chunk_id, _ in kept],
                 "dropped": [chunk_id for chunk_id, _ in dropped],
             }
-        if params["parent_expand"]:
-            selected = await asyncio.to_thread(self._expand_parents, selected, perm)
-        # 短叶子父块（制度点分条款各成碎片时）把同章兄弟一并带入，补全召回上下文
-        selected = await asyncio.to_thread(self._expand_short_siblings, selected, perm)
-        # 正文命中后，把同页的 figure 一并带进上下文（PPT「把照片发出来」依赖这条）
-        selected = await asyncio.to_thread(self._expand_page_figures, selected, perm)
-        # docx 等常无页码：同页扩不到时，再按同文档补 figure（熙物联二维码踩过）
-        selected = await asyncio.to_thread(self._expand_doc_figures, selected, perm)
+        selected = await self._expand_context_chunks(
+            selected, perm, query=query, parent_expand=bool(params["parent_expand"])
+        )
         # 父块/整表扩展会把同一父块的多个叶子折叠成重复块（实测 35274×2 / 35281×2）：
         # 必须在**所有扩展之后**去重，否则重复块会白占 prompt 预算、生成两个指向同块的引用编号。
         selected, deduped = _dedupe_expanded(selected)
@@ -1268,6 +1279,37 @@ class RetrievalPipeline:
                     "dropped_chunk_ids": dropped,
                 }
         return kept
+
+    def _prefer_prose_over_figures(
+        self,
+        survivors: list[RetrievedChunk],
+        result: Any,
+        collect_debug: bool,
+    ) -> list[RetrievedChunk]:
+        """丢掉精排里偶发出现的 figure（新口径 figure 不入召回；兼容未重解析旧索引）。
+
+        挂图改走 ``_expand_bound_figures``（按 ``parent_id``），不再靠 figure 抢 keep。
+        """
+        if not survivors:
+            return survivors
+        prose = [c for c in survivors if c.chunk_type != "figure"]
+        figures = [c for c in survivors if c.chunk_type == "figure"]
+        if not figures:
+            return survivors
+        dropped = [f.chunk_id for f in figures]
+        result.degraded.append("figure_recall_dropped")
+        log.info(
+            "retrieval_figure_recall_dropped",
+            count=len(dropped),
+            chunk_ids=dropped,
+        )
+        if collect_debug:
+            result.stage_debug["figure_demote"] = {
+                "prose_first": True,
+                "junk_dropped": dropped,
+                "figure_kept": [],
+            }
+        return prose if prose else survivors
 
     def _record_title_debug(
         self, result: RetrievalResult, debug: dict[str, Any], collect_debug: bool
@@ -1676,6 +1718,159 @@ class RetrievalPipeline:
                 expanded.append(chunk)
         return expanded
 
+    async def _expand_context_chunks(
+        self,
+        selected: list[RetrievedChunk],
+        perm: PermContext,
+        *,
+        query: str,
+        parent_expand: bool,
+    ) -> list[RetrievedChunk]:
+        """精排后扩展：比较意图跳过父块、改同行补齐；其它走父块/短兄弟/绑图。"""
+        compare_intent = is_compare_rank_intent(query)
+        # 比较/排名必须保留 tidy 长叶子：父块展开会换成宽表容器，月份观测被淹没。
+        if parent_expand and not compare_intent:
+            selected = await asyncio.to_thread(self._expand_parents, selected, perm)
+        if not compare_intent:
+            selected = await asyncio.to_thread(self._expand_short_siblings, selected, perm)
+        if compare_intent:
+            selected = await asyncio.to_thread(
+                self._expand_compare_peers, selected, perm, query
+            )
+        return await asyncio.to_thread(self._expand_bound_figures, selected, perm)
+
+    def _year_from_doc_title(self, doc_id: int) -> str | None:
+        with self.db.sync_connect() as conn:
+            title_row = conn.execute(
+                "SELECT title FROM ekbs_document WHERE doc_id = ?",
+                (int(doc_id),),
+            ).fetchone()
+        title = str(title_row["title"] if title_row else "")
+        match = re.search(r"(20\d{2})\s*年", title)
+        return match.group(1) if match else None
+
+    def _table_stems_from_chunks(self, chunks: Sequence[RetrievedChunk]) -> set[str]:
+        stem_re = re.compile(r"表名:\s*([^\n（(]+)")
+        stems = {
+            stem_re.search(c.content).group(1).strip()
+            for c in chunks
+            if c.chunk_type == "table" and stem_re.search(c.content or "")
+        }
+        stems.discard("")
+        return stems
+
+    def _peer_ids_for_key(
+        self,
+        *,
+        doc_id: int,
+        year: str | None,
+        month: int,
+        table_stems: set[str],
+        existing: set[int],
+    ) -> list[int]:
+        resolved_year = year or self._year_from_doc_title(doc_id)
+        sql = (
+            "SELECT chunk_id FROM ekbs_chunk "
+            "WHERE doc_id = ? AND chunk_type = 'table' "
+            "AND parent_id IS NOT NULL "
+            "AND content LIKE ? "
+        )
+        params: list[Any] = [int(doc_id), f"%月份={month}%"]
+        if resolved_year:
+            sql += "AND content LIKE ? "
+            params.append(f"%年度={resolved_year}%")
+        if table_stems:
+            sql += "AND (" + " OR ".join(["content LIKE ?" for _ in table_stems]) + ") "
+            params.extend(f"%表名: {stem}%" for stem in sorted(table_stems))
+        sql += "AND content NOT LIKE '%排名类型=%' ORDER BY seq LIMIT ?"
+        params.append(PEER_EXPAND_MAX_LEAVES)
+        with self.db.sync_connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [int(r["chunk_id"]) for r in rows if int(r["chunk_id"]) not in existing]
+
+    def _expand_compare_peers(
+        self,
+        chunks: list[RetrievedChunk],
+        perm: PermContext,
+        question: str,
+    ) -> list[RetrievedChunk]:
+        """比较/排名意图：按命中表的 (doc_id, 年度, 月份) 补齐更多 tidy 长叶子。
+
+        只补 ``chunk_type=table`` 且可解析为月份观测的叶子；仍走 C5。普通查数不触发。
+        跨分节表（餐饮/娱乐…）靠同 doc + 同年月 + 同表名前缀对齐。
+        """
+        if not is_compare_rank_intent(question):
+            return chunks
+        keys = peer_keys_from_chunks(chunks, question)
+        if not keys:
+            return chunks
+        existing = {c.chunk_id for c in chunks}
+        added: list[RetrievedChunk] = []
+        total_tokens = sum(count_tokens(c.content) for c in chunks)
+        table_stems = self._table_stems_from_chunks(chunks)
+        for doc_id, year, month in keys:
+            if len(added) >= PEER_EXPAND_MAX_LEAVES:
+                break
+            peer_ids = self._peer_ids_for_key(
+                doc_id=doc_id,
+                year=year,
+                month=month,
+                table_stems=table_stems,
+                existing=existing,
+            )
+            if not peer_ids:
+                continue
+            loaded = self.load_chunks(peer_ids)
+            kept, dropped = self.gate.filter_chunks(
+                perm, [(cid, loaded[cid].doc_id) for cid in loaded]
+            )
+            if dropped:
+                log.info(
+                    "c5_denied_compare_peer",
+                    count=len(dropped),
+                    user_id=perm.user_id,
+                    doc_id=doc_id,
+                    year=year,
+                    month=month,
+                )
+            allowed = {cid for cid, _ in kept}
+            seed = next(
+                (c for c in chunks if c.doc_id == doc_id and c.chunk_type == "table"),
+                chunks[0] if chunks else None,
+            )
+            for cid in peer_ids:
+                if cid not in allowed or cid in existing:
+                    continue
+                peer = loaded.get(cid)
+                if peer is None:
+                    continue
+                tokens = count_tokens(peer.content)
+                if added and total_tokens + tokens > PEER_EXPAND_MAX_TOKENS:
+                    break
+                if seed is not None:
+                    peer = replace(
+                        peer,
+                        expanded_from=seed.expanded_from or seed.chunk_id,
+                        rerank_score=seed.rerank_score,
+                        rrf_score=seed.rrf_score,
+                        dense_rank=seed.dense_rank,
+                        sparse_rank=seed.sparse_rank,
+                    )
+                added.append(peer)
+                existing.add(cid)
+                total_tokens += tokens
+                if len(added) >= PEER_EXPAND_MAX_LEAVES:
+                    break
+        if added:
+            log.info(
+                "compare_peers_expanded",
+                added=len(added),
+                keys=keys,
+                user_id=perm.user_id,
+            )
+            return [*chunks, *added]
+        return chunks
+
     def _expand_table_group(
         self, hit_segment: RetrievedChunk, source_chunk: RetrievedChunk, perm: PermContext
     ) -> list[RetrievedChunk]:
@@ -1933,7 +2128,52 @@ class RetrievalPipeline:
                 inserted.add(fig.chunk_id)
         return out, inserted
 
-    def _expand_page_figures(
+    def _bound_figure_ids(
+        self,
+        anchors: list[RetrievedChunk],
+        present: set[int],
+        *,
+        max_per_anchor: int,
+        max_total: int,
+    ) -> list[int]:
+        """按入库 ``parent_id`` 绑定取同节 figure（child → 其 parent；parent → 自身）。"""
+        figure_ids: list[int] = []
+        seen_fig: set[int] = set()
+        containers: list[int] = []
+        seen_container: set[int] = set()
+        for anchor in anchors:
+            if anchor.chunk_type == "figure":
+                continue
+            container: int | None = None
+            if anchor.chunk_type == "parent":
+                container = int(anchor.chunk_id)
+            elif anchor.parent_chunk_id:
+                container = int(anchor.parent_chunk_id)
+            if container is None or container in seen_container:
+                continue
+            seen_container.add(container)
+            containers.append(container)
+        if not containers:
+            return []
+        with self.db.sync_connect() as conn:
+            for container_id in containers:
+                rows = conn.execute(
+                    "SELECT chunk_id FROM ekbs_chunk "
+                    "WHERE parent_id = ? AND chunk_type = 'figure' "
+                    "ORDER BY seq LIMIT ?",
+                    (int(container_id), int(max_per_anchor)),
+                ).fetchall()
+                for row in rows:
+                    cid = int(row["chunk_id"])
+                    if cid in present or cid in seen_fig:
+                        continue
+                    seen_fig.add(cid)
+                    figure_ids.append(cid)
+                    if len(figure_ids) >= max_total:
+                        return figure_ids
+        return figure_ids
+
+    def _expand_bound_figures(
         self,
         chunks: list[RetrievedChunk],
         perm: PermContext,
@@ -1941,22 +2181,15 @@ class RetrievalPipeline:
         max_per_anchor: int = 8,
         max_total: int = 12,
     ) -> list[RetrievedChunk]:
-        """正文/表格命中后，把**同一文档、页码重叠**的 figure 块并入上下文。
-
-        PPT「计量表更换」正文与电表照片常分属 parent / figure；只靠向量时照片
-        往往排不进 top-k，用户一问「把照片发出来」就会因上下文无图而拒答。
-        """
+        """正文/表命中后，把**同 parent 绑定**的 figure 资产并入结果（供回源，不进 prompt）。"""
         if not chunks:
             return chunks
         present = {c.chunk_id for c in chunks}
-        anchors = [
-            c for c in chunks
-            if c.chunk_type != "figure" and c.page_from is not None
-        ]
+        anchors = [c for c in chunks if c.chunk_type != "figure"]
         if not anchors:
             return chunks
 
-        figure_ids = self._page_figure_ids(
+        figure_ids = self._bound_figure_ids(
             anchors, present, max_per_anchor=max_per_anchor, max_total=max_total
         )
         if not figure_ids:
@@ -1968,86 +2201,19 @@ class RetrievalPipeline:
         )
         allowed = {chunk_id for chunk_id, _ in kept}
         if dropped:
-            log.info("c5_denied_figure", count=len(dropped), user_id=perm.user_id)
+            log.info("c5_denied_bound_figure", count=len(dropped), user_id=perm.user_id)
 
-        by_doc_page = self._group_figures_by_page(figure_ids, allowed, figures)
-        out, inserted = self._attach_figures_by_page(list(chunks), by_doc_page, present)
-        # 未挂上的（页码对不上）仍追加在末尾，避免丢掉
-        for cid in figure_ids:
-            if cid in allowed and cid not in inserted and cid not in present:
-                out.append(figures[cid])
-                inserted.add(cid)
-        if inserted:
-            log.info(
-                "page_figures_expanded",
-                anchors=len(anchors),
-                figures=len(inserted),
-                user_id=perm.user_id,
+        score_by_parent: dict[int, tuple[float, float]] = {}
+        for c in anchors:
+            key = (
+                int(c.chunk_id)
+                if c.chunk_type == "parent"
+                else int(c.parent_chunk_id or 0)
             )
-        return out
-
-    def _expand_doc_figures(
-        self,
-        chunks: list[RetrievedChunk],
-        perm: PermContext,
-        *,
-        max_per_doc: int = 4,
-        max_total: int = 8,
-    ) -> list[RetrievedChunk]:
-        """正文命中但无页码（docx 常见）时，把**同文档** figure 并入上下文。
-
-        ``_expand_page_figures`` 要求 page_from 非空；熙物联教程正文与图都无页码时
-        会静默跳过，模型只能看到「请扫二维码」文字却看不到图，进而拒答或乱引其它文档的图。
-        """
-        if not chunks:
-            return chunks
-        present = {c.chunk_id for c in chunks}
-        already_has_fig = {c.doc_id for c in chunks if c.chunk_type == "figure" or c.figure_id}
-        doc_ids = sorted(
-            {
-                int(c.doc_id)
-                for c in chunks
-                if c.chunk_type != "figure" and int(c.doc_id or 0) not in already_has_fig
-            }
-        )
-        if not doc_ids:
-            return chunks
-
-        figure_ids: list[int] = []
-        with self.db.sync_connect() as conn:
-            for doc_id in doc_ids:
-                rows = conn.execute(
-                    "SELECT chunk_id FROM ekbs_chunk "
-                    "WHERE doc_id = ? AND chunk_type = 'figure' "
-                    "ORDER BY seq LIMIT ?",
-                    (doc_id, int(max_per_doc)),
-                ).fetchall()
-                for row in rows:
-                    cid = int(row["chunk_id"])
-                    if cid in present:
-                        continue
-                    figure_ids.append(cid)
-                    if len(figure_ids) >= max_total:
-                        break
-                if len(figure_ids) >= max_total:
-                    break
-        if not figure_ids:
-            return chunks
-
-        figures = self.load_chunks(figure_ids)
-        kept, dropped = self.gate.filter_chunks(
-            perm, [(cid, figures[cid].doc_id) for cid in figures]
-        )
-        allowed = {chunk_id for chunk_id, _ in kept}
-        if dropped:
-            log.info("c5_denied_doc_figure", count=len(dropped), user_id=perm.user_id)
-
-        score_by_doc: dict[int, tuple[float, float]] = {}
-        for c in chunks:
-            if c.chunk_type == "figure":
+            if not key:
                 continue
-            prev = score_by_doc.get(int(c.doc_id), (0.0, 0.0))
-            score_by_doc[int(c.doc_id)] = (
+            prev = score_by_parent.get(key, (0.0, 0.0))
+            score_by_parent[key] = (
                 max(prev[0], float(c.rerank_score or 0.0)),
                 max(prev[1], float(c.rrf_score or 0.0)),
             )
@@ -2058,7 +2224,8 @@ class RetrievalPipeline:
             if cid not in allowed or cid in present:
                 continue
             fig = figures[cid]
-            base = score_by_doc.get(int(fig.doc_id), (0.0, 0.0))
+            parent_key = int(fig.parent_chunk_id or 0)
+            base = score_by_parent.get(parent_key, (0.0, 0.0))
             fig.rerank_score = float(base[0]) * 0.9 if base[0] else 0.0
             fig.rrf_score = float(base[1]) * 0.9 if base[1] else 0.0
             out.append(fig)
@@ -2066,12 +2233,38 @@ class RetrievalPipeline:
             inserted += 1
         if inserted:
             log.info(
-                "doc_figures_expanded",
-                docs=len(doc_ids),
+                "bound_figures_expanded",
+                anchors=len(anchors),
                 figures=inserted,
                 user_id=perm.user_id,
             )
         return out
+
+    def _expand_page_figures(
+        self,
+        chunks: list[RetrievedChunk],
+        perm: PermContext,
+        *,
+        max_per_anchor: int = 8,
+        max_total: int = 12,
+    ) -> list[RetrievedChunk]:
+        """兼容旧测试名：转发到 ``_expand_bound_figures``（按 parent 绑定，不再按页启发式）。"""
+        return self._expand_bound_figures(
+            chunks, perm, max_per_anchor=max_per_anchor, max_total=max_total
+        )
+
+    def _expand_doc_figures(
+        self,
+        chunks: list[RetrievedChunk],
+        perm: PermContext,
+        *,
+        max_per_doc: int = 4,
+        max_total: int = 8,
+    ) -> list[RetrievedChunk]:
+        """兼容旧测试名：无页码时同样走 parent 绑定展开（``max_per_doc`` 映射为每锚点上限）。"""
+        return self._expand_bound_figures(
+            chunks, perm, max_per_anchor=max_per_doc, max_total=max_total
+        )
 
     # ------------------------------------------------------------------
     # 生成与引用
@@ -2087,7 +2280,9 @@ class RetrievalPipeline:
         from ekbs.ingest.table_serialize import information_block_to_html
 
         lines: list[str] = []
-        for index, chunk in enumerate(chunks, start=1):
+        # figure 只走附件回源，不进 LLM 上下文（避免占位/旧 OCR 题注污染答案）
+        prose_chunks = [c for c in chunks if c.chunk_type != "figure"]
+        for index, chunk in enumerate(prose_chunks, start=1):
             page = ""
             if chunk.page_from:
                 page = f"（第 {chunk.page_from} 页）" if chunk.page_from == chunk.page_to else (
@@ -2098,9 +2293,7 @@ class RetrievalPipeline:
             heading = f"{chunk.heading_path} " if chunk.heading_path else ""
             kind = ""
             body = chunk.content
-            if chunk.chunk_type == "figure":
-                kind = "【图片】"
-            elif chunk.chunk_type == "table":
+            if chunk.chunk_type == "table":
                 kind = "【表格】"
                 html = information_block_to_html(chunk.content)
                 if html:
@@ -2244,9 +2437,22 @@ class RetrievalPipeline:
                 refusal_reason=reason,
             )
 
+        # prompt 只喂文字；绑定 figure 留在 retrieval.chunks 供 figure_attachments
+        prose_for_prompt = [c for c in chunks if c.chunk_type != "figure"]
+        if not prose_for_prompt:
+            reason = retrieval.refusal_reason or REFUSE_EMPTY_ANSWER
+            return AnswerResult(
+                answer=refusal_answer_text(reason),
+                citations=[],
+                retrieval=retrieval,
+                model=self.providers.llm.ref.ident,
+                refused=True,
+                refusal_reason=reason or REFUSE_NO_BASIS,
+            )
+
         # **上下文预算**：资料 + 记忆 + 问题一起裁（保证至少 1 块 + 最近 1 轮）
         chunks, history, budget = self._fit_prompt(
-            chunks, history, question,
+            prose_for_prompt, history, question,
             system_tokens=count_tokens(SYSTEM_PROMPT.format(context="")),
         )
         # 裁剪后的 ``chunks`` 正是 ``build_context`` 编号 [1]..[N] 的那几块，也就是
@@ -2485,6 +2691,152 @@ class RetrievalPipeline:
         except Exception as exc:  # noqa: BLE001 - 门禁失败不能拖垮问答
             log.warning("answer_verify_failed", error=str(exc))
             return VerifyResult(supported=None, error=f"{type(exc).__name__}: {exc}")
+
+    def _try_structured_answer(
+        self,
+        question: str,
+        retrieval: RetrievalResult,
+        perm: PermContext,
+    ) -> AnswerResult | None:
+        """受限观测表聚合/查找；无可见分片或无命中时返回 ``None`` 以降级。"""
+        prefer_docs = sorted(
+            {
+                int(c.doc_id)
+                for c in retrieval.chunks
+                if getattr(c, "doc_id", None) is not None
+            }
+        )
+        with self.db.sync_connect() as conn:
+            hit = try_structured_query(
+                conn, question, perm, prefer_doc_ids=prefer_docs or None
+            )
+        if hit is None:
+            return None
+        if hit.is_na and hit.reason in {"no_rows", "not_found", "no_entity"}:
+            # 降级：让 numeric/prose 再试
+            return None
+        if hit.is_na and hit.reason == "no_visible_shard":
+            return AnswerResult(
+                answer="当前权限下没有可访问的资料。",
+                citations=[],
+                retrieval=retrieval,
+                model="structured_query",
+                refused=True,
+                refusal_reason="no_visible_shard",
+                mode_used=MODE_STRUCTURED,
+                intent="structured",
+                numeric=hit.as_dict(),
+            )
+        if hit.is_na and hit.reason == "yoy_column_missing":
+            return AnswerResult(
+                answer="资料中没有同比/环比列，无法计算，已按规则返回 N/A（禁止推算）。",
+                citations=[],
+                retrieval=retrieval,
+                model="structured_query",
+                refused=False,
+                mode_used=MODE_STRUCTURED,
+                intent="structured",
+                numeric=hit.as_dict(),
+            )
+        # 有数值/查找结果
+        if hit.op == "filter":
+            answer_text = f"共 {hit.value} 条：{hit.surface}"
+        elif hit.op == "lookup":
+            answer_text = str(hit.surface)
+        elif hit.op == "count":
+            answer_text = f"{hit.surface} 笔"
+        elif hit.op == "printed_total":
+            if (hit.extras or {}).get("yoy_copied"):
+                kind = (hit.extras or {}).get("yoy_kind") or "同比"
+                answer_text = f"{hit.surface}（表内印刷{kind}列）"
+            else:
+                period = hit.period or ""
+                suffix = f"，{period}" if period else ""
+                answer_text = f"{hit.surface}（表内印刷合计{suffix}）"
+        else:
+            answer_text = str(hit.surface)
+        # 尽量挂回检索到的可见 chunk 作引用
+        cite_chunks = [
+            c for c in retrieval.chunks if c.chunk_id in set(hit.chunk_ids)
+        ] or list(retrieval.chunks[:3])
+        citations = (
+            self._post_check_citations(
+                f"{answer_text} [1]",
+                cite_chunks[:1],
+                perm,
+                indices=[1],
+            )
+            if cite_chunks
+            else []
+        )
+        return AnswerResult(
+            answer=answer_text,
+            citations=citations,
+            retrieval=retrieval,
+            model="structured_query",
+            refused=False,
+            mode_used=MODE_STRUCTURED,
+            intent="structured",
+            context_chunks=cite_chunks[:5],
+            context_chunk_ids=[c.chunk_id for c in cite_chunks[:5]],
+            numeric=hit.as_dict(),
+        )
+
+    def _answer_from_rank(
+        self,
+        question: str,
+        retrieval: RetrievalResult,
+        perm: PermContext,
+        rank: Any,
+    ) -> AnswerResult:
+        """受限排序答题：服务端 max/min/rank，答案引用可解析 tidy 叶子。
+
+        与 numeric「只抄不算」并存：比较类不走 LLM 计算；引用编号写入答案文本，
+        再经 ``_post_check_citations`` 走同一套 ACL/页码校验。
+        """
+        from ekbs.retrieval.table_rank import RankAnswer
+
+        assert isinstance(rank, RankAnswer)
+        chunks_by_id = {c.chunk_id: c for c in retrieval.chunks}
+        ordered: list[RetrievedChunk] = []
+        for cid in rank.cite_chunk_ids:
+            chunk = chunks_by_id.get(cid)
+            if chunk is not None and chunk not in ordered:
+                ordered.append(chunk)
+        # 其余同行也进上下文（审计可见），但引用优先冠军/亚军
+        for chunk in retrieval.chunks:
+            if chunk not in ordered:
+                ordered.append(chunk)
+        # 答案里标 [1]..[n] 对应 cite_chunk_ids 顺序
+        cite_marks = " ".join(f"[{i}]" for i in range(1, len(rank.cite_chunk_ids) + 1))
+        answer_text = f"{rank.answer} {cite_marks}".strip()
+        citations = self._post_check_citations(
+            answer_text,
+            ordered[: max(len(rank.cite_chunk_ids), 1)],
+            perm,
+            indices=list(range(1, len(rank.cite_chunk_ids) + 1)),
+        )
+        return AnswerResult(
+            answer=answer_text,
+            citations=citations,
+            retrieval=retrieval,
+            model="table_rank",
+            refused=False,
+            mode_used=MODE_TABLE_RANK,
+            intent="compare",
+            context_chunks=ordered[: PEER_EXPAND_MAX_LEAVES],
+            context_chunk_ids=[c.chunk_id for c in ordered[:PEER_EXPAND_MAX_LEAVES]],
+            numeric={
+                "value": rank.winner_value,
+                "unit": "",
+                "indicator": rank.metric,
+                "scope": f"{rank.year}年{rank.month}月",
+                "surface": rank.winner_surface,
+                "entity": rank.winner_entity,
+                "op": rank.op,
+                "verified": True,
+            },
+        )
 
     async def _answer_numeric(
         self, question: str, retrieval: RetrievalResult, perm: PermContext
@@ -2860,6 +3212,14 @@ class RetrievalPipeline:
             # 多子问合并回答属 prose 语义；取数模式是单问题语义。覆盖必须留痕，便于排障。
             numeric_overridden = True
             mode_used = MODE_PROSE
+        # 缓存键用「路由候选 mode」：比较/结构化意图与 prose 答案形态不同，必须分键，
+        # 否则 rank/SQL 成功后会写进 prose 键，显式 prose 请求会串到约束答案。
+        cache_mode = mode_used
+        if mode_used == MODE_PROSE:
+            if is_compare_rank_intent(question):
+                cache_mode = MODE_TABLE_RANK
+            elif is_structured_query_intent(question):
+                cache_mode = MODE_STRUCTURED
         sub_key = (
             "|subq=" + "|".join(sq.text for sq in sub_questions) if multi_intent else ""
         )
@@ -2875,9 +3235,8 @@ class RetrievalPipeline:
         cache_key = CacheStore.answer_key(
             perm.fingerprint,
             f"{rewrite.rewritten}{sub_key}|gen={int(allow_generation)}"
-            # 模式必须进键：取数模式与业务问答的答案形态完全不同，
-            # 用解析后的 mode_used（auto→prose/numeric），避免同意图重复缓存两套键。
-            f"|mode={mode_used}|rc={self.retrieval_cache_revision()}|idx={self.index_cache_revision()}",
+            # 模式必须进键：取数/排名/结构化/散文答案形态完全不同。
+            f"|mode={cache_mode}|rc={self.retrieval_cache_revision()}|idx={self.index_cache_revision()}",
         )
         if use_cache and not collect_debug:
             cached = await self.cache.get(cache_key)
@@ -2896,7 +3255,30 @@ class RetrievalPipeline:
             overrides=overrides,
             collect_debug=collect_debug,
         )
-        if allow_generation and mode_used == MODE_NUMERIC:
+        # 四路路由：table_rank → structured_query → numeric → prose
+        # （比较意图优先于聚合；structured 失败/不适用再降级。）
+        rank_hit = (
+            try_constrained_rank(question, retrieval.chunks)
+            if allow_generation and is_compare_rank_intent(question)
+            else None
+        )
+        structured_hit = None
+        if (
+            allow_generation
+            and rank_hit is None
+            and mode_used != MODE_NUMERIC
+            and (mode_used == MODE_STRUCTURED or is_structured_query_intent(question))
+        ):
+            structured_hit = await asyncio.to_thread(
+                self._try_structured_answer, question, retrieval, perm
+            )
+        if allow_generation and rank_hit is not None:
+            result = self._answer_from_rank(question, retrieval, perm, rank_hit)
+            mode_used = MODE_TABLE_RANK
+        elif allow_generation and structured_hit is not None:
+            result = structured_hit
+            mode_used = MODE_STRUCTURED
+        elif allow_generation and mode_used == MODE_NUMERIC:
             result = await self._answer_numeric(question, retrieval, perm)
         elif allow_generation and multi_intent and per_sub:
             # 多问题：逐子问生成再拼接（共享 2048 输出上限会让后面的问题被略过）
@@ -2966,7 +3348,12 @@ class RetrievalPipeline:
 
     def _enforce_number_evidence(self, result: AnswerResult, retrieval: RetrievalResult) -> AnswerResult:
         """输出门禁：答案里的数字必须能在检索内容中找到，禁止模型计算/编造。"""
-        if result.refused or result.mode_used == MODE_NUMERIC:
+        # 取数 / 排名 / 结构化聚合都是服务端约束输出，不走散文数字门禁
+        if result.refused or result.mode_used in {
+            MODE_NUMERIC,
+            MODE_STRUCTURED,
+            MODE_TABLE_RANK,
+        }:
             return result
         missing = _number_evidence_gate(result.answer, retrieval.chunks)
         if not missing:
@@ -3113,12 +3500,23 @@ class RetrievalPipeline:
 
     @staticmethod
     def _figure_is_junk(content: str, heading_path: str = "") -> bool:
-        """多模态旁路常把扫描件空白页当「图」召回；这类不得回源。"""
+        """多模态旁路常把扫描件空白页 / 水印壳 / 手写误识当「图」召回；这类不得回源。"""
+        from ekbs.ingest.clean import is_low_quality_figure_caption
+
         blob = f"{content or ''}\n{heading_path or ''}"
-        return any(
+        if any(
             mark in blob
-            for mark in ("无可读文字", "纯白背景", "纯白色的背景", "没有任何可识别")
-        )
+            for mark in (
+                "无可读文字",
+                "纯白背景",
+                "纯白色的背景",
+                "没有任何可识别",
+                "[手写表格照片]",
+                "[现场照片]",
+            )
+        ):
+            return True
+        return is_low_quality_figure_caption(blob)
 
     @staticmethod
     def _figure_query_score(
@@ -3207,18 +3605,18 @@ class RetrievalPipeline:
                 content,
             )
 
-        if (intent or "").strip().lower() == "figure":
-            for chunk in chunks:
-                if chunk.chunk_type != "figure" and not chunk.figure_id:
-                    continue
-                _push(
-                    int(chunk.chunk_id),
-                    str(chunk.figure_id or ""),
-                    str(chunk.image_path or ""),
-                    str(chunk.doc_title or ""),
-                    int(chunk.doc_id or 0),
-                    str(chunk.content or chunk.heading_path or ""),
-                )
+        # 任意意图：文字命中后展开的绑定 figure 都可回源（不再依赖模型 cite 图块）
+        for chunk in chunks:
+            if chunk.chunk_type != "figure" and not chunk.figure_id:
+                continue
+            _push(
+                int(chunk.chunk_id),
+                str(chunk.figure_id or ""),
+                str(chunk.image_path or ""),
+                str(chunk.doc_title or ""),
+                int(chunk.doc_id or 0),
+                str(chunk.heading_path or chunk.content or ""),
+            )
 
         if not candidates:
             return []

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from ekbs.ingest.chunker import TableInput, count_tokens
 from ekbs.ingest.pipeline import IngestPipeline
 from ekbs.retrieval.pipeline import (
@@ -96,60 +98,78 @@ def _add_chunk(
         return int(cursor.lastrowid)
 
 
-async def test_expand_page_figures_by_page_overlap(seeded) -> None:
-    """正文页 3-4 命中 → 同文档 page 4 的图被并入；page 9 的图不并入。"""
+async def test_expand_bound_figures_by_parent(seeded) -> None:
+    """正文 child 命中 → 同 parent 绑定的图并入；其它 parent 下的图不并入。"""
     runtime, _ = seeded
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
     doc_id, shard = _visible_doc(runtime)
+    parent_near = _add_chunk(
+        runtime, doc_id, shard, seq=900, content="近节父块", chunk_type="parent",
+        page_from=3, page_to=4,
+    )
+    parent_far = _add_chunk(
+        runtime, doc_id, shard, seq=901, content="远节父块", chunk_type="parent",
+        page_from=9, page_to=9,
+    )
     body_id = _add_chunk(
-        runtime, doc_id, shard, seq=900, content="正文第3-4页", page_from=3, page_to=4
+        runtime, doc_id, shard, seq=902, content="正文第3-4页",
+        page_from=3, page_to=4, parent_id=parent_near,
     )
     near = _add_chunk(
-        runtime, doc_id, shard, seq=901, content="图:电表", chunk_type="figure",
+        runtime, doc_id, shard, seq=903, content="[图片]", chunk_type="figure",
         page_from=4, page_to=4, figure_id="fig-near", image_path="parse/x/near.png",
+        parent_id=parent_near,
     )
     far = _add_chunk(
-        runtime, doc_id, shard, seq=902, content="图:远页", chunk_type="figure",
+        runtime, doc_id, shard, seq=904, content="[图片]", chunk_type="figure",
         page_from=9, page_to=9, figure_id="fig-far", image_path="parse/x/far.png",
+        parent_id=parent_far,
     )
     anchor = RetrievedChunk(
         chunk_id=body_id, doc_id=doc_id, shard_id=shard, content="正文",
-        page_from=3, page_to=4, rerank_score=0.87,
+        page_from=3, page_to=4, rerank_score=0.87, parent_chunk_id=parent_near,
     )
-    out = runtime.pipeline._expand_page_figures([anchor], alice)
+    out = runtime.pipeline._expand_bound_figures([anchor], alice)
     ids = [chunk.chunk_id for chunk in out]
-    assert near in ids, "页码重叠的图必须并入上下文"
-    assert far not in ids, "页码不相交的图不得并入"
+    assert near in ids, "同 parent 绑定的图必须并入"
+    assert far not in ids, "其它 parent 下的图不得并入"
     got = next(chunk for chunk in out if chunk.chunk_id == near)
-    assert got.rerank_score == 0.87, "插图应继承锚点的精排分，便于就近引用"
+    assert got.rerank_score == pytest.approx(0.87 * 0.9)
 
 
-async def test_expand_page_figures_no_page_anchor_is_noop(seeded) -> None:
-    """锚点没有 page_from（docx 正文）→ 原样返回，交给 _expand_doc_figures。"""
+async def test_expand_bound_figures_without_parent_is_noop(seeded) -> None:
+    """锚点没有 parent_chunk_id → 无法绑图，原样返回。"""
     runtime, _ = seeded
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
-    doc_id, shard = _visible_doc(runtime)
     anchor = RetrievedChunk(
-        chunk_id=9901, doc_id=doc_id, shard_id=shard, content="无页码正文",
+        chunk_id=9901, doc_id=1, shard_id="kb_all_L1", content="无父块正文",
     )
-    assert runtime.pipeline._expand_page_figures([anchor], alice) == [anchor]
+    assert runtime.pipeline._expand_bound_figures([anchor], alice) == [anchor]
 
 
-async def test_expand_doc_figures_by_doc(seeded) -> None:
-    """正文无页码时，同文档 figure 仍被并入（docx 常见，否则「扫码」问不到图）。"""
+async def test_expand_bound_figures_via_compat_aliases(seeded) -> None:
+    """旧 expand_page/doc 入口转发到 parent 绑定展开。"""
     runtime, _ = seeded
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
     doc_id, shard = _visible_doc(runtime)
-    body_id = _add_chunk(runtime, doc_id, shard, seq=910, content="无页码正文")
+    parent_id = _add_chunk(
+        runtime, doc_id, shard, seq=910, content="无页码父块", chunk_type="parent",
+    )
+    body_id = _add_chunk(
+        runtime, doc_id, shard, seq=911, content="无页码正文", parent_id=parent_id,
+    )
     fig_id = _add_chunk(
-        runtime, doc_id, shard, seq=911, content="图:二维码", chunk_type="figure",
-        figure_id="fig-doc", image_path="parse/x/qr.png",
+        runtime, doc_id, shard, seq=912, content="[图片]", chunk_type="figure",
+        figure_id="fig-doc", image_path="parse/x/qr.png", parent_id=parent_id,
     )
     anchor = RetrievedChunk(
         chunk_id=body_id, doc_id=doc_id, shard_id=shard, content="无页码正文",
+        parent_chunk_id=parent_id,
     )
     out = runtime.pipeline._expand_doc_figures([anchor], alice)
     assert fig_id in [chunk.chunk_id for chunk in out]
+    out2 = runtime.pipeline._expand_page_figures([anchor], alice)
+    assert fig_id in [chunk.chunk_id for chunk in out2]
 
 
 async def test_expand_parents_records_ranked_source_and_dedupes(seeded) -> None:
@@ -308,6 +328,70 @@ async def test_expand_oversized_table_returns_all_segments(seeded) -> None:
     assert dropped == len(segment_ids)
     assert [chunk.chunk_id for chunk in deduped] == segment_ids
     assert all(chunk.expanded_from == anchor.chunk_id for chunk in deduped)
+
+
+def test_expand_compare_peers_only_on_compare_intent_and_respects_budget() -> None:
+    """比较意图才按 (doc,年,月) 补齐 tidy 同行；条数/token 有上限。"""
+    from ekbs.retrieval.pipeline import PEER_EXPAND_MAX_LEAVES, RetrievalPipeline
+    from ekbs.retrieval.table_rank import is_compare_rank_intent
+
+    assert is_compare_rank_intent("9月谁更高")
+    assert not is_compare_rank_intent("9月用电量是多少")
+
+    class _Gate:
+        def filter_chunks(self, perm, pairs):
+            return list(pairs), []
+
+    def _leaf(chunk_id: int, entity: str, value: str) -> RetrievedChunk:
+        return RetrievedChunk(
+            chunk_id=chunk_id,
+            doc_id=7,
+            shard_id="s",
+            chunk_type="table",
+            parent_chunk_id=1,
+            content=(
+                "表名: 大户用电监视\n相关表头: 用户名 | 年度 | 月份 | 用电量\n"
+                f"用户名={entity}; 年度=2026; 月份=9; 用电量={value}"
+            ),
+            rerank_score=0.9,
+        )
+
+    hit = _leaf(10, "甲", "100")
+    peers = [_leaf(100 + i, f"商户{i}", str(1000 + i)) for i in range(5)]
+
+    pipe = object.__new__(RetrievalPipeline)
+    pipe.gate = _Gate()  # type: ignore[attr-defined]
+    pipe.db = SimpleNamespace()  # type: ignore[attr-defined]
+
+    class _Conn:
+        def execute(self, sql, params):
+            if "FROM ekbs_document" in sql:
+                return SimpleNamespace(
+                    fetchone=lambda: {"title": "工程部/2026年9月能耗分析"}
+                )
+            return SimpleNamespace(
+                fetchall=lambda: [{"chunk_id": p.chunk_id} for p in peers]
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    pipe.db.sync_connect = lambda: _Conn()  # type: ignore[attr-defined]
+    pipe.load_chunks = lambda ids: {p.chunk_id: p for p in peers if p.chunk_id in ids}  # type: ignore[attr-defined]
+
+    out = pipe._expand_compare_peers([hit], SimpleNamespace(user_id=1), "9月用电量谁更高")
+    assert len(out) == 1 + len(peers)
+    assert {c.chunk_id for c in out} == {10, *[p.chunk_id for p in peers]}
+    assert all(c.rerank_score == 0.9 for c in out[1:])
+    assert len(out) - 1 <= PEER_EXPAND_MAX_LEAVES
+
+    unchanged = pipe._expand_compare_peers(
+        [hit], SimpleNamespace(user_id=1), "9月用电量是多少"
+    )
+    assert unchanged == [hit]
 
 
 def test_expand_table_group_truncates_over_budget_and_keeps_hit_segment() -> None:

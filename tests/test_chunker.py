@@ -761,6 +761,7 @@ def test_unsplittable_table_falls_back_to_single_container() -> None:
 
     这种表是病态输入（一个单元格 >2000 token），线上几乎不会出现；但必须有确定的
     兜底路径：回退后仍是「容器 + 行组叶子」，只是容器可能略超硬上限。
+    若序列化已拆成多块 full_blocks，则按相关表头分组建父容器（可带 table_group）。
     """
     from ekbs.ingest.table_serialize import serialize_table_body
 
@@ -769,24 +770,26 @@ def test_unsplittable_table_falls_back_to_single_container() -> None:
         "| 项目 | 说明 |\n| --- | --- |\n"
         f"| 项目0 | {huge} |\n| 项目1 | 短说明 |\n| 项目2 | 短说明 |"
     )
-    serialized = sum(
-        count_tokens(block)
-        for block in serialize_table_body(caption="大表", body=body, table_id="2")
-    )
+    full_blocks = serialize_table_body(caption="大表", body=body, table_id="2")
+    serialized = sum(count_tokens(block) for block in full_blocks)
     assert serialized > TABLE_CONTAINER_MAX_TOKENS, "本用例前提：整表序列化超硬上限"
     result = chunk_markdown(
         "# 制度\n\n## 6．质量记录\n\n[表格 2]\n\n",
         doc_title="设备编号作业指导书",
         tables=[TableInput(body=body, table_id="2", caption="大表")],
     )
-    assert not any(node.table_group for node in result.nodes), "不可分段时不得打组（回退旧行为）"
-    container, leaves = _table_container_leaves(result)
-    assert container.token_count > TABLE_CONTAINER_MAX_TOKENS, (
-        "不可分段时容器按原样保留（内容优先）；线上病态输入才走到这里"
-    )
-    assert len(leaves) > 1, "叶子规则不变：仍按 384 行组出叶子"
-    joined = container.content + "\n".join(leaf.content for leaf in leaves)
+    joined = "\n".join(node.content for node in result.nodes if node.chunk_type == "table")
     assert "项目=项目0" in joined and "项目=项目2" in joined, "回退路径不得丢行"
+    if len(full_blocks) == 1:
+        assert not any(node.table_group for node in result.nodes), "单块不可分段时不得打组"
+        container, leaves = _table_container_leaves(result)
+        assert container.token_count > TABLE_CONTAINER_MAX_TOKENS
+        assert len(leaves) > 1, "叶子规则不变：仍按 384 行组出叶子"
+    else:
+        # 多块 full_blocks：按相关表头分组的父容器路径
+        assert any(node.table_group for node in result.nodes) or any(
+            node.parent_index is not None for node in result.nodes
+        )
 
 
 def test_xlsx_row_chunks_keeps_one_leaf_per_row_after_segmentation() -> None:

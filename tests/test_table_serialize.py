@@ -356,6 +356,89 @@ def test_general_format_date_serials_in_date_header(tmp_path) -> None:
     assert "46295" not in body and "2026-09-30" in body
 
 
+def test_calendar_serial_row_without_date_word_converts(tmp_path) -> None:
+    """水费/熙丰：日期行没有「日期」二字，但序列号按月间隔 → 仍转成 YYYY-MM-DD。"""
+    from openpyxl import Workbook
+    from ekbs.ingest.parser import parse_file
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "水费账单"
+    # 45292=2024-01-01, 45323=2024-02-01, 45352=2024-03-01（General 格式）
+    ws.append(["序号", "水卡号", "用途", 45292, "", "", 45323, "", "", 45352, "", ""])
+    ws.append(["序号", "水卡号", "用途", "上月起度", "本月止度", "用量", "上月起度", "本月止度", "用量", "上月起度", "本月止度", "用量"])
+    ws.append([1, "30005", "绿化", 100, 110, 10, 110, 125, 15, 125, 140, 15])
+    path = tmp_path / "water_serial.xlsx"
+    wb.save(path)
+    doc = parse_file(path)
+    body = doc.tables[0].body
+    assert "45292" not in body
+    assert "2024-01-01" in body
+
+
+def test_date_row_above_labels_merges_into_headers() -> None:
+    """日期行在字段名行之上时并入列名，不得变成 `上月起度=45292` 数据行。
+
+    宽表按指标组切开后，两个月可能落在不同块；拼起来断言即可。
+    """
+    rows = [
+        ["序号", "用途", "2024-01-01", "", "", "2024-02-01", "", ""],
+        ["序号", "用途", "上月起度", "本月止度", "用量", "上月起度", "本月止度", "用量"],
+        ["1", "绿化", "100", "110", "10", "110", "125", "15"],
+    ]
+    blocks = serialize_information_blocks(caption="水费账单", rows=rows)
+    text = "\n".join(blocks)
+    assert "上月起度=45292" not in text
+    assert "上月起度/2024-01-01" in text
+    assert "上月起度/2024-02-01" in text
+    assert "用途=绿化" in text
+    assert all("相关表头:" in b for b in blocks)
+    # 每块相关表头不得拖着另一月的整组列
+    assert all(
+        not ("上月起度/2024-01-01" in b and "上月起度/2024-02-01" in b) for b in blocks
+    ), blocks
+
+
+def test_numeric_data_row_not_merged_as_subheader() -> None:
+    """气费：顶行空首列 + 下一行锅炉读数，不得并成 `起度/379749` 相关表头。"""
+    rows = [
+        ["", "起度", "止度", "用量", "单价", "金额"],
+        ["锅炉", "379749", "410802", "31053", "2.576", "79992.53"],
+        ["食堂", "8911", "9088", "177", "2.576", "455.95"],
+    ]
+    text = serialize_information_blocks(caption="气费账单", rows=rows)[0]
+    header_line = next(line for line in text.splitlines() if line.startswith("相关表头:"))
+    assert "起度/379749" not in header_line
+    assert "379749" not in header_line
+    assert "起度" in header_line
+    assert "列1=锅炉" in text or "; 起度=379749" in text
+    assert "食堂" in text
+
+
+def test_wide_row_chunks_split_by_column_windows() -> None:
+    """宽抄表一行仍超叶子预算时按列窗拆，每块 ≤ max_tokens。"""
+    # 4 身份列 + 12 个月 × 5 指标
+    headers = ["序号", "卡号", "表号", "用途"]
+    for month in range(1, 13):
+        headers.extend([
+            f"上月起度/2024-{month:02d}-01",
+            f"本月止度/2024-{month:02d}-01",
+            f"用量/2024-{month:02d}-01",
+            f"单价/2024-{month:02d}-01",
+            f"金额/2024-{month:02d}-01",
+        ])
+    data = ["1", "30005", "1905", "绿化"] + ["100", "110", "10", "4.55", "45.5"] * 12
+    rows = [headers, data]
+    blocks = serialize_information_blocks(
+        caption="水费账单", rows=rows, row_chunks=True, max_tokens=384
+    )
+    from ekbs.ingest.chunker import count_tokens
+
+    assert len(blocks) > 1, "12 个月宽行必须拆成多块"
+    assert all(count_tokens(b) <= 384 for b in blocks), [count_tokens(b) for b in blocks]
+    assert any("上月起度/2024-01-01" in b for b in blocks)
+
+
 # --- Word/PowerPoint 合并单元格（colspan / rowspan）的网格还原 -------------------
 # 事故（doc_id=196 XJWY-GC-12 能耗管理作业指导书）：
 #   表 1 两行表头 `<th rowspan="2">级别</th><th colspan="3">分级内容</th>` 被展平成
@@ -510,3 +593,83 @@ def test_xlsx_table_body_is_html_for_document_compare(tmp_path) -> None:
     assert "-17.19%" in body
     assert "4379405.00" in body
     assert not body.lstrip().startswith("|")
+
+
+def test_month_wide_table_melts_to_tidy_leaves_when_row_chunks() -> None:
+    """宽月份表 + row_chunks → 一行一月观测；并产出按月 TopN 摘要。"""
+    rows = [
+        ["铺号", "用户名", "年度", "1月", "2月", "9月", "10月", "11月", "12月"],
+        ["A-1", "甲商户", "2026年", "10", "20", "100", "40", "50", "60"],
+        ["B-2", "乙商户", "2026年", "11", "21", "200", "41", "51", "61"],
+        ["C-3", "丙商户", "2026年", "12", "22", "150", "42", "52", "62"],
+    ]
+    # 非 row_chunks：保持宽行，不熔
+    wide = serialize_information_blocks(caption="大户用电监视", rows=rows, row_chunks=False)
+    assert any("1月=10" in block and "9月=100" in block for block in wide)
+
+    leaves = serialize_information_blocks(
+        caption="大户用电监视（第1段）（用电大户用量监视（度） / 娱乐）",
+        rows=rows,
+        row_chunks=True,
+    )
+    tidy = [b for b in leaves if "月份=" in b and "用电量=" in b]
+    assert len(tidy) == 3 * 6  # 3 户 × 6 个月列
+    hit = next(b for b in tidy if "用户名=乙商户" in b and "月份=9" in b)
+    assert "用电量=200" in hit
+    assert "年度=2026" in hit
+    assert "类别=娱乐" in hit
+    # 宽行键不应再出现在叶子里
+    assert not any("; 1月=" in b and "; 9月=" in b for b in tidy)
+    summaries = [b for b in leaves if "排名类型=Top10" in b]
+    assert summaries
+    sep = next(b for b in summaries if "月份=9" in b and "年度=2026" in b)
+    assert "1. 乙商户=200" in sep
+    assert "2. 丙商户=150" in sep
+
+
+def test_month_series_infers_layout_from_uniform_category_headers() -> None:
+    """分节后伪表头（整行「娱乐」）仍能按数据形态熔成长叶子。"""
+    rows = [
+        ["娱乐"] * 15,
+        ["(2A-1)", "海豚电竞", "2026年", "1", "2", "3", "4", "5", "6", "7", "8", "131120", "10", "11", "12"],
+        ["(其它)", "保利影城", "2026年", "1", "2", "3", "4", "5", "6", "7", "8", "90000", "10", "11", "12"],
+    ]
+    leaves = serialize_information_blocks(
+        caption="大户用电监视（第3段）", rows=rows, row_chunks=True
+    )
+    hit = next(
+        b for b in leaves
+        if "用户名=海豚电竞" in b and "月份=9" in b and "用电量=131120" in b
+    )
+    assert "类别=娱乐" in hit
+    assert "年度=2026" in hit
+
+
+def test_month_wide_without_year_column_does_not_melt() -> None:
+    """Phase A：≥6 个月列但无年列 → 不熔（安全默认；不从文件名猜年）。
+
+    显式 ``default_year`` 才会熔（对应 ``month_series_infer_year_from_filename``）。
+    """
+    from ekbs.ingest.table_serialize import detect_month_series_layout
+
+    rows = [
+        ["铺号", "用户名", "1月", "2月", "3月", "4月", "5月", "6月", "9月"],
+        ["A-1", "甲商户", "10", "20", "30", "40", "50", "60", "100"],
+        ["B-2", "乙商户", "11", "21", "31", "41", "51", "61", "200"],
+    ]
+    headers, data = rows[0], rows[1:]
+    assert detect_month_series_layout(headers, data, caption="大户用电2026") is None
+    # 宽行保留，不产出月份= tidy 叶子
+    leaves = serialize_information_blocks(
+        caption="大户用电2026", rows=rows, row_chunks=True
+    )
+    assert not any("月份=" in b for b in leaves)
+    assert any("1月=" in b and "9月=" in b for b in leaves)
+    # 显式传年才熔（产品开关路径）
+    assert detect_month_series_layout(
+        headers, data, caption="大户用电", default_year="2026"
+    ) is not None
+    melted = serialize_information_blocks(
+        caption="大户用电", rows=rows, row_chunks=True, default_year="2026"
+    )
+    assert any("月份=9" in b and "用电量=200" in b for b in melted)

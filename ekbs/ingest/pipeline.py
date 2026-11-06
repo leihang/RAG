@@ -398,6 +398,22 @@ class IngestPipeline:
                     source_path=source_path,
                     table_row_chunks=bool(getattr(self.settings.retrieval, "table_row_chunks", False)),
                     doc_metadata_line=metadata_line,
+                    month_series_infer_year_from_filename=bool(
+                        getattr(
+                            self.settings.retrieval,
+                            "month_series_infer_year_from_filename",
+                            False,
+                        )
+                    ),
+                    table_leaf_policy=str(
+                        getattr(self.settings.retrieval, "table_leaf_policy", "auto") or "auto"
+                    ),
+                    table_leaf_sample_max=int(
+                        getattr(self.settings.retrieval, "table_leaf_sample_max", 64) or 64
+                    ),
+                    table_leaf_sample_min_rows=int(
+                        getattr(self.settings.retrieval, "table_leaf_sample_min_rows", 200) or 200
+                    ),
                 )
             # **零丢失守卫**：分块把"整行当标题"时文字会静默消失（实测 22 段丢 11 段，
             # 而空页率/乱码率/空 heading 全 PASS）。这里逐行核对，丢实质内容就打警告 +
@@ -414,6 +430,9 @@ class IngestPipeline:
                 )
             await self._apply_contextual_retrieval(title, chunking.nodes)
             self._insert_chunks(doc_id, shard_id, chunking.nodes)
+            self._maybe_write_table_observations(
+                doc_id, shard_id, tables, source_path=source_path
+            )
             child_ids = self._child_chunk_ids(doc_id)
             if defer_vector:
                 # 复核只做到"分块落库"：不调嵌入、不写分片、不发布。
@@ -669,6 +688,9 @@ class IngestPipeline:
         if self.figure_index is not None:
             self.figure_index.remove(chunk_ids)
         with self.db.sync_connect() as conn:
+            from ekbs.ingest.table_observations import delete_observations_for_doc
+
+            delete_observations_for_doc(conn, doc_id)
             conn.execute("DELETE FROM ekbs_chunk WHERE doc_id = ?", (doc_id,))
             conn.commit()
         # 这是**正常路径**，不是告警：上面已连同分块与 FTS 一起把旧向量真删了。
@@ -714,6 +736,35 @@ class IngestPipeline:
             conn.commit()
         return doc_id
 
+    def _maybe_write_table_observations(
+        self,
+        doc_id: int,
+        shard_id: str,
+        tables: Sequence[TableInput],
+        *,
+        source_path: str,
+    ) -> None:
+        """有 HTML 表则按表型双写观测行（xlsx / docx / pdf 一视同仁）。
+
+        * **观测双写**：只要 ``tables`` 非空就分类写入 —— Word/PDF 经 MinerU/Office
+          抽出的 ``table_body`` 同样可做台账查找、印刷合计等；
+        * **月份熔长叶子 / ``table_row_chunks``**：仍只在电子表格路径生效（见
+          ``chunker`` + ``is_spreadsheet_source``），避免把 Word 排版表拆成行噪声。
+        """
+        if not tables or is_code_source(source_path):
+            return
+        from ekbs.ingest.table_observations import write_observations_for_tables
+
+        with self.db.sync_connect() as conn:
+            write_observations_for_tables(
+                conn,
+                doc_id=doc_id,
+                shard_id=shard_id,
+                tables=tables,
+                source_path=source_path,
+            )
+            conn.commit()
+
     def _insert_chunks(self, doc_id: int, shard_id: str, nodes: Sequence[ChunkNode]) -> None:
         """按 ``seq`` 顺序插入，把子块的 ``parent_index`` 解析成真实 ``parent_id``。"""
         with self.db.sync_connect() as conn:
@@ -744,8 +795,8 @@ class IngestPipeline:
     def _child_chunk_ids(self, doc_id: int) -> list[int]:
         """**可向量化/可检索**的块 id —— 口径见 :mod:`ekbs.ingest.retrievable`。
 
-        一条「叶子块才是检索单元」同时兑现三件事：图片块进得了向量（图上的文字搜得到）、
-        代码的符号块进得了向量（代码库不再是"存了但搜不到"）、Markdown 的父容器不重复入向量。
+        「叶子块才是检索单元」：代码符号块进向量；Markdown 父容器不重复入向量；
+        ``figure`` 不在白名单（只作文字分片附件，不进向量/FTS）。
         """
         with self.db.sync_connect() as conn:
             return retrievable_chunk_ids(conn, doc_id=doc_id)
@@ -774,7 +825,7 @@ class IngestPipeline:
         log.info("fts_indexed", doc_id=doc_id, rows=written)
 
     async def _embed_children(self, doc_id: int, chunk_ids: Sequence[int]):
-        """分批嵌入（``models.embed.batch_size``）—— **子块 + 图片块**，
+        """分批嵌入（``models.embed.batch_size``）—— **可检索叶子**（不含 figure），
         入库期失败按 `00` §2.3 排队重试。
 
         同时**顺手完成 token 校准的一条记录**：本方法知道"发给嵌入模型的正是这些文本"，
@@ -855,9 +906,11 @@ class IngestPipeline:
         return array, stats
 
     async def _embed_figures_multimodal(self, doc_id: int) -> tuple[int, int]:
-        """figure 块再写一路多模态图像向量（与文本 FAISS 分索引，维度通常 1152）。"""
+        """figure 多模态向量（可选旁路）。默认关闭：图片只作文字附件，不写图向量。"""
         import numpy as np
 
+        if not bool(getattr(self.settings.retrieval, "figure_multimodal", False)):
+            return 0, 0
         if self.figure_index is None or self.providers.multimodal is None:
             return 0, 0
         with self.db.sync_connect() as conn:

@@ -53,8 +53,17 @@ retrieval:
   multi_query: 3
   # 稠密侧多查询数（1=关）。离线/mock：保持原行为
   dense_multi_query: 1
-  # figure 多模态旁路索引（课程 17）：图片向量与文本 embed 维度不同，单独 FAISS + RRF 第三路
-  figure_multimodal: true
+  # figure 多模态旁路：默认关。图片只作文字分片附件，不进向量召回。
+  figure_multimodal: false
+  # **仅电子表格**（与 cloud/deploy 对齐）：一行一块；月份宽表 melt 成 tidy 长叶子。
+  # 缺此键时默认 false → 开发机验收题「9月谁更高」不会走月份熔断路径。
+  table_row_chunks: true
+  # 无显式年列时不从文件名推断年份（安全默认）；见 README 发现 94。
+  month_series_infer_year_from_filename: false
+  # B 型收费明细：大表叶子抽样进 FAISS，全量行写观测表做 SUM/COUNT。
+  table_leaf_policy: auto
+  table_leaf_sample_max: 64
+  table_leaf_sample_min_rows: 200
   # 多意图拆分（P0）：一次问多个问题时拆成子问，每子问独立召回 + 配额精排
   intent_split:
     enabled: true

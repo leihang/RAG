@@ -73,9 +73,15 @@ retrieval:
   # 取 0.85 保留 15% 词法权重作为"精确编号/金额"类查询的保险。依据见 README §四 第 75 条。
   fusion: alpha
   hybrid_alpha: 0.75
+  # 图片不进向量召回：只作文字分片附件（parent 绑定后回源）
+  figure_multimodal: false
   # 仅电子表格（xlsx/xls/xlsm）一行一个块、表头每块重复（RAGFlow 口径）；
   # Word/PDF/PPT 一律按 384 token 行组叶子（来源判定在 ingest/chunker.py）。
   table_row_chunks: true
+  month_series_infer_year_from_filename: false
+  table_leaf_policy: auto
+  table_leaf_sample_max: 64
+  table_leaf_sample_min_rows: 200
   cache:
     # 本栈无 Redis：L1 为进程内 LRU，L2 为 SQLite 表 ekbs_cache（键必须含 perm_fingerprint）
     backend: memory+sqlite

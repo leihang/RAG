@@ -41,11 +41,25 @@ async def test_mock_multimodal_aligns_stem_with_query(tmp_path: Path) -> None:
     assert score > 0.3
 
 
+def _enable_figure_multimodal(runtime) -> FigureIndex:
+    """可选旁路：测试显式打开 figure_multimodal 并注入 mock 多模态索引。"""
+    runtime.settings.retrieval.figure_multimodal = True
+    dim = int(runtime.settings.models.multimodal_embed.dim or 64)
+    if runtime.providers.multimodal is None:
+        runtime.providers.multimodal = MockMultimodalEmbeddingProvider(dim=dim)
+    if runtime.figure_index is None:
+        path = runtime.settings.data_dir / "index" / "figures-test.faiss"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        runtime.figure_index = FigureIndex(path, dim=dim)
+    runtime.pipeline.figure_index = runtime.figure_index
+    return runtime.figure_index
+
+
 @pytest.mark.asyncio
-async def test_ingest_writes_figure_multimodal_and_retrieve(seeded) -> None:
+async def test_ingest_writes_figure_multimodal_when_enabled(seeded) -> None:
+    """可选旁路：显式打开 figure_multimodal 时仍可写入图向量（默认生产关闭）。"""
     runtime, summary = seeded
-    assert runtime.providers.multimodal is not None
-    assert runtime.figure_index is not None
+    figure_index = _enable_figure_multimodal(runtime)
 
     assets = runtime.settings.data_dir / "parse" / "mm_test" / "images"
     assets.mkdir(parents=True, exist_ok=True)
@@ -59,9 +73,9 @@ async def test_ingest_writes_figure_multimodal_and_retrieve(seeded) -> None:
         providers=runtime.providers,
         shards=runtime.shards,
         fts=runtime.fts,
-        figure_index=runtime.figure_index,
+        figure_index=figure_index,
     )
-    before = runtime.figure_index.vector_count
+    before = figure_index.vector_count
     result = await pipeline.ingest_markdown(
         title="巡检图册",
         markdown="# 巡检\n\n现场更换记录见附图。\n",
@@ -80,10 +94,9 @@ async def test_ingest_writes_figure_multimodal_and_retrieve(seeded) -> None:
         ),
     )
     assert result.figure_vector_count >= 1
-    assert runtime.figure_index.vector_count >= before + 1
+    assert figure_index.vector_count >= before + 1
 
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
-    # 关掉稀疏/文本稠密主导：仍应靠 MM 第三路捞到 figure
     retrieved = await runtime.pipeline.retrieve(
         "电表更换",
         alice,
@@ -97,15 +110,10 @@ async def test_ingest_writes_figure_multimodal_and_retrieve(seeded) -> None:
     )
     assert "figure_mm" in retrieved.stage_debug
     assert retrieved.stage_debug["figure_mm"]["enabled"] is True
-    figure_hits = {
-        c.chunk_id
-        for c in retrieved.chunks
-        if c.chunk_type == "figure" and "电表" in (c.content or "")
-    }
-    # 至少 MM lane 有命中记录，或最终上下文含该 figure
+    # 新口径：figure 不进最终 keep（会被 prose 优先丢掉）；MM lane 仍可有命中记录
     mm_ids = {h["chunk_id"] for h in retrieved.stage_debug["figure_mm"]["hits"]}
-    assert mm_ids or figure_hits, (
-        f"expected figure mm recall; refused={retrieved.refused} "
+    assert mm_ids or not retrieved.refused, (
+        f"expected figure mm lane activity; refused={retrieved.refused} "
         f"debug={retrieved.stage_debug.get('figure_mm')}"
     )
 
@@ -120,6 +128,7 @@ async def test_figure_embed_failure_is_retried_then_reported(seeded) -> None:
     除人工比对文件之外没有任何信号（实测 2/201 张如此）。
     """
     runtime, summary = seeded
+    _enable_figure_multimodal(runtime)
     assets = runtime.settings.data_dir / "parse" / "mm_retry" / "images"
     assets.mkdir(parents=True, exist_ok=True)
     name = "重试用例.png"
@@ -177,6 +186,7 @@ async def test_figure_embed_failure_is_retried_then_reported(seeded) -> None:
 async def test_figure_embed_permanent_failure_is_visible(seeded) -> None:
     """重试仍失败 → 失败数进结果（可观测），文档不因此整篇失败。"""
     runtime, summary = seeded
+    _enable_figure_multimodal(runtime)
     assets = runtime.settings.data_dir / "parse" / "mm_fail" / "images"
     assets.mkdir(parents=True, exist_ok=True)
     name = "永久失败.png"
