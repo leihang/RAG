@@ -55,7 +55,7 @@ describe('分块预览的向量标签', () => {
     })
 
     mount()
-    await waitFor(() => expect(screen.getByText('上下文块')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getAllByText('上下文块').length).toBeGreaterThan(0))
     expect(screen.queryByText('未入向量')).toBeNull()
   })
 
@@ -76,7 +76,7 @@ describe('分块预览的向量标签', () => {
     })
 
     mount()
-    await waitFor(() => expect(screen.getByText('未入文本向量')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getAllByText('未入文本向量').length).toBeGreaterThan(0))
     expect(screen.getByText('未入向量（异常，可点「重新向量化」）')).toBeInTheDocument()
     expect(screen.queryByText('上下文块')).toBeNull()
   })
@@ -109,9 +109,9 @@ describe('分块预览的向量标签', () => {
     })
 
     mount()
-    await waitFor(() => expect(screen.getByText('子块（2）')).toBeInTheDocument())
-    expect(screen.getByText('子块A内容')).toBeInTheDocument()
-    expect(screen.getByText('子块B内容')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByText('分块（3）')).toBeInTheDocument())
+    expect(screen.getAllByText(/子块A内容/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/子块B内容/).length).toBeGreaterThan(0)
   })
 
   it('figure 块展示「多模态已索引」标识', async () => {
@@ -182,7 +182,7 @@ describe('分块预览的表格父容器', () => {
     api.getChunkTree.mockResolvedValue(tableContainerTree())
 
     mount()
-    await waitFor(() => expect(screen.getByText('表格父容器')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getAllByText('表格父容器').length).toBeGreaterThan(0))
     expect(screen.queryByText('未入文本向量')).toBeNull()
     expect(screen.queryByText('未入向量（异常，可点「重新向量化」）')).toBeNull()
   })
@@ -215,7 +215,7 @@ describe('分块预览的表格父容器', () => {
     })
 
     mount()
-    await waitFor(() => expect(screen.getByText('未入文本向量')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getAllByText('未入文本向量').length).toBeGreaterThan(0))
     expect(screen.getByText('未入向量（异常，可点「重新向量化」）')).toBeInTheDocument()
     expect(screen.queryByText('表格父容器')).toBeNull()
   })
@@ -241,9 +241,9 @@ describe('分块全文对比', () => {
       orphan_children: [],
     })
     mount()
-    await waitFor(() => expect(screen.getByText('第一段完整内容')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getAllByText('第一段完整内容').length).toBeGreaterThan(0))
     fireEvent.click(screen.getByText('加入对比'))
-    fireEvent.click(screen.getByText('第二段'))
+    fireEvent.click(screen.getByText(/#32/))
     fireEvent.click(screen.getByText('加入对比'))
     const button = screen.getByRole('button', { name: /对比已选（2\/2）/ })
     expect(button).toBeEnabled()

@@ -40,10 +40,6 @@ function hasChildren(node: ChunkNode | ChunkTreeNode | null | undefined): boolea
   return childNodes(node).length > 0
 }
 
-function isLeafTopNode(node: ChunkTreeNode | null | undefined): boolean {
-  return Boolean(node) && !hasChildren(node)
-}
-
 function typeLabel(node: ChunkNode, leafTop: boolean): string {
   if (node.chunk_type === 'figure') return '图片'
   if (node.chunk_type === 'table') return hasChildren(node) ? '表格父容器' : '表格'
@@ -59,6 +55,19 @@ function findNodePath(nodes: ChunkTreeNode[], chunkId: number): ChunkTreeNode[] 
     if (rest) return [node, ...rest]
   }
   return null
+}
+
+interface FlatChunk {
+  node: ChunkTreeNode
+  depth: number
+}
+
+/** 把树摊平成左栏滚动列表；depth 用于缩进，父容器/表格容器/行组叶子一眼可见。 */
+function flattenChunks(nodes: ChunkTreeNode[], depth = 0): FlatChunk[] {
+  return nodes.flatMap((node) => [
+    { node, depth },
+    ...flattenChunks(childNodes(node), depth + 1),
+  ])
 }
 
 /** 向量状态标签：容器按设计不进向量（不是异常）；叶子缺 faiss_row 才是异常。 */
@@ -105,7 +114,6 @@ export default function ChunkExplorer() {
   const focusChunkId = Number(searchParams.get('chunk') || '')
   const [tree, setTree] = useState<ChunkTree | null>(null)
   const [loading, setLoading] = useState(true)
-  const [activeParentId, setActiveParentId] = useState<number | null>(null)
   const [activeChunk, setActiveChunk] = useState<ChunkNode | null>(null)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
@@ -124,19 +132,16 @@ export default function ChunkExplorer() {
         // 树可有三层：parent -> table 父容器 -> table 行组叶子，focus 可能是任意一层
         const path = findNodePath(data.tree ?? [], focus)
         if (path) {
-          setActiveParentId(path[0].chunk_id)
           setActiveChunk(path[path.length - 1])
           return
         }
         const orphan = (data.orphan_children ?? []).find((c) => c.chunk_id === focus)
         if (orphan) {
-          setActiveParentId(null)
           setActiveChunk(orphan)
           return
         }
       }
-      const first = data.tree?.[0]
-      setActiveParentId(first?.chunk_id ?? null)
+      const first = flattenChunks(data.tree ?? [])[0]?.node
       setActiveChunk(first ?? null)
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err))
@@ -145,11 +150,7 @@ export default function ChunkExplorer() {
 
   useEffect(() => { void load() }, [load])
 
-  const activeParent = useMemo(
-    () => (tree?.tree ?? []).find((n) => n.chunk_id === activeParentId) ?? null,
-    [tree, activeParentId],
-  )
-  const children = activeParent?.children ?? []
+  const flatNodes = useMemo(() => flattenChunks(tree?.tree ?? []), [tree])
 
   const saveEdit = async () => {
     if (!activeChunk) return
@@ -224,188 +225,97 @@ export default function ChunkExplorer() {
       {tree.tree?.length ? (
         // 窄屏时上下堆叠：右栏（子块）是检索单元，不能因为窗口窄被挤成 0 宽度而"看不见"
         <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' }}>
-          <Card title={`父块（${tree.tree.length}）`} style={{ width: 400, flex: 'none' }} styles={{ body: { padding: 0 } }}>
+          <Card
+            title={`分块（${flatNodes.length}）`}
+            style={{ width: 400, flex: 'none' }}
+            styles={{ body: { padding: 0, maxHeight: 'calc(100vh - 250px)', overflowY: 'auto' } }}
+          >
             <List
               size="small"
-              dataSource={tree.tree}
-              renderItem={(p) => {
-                const container = hasChildren(p)
+              dataSource={flatNodes}
+              renderItem={({ node, depth }) => {
+                const nodeChildren = childNodes(node)
                 return (
-                <List.Item
-                  onClick={() => { setActiveParentId(p.chunk_id); setActiveChunk(p); setEditing(false) }}
-                  style={{ cursor: 'pointer', background: activeParentId === p.chunk_id ? '#e6f4ff' : undefined, paddingInline: 16 }}
-                >
-                  <List.Item.Meta
-                    title={<Typography.Text ellipsis style={{ maxWidth: 320 }}>{p.heading_path || '(无标题路径)'}</Typography.Text>}
-                    description={
-                      <Space size={6} wrap>
-                        <Tag color={p.chunk_type === 'figure' ? 'purple' : container ? (p.chunk_type === 'table' ? 'geekblue' : undefined) : 'blue'}>
-                          {p.chunk_type === 'figure' ? '图片' : p.chunk_type === 'table' ? '表格' : container ? '父容器' : '叶子块'}
-                        </Tag>
-                        <span>{p.token_count ?? 0} tok</span>
-                        {container ? <span>子块 {childNodes(p).length}</span> : null}
-                        <MmBadge node={p} />
-                        {/* 有子块 = 上下文容器，按设计不进向量；无子块 = 叶子，必须进向量 */}
-                        <VectorTag node={p} />
-                      </Space>
-                    }
-                  />
-                </List.Item>
+                  <List.Item
+                    onClick={() => { setActiveChunk(node); setEditing(false) }}
+                    style={{
+                      cursor: 'pointer',
+                      paddingLeft: 12 + depth * 16,
+                      background: activeChunk?.chunk_id === node.chunk_id ? '#e6f4ff' : undefined,
+                    }}
+                  >
+                    <List.Item.Meta
+                      title={
+                        <Space size={6} wrap>
+                          <Typography.Text ellipsis style={{ maxWidth: 240 }}>
+                            #{node.chunk_id} {node.heading_path || `seq ${node.seq}`}
+                          </Typography.Text>
+                          <Tag color={node.chunk_type === 'table' ? 'geekblue' : node.chunk_type === 'figure' ? 'purple' : undefined}>
+                            {typeLabel(node, !hasChildren(node))}
+                          </Tag>
+                          <VectorTag node={node} />
+                          <span>{node.token_count ?? 0} tok</span>
+                          {nodeChildren.length > 0 ? (
+                            <Tag>{node.chunk_type === 'table' ? '行组' : '子块'} {nodeChildren.length}</Tag>
+                          ) : null}
+                        </Space>
+                      }
+                      description={
+                        <Typography.Paragraph className="ekbs-ellipsis-2" style={{ marginBottom: 0, fontSize: 12 }}>
+                          {(node.content || '').slice(0, 160)}
+                        </Typography.Paragraph>
+                      }
+                    />
+                  </List.Item>
                 )
               }}
             />
           </Card>
 
           <Card
-            title={isLeafTopNode(activeParent) ? '检索单元（短节无子块）' : `子块（${children.length}）`}
-            style={{ flex: '1 1 360px', minWidth: 360 }}
+            title={activeChunk ? `分块内容 #${activeChunk.chunk_id}` : '分块内容'}
+            style={{ flex: '1 1 520px', minWidth: 420 }}
+            styles={{ body: { maxHeight: 'calc(100vh - 250px)', overflowY: 'auto' } }}
             extra={
-              activeChunk?.chunk_type === 'child' ? (
-                <Space>
-                  <Auth code="doc:chunk:update">
-                    <Button size="small" onClick={() => { setDraft(activeChunk.content); setEditing(true) }}>编辑</Button>
-                  </Auth>
-                  <Auth code="doc:chunk:update">
-                    <Button size="small" onClick={() => setPending({ kind: 'split', chunk: activeChunk })}>拆分</Button>
-                  </Auth>
-                  <Auth code="doc:chunk:update">
-                    <Button size="small" onClick={() => setPending({ kind: 'merge', chunk: activeChunk })}>合并下一块</Button>
-                  </Auth>
-                  <Auth code="doc:chunk:reembed">
-                    <Button size="small" onClick={() => setPending({ kind: 'reembed', chunk: activeChunk })}>重新向量化</Button>
-                  </Auth>
-                </Space>
-              ) : (
-                <Typography.Text type="secondary">
-                  {activeChunk
-                    ? isLeafTopNode(activeParent) && activeChunk.chunk_id === activeParent?.chunk_id
-                      ? '短节叶子块：内容即检索单元（PPT 常见），仅 child 支持在线拆分/编辑'
-                      : `${typeLabel(activeChunk, false)} 不支持在线编辑（后端仅支持 child）`
-                    : ''}
-                </Typography.Text>
-              )
-            }
-          >
-            {isLeafTopNode(activeParent) && activeParent?.chunk_type === 'parent' ? (
-              <Empty
-                description={
-                  <span>
-                    本段短于子块下限（约 256 token），未再建同文子块。
-                    <br />
-                    左侧父块本身就是检索叶子，已入向量（见下方详情）。
-                  </span>
-                }
-              />
-            ) : isLeafTopNode(activeParent) && (activeParent?.chunk_type === 'figure' || activeParent?.chunk_type === 'table') ? (
-              <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-                {activeParent.chunk_type === 'figure' ? '图片块为独立检索单元（见下方详情与多模态标识）。' : '表格块为独立检索单元。'}
-              </Typography.Paragraph>
-            ) : (
-            <List
-              size="small"
-              dataSource={children}
-              locale={{ emptyText: <Empty description="该父块下没有子块（父块本身即检索单元）" /> }}
-              renderItem={(c) => {
-                const grandchildren = childNodes(c)
-                // 表格父容器（chunk_type='table' 且有行组叶子）：组头 + 缩进的行组叶子，
-                // 让"整表上下文 -> 检索单元"的真实结构可见，而不是把它当成一个平铺的表格块。
-                if (grandchildren.length > 0) {
-                  return (
-                    <List.Item style={{ display: 'block' }}>
-                      <div
-                        onClick={() => { setActiveChunk(c); setEditing(false) }}
-                        style={{
-                          cursor: 'pointer',
-                          padding: '6px 0',
-                          background: activeChunk?.chunk_id === c.chunk_id ? '#f5f7fa' : undefined,
-                        }}
-                      >
-                        <Space size={6} wrap>
-                          <Typography.Text ellipsis style={{ maxWidth: 420 }}>{c.heading_path || `#${c.seq}`}</Typography.Text>
-                          <VectorTag node={c} />
-                          <span>{c.token_count ?? 0} tok</span>
-                          <Tag>{c.chunk_type === 'table' ? '行组' : '子块'} {grandchildren.length}</Tag>
-                          <MmBadge node={c} />
-                        </Space>
-                        <Typography.Paragraph className="ekbs-ellipsis-2" style={{ marginBottom: 0 }}>
-                          {c.content}
-                        </Typography.Paragraph>
-                      </div>
-                      <List
-                        size="small"
-                        dataSource={grandchildren}
-                        style={{ marginLeft: 20 }}
-                        renderItem={(g) => (
-                          <List.Item
-                            onClick={() => { setActiveChunk(g); setEditing(false) }}
-                            style={{
-                              cursor: 'pointer',
-                              background: activeChunk?.chunk_id === g.chunk_id ? '#f5f7fa' : undefined,
-                              paddingInline: 8,
-                            }}
-                          >
-                            <List.Item.Meta
-                              title={
-                                <Space size={6} wrap>
-                                  <Typography.Text ellipsis style={{ maxWidth: 420 }}>{g.heading_path || `#${g.seq}`}</Typography.Text>
-                                  <span>{g.token_count ?? 0} tok</span>
-                                  <VectorTag node={g} />
-                                  <MmBadge node={g} />
-                                </Space>
-                              }
-                              description={
-                                <Typography.Paragraph className="ekbs-ellipsis-2" style={{ marginBottom: 0 }}>
-                                  {g.content}
-                                </Typography.Paragraph>
-                              }
-                            />
-                          </List.Item>
-                        )}
-                      />
-                    </List.Item>
-                  )
-                }
-                return (
-                  <List.Item
-                    onClick={() => { setActiveChunk(c); setEditing(false) }}
-                    style={{ cursor: 'pointer', background: activeChunk?.chunk_id === c.chunk_id ? '#f5f7fa' : undefined }}
-                  >
-                    <List.Item.Meta
-                      title={
-                        <Space size={6} wrap>
-                          <Typography.Text ellipsis style={{ maxWidth: 420 }}>{c.heading_path || `#${c.seq}`}</Typography.Text>
-                          <span>{c.token_count ?? 0} tok</span>
-                          <VectorTag node={c} />
-                          <MmBadge node={c} />
-                        </Space>
-                      }
-                      description={<Typography.Paragraph className="ekbs-ellipsis-2" style={{ marginBottom: 0 }}>{c.content}</Typography.Paragraph>}
-                    />
-                  </List.Item>
-                )
-              }}
-            />
-            )}
-
-            {activeChunk ? (
-              <Card
-                size="small"
-                style={{ marginTop: 12 }}
-                title="分块详情"
-                extra={
+              activeChunk ? (
+                <Space wrap>
                   <Button size="small" onClick={() => toggleCompare(activeChunk)}>
                     {inCompare(activeChunk.chunk_id) ? '移出对比' : '加入对比'}
                   </Button>
-                }
-              >
+                  {activeChunk.chunk_type === 'child' ? (
+                    <>
+                      <Auth code="doc:chunk:update">
+                        <Button size="small" onClick={() => { setDraft(activeChunk.content); setEditing(true) }}>编辑</Button>
+                      </Auth>
+                      <Auth code="doc:chunk:update">
+                        <Button size="small" onClick={() => setPending({ kind: 'split', chunk: activeChunk })}>拆分</Button>
+                      </Auth>
+                      <Auth code="doc:chunk:update">
+                        <Button size="small" onClick={() => setPending({ kind: 'merge', chunk: activeChunk })}>合并下一块</Button>
+                      </Auth>
+                      <Auth code="doc:chunk:reembed">
+                        <Button size="small" onClick={() => setPending({ kind: 'reembed', chunk: activeChunk })}>重新向量化</Button>
+                      </Auth>
+                    </>
+                  ) : null}
+                </Space>
+              ) : null
+            }
+          >
+            {!activeChunk ? (
+              <Empty description="从左侧选择一个分块查看全文" />
+            ) : (
+              <>
+                <Space size={6} wrap style={{ marginBottom: 12 }}>
+                  <Tag>#{activeChunk.chunk_id}</Tag>
+                  <Tag>{typeLabel(activeChunk, !hasChildren(activeChunk))}</Tag>
+                  <VectorTag node={activeChunk} />
+                  <span>{activeChunk.token_count ?? 0} tok</span>
+                  {hasChildren(activeChunk) ? <Tag>子块 {childNodes(activeChunk).length}</Tag> : null}
+                  <MmBadge node={activeChunk} />
+                </Space>
                 <Descriptions size="small" column={2} bordered>
-                  <Descriptions.Item label="chunk_id">{activeChunk.chunk_id}</Descriptions.Item>
-                  <Descriptions.Item label="类型">
-                    <Space size={6} wrap>
-                      {typeLabel(activeChunk, isLeafTopNode(activeParent) && activeChunk.chunk_id === activeParent?.chunk_id)}
-                      <MmBadge node={activeChunk} />
-                    </Space>
-                  </Descriptions.Item>
+                  <Descriptions.Item label="类型">{typeLabel(activeChunk, !hasChildren(activeChunk))}</Descriptions.Item>
                   <Descriptions.Item label="seq">{activeChunk.seq}</Descriptions.Item>
                   <Descriptions.Item label="token">{activeChunk.token_count ?? '-'}</Descriptions.Item>
                   <Descriptions.Item label="分片">{activeChunk.shard_id ?? '-'}</Descriptions.Item>
@@ -432,7 +342,7 @@ export default function ChunkExplorer() {
                 </Descriptions>
                 {editing ? (
                   <Space direction="vertical" style={{ width: '100%', marginTop: 12 }}>
-                    <Input.TextArea rows={8} value={draft} onChange={(e) => setDraft(e.target.value)} />
+                    <Input.TextArea rows={14} value={draft} onChange={(e) => setDraft(e.target.value)} />
                     <Space>
                       <Button type="primary" onClick={() => void saveEdit()}>保存</Button>
                       <Button onClick={() => setEditing(false)}>取消</Button>
@@ -444,8 +354,8 @@ export default function ChunkExplorer() {
                     {activeChunk.content}
                   </pre>
                 )}
-              </Card>
-            ) : null}
+              </>
+            )}
           </Card>
         </div>
       ) : (
