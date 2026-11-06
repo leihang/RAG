@@ -284,7 +284,6 @@ async def qa_chat(
         "degraded": [*answer.retrieval.degraded, *answer.degraded],
         # 取数模式的结构化结果（prose 模式下为 None）
         "numeric": answer.numeric,
-        "provenance": answer.provenance,
         "mode": payload.mode,
         "mode_used": answer.mode_used,
         "intent": answer.intent,
@@ -432,7 +431,6 @@ async def qa_chat_stream(
                 "perm_fingerprint": perm.fingerprint,
                 "timings_ms": answer.retrieval.timings_ms if answer.retrieval else {},
                 "numeric": answer.numeric,
-        "provenance": answer.provenance,
                 "model": answer.model,
             },
             ensure_ascii=False,

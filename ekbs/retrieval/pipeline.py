@@ -48,18 +48,6 @@ from ekbs.retrieval.faithfulness import (
     mostly_unsupported,
     supporting_chunk_indices,
 )
-from ekbs.retrieval.calc_plan import generate_calc_plan
-from ekbs.retrieval.plan_llm import generate_llm_calc_plan
-from ekbs.retrieval.table_query import (
-    compute_table_average,
-    compute_table_binary,
-    compute_table_filtered,
-    compute_table_comparison,
-    compute_table_rank,
-    compute_table_ratio,
-    compute_table_lookup,
-    compute_table_value,
-)
 from ekbs.retrieval.numeric import (
     MODE_AUTO,
     MODE_NUMERIC,
@@ -518,8 +506,6 @@ class AnswerResult:
     #: **取数模式**的结构化结果（值/单位/页码/原文片段/是否通过抄写校验）。
     #: 业务问答（prose）下为 None —— 两种模式的答案形态不同，前端据此分别渲染。
     numeric: dict[str, Any] | None = None
-    #: 数值答案的计算溯源；没有 provenance 的数值答案不得作为最终答案。
-    provenance: dict[str, Any] | None = None
     #: 解析后的实际作答模式（``prose`` | ``numeric``）；请求可为 ``auto``
     mode_used: str = MODE_PROSE
     #: 查询改写侧意图标签（factual / numeric / figure / procedure）
@@ -644,36 +630,40 @@ TRUNCATION_NOTICE = "（提示：回答已达长度上限被截断，未显示�
 #: 否则旧提示词生成的答案会继续从缓存里被服务。
 PROMPT_REVISION = "v9"
 
+_ANSWER_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
+_CITATION_MARK_RE = re.compile(r"\[\d+\]")
 
 
+def _numeric_tokens_in_answer(answer: str) -> list[str]:
+    text = _CITATION_MARK_RE.sub("", str(answer or ""))
+    return _ANSWER_NUMBER_RE.findall(text)
 
 
+def _number_evidence_gate(answer: str, chunks: Sequence[Any]) -> list[str]:
+    """返回答案中无法在检索原文逐字找到的数字；空列表表示通过。
 
-def _numbers_are_copied(answer: str, chunks: Any) -> bool:
-    """答案中的数字是否全部能在表格原文中逐字找到（只允许抄写，不允许模型计算）。"""
-    import re
-
-    tokens = re.findall(r"\d[\d,]*(?:\.\d+)?%?", str(answer or ""))
+    只做“抄写校验”，不做任何算术：模型可以引用原文数字，不能自行算出新数字。
+    """
+    tokens = _numeric_tokens_in_answer(answer)
     if not tokens:
-        return True
-    source = " ".join(str(getattr(chunk, "content", "") or "") for chunk in chunks)
-    source = source.replace(",", "")
+        return []
+    source = "".join(
+        re.sub(r"[\s,，]", "", str(getattr(chunk, "content", "") or ""))
+        for chunk in chunks
+    )
+    missing: list[str] = []
     for token in tokens:
         raw = token.rstrip("%").replace(",", "")
+        # 年份/期间编号不要求原文逐字重复（2026、9 等）。
+        if re.fullmatch(r"(?:19|20)\d{2}", raw):
+            continue
+        if raw.isdigit() and len(raw) <= 2:
+            continue
         variants = {raw, raw.rstrip("0").rstrip(".") if "." in raw else raw}
         if not any(variant and variant in source for variant in variants):
-            return False
-    return True
+            missing.append(token)
+    return missing
 
-
-
-def _looks_numeric(question: str) -> bool:
-    return bool(
-        __import__("re").search(
-            r"多少|几|合计|总计|增长|减少|增加|下降|占比|比例|平均|排名|最高|最低|前\s*[一二三四五六七八九十\d]|乘|除以|减",
-            str(question or ""),
-        )
-    )
 
 class RetrievalPipeline:
     def __init__(
@@ -2858,8 +2848,6 @@ class RetrievalPipeline:
 
         # ② 查询改写（00 §2.1 的第一步）；改写后的查询才是检索输入
         rewrite = await self._rewrite(question, messages)
-        # 计划/确定性计算用改写后的自包含查询；生成仍用用户原问题。
-        plan_question = str(getattr(rewrite, "rewritten", "") or question)
         intent = str(getattr(rewrite, "intent", "factual") or "factual")
         auto_numeric = bool((getattr(self.settings, "qa", None) or {}).get("auto_numeric", True))
         mode_used = resolve_answer_mode(mode, intent, auto_numeric=auto_numeric)
@@ -2908,245 +2896,7 @@ class RetrievalPipeline:
             overrides=overrides,
             collect_debug=collect_debug,
         )
-        calc_plan = (
-            generate_calc_plan(plan_question)
-            if allow_generation and mode_used == MODE_PROSE and not multi_intent
-            else None
-        )
-        llm_plan_enabled = bool((getattr(self.settings, "qa", None) or {}).get("llm_plan", False))
-        if (
-            calc_plan is None
-            and llm_plan_enabled
-            and allow_generation
-            and mode_used == MODE_PROSE
-            and not multi_intent
-            and _looks_numeric(question)
-        ):
-            calc_plan = await generate_llm_calc_plan(plan_question, self.providers.llm)
-        if calc_plan is not None:
-            self._augment_table_context(retrieval)
-            if not any(
-                str(getattr(chunk, "chunk_type", "")) == "table"
-                for chunk in retrieval.chunks
-            ):
-                await self._retrieve_table_context(
-                    plan_question, retrieval, perm, overrides=overrides
-                )
-        table_lookup = (
-            compute_table_lookup(plan_question, retrieval.chunks, db=self.db)
-            if calc_plan is None and allow_generation and mode_used == MODE_PROSE and not multi_intent
-            else None
-        )
-        table_answer = (
-            compute_table_comparison(plan_question, retrieval.chunks, db=self.db)
-            if calc_plan is not None and calc_plan.operation == "compare"
-            else None
-        )
-        table_value = (
-            compute_table_value(plan_question, retrieval.chunks, db=self.db)
-            if calc_plan is not None and calc_plan.operation == "value"
-            else None
-        )
-        table_avg = (
-            compute_table_average(plan_question, retrieval.chunks, db=self.db)
-            if calc_plan is not None and calc_plan.operation == "avg"
-            else None
-        )
-        table_ratio = (
-            compute_table_ratio(plan_question, retrieval.chunks, db=self.db)
-            if calc_plan is not None and calc_plan.operation == "ratio"
-            else None
-        )
-        table_rank = (
-            compute_table_rank(plan_question, retrieval.chunks, db=self.db)
-            if calc_plan is not None and calc_plan.operation == "rank"
-            else None
-        )
-        table_binary = (
-            compute_table_binary(plan_question, retrieval.chunks, db=self.db)
-            if calc_plan is not None and calc_plan.operation == "binary"
-            else None
-        )
-        table_filtered = (
-            compute_table_filtered(plan_question, retrieval.chunks, db=self.db)
-            if calc_plan is not None and calc_plan.operation == "filter"
-            else None
-        )
-        table_plan_clarify = (
-            calc_plan is not None
-            and calc_plan.operation in {"avg", "ratio", "rank", "binary"}
-            and table_answer is None
-            and table_value is None
-            and table_avg is None
-            and table_ratio is None
-            and table_rank is None
-            and table_binary is None
-            and table_filtered is None
-            and any(
-                str(getattr(chunk, "chunk_type", "")) == "table"
-                for chunk in retrieval.chunks
-            )
-        )
-        numeric_unplanned = (
-            calc_plan is not None
-            and calc_plan.operation == "compare"
-            and table_answer is None
-            and any(
-                str(getattr(chunk, "chunk_type", "")) == "table"
-                for chunk in retrieval.chunks
-            )
-        )
-        if table_lookup is not None:
-            lookup_text = table_lookup.render()
-            result = AnswerResult(
-                answer=lookup_text,
-                citations=self._post_check_citations(lookup_text, retrieval.chunks, perm),
-                retrieval=retrieval,
-                model="table_lookup",
-                provenance={
-                    "op": "table_lookup",
-                    "subject": table_lookup.subject,
-                    "field": table_lookup.field,
-                    "value": table_lookup.value,
-                },
-                degraded=["deterministic_table_lookup"],
-            )
-        elif table_answer is not None:
-            # 部分期间对比：直接按表内月份列求和，禁止模型拿年度合计做算术。
-            table_text = table_answer.render()
-            result = AnswerResult(
-                answer=table_text,
-                citations=self._post_check_citations(table_text, retrieval.chunks, perm),
-                retrieval=retrieval,
-                model="table_query",
-                provenance={
-                    "op": "table_compare",
-                    "subject": table_answer.subject,
-                    "years": list(table_answer.years),
-                    "totals": dict(table_answer.totals),
-                },
-                degraded=["deterministic_table_query"],
-            )
-        elif table_value is not None:
-            value_text = table_value.render()
-            result = AnswerResult(
-                answer=value_text,
-                citations=self._post_check_citations(value_text, retrieval.chunks, perm),
-                retrieval=retrieval,
-                model="table_value",
-                provenance={
-                    "op": "table_value",
-                    "subject": table_value.subject,
-                    "year": table_value.year,
-                    "value": table_value.value,
-                },
-                degraded=["deterministic_table_value"],
-            )
-        elif table_avg is not None:
-            avg_text = table_avg.render()
-            result = AnswerResult(
-                answer=avg_text,
-                citations=self._post_check_citations(avg_text, retrieval.chunks, perm),
-                retrieval=retrieval,
-                model="table_avg",
-                provenance={
-                    "op": "table_avg",
-                    "subject": table_avg.subject,
-                    "year": table_avg.year,
-                    "value": table_avg.value,
-                },
-                degraded=["deterministic_table_avg"],
-            )
-        elif table_ratio is not None:
-            ratio_text = table_ratio.render()
-            result = AnswerResult(
-                answer=ratio_text,
-                citations=self._post_check_citations(ratio_text, retrieval.chunks, perm),
-                retrieval=retrieval,
-                model="table_ratio",
-                provenance={
-                    "op": "table_ratio",
-                    "subject": table_ratio.subject,
-                    "denominator_subject": table_ratio.denominator_subject,
-                    "year": table_ratio.year,
-                    "percent": table_ratio.percent,
-                },
-                degraded=["deterministic_table_ratio"],
-            )
-        elif table_rank is not None:
-            rank_text = table_rank.render()
-            result = AnswerResult(
-                answer=rank_text,
-                citations=self._post_check_citations(rank_text, retrieval.chunks, perm),
-                retrieval=retrieval,
-                model="table_rank",
-                provenance={
-                    "op": "table_rank",
-                    "year": table_rank.year,
-                    "direction": table_rank.direction,
-                    "items": list(table_rank.items),
-                },
-                degraded=["deterministic_table_rank"],
-            )
-        elif table_filtered is not None:
-            filtered_text = table_filtered.render()
-            result = AnswerResult(
-                answer=filtered_text,
-                citations=self._post_check_citations(filtered_text, retrieval.chunks, perm),
-                retrieval=retrieval,
-                model="table_filtered",
-                provenance={
-                    "op": "table_filtered",
-                    "year": table_filtered.year,
-                    "subject": table_filtered.subject,
-                    "value": table_filtered.value,
-                    "label": table_filtered.label,
-                },
-                degraded=["deterministic_table_filtered"],
-            )
-        elif table_binary is not None:
-            binary_text = table_binary.render()
-            result = AnswerResult(
-                answer=binary_text,
-                citations=self._post_check_citations(binary_text, retrieval.chunks, perm),
-                retrieval=retrieval,
-                model="table_binary",
-                provenance={
-                    "op": "table_binary",
-                    "left": table_binary.left_subject,
-                    "right": table_binary.right_subject,
-                    "year": table_binary.year,
-                    "value": table_binary.value,
-                },
-                degraded=["deterministic_table_binary"],
-            )
-        elif table_plan_clarify:
-            result = AnswerResult(
-                answer=(
-                    "资料里有相关表格，但当前问题涉及的指标/口径未能从表内唯一确定。"
-                    "请明确指标名称和期间（如“2026年1-9月”），我再按表计算。"
-                ),
-                citations=[],
-                retrieval=retrieval,
-                model="table_plan_clarify",
-                refused=True,
-                refusal_reason="table_plan_clarify",
-                degraded=["table_plan_clarify"],
-            )
-        elif numeric_unplanned:
-            result = AnswerResult(
-                answer=(
-                    "资料里有相关表格，但这个问题需要计算，当前未能从表内确定性解析。"
-                    "请明确指标、年份和期间（如“2026年1-9月”），我再按表计算。"
-                ),
-                citations=[],
-                retrieval=retrieval,
-                model="table_numeric_gate",
-                refused=True,
-                refusal_reason="table_numeric_unplanned",
-                degraded=["table_numeric_unplanned"],
-            )
-        elif allow_generation and mode_used == MODE_NUMERIC:
+        if allow_generation and mode_used == MODE_NUMERIC:
             result = await self._answer_numeric(question, retrieval, perm)
         elif allow_generation and multi_intent and per_sub:
             # 多问题：逐子问生成再拼接（共享 2048 输出上限会让后面的问题被略过）
@@ -3155,7 +2905,6 @@ class RetrievalPipeline:
             result = await self.generate(question, retrieval, perm, token_callback=token_callback)
         else:
             result = self._retrieval_only_answer(question, retrieval, perm)
-        result = self._enforce_numeric_provenance(result, calc_plan, mode_used, retrieval)
         self._annotate_result(
             result,
             rewrite,
@@ -3167,10 +2916,8 @@ class RetrievalPipeline:
             intent=intent,
             numeric_overridden=numeric_overridden,
         )
-        # 确定性表格路径不调用模型，但审计仍要能追溯“用了哪些来源块”。
-        if not result.context_chunk_ids and str(result.model).startswith("table_"):
-            result.context_chunk_ids = [cite.chunk_id for cite in result.citations]
         self._apply_figure_adjustments(result, retrieval, intent=intent, question=question)
+        result = self._enforce_number_evidence(result, retrieval)
 
         # ③ 写回上下文（群聊按用户隔离，见 session.py 的说明）
         await self._remember_turn(conversation_id, perm, question, result)
@@ -3186,41 +2933,6 @@ class RetrievalPipeline:
     # ------------------------------------------------------------------
     # answer() 的后处理（缓存命中 / 结果标注 / 找图修正 / 缓存写回）
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _enforce_numeric_provenance(
-        result: AnswerResult,
-        calc_plan: Any,
-        mode_used: str,
-        retrieval: Any,
-    ) -> AnswerResult:
-        """数值计划存在但答案无计算溯源时拦截；数字全部来自表格原文可放行。"""
-        if (
-            result.provenance is not None
-            or calc_plan is None
-            or mode_used != MODE_PROSE
-            or result.refused
-            or not any(
-                str(getattr(chunk, "chunk_type", "")) == "table"
-                for chunk in retrieval.chunks
-            )
-        ):
-            return result
-        if _numbers_are_copied(result.answer, retrieval.chunks):
-            result.provenance = {"op": "copy", "source": "table_chunks"}
-            return result
-        return AnswerResult(
-            answer=(
-                "资料里有表格，但这个问题需要计算，当前未能从表内确定性解析。"
-                "请明确指标、年份和期间（如“2026年1-9月”），我再按表计算。"
-            ),
-            citations=[],
-            retrieval=retrieval,
-            model="table_numeric_gate",
-            refused=True,
-            refusal_reason="table_numeric_unproven",
-            degraded=["table_numeric_unproven"],
-        )
 
     def _answer_from_cache(
         self, cached: dict[str, Any], rewrite: Any, mode_used: str, intent: str
@@ -3241,7 +2953,6 @@ class RetrievalPipeline:
             refused=bool(cached.get("refused", False)),
             refusal_reason=str(cached.get("refusal_reason", "")),
             numeric=cached.get("numeric"),
-            provenance=cached.get("provenance"),
             mode_used=str(cached.get("mode_used") or mode_used),
             intent=str(cached.get("intent") or intent),
             figure_attachments=list(cached.get("figure_attachments") or []),
@@ -3251,6 +2962,28 @@ class RetrievalPipeline:
             # 缓存命中路径上依然可查；老缓存条目没有该键 → 空列表，不崩。
             context_chunk_ids=[int(cid) for cid in (cached.get("context_chunk_ids") or [])],
             degraded=["answer_cache_hit"],
+        )
+
+    def _enforce_number_evidence(self, result: AnswerResult, retrieval: RetrievalResult) -> AnswerResult:
+        """输出门禁：答案里的数字必须能在检索内容中找到，禁止模型计算/编造。"""
+        if result.refused or result.mode_used == MODE_NUMERIC:
+            return result
+        missing = _number_evidence_gate(result.answer, retrieval.chunks)
+        if not missing:
+            return result
+        log.warning(
+            "answer_number_evidence_denied",
+            model=result.model,
+            missing=missing[:5],
+        )
+        return AnswerResult(
+            answer="资料中没有可直接引用的数字依据，已停止输出计算/推断结果。",
+            citations=[],
+            retrieval=retrieval,
+            model=result.model,
+            refused=True,
+            refusal_reason="answer_number_evidence_missing",
+            degraded=["answer_number_evidence_missing"],
         )
 
     def _annotate_result(
@@ -3367,7 +3100,6 @@ class RetrievalPipeline:
             "refusal_reason": result.refusal_reason,
             "citations": [c.__dict__ for c in result.citations],
             "numeric": result.numeric,
-            "provenance": result.provenance,
             "mode_used": mode_used,
             "intent": intent,
             "figure_attachments": result.figure_attachments,
@@ -3559,78 +3291,6 @@ class RetrievalPipeline:
             per_sub.append((sq.index, result))
         merged, hit_by = self._merge_retrievals(per_sub)
         return merged, hit_by, per_sub
-
-    async def _retrieve_table_context(
-        self,
-        question: str,
-        retrieval: RetrievalResult,
-        perm: PermContext,
-        *,
-        overrides: RetrievalOverrides | None = None,
-    ) -> None:
-        """数值计划专用：正常召回没有表格时，用“表格”语义再召回一次并只并表格块。"""
-        extra = await self.retrieve(
-            f"{question} 表格 数据 分析表", perm, overrides=overrides, collect_debug=False
-        )
-        existing = {chunk.chunk_id for chunk in retrieval.chunks}
-        added = 0
-        for chunk in extra.chunks:
-            if str(chunk.chunk_type) != "table" or chunk.chunk_id in existing:
-                continue
-            retrieval.chunks.append(chunk)
-            existing.add(chunk.chunk_id)
-            added += 1
-        if added:
-            retrieval.degraded.append("table_context_reretrieved")
-
-    def _augment_table_context(self, retrieval: RetrievalResult) -> None:
-        """数值计划用：把已召回文档的表格块补进上下文。
-
-        数值/排名/占比问题常因查询词“表格感”不足而漏召回表格；文档一旦召回，
-        同文档的表格块仍在 ACL 允许范围内，补进来让确定性执行器有表可用。
-        """
-        if any(str(chunk.chunk_type) == "table" for chunk in retrieval.chunks):
-            return
-        doc_ids = sorted({int(chunk.doc_id) for chunk in retrieval.chunks if chunk.doc_id})
-        if not doc_ids:
-            return
-        placeholders = ",".join("?" for _ in doc_ids)
-        with self.db.sync_connect() as conn:
-            rows = conn.execute(
-                "SELECT c.chunk_id, c.doc_id, c.shard_id, c.content, c.heading_path, "
-                "c.page_from, c.page_to, c.chunk_type, d.title AS doc_title, "
-                "d.doc_version "
-                "FROM ekbs_chunk c JOIN ekbs_document d ON d.doc_id = c.doc_id "
-                f"WHERE c.doc_id IN ({placeholders}) AND c.chunk_type = 'table' "
-                "ORDER BY c.doc_id, c.seq",
-                doc_ids,
-            ).fetchall()
-        existing = {chunk.chunk_id for chunk in retrieval.chunks}
-        added = 0
-        for row in rows:
-            if added >= 4:
-                break
-            chunk_id = int(row["chunk_id"])
-            if chunk_id in existing:
-                continue
-            retrieval.chunks.append(
-                RetrievedChunk(
-                    chunk_id=chunk_id,
-                    doc_id=int(row["doc_id"]),
-                    shard_id=str(row["shard_id"]),
-                    content=str(row["content"] or ""),
-                    heading_path=str(row["heading_path"] or ""),
-                    page_from=row["page_from"],
-                    page_to=row["page_to"],
-                    chunk_type=str(row["chunk_type"]),
-                    doc_title=str(row["doc_title"] or ""),
-                    doc_version=str(row["doc_version"] or "v1"),
-                )
-            )
-            existing.add(chunk_id)
-            added += 1
-        if added:
-            retrieval.degraded.append("table_context_injected")
 
     async def _retrieve_for_answer(
         self,

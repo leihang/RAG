@@ -49,7 +49,6 @@ from ekbs.personal import (
 from ekbs.ingest.dir_import import ImportPathError, assert_path_within_raw
 from ekbs.ingest.parser import SUFFIX_ENGINES, normalize_suffix
 from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE
-from ekbs.ingest.table_index import delete_document_table_rows
 from ekbs.logging import get_logger
 from ekbs.permission.changes import PermissionChangeService
 from ekbs.permission.router import bump_policy_version
@@ -743,7 +742,6 @@ def _prune_empty_dirs(path: Path, *, stop: Path) -> list[str]:
 
 def _drop_document_index(runtime: Any, doc_id: int) -> tuple[list[int], list[str]]:
     """从 FAISS / FTS / ekbs_chunk 摘掉该文档的全部索引，返回 (chunk_ids, shard_ids)。"""
-    delete_document_table_rows(runtime.db, doc_id)
     with runtime.db.sync_connect() as conn:
         rows = conn.execute(
             "SELECT chunk_id, shard_id FROM ekbs_chunk WHERE doc_id = ?", (doc_id,)
