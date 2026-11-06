@@ -17,11 +17,14 @@ import re
 from pathlib import Path
 from typing import Any
 
-from ekbs.config import Settings
+from ekbs.config import Secrets, Settings
 from ekbs.db import Database
 from ekbs.errors import ConfigError
 from ekbs.ingest.dir_import import raw_root
 from ekbs.ingest.parser import SUFFIX_ENGINES
+from ekbs.logging import get_logger
+
+log = get_logger(component="personal")
 
 PERSONAL_LEVEL = 2
 _USER_REF = re.compile(r"^user:(\d+)$")
@@ -117,14 +120,42 @@ def assert_personal_kb_storage(
 
 
 _STATUS_LABEL = {
-    "pending": "等待解析",
-    "parsing": "解析中",
+    "pending": "排队处理中",
+    "parsing": "处理中",
     "review": "待复核",
     "indexing": "入库中",
-    "published": "可提问",
-    "failed": "解析失败",
+    "published": "已处理完毕",
+    "failed": "处理失败",
     "offline": "已下线",
 }
+
+
+def personal_accepted_message(*, title: str = "") -> str:
+    """单聊刚收下文件：不回文件名，只说正在处理。"""
+    _ = title  # 调用方仍传 title；文案刻意不带文件名
+    return "正在处理"
+
+
+def personal_ready_message(*, title: str = "") -> str:
+    """私有库解析入库成功后推给本人。"""
+    _ = title
+    return "处理完毕，可以使用了"
+
+
+def personal_failed_message(*, title: str = "") -> str:
+    """私有库解析失败后推给本人。"""
+    _ = title
+    return "处理失败，请换一份再发"
+
+
+def personal_duplicate_message(*, title: str = "", status: str = "") -> str:
+    """同内容已在私有库时的回执。"""
+    _ = title
+    if str(status) == "published":
+        return "处理完毕，可以使用了"
+    if str(status) in {"pending", "parsing", "indexing"}:
+        return "正在处理"
+    return "文件已在私有库中"
 
 
 def scope_ref(user_id: int) -> str:
@@ -179,6 +210,21 @@ def personal_kb_name(user_id: int, nick: str) -> str:
 def personal_user_id_from_code(code: str | None) -> int | None:
     match = _PERSONAL_CODE.match(str(code or "").strip())
     return int(match.group(1)) if match else None
+
+
+def personal_raw_rel(user_id: int) -> str:
+    """个人原件在 raw 下的相对根：``personal/<uid>``。
+
+    知识库代号是 ``personal-<uid>``，但钉钉投递历来写在 ``personal/<uid>/``。
+    管理台上传若按代号建目录，会落到另一棵 ``personal-<uid>/``，原库里对不上。
+    """
+    return f"personal/{int(user_id)}"
+
+
+def personal_raw_rel_from_code(code: str | None) -> str | None:
+    """个人库代号 → raw 相对根；非个人库返回 None。"""
+    user_id = personal_user_id_from_code(code)
+    return personal_raw_rel(user_id) if user_id is not None else None
 
 
 def personal_user_id_from_dept(dept_code: str | None) -> int | None:
@@ -300,12 +346,15 @@ def register_personal_upload(
                 "title": str(existing["title"]),
                 "status": str(existing["status"]),
                 "created": False,
-                "message": f"这份文件已在你的私有库里（{existing['title']}，{_STATUS_LABEL.get(str(existing['status']), existing['status'])}）。",
+                "message": personal_duplicate_message(
+                    title=str(existing["title"]),
+                    status=str(existing["status"]),
+                ),
             }
         assert_personal_storage(
             conn, settings, user_id=int(user_id), incoming=len(content)
         )
-        folder = raw_root(settings) / "personal" / str(int(user_id))
+        folder = raw_root(settings) / personal_raw_rel(int(user_id))
         folder.mkdir(parents=True, exist_ok=True)
         target = folder / safe_name
         if target.exists():
@@ -338,11 +387,7 @@ def register_personal_upload(
         "title": target.stem,
         "status": "pending",
         "created": True,
-        "message": (
-            f"已放入你的私有库：{target.stem}。"
-            "解析完成后就可以直接提问。说「我的文件」查看，说「删除我的文件 标题」删除。"
-            "这份文件只有你能看。"
-        ),
+        "message": personal_accepted_message(title=target.stem),
     }
 
 
@@ -376,6 +421,71 @@ def format_personal_list(items: list[dict[str, Any]]) -> str:
         lines.append(f"…共 {len(items)} 份，这里只列出 40 份")
     lines.append("删除请说「删除我的文件 标题」。")
     return "\n".join(lines)
+
+
+def personal_owner_dingtalk_userid(db: Database, *, user_id: int) -> str | None:
+    """私有库主人的钉钉 staffId；没有或演示账号返回 None。"""
+    with db.sync_connect() as conn:
+        row = conn.execute(
+            "SELECT dingtalk_userid FROM ekbs_user "
+            "WHERE user_id = ? AND status = 'active' AND deleted_at IS NULL",
+            (int(user_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    staff = str(row["dingtalk_userid"] or "").strip()
+    if not staff or staff.startswith("demo_"):
+        return None
+    return staff
+
+
+async def notify_personal_owner(
+    *,
+    settings: Settings,
+    secrets: Secrets,
+    db: Database,
+    user_id: int,
+    text: str,
+    doc_id: int | None = None,
+) -> bool:
+    """向私有库主人单聊推一条机器人文本。缺凭据或找不到人时只记日志、不抛。"""
+    staff = personal_owner_dingtalk_userid(db, user_id=user_id)
+    if not staff:
+        log.warning("personal_notify_skip", user_id=int(user_id), doc_id=doc_id, reason="no_staff")
+        return False
+    if not (
+        secrets.is_configured("DINGTALK_CLIENT_ID")
+        and secrets.is_configured("DINGTALK_CLIENT_SECRET")
+    ):
+        log.warning("personal_notify_skip", user_id=int(user_id), doc_id=doc_id, reason="no_secrets")
+        return False
+    try:
+        from ekbs.dingtalk.client import DingTalkOpenApiClient, MSG_KEY_TEXT, text_msg_param
+        from ekbs.dingtalk.token import DingTalkTokenClient
+
+        token_client = DingTalkTokenClient.from_settings(settings, secrets)
+        robot_code = str(
+            (settings.dingtalk or {}).get("robot_code")
+            or secrets.get("DINGTALK_ROBOT_CODE")
+            or secrets.get("DINGTALK_CLIENT_ID")
+            or ""
+        )
+        client = DingTalkOpenApiClient(
+            token_client=token_client,
+            robot_code=robot_code,
+            base_url=((settings.dingtalk or {}).get("openapi") or {}).get("base_url"),
+        )
+        await client.send_oto_message([staff], MSG_KEY_TEXT, text_msg_param(text))
+    except Exception as exc:  # noqa: BLE001 - 通知失败不能拖垮解析主路径
+        log.warning(
+            "personal_notify_failed",
+            user_id=int(user_id),
+            doc_id=doc_id,
+            error=str(exc)[:200],
+        )
+        return False
+    log.info("personal_notify_sent", user_id=int(user_id), doc_id=doc_id)
+    return True
 
 
 def delete_personal_file(

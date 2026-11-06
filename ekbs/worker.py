@@ -50,7 +50,13 @@ from ekbs.ingest.scan_review import (
     save_review_draft,
     tables_from_sidecar,
 )
-from ekbs.personal import is_personal_scope
+from ekbs.personal import (
+    is_personal_scope,
+    notify_personal_owner,
+    personal_failed_message,
+    personal_ready_message,
+    sole_personal_owner,
+)
 from ekbs.logging import get_logger
 from ekbs.runtime import Runtime
 
@@ -346,6 +352,7 @@ async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:
                 personal=True,
             )
             log.info("personal_doc_published", doc_id=doc_id)
+            await _notify_personal_result(runtime, doc, ok=True)
             return True
         await asyncio.to_thread(mark_document_review, runtime.db, doc_id, parse_path)
         await asyncio.to_thread(
@@ -365,10 +372,35 @@ async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:
     except ParserUnavailable as exc:
         log.error("parser_unavailable", doc_id=doc_id, error=str(exc))
         await asyncio.to_thread(_mark_failed, runtime, doc_id)
+        await _notify_personal_result(runtime, doc, ok=False)
     except Exception as exc:
         log.error("doc_parse_failed", doc_id=doc_id, error=str(exc))
         await asyncio.to_thread(_mark_failed, runtime, doc_id)
+        await _notify_personal_result(runtime, doc, ok=False)
     return True
+
+
+async def _notify_personal_result(runtime: Runtime, doc: dict[str, Any], *, ok: bool) -> None:
+    """私有库解析终态推一条钉钉单聊；非私有库直接跳过。"""
+    if not is_personal_scope(doc.get("visible_dept_ids")):
+        return
+    try:
+        visible = json.loads(doc.get("visible_dept_ids") or "[]")
+        owner = sole_personal_owner([str(item) for item in visible])
+    except (ValueError, ConfigError):
+        return
+    if owner is None:
+        return
+    title = str(doc.get("title") or "")
+    text = personal_ready_message(title=title) if ok else personal_failed_message(title=title)
+    await notify_personal_owner(
+        settings=runtime.settings,
+        secrets=runtime.secrets,
+        db=runtime.db,
+        user_id=int(owner),
+        text=text,
+        doc_id=int(doc["doc_id"]),
+    )
 
 
 def _record_parse_ms(runtime: Runtime, doc_id: int, parse_ms: int) -> None:

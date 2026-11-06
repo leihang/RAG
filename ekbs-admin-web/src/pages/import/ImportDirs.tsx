@@ -46,7 +46,7 @@ import type {
   ImportScanResp,
 } from '@/api/types'
 import { formatBytes } from '@/utils/format'
-import { buildKbTargetTree, isPersonalCode, parseKbTarget, personalOwnerId } from '@/components/kbTargetTree'
+import { buildKbTargetTree, isPersonalCode, parseKbTarget, personalOwnerId, rawRootForKb } from '@/components/kbTargetTree'
 import { personalOwnerText } from '@/utils/personalKb'
 import {
   actionMeta,
@@ -531,10 +531,10 @@ export default function ImportDirs() {
             <Button
               size="small"
               disabled={!kb}
-              onClick={() => void enterDir(kb?.code ?? '')}
-              title="跳到 raw 下与该知识库 code 同名的目录（不存在时会提示）"
+              onClick={() => void enterDir(rawRootForKb(kb?.code) || '')}
+              title="跳到该知识库在 raw 下的原件目录（个人库是 personal/<uid>，与钉钉一致）"
             >
-              定位到知识库目录{kb ? `（${kb.code}）` : ''}
+              定位到知识库目录{kb ? `（${rawRootForKb(kb.code)}）` : ''}
             </Button>
           </Space>
         }

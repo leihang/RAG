@@ -13,8 +13,14 @@ from ekbs.personal import (
     attach_personal_owners,
     delete_personal_file,
     list_personal_files,
+    personal_accepted_message,
+    personal_duplicate_message,
+    personal_failed_message,
     personal_kb_name,
     personal_max_file_mb,
+    personal_raw_rel,
+    personal_raw_rel_from_code,
+    personal_ready_message,
     personal_storage_limit_bytes,
     personal_shard_id,
     personal_upload_exceeds,
@@ -26,6 +32,47 @@ from ekbs.personal import (
 from ekbs.discovery import is_personal_list_command, personal_delete_title
 from ekbs.tools.sync_org import rebuild_dept_closure, refresh_user_dept_chain
 from tests.conftest import user_id_of
+
+
+def test_personal_raw_rel_uses_slash_not_dash() -> None:
+    """管理台与钉钉必须共用 personal/<uid>，不能再写到 personal-<uid>。"""
+    assert personal_raw_rel(5) == "personal/5"
+    assert personal_raw_rel_from_code("personal-5") == "personal/5"
+    assert personal_raw_rel_from_code("gongkai") is None
+
+
+def test_personal_status_messages_say_processing_and_done() -> None:
+    """钉钉回执不带文件名，只说正在处理 / 处理完毕。"""
+    assert personal_accepted_message(title="九月汇报") == "正在处理"
+    assert personal_ready_message(title="九月汇报") == "处理完毕，可以使用了"
+    assert personal_failed_message(title="九月汇报") == "处理失败，请换一份再发"
+    assert personal_duplicate_message(title="九月汇报", status="pending") == "正在处理"
+    assert personal_duplicate_message(title="九月汇报", status="published") == (
+        "处理完毕，可以使用了"
+    )
+
+
+def test_register_personal_upload_message_is_processing(seeded) -> None:
+    runtime, _ = seeded
+    alice = user_id_of(runtime.db, "demo_alice")
+    stored = register_personal_upload(
+        runtime.db,
+        runtime.settings,
+        user_id=alice,
+        filename="进度提示.txt",
+        content=b"status-message-probe",
+    )
+    assert stored["created"] is True
+    assert stored["message"] == "正在处理"
+    again = register_personal_upload(
+        runtime.db,
+        runtime.settings,
+        user_id=alice,
+        filename="进度提示.txt",
+        content=b"status-message-probe",
+    )
+    assert again["created"] is False
+    assert again["message"] == "正在处理"
 
 
 def test_personal_owner_label_has_name_and_ids(seeded) -> None:
@@ -76,6 +123,13 @@ def test_upload_list_and_delete_stay_inside_one_user(seeded) -> None:
     )
     assert stored["created"] is True
     assert stored["status"] == "pending"
+    with runtime.db.sync_connect() as conn:
+        path = str(conn.execute(
+            "SELECT source_path FROM ekbs_document WHERE doc_id = ?",
+            (stored["doc_id"],),
+        ).fetchone()["source_path"])
+    assert f"/personal/{alice}/" in path.replace("\\", "/")
+    assert f"/personal-{alice}/" not in path.replace("\\", "/")
     again = register_personal_upload(
         runtime.db, runtime.settings,
         user_id=alice, filename="私人备忘.txt", content="只有 Alice 能看".encode(),

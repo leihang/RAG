@@ -43,6 +43,7 @@ from ekbs.errors import ConfigError, PermissionDenied, SchemaError
 from ekbs.personal import (
     PERSONAL_LEVEL,
     assert_personal_kb_storage,
+    personal_raw_rel_from_code,
     personal_user_id_from_code,
     scope_ref,
 )
@@ -759,6 +760,12 @@ def _drop_document_index(runtime: Any, doc_id: int) -> tuple[list[int], list[str
         if getattr(runtime, "figure_index", None) is not None:
             runtime.figure_index.remove(chunk_ids)
     with runtime.db.sync_connect() as conn:
+        try:
+            from ekbs.ingest.table_observations import delete_observations_for_doc
+
+            delete_observations_for_doc(conn, doc_id)
+        except Exception:  # noqa: BLE001 — 观测表缺失时不阻断删文档
+            pass
         conn.execute("DELETE FROM ekbs_chunk WHERE doc_id = ?", (doc_id,))
         conn.commit()
     return chunk_ids, shards
@@ -1402,7 +1409,9 @@ async def upload_complete(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     rel_name = safe_relative_name(str(state["filename"]))
-    final_path = raw_root / safe_relative_name(str(kb_code)) / rel_name
+    # 个人库代号是 personal-<uid>，原件目录与钉钉一致用 personal/<uid>/。
+    landing = personal_raw_rel_from_code(str(kb_code)) or str(kb_code)
+    final_path = raw_root / safe_relative_name(landing) / rel_name
     final_path.parent.mkdir(parents=True, exist_ok=True)
     if final_path.exists():
         # 同名但内容不同（改了再传）：不覆盖原件，加内容后缀区分

@@ -37,6 +37,17 @@ export function personalOwnerId(row: { code?: string; owner_user_id?: number | n
   return matched ? Number(matched[1]) : null
 }
 
+/** 个人原件在 raw 下的相对根：`personal/<uid>`（与钉钉投递一致，不是 `personal-<uid>`）。 */
+export function personalRawRel(code: string | undefined): string | null {
+  const owner = personalOwnerId({ code })
+  return owner != null ? `personal/${owner}` : null
+}
+
+/** 知识库在 raw 下的目录前缀：个人库走 personal/<uid>，部门库仍用 code。 */
+export function rawRootForKb(code: string | undefined): string {
+  return personalRawRel(code) ?? String(code ?? '')
+}
+
 export function formatKbTarget(kbId: number | undefined, dest?: string): string | undefined {
   if (kbId == null) return undefined
   const folder = String(dest ?? '').replace(/^\/+|\/+$/g, '')
@@ -110,10 +121,14 @@ export function buildKbTargetTree(
       title: '个人知识库',
       value: 'group:personal',
       selectable: false,
-      children: personal.map((kb) => ({
-        title: `${ownerText(kb) || kb.name}${kb.document_count ? `（${kb.document_count} 篇）` : ''}`,
-        value: `kb:${kb.kb_id}`,
-      })),
+      children: personal.map((kb) => {
+        const children = nestFolders(kb.kb_id, foldersByKbId[kb.kb_id] ?? [])
+        return {
+          title: `${ownerText(kb) || kb.name}${kb.document_count ? `（${kb.document_count} 篇）` : ''}`,
+          value: `kb:${kb.kb_id}`,
+          ...(children.length ? { children } : {}),
+        }
+      }),
     })
   }
   return nodes

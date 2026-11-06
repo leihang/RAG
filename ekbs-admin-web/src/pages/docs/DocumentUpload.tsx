@@ -23,7 +23,7 @@ import {
   uploadStatus,
 } from '@/api/doc'
 import { http } from '@/api/client'
-import { buildKbTargetTree, formatKbTarget, isPersonalCode, parseKbTarget, personalOwnerId } from '@/components/kbTargetTree'
+import { buildKbTargetTree, formatKbTarget, isPersonalCode, parseKbTarget, personalOwnerId, rawRootForKb } from '@/components/kbTargetTree'
 import { personalOwnerText } from '@/utils/personalKb'
 import DeptPicker from '@/components/DeptPicker'
 import ViewerPicker from '@/components/ViewerPicker'
@@ -129,14 +129,16 @@ export default function DocumentUpload() {
 
   const loadDestFolders = useCallback(async (kbId: number | undefined) => {
     const kb = kbs.find((k) => k.kb_id === kbId)
-    if (!kb?.code || isPersonalCode(kb.code)) {
+    if (!kb?.code) {
       if (kbId != null) setFoldersByKb((prev) => ({ ...prev, [kbId]: [] }))
       return
     }
+    const rawPrefix = rawRootForKb(kb.code)
     try {
       // 新库还没上传过时目录不存在，后端 404。这里自己当成空列表。
+      // 个人库列 personal/<uid>，与钉钉原库同根；不要用代号 personal-<uid>。
       const res = (await http.get('/import/dirs', {
-        params: { path: kb.code, recursive: true },
+        params: { path: rawPrefix, recursive: true },
         skipErrorToast: true,
       })) as {
         dirs?: {
@@ -153,9 +155,9 @@ export default function DocumentUpload() {
         .map((row) => {
           const under = String(row.rel_under || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
           const full = String(row.rel_path || row.name || '').replace(/\\/g, '/')
-          const prefix = `${kb.code}/`
+          const prefix = `${rawPrefix}/`
           const path = under || (full.startsWith(prefix) ? full.slice(prefix.length) : full)
-          if (!path || path === kb.code) return null
+          if (!path || path === rawPrefix) return null
           return {
             path,
             level: row.level ?? null,
@@ -198,7 +200,7 @@ export default function DocumentUpload() {
     if (!window.confirm(`删除文件夹「${folderPath}」？里面有文件时会拒绝。`)) return
     try {
       await http.delete('/import/dirs', {
-        params: { path: `${kb.code}/${folderPath}` },
+        params: { path: `${rawRootForKb(kb.code)}/${folderPath}` },
         skipErrorToast: true,
       })
       message.success('已删除文件夹')
@@ -230,8 +232,9 @@ export default function DocumentUpload() {
     }
     setCreatingFolder(true)
     try {
+      const mkdirPath = `${rawRootForKb(kb.code)}/${name}`
       await http.post('/import/dirs', {
-        path: `${kb.code}/${name}`,
+        path: mkdirPath,
         ...(personal ? {} : {
           level: newFolderLevel,
           visible_dept_ids: newFolderDepts,
@@ -296,7 +299,7 @@ export default function DocumentUpload() {
   useEffect(() => {
     if (!kbLoaded) return
     for (const kb of kbs) {
-      if (!isPersonalCode(kb.code)) void loadDestFolders(kb.kb_id)
+      void loadDestFolders(kb.kb_id)
     }
   }, [kbLoaded, kbs, loadDestFolders])
 
@@ -462,7 +465,9 @@ export default function DocumentUpload() {
     const target = kbs.find((k) => k.kb_id === values.kb_id)
     const personal = isPersonalCode(target?.code)
     const destFolders = foldersByKb[values.kb_id] ?? []
-    const dest = personal ? '' : String(values.dest_folder ?? '').replace(/^\/+|\/+$/g, '')
+    const selectedDest = String(values.dest_folder ?? '').replace(/^\/+|\/+$/g, '')
+    // 个人库也落进选中的子文件夹（钉钉原库 personal/<uid>/…），不再强制清空。
+    const dest = selectedDest
     const folder = destFolders.find((row) => row.path === dest)
     // 用「文件夹是否有有效密级」判断是否沿用文件夹策略，而不是「有没有部门」——
     // L1（公开）文件夹本来就没部门，用部门判断会把它的 L1 误当成「无策略」，
@@ -572,7 +577,7 @@ export default function DocumentUpload() {
     const kb = kbs.find((item) => item.kb_id === parsed.kbId)
     const previous = form.getFieldValue('kb_id') as number | undefined
     form.setFieldValue('kb_id', parsed.kbId)
-    form.setFieldValue('dest_folder', isPersonalCode(kb?.code) ? '' : parsed.dest)
+    form.setFieldValue('dest_folder', parsed.dest)
     if (previous !== parsed.kbId && kb && !isPersonalCode(kb.code)) {
       const initial = initialLevelForKb(kbs, parsed.kbId)
       if (initial) form.setFieldValue('level', initial)
@@ -815,7 +820,7 @@ export default function DocumentUpload() {
 
       <Card title="2. 目标">
         <Form form={form} layout="vertical" initialValues={{ level: 2, dest_folder: '' }} style={{ maxWidth: 720 }}>
-          <Form.Item label="目标知识库" required tooltip="部门库展开后选择文件夹。个人库收在最下面，选中后直接投喂。">
+          <Form.Item label="目标知识库" required tooltip="部门库与个人库都可展开到文件夹；个人库落在钉钉原库 personal/<uid>/ 下。">
             <Space.Compact style={{ width: '100%' }}>
               <TreeSelect
                 style={{ width: 'calc(100% - 160px)' }}
@@ -858,20 +863,41 @@ export default function DocumentUpload() {
             const kb = kbs.find((item) => item.kb_id === watchedKbId)
             if (!kb) return null
             const personal = isPersonalCode(kb?.code)
-            if (personal) {
-              return (
-                <Alert
-                  type="info"
-                  showIcon
-                  style={{ marginBottom: 16 }}
-                  message={`投喂到${personalOwnerText(kb ?? {}) || '这个人'}的私有库`}
-                  description="只有本人能检索。不用再选文件夹、密级、部门或额外可查看的人。"
-                />
-              )
-            }
             const dest = String(watchedDest ?? '')
             const folder = destFolders.find((row) => row.path === dest)
             const ready = (folder?.visible_dept_ids.length ?? 0) > 0
+            if (personal) {
+              return (
+                <>
+                  <Space style={{ marginBottom: 8 }}>
+                    <Button
+                      htmlType="button"
+                      onClick={() => {
+                        const kbId = form.getFieldValue('kb_id') as number | undefined
+                        void loadDestFolders(kbId)
+                      }}
+                    >
+                      刷新
+                    </Button>
+                    <Button htmlType="button" onClick={() => openFolderModal()}>
+                      新建文件夹
+                    </Button>
+                    {folder ? (
+                      <Button htmlType="button" danger onClick={() => void removeFolder(folder.path)}>
+                        删除当前文件夹
+                      </Button>
+                    ) : null}
+                  </Space>
+                  <Alert
+                    type="info"
+                    showIcon
+                    style={{ marginBottom: 16 }}
+                    message={`投喂到${personalOwnerText(kb ?? {}) || '这个人'}的私有库${folder ? ` / ${folder.path}` : ''}`}
+                    description={`原件落在钉钉原库 ${rawRootForKb(kb.code)}/ 下；只有本人能检索，不用另选密级和部门。`}
+                  />
+                </>
+              )
+            }
             return (
               <>
                 <Space style={{ marginBottom: 8 }}>
