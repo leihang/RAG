@@ -10,7 +10,7 @@
  * 改子块会**追加新向量并重写 FTS**（不是原地改），提交前必须提示。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Button, Card, Descriptions, Empty, Input, List, Space, Spin, Tag, Tooltip, Typography, message } from 'antd'
+import { Button, Card, Descriptions, Empty, Input, List, Modal, Space, Spin, Tag, Tooltip, Typography, message } from 'antd'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import Auth from '@/components/Auth'
 import ClearanceTag from '@/components/ClearanceTag'
@@ -110,6 +110,8 @@ export default function ChunkExplorer() {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
   const [pending, setPending] = useState<{ kind: 'split' | 'merge' | 'reembed'; chunk: ChunkNode } | null>(null)
+  const [compareNodes, setCompareNodes] = useState<ChunkNode[]>([])
+  const [compareOpen, setCompareOpen] = useState(false)
 
   const load = useCallback(async () => {
     if (!Number.isFinite(id)) return
@@ -176,6 +178,19 @@ export default function ChunkExplorer() {
 
   const total = (tree.parents ?? 0) + (tree.children ?? 0)
   const leafParents = (tree.tree ?? []).filter((p) => !hasChildren(p)).length
+  const inCompare = (chunkId: number) => compareNodes.some((n) => n.chunk_id === chunkId)
+  const toggleCompare = (node: ChunkNode) => {
+    setCompareNodes((prev) => {
+      if (prev.some((n) => n.chunk_id === node.chunk_id)) {
+        return prev.filter((n) => n.chunk_id !== node.chunk_id)
+      }
+      if (prev.length >= 2) {
+        message.info('最多对比 2 个分块，已替换最早选择的一个')
+        return [prev[1], node]
+      }
+      return [...prev, node]
+    })
+  }
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -200,6 +215,9 @@ export default function ChunkExplorer() {
           <span />
           <Button size="small" onClick={() => navigate('/docs/list')}>返回文档列表</Button>
           <Button size="small" onClick={() => void load()}>刷新</Button>
+          <Button size="small" disabled={compareNodes.length !== 2} onClick={() => setCompareOpen(true)}>
+            对比已选（{compareNodes.length}/2）
+          </Button>
         </Space>
       </Card>
 
@@ -370,7 +388,16 @@ export default function ChunkExplorer() {
             )}
 
             {activeChunk ? (
-              <Card size="small" style={{ marginTop: 12 }} title="分块详情">
+              <Card
+                size="small"
+                style={{ marginTop: 12 }}
+                title="分块详情"
+                extra={
+                  <Button size="small" onClick={() => toggleCompare(activeChunk)}>
+                    {inCompare(activeChunk.chunk_id) ? '移出对比' : '加入对比'}
+                  </Button>
+                }
+              >
                 <Descriptions size="small" column={2} bordered>
                   <Descriptions.Item label="chunk_id">{activeChunk.chunk_id}</Descriptions.Item>
                   <Descriptions.Item label="类型">
@@ -424,6 +451,45 @@ export default function ChunkExplorer() {
       ) : (
         <Card><Empty description="该文档还没有分块，请确认 worker 已解析完成" /></Card>
       )}
+
+      <Modal
+        open={compareOpen}
+        width="90vw"
+        footer={null}
+        onCancel={() => setCompareOpen(false)}
+        title="分块对比（全文）"
+        destroyOnClose
+      >
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          {compareNodes.map((node) => (
+            <div key={node.chunk_id}>
+              <Space size={6} wrap style={{ marginBottom: 8 }}>
+                <Tag>#{node.chunk_id}</Tag>
+                <Tag>{typeLabel(node, false)}</Tag>
+                <span>{node.token_count ?? 0} tok</span>
+                <Typography.Text ellipsis style={{ maxWidth: 260 }}>
+                  {node.heading_path || `#${node.seq}`}
+                </Typography.Text>
+              </Space>
+              <pre
+                style={{
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  maxHeight: '65vh',
+                  overflow: 'auto',
+                  padding: 12,
+                  background: '#fafafa',
+                  border: '1px solid #f0f0f0',
+                  fontSize: 12,
+                  margin: 0,
+                }}
+              >
+                {node.content}
+              </pre>
+            </div>
+          ))}
+        </div>
+      </Modal>
 
       <ImpactConfirmModal
         open={pending !== null}

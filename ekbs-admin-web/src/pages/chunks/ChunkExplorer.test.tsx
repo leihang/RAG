@@ -6,7 +6,7 @@
  * （`ekbs/ingest/retrievable.py`：只有叶子块进向量与 FTS）。
  * 只有**叶子块**缺 `faiss_row` 才是真异常，那才该报警。
  */
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -218,5 +218,38 @@ describe('分块预览的表格父容器', () => {
     await waitFor(() => expect(screen.getByText('未入文本向量')).toBeInTheDocument())
     expect(screen.getByText('未入向量（异常，可点「重新向量化」）')).toBeInTheDocument()
     expect(screen.queryByText('表格父容器')).toBeNull()
+  })
+})
+
+
+describe('分块全文对比', () => {
+  it('选择两个分块后可打开双栏全文对比', async () => {
+    api.getChunkTree.mockResolvedValue({
+      document: { doc_id: 1, title: '对比文档', status: 'published', level: 1 },
+      parents: 2,
+      children: 0,
+      tree: [
+        {
+          chunk_id: 31, doc_id: 1, chunk_type: 'parent', seq: 1, content: '第一段完整内容',
+          heading_path: '第一段', token_count: 8, faiss_row: 1, children: [],
+        },
+        {
+          chunk_id: 32, doc_id: 1, chunk_type: 'parent', seq: 2, content: '第二段完整内容',
+          heading_path: '第二段', token_count: 8, faiss_row: 2, children: [],
+        },
+      ],
+      orphan_children: [],
+    })
+    mount()
+    await waitFor(() => expect(screen.getByText('第一段完整内容')).toBeInTheDocument())
+    fireEvent.click(screen.getByText('加入对比'))
+    fireEvent.click(screen.getByText('第二段'))
+    fireEvent.click(screen.getByText('加入对比'))
+    const button = screen.getByRole('button', { name: /对比已选（2\/2）/ })
+    expect(button).toBeEnabled()
+    fireEvent.click(button)
+    expect(await screen.findByText('分块对比（全文）')).toBeInTheDocument()
+    expect(screen.getAllByText('第一段完整内容').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('第二段完整内容').length).toBeGreaterThan(0)
   })
 })
