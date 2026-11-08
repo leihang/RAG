@@ -192,6 +192,25 @@ def test_unsupported_suffixes_are_not_counted_or_scanned(runtime) -> None:
     assert rel == {"a.md"}, f".csv/.exe/.json 不该被收：{rel}"
 
 
+def test_list_raw_top_dirs_marks_orphans(runtime) -> None:
+    """UI 与 raw 对齐：有 kb.code 的顶层不算 orphan；无对应库的目录必须标 orphan。"""
+    from ekbs.ingest.dir_import import list_raw_top_dirs, raw_root
+
+    root = raw_root(runtime.settings)
+    (root / "known_kb" / "子文件夹").mkdir(parents=True)
+    (root / "orphan_only").mkdir(parents=True)
+    (root / "personal" / "9").mkdir(parents=True)
+    rows = list_raw_top_dirs(
+        runtime.settings, kb_codes=["known_kb", "personal-9", "other"]
+    )
+    by_path = {r["rel_path"]: r for r in rows}
+    assert by_path["known_kb"]["orphan"] is False
+    assert by_path["known_kb"]["subfolder_count"] == 1
+    assert by_path["orphan_only"]["orphan"] is True
+    assert by_path["personal/9"]["orphan"] is False
+    assert by_path["personal/9"]["kb_code"] == "personal-9"
+
+
 # ---------------------------------------------------------------------------
 # 3. 扫描分类
 # ---------------------------------------------------------------------------

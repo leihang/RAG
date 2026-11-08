@@ -209,7 +209,8 @@ class Database:
             # 推荐问答 tier-3：文档级「代表问句」表（新库由 001_init.sql 建，存量库在此补建）。
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS ekbs_doc_recommend ("
-                " doc_id INTEGER PRIMARY KEY REFERENCES ekbs_document(doc_id),"
+                " doc_id INTEGER PRIMARY KEY "
+                "REFERENCES ekbs_document(doc_id) ON DELETE CASCADE,"
                 " question TEXT NOT NULL,"
                 " rerank_score REAL,"
                 " status TEXT NOT NULL DEFAULT 'verified',"

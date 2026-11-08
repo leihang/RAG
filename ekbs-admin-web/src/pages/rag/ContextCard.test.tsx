@@ -124,4 +124,16 @@ describe('ContextCard 模型上下文（引用 ≠ 上下文）', () => {
     expect(screen.getByText(/本次请求没有记录模型上下文/)).toBeInTheDocument()
     expect(screen.getByText('合计 0 tok')).toBeInTheDocument()
   })
+
+  it('有 collapsedKeptIds 时提示与 Rerank 条数不一致是预期', () => {
+    render(
+      <ContextCard
+        contextChunks={DOC_205_CONTEXT}
+        contextTokens={2122}
+        collapsedKeptIds={[65132, 68809]}
+      />,
+    )
+    expect(screen.getByText(/与 Rerank「进扩展」条数不一致是预期/)).toBeInTheDocument()
+    expect(screen.getByText(/65132、68809/)).toBeInTheDocument()
+  })
 })

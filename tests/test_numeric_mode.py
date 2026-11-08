@@ -500,8 +500,37 @@ def test_resolve_answer_mode_auto_and_explicit() -> None:
     assert resolve_answer_mode("auto", "numeric", auto_numeric=False) == "prose"
 
 
+@pytest.mark.asyncio
+async def test_answer_never_short_circuits_structured_query(
+    seeded, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """据实抄写：用电量/合计类问句不得在进 LLM 前走 structured_query 聚合。"""
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+
+    def _must_not_run(*_a, **_k):  # noqa: ANN002, ANN003
+        raise AssertionError("answer path must not call _try_structured_answer")
+
+    monkeypatch.setattr(runtime.pipeline, "_try_structured_answer", _must_not_run)
+    for question in (
+        "三期嘛嘛公寓2月用电量是多少",
+        "全季酒店2025年1-12月用电量是多少",
+        "嘛嘛公寓2026年1-9月累计用电量",
+    ):
+        result = await _with_stub_llm(
+            runtime,
+            "资料显示用电量见引用 [1]。",
+            lambda q=question: runtime.pipeline.answer(
+                q, alice, mode="prose", use_cache=False
+            ),
+        )
+        assert result.model != "structured_query"
+        assert result.mode_used != "structured_query"
+
+
+@pytest.mark.asyncio
 async def test_auto_mode_routes_numeric_intent(seeded, monkeypatch) -> None:
-    """mode=auto + 取数意图 → 实际走 numeric（mode_used）。"""
+    """mode=auto + 取数意图：无电子表格时降级 prose（旁路仅表格）。"""
     runtime, _ = seeded
     runtime.settings.qa = {**(runtime.settings.qa or {}), "auto_numeric": True}
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
@@ -514,9 +543,9 @@ async def test_auto_mode_routes_numeric_intent(seeded, monkeypatch) -> None:
         ),
     )
     assert result.intent == "numeric"
-    assert result.mode_used == "numeric"
-    assert result.refused is False
-    assert "依据：" in result.answer or result.numeric
+    # 年假制度是 Word：auto 不得进 numeric；显式 mode=numeric 才走取数。
+    assert result.mode_used == "prose"
+    assert result.numeric is None
 
 
 def test_question_pinning_suppresses_ambiguity_noise() -> None:

@@ -15,8 +15,8 @@ RAG 的"记忆"是**把资料 + 多轮历史 + 问题一起塞给模型**，而�
 
 * `session.context_ttl_seconds` 2 小时 → **7 天**（604800）：跨天追问还能用上上下文
 * `session.context_max_turns` 6 → **10 轮**：满足"至少 10 轮"的要求
-* `models.llm.max_input_tokens` 新增 **20000**：按"本地 Qwen 计数 × 最坏偏差 1.19 ≈ 23.8k"
-  留约 23% 余量（本地计数器在标点/数字密集文本上会低估，实测比例最高 1.1898）
+* `models.llm.max_input_tokens`：**200000**（20 万）。主模型已切 deepseek-v4.1-flash
+  （窗口约 1M）；预算须低于窗口并给输出/本地计数偏差留余量
 
 裁剪**牺牲顺序**：① 最旧轮次 → ② 排名最低的块 → ③ 截断最后一块。
 永远保留：最近 1 轮 + 至少 1 个块。
@@ -45,9 +45,9 @@ def test_shipped_configs_meet_the_new_policy() -> None:
         settings = load_settings(path)
         assert int(settings.session["context_ttl_seconds"]) >= 7 * 24 * 3600, path
         assert int(settings.session["context_max_turns"]) == 10, path
-        assert int(settings.models.llm.max_input_tokens) > 0, path
-        # 上限必须**低于**模型窗口（30,720），且留出偏差余量
-        assert settings.models.llm.max_input_tokens * 1.25 < 30720, path
+        assert int(settings.models.llm.max_input_tokens) >= 200000, path
+        # 上限必须**低于**主模型窗口（deepseek-v4.1-flash ≈ 1M），且留出偏差余量
+        assert settings.models.llm.max_input_tokens * 1.25 < 1_000_000, path
 
 
 # ---------------------------------------------------------------- 记忆窗口
@@ -168,7 +168,7 @@ async def test_answer_reports_budget_trimming(seeded) -> None:
             question, retrieval, alice, history=[{"role": "user", "content": "上文" * 40}]
         )
     finally:
-        settings.models.llm.max_input_tokens = 20000
+        settings.models.llm.max_input_tokens = 200000
     assert answer.refused is False
     assert answer.dropped_chunks >= 1 or answer.dropped_history >= 1
     assert len(answer.citations) <= len(retrieval.chunks)

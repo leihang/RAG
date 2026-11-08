@@ -247,8 +247,26 @@ function RerankCard({
 }) {
   const [expanded, setExpanded] = useState(false)
   const { minScore, keep } = rerank
-  const columns: ColumnsType<NonNullable<DebugStages['rerank']>['scores'][number] & { decision: string }> = [
-    { title: '排名', width: 64, render: (_v, _row, index) => index + 1 },
+  type RerankRow = NonNullable<DebugStages['rerank']>['scores'][number] & {
+    decision: string
+    rank: number
+  }
+  // 判定必须按全量精排名次算，再 preview；否则「展开前 10 条」里 index 错位会把 keep 内叶子标成超输出。
+  const decided: RerankRow[] = rerank.scores.map((row, index) => {
+    let decision = '—'
+    if (row.rerank_score != null && minScore != null && row.rerank_score < minScore) {
+      decision = '✖ 低于阈值'
+    } else if (keep != null && index >= keep) {
+      decision = '— 超 keep'
+    } else if (row.rerank_score != null) {
+      // 「进扩展」≠「必然进模型上下文」：同表折叠 / prompt 预算裁剪会再丢
+      decision = '✔ 进扩展'
+    }
+    return { ...row, decision, rank: index + 1 }
+  })
+  const rows = preview(decided, expanded)
+  const columns: ColumnsType<RerankRow> = [
+    { title: '排名', width: 64, dataIndex: 'rank' },
     {
       title: 'chunk_id',
       dataIndex: 'chunk_id',
@@ -262,19 +280,11 @@ function RerankCard({
       render: (value: number | null) => (value == null ? '-' : value.toFixed(4)),
     },
     {
-      // 判定只用后端真的给了的 min_score / 排名，不臆造规则
       title: '判定',
       dataIndex: 'decision',
       render: (value: string) => <span>{value}</span>,
     },
   ]
-  const rows = preview(rerank.scores, expanded).map((row, index) => {
-    let decision = '—'
-    if (row.rerank_score != null && minScore != null && row.rerank_score < minScore) decision = '✖ 低于阈值'
-    else if (keep != null && index >= keep) decision = '— 超 Rerank 输出'
-    else if (row.rerank_score != null) decision = '✔ 保留'
-    return { ...row, decision }
-  })
 
   return (
     <Card
@@ -290,10 +300,15 @@ function RerankCard({
         </Space>
       }
       extra={
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          requested_top_n={rerank.requestedTopN ?? '-'} · keep={rerank.keep ?? '-'} · min_score=
-          {rerank.minScore ?? '-'}
-        </Typography.Text>
+        <Space size={6}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            requested_top_n={rerank.requestedTopN ?? '-'} · keep={rerank.keep ?? '-'} · min_score=
+            {rerank.minScore ?? '-'}
+          </Typography.Text>
+          <Tooltip title="✔ 进扩展 = 进入父块/整表扩展候选，不等于最终都进模型上下文；同表多叶子会折叠，超预算还会裁掉尾部">
+            <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+          </Tooltip>
+        </Space>
       }
     >
       <Table
@@ -401,6 +416,19 @@ function ExpandCard({
       render: (value: string | null) => value ?? '-',
     },
   ]
+  const renderIds = (ids: number[]) => {
+    if (!ids.length) return '—'
+    if (!onOpenChunk) return ids.join(', ')
+    return (
+      <Space size={[4, 4]} wrap>
+        {ids.map((id) => (
+          <Typography.Link key={id} onClick={() => onOpenChunk(id)} className="ekbs-mono">
+            {id}
+          </Typography.Link>
+        ))}
+      </Space>
+    )
+  }
   return (
     <Card
       size="small"
@@ -426,6 +454,21 @@ function ExpandCard({
         </Space>
       }
     >
+      {expand.collapsedKeptIds.length > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="精排保留叶子被同表/同父块折叠"
+          description={
+            <span>
+              keep 叶子 {renderIds(expand.keptLeafIds)} 中，
+              {renderIds(expand.collapsedKeptIds)} 与更高分叶子展开到同一父块/整表，去重后溯源只保留首次来源。
+              模型上下文里仍有这些表的内容，只是「来源」列不会再指向被折叠的叶子 —— 这与 Rerank 条数不一致是预期行为。
+            </span>
+          }
+        />
+      ) : null}
       <Table
         size="small"
         rowKey={(_row, index) => `expand-${index ?? 0}`}

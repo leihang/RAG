@@ -4,18 +4,18 @@
 
 | 项 | 值 |
 |---|---|
-| 父块 | **1024 ~ 1536 token** |
-| 子块 | **256 ~ 384 token**（±5 容差） |
+| 父块 | **1024 ~ 2048 token**（与表格容器同上限） |
+| 子块 | **300 ~ 500 token**（±5 容差） |
 | 相邻子块重叠 | **12% ~ 15%** |
 | 回退窗口 | 100 字符（切不出完整句子时向后找边界） |
 | 表格 | 整块不切；> 2048 token 时按行分组 |
-| 子块上限 | 384（适配 rerank ``max_length=512``） |
+| 子块上限 | 500（正文；表格叶子仍见 ``TABLE_LEAF_TOKENS``） |
 
 切分优先级（`20` §3.2）：Markdown ``#`` 标题 → 中文条款
 （``第X章/节/条``）→ ``X.X`` 编号 → 句子聚合 → 长度兜底。
 
 **条款各自成块**：``第X条``、``4.1`` 这种已经切开的条款不再按长度并进同一块。
-一条写得很长时，仍只在这一条内部按 1024～1536 / 256～384 切开。
+一条写得很长时，仍只在这一条内部按 1024～2048 / 300～500 切开。
 
 ``heading_path`` **不得为空**：缺标题时用 ``doc_title`` / ``文档`` 作根。
 """
@@ -32,21 +32,20 @@ from ekbs.logging import get_logger
 log = get_logger(component="chunker")
 
 PARENT_MIN_TOKENS = 1024
-PARENT_MAX_TOKENS = 1536
-CHILD_MIN_TOKENS = 256
-CHILD_MAX_TOKENS = 384
+PARENT_MAX_TOKENS = 2048
+CHILD_MIN_TOKENS = 300
+CHILD_MAX_TOKENS = 500
 OVERLAP_MIN_RATIO = 0.12
 OVERLAP_MAX_RATIO = 0.15
 #: 只有标题/占位符、没有正文的节（如 ``[表格 1]``、``[图片]``）
 _PLACEHOLDER_ONLY_RE = re.compile(r"^\[(?:表格|图片)\s*\d*\]$")
 TABLE_SPLIT_TOKENS = 2048
-#: 表格**叶子**预算（与正文 child 上限 384 对齐）：整表超过这个就拆「行组叶子」，
-#: 每叶重复表头、逐块嵌入。整表一个向量时十几行数据会互相稀释（实测 920 token 的
-#: 「表1-年度能耗管理计划编制及实施要求」查「A级能耗普查」检索不中）。
+#: 表格**叶子**预算（独立于正文 child；正文已调到 300~500，表叶仍用 384 防稀释）：
+#: 整表超过这个就拆「行组叶子」，每叶重复表头、逐块嵌入。
 TABLE_LEAF_TOKENS = 384
 #: 表格父容器**硬上限**（与 ``table_serialize.TABLE_MAX_TOKENS`` 对齐）：DB 里任何块都
-#: 不得超过它。整表序列化 + 上下文超限时按行分段，检索命中任一叶子时由
-#: ``retrieval._expand_parents`` 展开全部分段（内容完整，见 ``TABLE_EXPAND_MAX_TOKENS``）。
+#: 不得超过它。整表序列化 + 上下文超限时按行/表头打满分段；检索命中叶子时只展开
+#: **直系父段**（不再把同 ``table_group`` 兄妹段一并塞进 prompt）。
 TABLE_CONTAINER_MAX_TOKENS = 2048
 #: 分段预算的安全余量：分段标记行的长度随「第 i/n 段」变化，留一点防越界。
 _TABLE_SEGMENT_MARGIN_TOKENS = 16
@@ -761,8 +760,54 @@ def _child_body(buf: Sequence[Section]) -> str:
     return "\n\n".join(parts)
 
 
+_SLIDE_PAGE_HEADING_RE = re.compile(r"^第\s*(\d+)\s*页\s*$")
+
+
+def slide_page_map_from_markdown(markdown: str) -> list[tuple[int, int, int]]:
+    """从 ``## 第 N 页`` 重建 page_map（清洗改字后旧偏移会错位，幻灯片必须重扫）。"""
+    out: list[tuple[int, int, int]] = []
+    for match in re.finditer(r"^#{1,6}\s*第\s*(\d+)\s*页\s*$", markdown or "", re.MULTILINE):
+        page = int(match.group(1))
+        out.append((match.start(), page, page))
+    return out
+
+
+def _slide_page_from_heading(heading_path: str) -> int | None:
+    """从 heading_path 任一段提取「第 N 页」（含 ``第 14 页 > 2. 设备运维``）。"""
+    for part in _heading_parts(heading_path):
+        marker = _SLIDE_PAGE_HEADING_RE.match(part.strip())
+        if marker:
+            return int(marker.group(1))
+    return None
+
+
+def _force_slide_section_pages(sections: Sequence[Section]) -> list[Section]:
+    """幻灯片小节页码以「第 N 页」标题为准；其下条款继承该页，杜绝 page_map 渗色。"""
+    current: int | None = None
+    out: list[Section] = []
+    for section in sections:
+        marked = _slide_page_from_heading(section.heading_path)
+        if marked is not None:
+            current = marked
+        page = current if current is not None else section.page_from
+        out.append(
+            Section(
+                heading_path=section.heading_path,
+                text=section.text,
+                page_from=page,
+                page_to=page,
+                start_offset=section.start_offset,
+            )
+        )
+    return out
+
+
 def _build_child_drafts(
-    sections: Sequence[Section], *, child_min: int, child_max: int
+    sections: Sequence[Section],
+    *,
+    child_min: int,
+    child_max: int,
+    page_hard_cut: bool = False,
 ) -> list[_ChildDraft]:
     """按 token 目标把小节**跨标题**聚合成子块（`20` §3.2 规则 3/4）。
 
@@ -770,6 +815,8 @@ def _build_child_drafts(
     出来的块只有 10~60 token，父子块全部退化成碎片（实测 doc 196 的 33 节 → 33 个
     6~120 token 的块，父子关系名存实亡）。聚合到 ``child_min`` 才收口；收口点落在
     标题边界上（小节是切分的最小单位，不会把一行拆两半）。
+
+    ``page_hard_cut``：幻灯片一页一屏，**禁止跨页聚合**（否则挂图/问句都会漂到邻页）。
     """
     drafts: list[_ChildDraft] = []
     buf: list[Section] = []
@@ -781,13 +828,18 @@ def _build_child_drafts(
         if body:
             starts = [s.page_from for s in buf if s.page_from is not None]
             ends = [s.page_to for s in buf if s.page_to is not None]
+            page_from = min(starts) if starts else None
+            page_to = max(ends) if ends else None
+            # 幻灯片一块只标一页：page_map 边界渗色不影响挂图/引用页码
+            if page_hard_cut and page_from is not None:
+                page_to = page_from
             drafts.append(
                 _ChildDraft(
                     content=body,
                     body=body,
                     heading_path=buf[0].heading_path,
-                    page_from=min(starts) if starts else None,
-                    page_to=max(ends) if ends else None,
+                    page_from=page_from,
+                    page_to=page_to,
                     table_ids=tuple(
                         table_id
                         for section in buf
@@ -817,25 +869,44 @@ def _build_child_drafts(
                     )
                 )
             continue
+        if page_hard_cut and buf and section.page_from is not None:
+            # 以缓冲**起始页**为准。page_map 边界常让上一节 page_to=下一页，
+            # 若用「页集合相交」判断会把第 N/N+1 页粘在一起（实测 36 页→10 块）。
+            anchor = buf[0].page_from
+            if anchor is not None and int(section.page_from) != int(anchor):
+                flush()
         if buf and buf_tokens + section_tokens > child_max:
             flush()
         buf.append(section)
         buf_tokens += section_tokens
-        if buf_tokens >= child_min:
+        # 幻灯片：同页继续攒、跨页才收口（上面已 flush）；短页也不等 child_min。
+        # 非幻灯片仍按 child_min 聚合。
+        if not page_hard_cut and buf_tokens >= child_min:
             flush()
     flush()
     return drafts
 
 
-def _merge_small_tail_child(drafts: list[_ChildDraft], *, child_min: int, child_max: int) -> None:
+def _merge_small_tail_child(
+    drafts: list[_ChildDraft],
+    *,
+    child_min: int,
+    child_max: int,
+    page_hard_cut: bool = False,
+) -> None:
     """收尾的碎块（< child_min/2）并入前一块 —— 尾部余量不该单独成块。
 
     尾部是否成块取决于总长能否整除目标，无法从算法上避免；但 10~60 token 的孤立尾块
     会污染 rerank（同一篇里块大小差一个量级），所以超小尾块并回前一块（不超 child_max 时）。
+    幻灯片禁止跨页并尾。
     """
     if len(drafts) < 2:
         return
     last, prev = drafts[-1], drafts[-2]
+    if page_hard_cut and (
+        last.page_from != prev.page_from or last.page_to != prev.page_to
+    ):
+        return
     last_tokens = count_tokens(last.content)
     if last_tokens >= child_min // 2:
         return
@@ -881,13 +952,22 @@ def _parent_heading(drafts: Sequence[_ChildDraft], *, root: str) -> str:
 
 
 def _pack_parent_drafts(
-    drafts: Sequence[_ChildDraft], *, parent_min: int, parent_max: int
+    drafts: Sequence[_ChildDraft],
+    *,
+    parent_min: int,
+    parent_max: int,
+    page_hard_cut: bool = False,
 ) -> list[list[_ChildDraft]]:
     """把子块按 ``parent_min``~``parent_max`` 装箱成父块（可跨章跨节，`20` §3.1）。
 
     父子关系要有意义，父块就必须比子块大一个量级：按标题/章分组时，2 页文档的「章」
     只有几十到几百 token，父块约等于子块 → 父块扩展等于没扩展（用户实测反馈）。
+
+    幻灯片：每页一个父块，图才能挂到同页 parent（跨页装箱会让 38 张图共挂一个父）。
     """
+    if page_hard_cut:
+        return [[draft] for draft in drafts]
+
     groups: list[list[_ChildDraft]] = []
     current: list[_ChildDraft] = []
     tokens = 0
@@ -915,7 +995,9 @@ def _pack_parent_drafts(
     return groups
 
 
-def merge_short_sections_into_next(sections: Sequence[Section]) -> list[Section]:
+def merge_short_sections_into_next(
+    sections: Sequence[Section], *, page_hard_cut: bool = False
+) -> list[Section]:
     """把**空壳节**（无正文 / 只有占位符）并入下一节（行尾连续的并入上一节）。
 
     为什么只并空壳、不做"短节按长度合并"：条款（``第X条`` / ``4.1``）和编号小节各自
@@ -923,13 +1005,45 @@ def merge_short_sections_into_next(sections: Sequence[Section]) -> list[Section]
     `test_chapter_and_fullwidth_dotted_headings`），按长度合并会把不同规定混进同一个块，
     检索精度反而变差。这里只清掉**没有正文可检索**的碎片块（实测 ``[表格 1]``、
     ``6．质量记录`` 这类块会跨文档重复出现，命中后什么信息也没有）。
+
+    幻灯片禁止跨页并空壳（``[表格 N]`` 页不能并进下一页正文）。
     """
     merged: list[Section] = []
     buffered: list[Section] = []
+
+    def _emit_placeholder(item: Section) -> None:
+        text = _section_with_heading(item)
+        if not text:
+            return
+        merged.append(
+            Section(
+                heading_path=item.heading_path,
+                text=text,
+                page_from=item.page_from,
+                page_to=item.page_to,
+                start_offset=item.start_offset,
+            )
+        )
+
     for section in sections:
         if _is_placeholder_only(section):
             buffered.append(section)
             continue
+        if page_hard_cut and buffered:
+            same: list[Section] = []
+            for item in buffered:
+                if (
+                    item.page_from is not None
+                    and section.page_from is not None
+                    and int(item.page_from) != int(section.page_from)
+                ):
+                    if merged and merged[-1].page_from == item.page_from:
+                        merged[-1] = _join_trailing(merged[-1], [item])
+                    else:
+                        _emit_placeholder(item)
+                else:
+                    same.append(item)
+            buffered = same
         starts = [s.page_from for s in (*buffered, section) if s.page_from is not None]
         ends = [s.page_to for s in (*buffered, section) if s.page_to is not None]
         pieces = [_section_with_heading(item) for item in buffered]
@@ -946,7 +1060,14 @@ def merge_short_sections_into_next(sections: Sequence[Section]) -> list[Section]
     if buffered:
         if not merged:
             return list(sections)
-        merged[-1] = _join_trailing(merged[-1], buffered)
+        if page_hard_cut:
+            for item in buffered:
+                if merged[-1].page_from == item.page_from:
+                    merged[-1] = _join_trailing(merged[-1], [item])
+                else:
+                    _emit_placeholder(item)
+        else:
+            merged[-1] = _join_trailing(merged[-1], buffered)
     return merged
 
 
@@ -1217,6 +1338,97 @@ def _relevant_header_line(text: str) -> str:
     return ""
 
 
+_TABLE_META_LINE_PREFIXES = ("表名:", "核心实体:", "相关表头:", "本段为整表")
+
+
+def _is_serialized_table_data_line(line: str) -> bool:
+    """序列化表块里的数据行（``列=值; …``），用于父块超限时按行再切。"""
+    text = (line or "").strip()
+    if not text or text.startswith(_TABLE_META_LINE_PREFIXES):
+        return False
+    return "=" in text
+
+
+def _split_serialized_block_to_parent_budget(
+    block: str,
+    *,
+    section_path: str,
+    above: str,
+    below: str,
+    marker_pad: str,
+) -> list[str]:
+    """单块（常是一个月）加标题/标记后仍超 2048 时，按数据行再切，每片自带 preamble。"""
+
+    def _fits(body: str, *, with_above: bool, with_below: bool) -> bool:
+        wrapped = _table_parent_content(
+            section_path=section_path,
+            above=above if with_above else "",
+            full_table=f"{marker_pad}\n{body}",
+            below=below if with_below else "",
+        )
+        return count_tokens(wrapped) <= TABLE_CONTAINER_MAX_TOKENS
+
+    if _fits(block, with_above=True, with_below=True):
+        return [block]
+
+    lines = str(block).splitlines()
+    preamble: list[str] = []
+    data_lines: list[str] = []
+    for line in lines:
+        if _is_serialized_table_data_line(line):
+            data_lines.append(line)
+        elif data_lines:
+            # 数据区之后偶发空行/脚注，并进当前数据流，避免拆丢
+            data_lines.append(line)
+        else:
+            preamble.append(line)
+    if not data_lines:
+        return [block]
+
+    def _compose(rows: Sequence[str]) -> str:
+        parts = [p for p in ("\n".join(preamble), "\n".join(rows)) if p]
+        return "\n".join(parts)
+
+    pieces: list[str] = []
+    cur_rows: list[str] = []
+    for line in data_lines:
+        trial = cur_rows + [line]
+        body = _compose(trial)
+        # 与打包同一口径：按首/末段上下文预留，避免落库后再涨
+        if cur_rows and not _fits(body, with_above=True, with_below=True):
+            pieces.append(_compose(cur_rows))
+            cur_rows = [line]
+            # 单行本身加壳仍超限：不得不收下（与行向 unsplittable 同口径，不丢行）
+            if not _fits(_compose(cur_rows), with_above=True, with_below=True):
+                pieces.append(_compose(cur_rows))
+                cur_rows = []
+        else:
+            cur_rows = trial
+    if cur_rows:
+        pieces.append(_compose(cur_rows))
+    return pieces or [block]
+
+
+def _leaves_matching_blocks(
+    blocks: Sequence[str], candidates: Sequence[str]
+) -> tuple[list[str], list[str]]:
+    """按数据行归属把叶子分给本段；未匹配的留给后续段（避免同叶挂多个父块）。"""
+    batch_text = "\n\n".join(blocks)
+    taken: list[str] = []
+    left: list[str] = []
+    for leaf in candidates:
+        data_lines = [
+            ln.strip()
+            for ln in str(leaf).splitlines()
+            if _is_serialized_table_data_line(ln)
+        ]
+        if data_lines and any(ln in batch_text for ln in data_lines):
+            taken.append(str(leaf))
+        else:
+            left.append(str(leaf))
+    return taken, left
+
+
 def _segments_by_relevant_header(
     *,
     full_blocks: Sequence[str],
@@ -1225,10 +1437,15 @@ def _segments_by_relevant_header(
     above: str,
     below: str,
 ) -> list[_TableContainerSegment]:
-    """宽表/多块回退：按「相关表头」分组建父容器，叶子挂到同组。
+    """宽表/多块回退：按「相关表头」保序，父块统一打满 ``TABLE_CONTAINER_MAX_TOKENS``。
+
+    旧行为「一组表头（常是一个月）就开一个父容器」会让熙丰月段只 ~600、水费同月
+    顶到 ~2000，父块观感两套尺。现规则与行向分段一致：**父块唯一预算 2048**——
+    多月/多组能并就并，超了再开下一段；单月加壳仍超限则按行再切。叶子按数据行
+    挂到「含该行」的那段（同月被切开时不会整组重复挂两个父块）。
 
     行向 ``_segment_table_container`` 在指标组切分后会让同一行号跨月重复出现，
-    ``row_range`` 叶子会串组；这里改用表头对齐，父容器天然 ≤ 单块打包预算。
+    ``row_range`` 叶子会串组，所以超限宽表仍走本函数（表头对齐），只改打包粒度。
     """
     from collections import OrderedDict
 
@@ -1236,45 +1453,70 @@ def _segments_by_relevant_header(
     for block in full_blocks:
         key = _relevant_header_line(block) or f"#{len(groups)}"
         groups.setdefault(key, []).append(str(block))
-    leaf_map: dict[str, list[str]] = {}
-    for leaf in leaf_blocks:
-        key = _relevant_header_line(leaf) or ""
-        leaf_map.setdefault(key, []).append(str(leaf))
 
-    keys = list(groups.keys())
-    segments: list[_TableContainerSegment] = []
-    for key_index, key in enumerate(keys):
-        blocks = groups[key]
-        leaves = list(leaf_map.get(key) or [])
-        # 同组多个行批：尽量并进一个父容器；超硬上限再拆，叶子轮转挂靠
-        batches: list[list[str]] = [[]]
+    # 最坏标记长度（位数多一点），避免「试算不过、落库越界」
+    marker_pad = _table_segment_marker(99, 99)
+
+    def _fits(blocks: list[str], *, with_above: bool, with_below: bool) -> bool:
+        wrapped = _table_parent_content(
+            section_path=section_path,
+            above=above if with_above else "",
+            full_table=f"{marker_pad}\n" + "\n\n".join(blocks),
+            below=below if with_below else "",
+        )
+        return count_tokens(wrapped) <= TABLE_CONTAINER_MAX_TOKENS
+
+    # 保序展开；单块加壳超限先按行切开，再贪心打满 2048
+    ordered: list[str] = []
+    for _key, blocks in groups.items():
         for block in blocks:
-            trial = batches[-1] + [block]
-            wrapped = _table_parent_content(
-                section_path=section_path,
-                above="",
-                full_table="\n\n".join(trial),
-                below="",
+            ordered.extend(
+                _split_serialized_block_to_parent_budget(
+                    block,
+                    section_path=section_path,
+                    above=above,
+                    below=below,
+                    marker_pad=marker_pad,
+                )
             )
-            if batches[-1] and count_tokens(wrapped) > TABLE_CONTAINER_MAX_TOKENS:
-                batches.append([block])
-            else:
-                batches[-1] = trial
-        n_batch = len(batches)
-        for batch_index, batch in enumerate(batches):
-            is_first = key_index == 0 and batch_index == 0
-            is_last = key_index == len(keys) - 1 and batch_index == n_batch - 1
-            content = _table_parent_content(
-                section_path=section_path,
-                above=above if is_first else "",
-                full_table="\n\n".join(batch),
-                below=below if is_last else "",
-            )
-            if n_batch == 1:
-                part_leaves = leaves or list(batch)
-            else:
-                part_leaves = leaves[batch_index::n_batch] or list(batch)
-            segments.append(_TableContainerSegment(content=content, leaves=part_leaves))
+    if not ordered:
+        return []
+
+    raw_batches: list[list[str]] = []
+    cur_blocks: list[str] = []
+    for block in ordered:
+        trial_blocks = cur_blocks + [block]
+        # 试算按「可能是首段/末段」留上下文余量，偏保守；空批次也要过预算
+        if cur_blocks and not _fits(trial_blocks, with_above=True, with_below=True):
+            raw_batches.append(cur_blocks)
+            cur_blocks = [block]
+        elif not cur_blocks and not _fits(trial_blocks, with_above=True, with_below=True):
+            # 切开后仍单片超限（极端宽行）：照收，避免丢内容
+            raw_batches.append(trial_blocks)
+            cur_blocks = []
+        else:
+            cur_blocks = trial_blocks
+    if cur_blocks:
+        raw_batches.append(cur_blocks)
+
+    total = len(raw_batches)
+    remaining_leaves = [str(leaf) for leaf in leaf_blocks]
+    segments: list[_TableContainerSegment] = []
+    for index, batch in enumerate(raw_batches):
+        marker = _table_segment_marker(index + 1, total)
+        content = _table_parent_content(
+            section_path=section_path,
+            above=above if index == 0 else "",
+            full_table=f"{marker}\n" + "\n\n".join(batch),
+            below=below if index == total - 1 else "",
+        )
+        part_leaves, remaining_leaves = _leaves_matching_blocks(batch, remaining_leaves)
+        if not part_leaves:
+            part_leaves = list(batch)
+        segments.append(_TableContainerSegment(content=content, leaves=part_leaves))
+    # 未匹配叶子挂到最后一段，避免检索侧丢叶
+    if remaining_leaves and segments:
+        segments[-1].leaves.extend(remaining_leaves)
     return segments
 
 
@@ -1344,8 +1586,9 @@ def _append_table_nodes(
 
     * 小表（整表 ≤2048 且拆不出第二块）：上下文折进唯一叶子，不另设父容器；
     * 大表：父容器（上文 + 整表 + 下文）+ 行组叶子；
-    * 父容器 > :data:`TABLE_CONTAINER_MAX_TOKENS`：按行分段（每段 ≤2048），
-      每段带自己的叶子；分段共用一个 ``table_group`` 供检索时整表展开。
+    * 父容器 > :data:`TABLE_CONTAINER_MAX_TOKENS`（统一 **2048**）：按行或按表头保序
+      **打满 2048 再切段**（不再「一个月一个小父块」），每段自带叶子；同表共用
+      ``table_group`` 标识同表分段（检索只扩直系父段，不按组拼整表）。
     """
     from ekbs.ingest.table_serialize import serialize_table_body
 
@@ -1564,7 +1807,7 @@ def _default_year_for_month_series(
     return infer_year_from_source(source_path=source_path)
 
 
-def chunk_markdown(
+def chunk_markdown(  # noqa: C901 — 结构切分/装箱主路径，历史债
     markdown: str,
     *,
     page_map: Sequence[tuple[int, int, int]] | None = None,
@@ -1600,10 +1843,10 @@ def chunk_markdown(
     不写进叶子块——否则又会变成每篇文档都一样的可检索文本。容器不进向量/FTS，
     命中子块后经 ``parent_expand`` 带进 prompt，日期类问题才有依据。
 
-    ``source_path``：原始文件路径，只用于**判定表块粒度** —— ``table_row_chunks``
-    只对电子表格（xlsx/xls/xlsm，一行=一条记录）生效；Word/PDF/PPT 与**漏传来源**
-    一律走 :data:`TABLE_LEAF_TOKENS` 行组叶子。规则放在这里而不是调用点：调用方
-    忘传来源时不能退化成一行一块（doc 205 的 41 块/36 表块就是这么来的）。
+    ``source_path``：原始文件路径，用于两处判定 ——
+    ① ``table_row_chunks`` 只对电子表格（xlsx/xls/xlsm）生效；
+    ② ``.ppt/.pptx`` 开启**按页硬切**（子块/父块都不跨页，挂图才能跟同页走）。
+    Word/PDF 与**漏传来源**仍按 token 聚合；忘传 ppt 路径时退回聚合，不能误伤制度文档。
 
     结构（`20` §3.1/§3.2）：**按 token 目标切，不按标题切**。
     制度/作业指导书每个标题下常常只有一两行，按标题切出来的块只有 10~60 token ——
@@ -1621,9 +1864,11 @@ def chunk_markdown(
     # 网格，逐行切会把制度表格碎成 55~115 token 的块。规则放在分块器内而不是调用点：
     # ``source_path`` 漏传时默认 False（行组叶子），调用方忘传也不能退化。
     # 延迟导入：parser → code_chunker → chunker 模块级会成环。
-    from ekbs.ingest.parser import is_spreadsheet_source
+    from ekbs.ingest.parser import is_slide_source, is_spreadsheet_source
 
     row_chunks = bool(table_row_chunks) and is_spreadsheet_source(source_path)
+    # 幻灯片硬按页切：短页也独立成块，父块一页一个，图挂同页。
+    page_hard_cut = is_slide_source(source_path)
     default_year = _default_year_for_month_series(
         source_path=source_path,
         infer_from_filename=month_series_infer_year_from_filename,
@@ -1632,14 +1877,26 @@ def chunk_markdown(
     result = ChunkingResult()
     seq = 0
     root = ensure_heading_path("", doc_title=doc_title)
-    raw_sections = pack_major_sections(split_sections(markdown, page_map=page_map))
+    # 幻灯片：清洗会改偏移，必须从「第 N 页」标题重扫 page_map，再强制小节页码=标题页。
+    effective_page_map = page_map
+    if page_hard_cut:
+        rebuilt = slide_page_map_from_markdown(markdown)
+        if rebuilt:
+            effective_page_map = rebuilt
+    raw_sections = pack_major_sections(
+        split_sections(markdown, page_map=effective_page_map)
+    )
+    if page_hard_cut:
+        raw_sections = _force_slide_section_pages(raw_sections)
     # 表块要挂回它**所在小节**的路径：必须在空壳节合并前取。合并后 heading 变成下一节的，
     # 5.3.2 的表会被记成 5.3.3（实测 doc 196 的表 5）。
     table_section_path: dict[str, str] = {}
     for section in raw_sections:
         for table_id in _placeholder_table_ids(section.text):
             table_section_path.setdefault(table_id, section.heading_path)
-    sections = merge_short_sections_into_next(raw_sections)
+    sections = merge_short_sections_into_next(
+        raw_sections, page_hard_cut=page_hard_cut
+    )
     # 文档元数据行作为**第一个小节**参与子块装箱：这样它计入 child_max 预算，
     # 第一个子块不会因为后置注入而越界（实测后置注入 370~422 > 384）。
     metadata_heading = sections[0].heading_path if sections else ""
@@ -1648,15 +1905,32 @@ def chunk_markdown(
             Section(heading_path="", text=doc_metadata_line, start_offset=0),
             *sections,
         ]
-    drafts = _build_child_drafts(sections, child_min=child_min, child_max=child_max)
+    drafts = _build_child_drafts(
+        sections,
+        child_min=child_min,
+        child_max=child_max,
+        page_hard_cut=page_hard_cut,
+    )
     if doc_metadata_line and drafts and not drafts[0].heading_path:
         # 元数据小节没有自己的 heading；第一个子块的 heading_path 仍取原来的第一小节，
         # 引用卡片才显示「1.目的」而不是文档名。
         drafts[0].heading_path = metadata_heading
-    _merge_small_tail_child(drafts, child_min=child_min, child_max=child_max)
-    _apply_draft_overlap(drafts, overlap_tokens=int(child_max * OVERLAP_MIN_RATIO))
+    _merge_small_tail_child(
+        drafts,
+        child_min=child_min,
+        child_max=child_max,
+        page_hard_cut=page_hard_cut,
+    )
+    # 幻灯片页间不做重叠：重叠前缀会把邻页正文/页码边界弄脏
+    if not page_hard_cut:
+        _apply_draft_overlap(drafts, overlap_tokens=int(child_max * OVERLAP_MIN_RATIO))
     table_container: dict[str, int] = {}
-    for group in _pack_parent_drafts(drafts, parent_min=parent_min, parent_max=parent_max):
+    for group in _pack_parent_drafts(
+        drafts,
+        parent_min=parent_min,
+        parent_max=parent_max,
+        page_hard_cut=page_hard_cut,
+    ):
         parent_text = "\n\n".join(draft.body for draft in group)
         if not parent_text:
             continue
@@ -1709,8 +1983,10 @@ def chunk_markdown(
             if parent_index is not None
             else ""
         )
+        # 题注/页标题进 heading：挂图回源按问句打分时要跟栏目走，不能只剩文档名。
+        caption = str(getattr(figure, "caption", "") or "").strip()
         fig_heading = ensure_heading_path(
-            parent_heading or doc_title, doc_title=doc_title
+            caption or parent_heading or doc_title, doc_title=doc_title
         )
         result.nodes.append(
             ChunkNode(

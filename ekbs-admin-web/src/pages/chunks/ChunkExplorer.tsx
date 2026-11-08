@@ -8,6 +8,9 @@
  *
  * 后端的真实约束（`ekbs/api/chunks.py`）：**拆分/合并/编辑只支持 `chunk_type='child'`**；
  * 改子块会**追加新向量并重写 FTS**（不是原地改），提交前必须提示。
+ *
+ * 大表（如能耗分析五千+行组）不能一次性展开：默认只展开「子节点不多」的容器，
+ * 左栏虚拟滚动；树接口只带 content_head，右栏点选再拉全文。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Button, Card, Descriptions, Empty, Input, List, Modal, Space, Spin, Tag, Tooltip, Typography, message } from 'antd'
@@ -17,12 +20,15 @@ import ClearanceTag from '@/components/ClearanceTag'
 import FigureThumb from '@/components/FigureThumb'
 import StatusTag from '@/components/StatusTag'
 import ImpactConfirmModal from '@/pages/docs/ImpactConfirmModal'
-import { getChunkTree, mergeChunk, reembedChunk, splitChunk, updateChunk } from '@/api/parse'
+import { getChunk, getChunkTree, mergeChunk, reembedChunk, splitChunk, updateChunk } from '@/api/parse'
 import type { ChunkNode, ChunkTree, ChunkTreeNode } from '@/api/types'
 
 const TYPE_TEXT: Record<string, string> = {
   parent: '父容器', child: '子块', table: '表格', figure: '图片', summary: '摘要',
 }
+
+/** 子节点数超过此值时默认折叠，避免电子表格一次摊开几千行把浏览器卡死。 */
+const AUTO_EXPAND_CHILD_LIMIT = 40
 
 /** 容器提示：有子节点 = 上下文容器，按设计不进向量（检索命中叶子后用它扩展上下文）。 */
 const CONTAINER_VECTOR_HINT = '按设计不进向量（检索命中叶子后用它扩展上下文）'
@@ -57,17 +63,44 @@ function findNodePath(nodes: ChunkTreeNode[], chunkId: number): ChunkTreeNode[] 
   return null
 }
 
+/** 收集「子节点不多」的容器 id，作为默认展开集；大容器留给用户点开。 */
+function defaultExpandedIds(nodes: ChunkTreeNode[]): Set<number> {
+  const out = new Set<number>()
+  const walk = (list: ChunkTreeNode[]) => {
+    for (const node of list) {
+      const kids = childNodes(node)
+      if (!kids.length) continue
+      if (kids.length <= AUTO_EXPAND_CHILD_LIMIT) {
+        out.add(node.chunk_id)
+        walk(kids)
+      }
+    }
+  }
+  walk(nodes)
+  return out
+}
+
 interface FlatChunk {
   node: ChunkTreeNode
   depth: number
 }
 
-/** 把树摊平成左栏滚动列表；depth 用于缩进，父容器/表格容器/行组叶子一眼可见。 */
-function flattenChunks(nodes: ChunkTreeNode[], depth = 0): FlatChunk[] {
-  return nodes.flatMap((node) => [
-    { node, depth },
-    ...flattenChunks(childNodes(node), depth + 1),
-  ])
+/** 按展开集摊平成左栏列表；未展开的容器只占一行。 */
+function flattenChunks(
+  nodes: ChunkTreeNode[],
+  expanded: Set<number>,
+  depth = 0,
+): FlatChunk[] {
+  return nodes.flatMap((node) => {
+    const kids = childNodes(node)
+    const row: FlatChunk = { node, depth }
+    if (!kids.length || !expanded.has(node.chunk_id)) return [row]
+    return [row, ...flattenChunks(kids, expanded, depth + 1)]
+  })
+}
+
+function previewText(node: ChunkNode): string {
+  return (node.content_head || node.content || '').slice(0, 160)
 }
 
 /** 向量状态标签：容器按设计不进向量（不是异常）；叶子缺 faiss_row 才是异常。 */
@@ -115,11 +148,28 @@ export default function ChunkExplorer() {
   const [tree, setTree] = useState<ChunkTree | null>(null)
   const [loading, setLoading] = useState(true)
   const [activeChunk, setActiveChunk] = useState<ChunkNode | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
   const [pending, setPending] = useState<{ kind: 'split' | 'merge' | 'reembed'; chunk: ChunkNode } | null>(null)
   const [compareNodes, setCompareNodes] = useState<ChunkNode[]>([])
   const [compareOpen, setCompareOpen] = useState(false)
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set())
+
+  const selectChunk = useCallback(async (node: ChunkNode) => {
+    setActiveChunk(node)
+    setEditing(false)
+    // 树接口只有 content_head；右栏/对比/编辑再拉全文
+    setDetailLoading(true)
+    try {
+      const { chunk } = await getChunk(node.chunk_id)
+      setActiveChunk((prev) => (prev?.chunk_id === node.chunk_id ? { ...prev, ...chunk } : prev))
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setDetailLoading(false)
+    }
+  }, [])
 
   const load = useCallback(async () => {
     if (!Number.isFinite(id)) return
@@ -127,30 +177,44 @@ export default function ChunkExplorer() {
     try {
       const data = await getChunkTree(id)
       setTree(data)
+      const roots = data.tree ?? []
+      const expanded = defaultExpandedIds(roots)
       const focus = Number.isFinite(focusChunkId) && focusChunkId > 0 ? focusChunkId : null
+      let focusNode: ChunkTreeNode | null = null
       if (focus != null) {
-        // 树可有三层：parent -> table 父容器 -> table 行组叶子，focus 可能是任意一层
-        const path = findNodePath(data.tree ?? [], focus)
+        const path = findNodePath(roots, focus)
         if (path) {
-          setActiveChunk(path[path.length - 1])
-          return
-        }
-        const orphan = (data.orphan_children ?? []).find((c) => c.chunk_id === focus)
-        if (orphan) {
-          setActiveChunk(orphan)
-          return
+          for (const node of path.slice(0, -1)) expanded.add(node.chunk_id)
+          focusNode = path[path.length - 1]
+        } else {
+          const orphan = (data.orphan_children ?? []).find((c) => c.chunk_id === focus)
+          if (orphan) focusNode = orphan as ChunkTreeNode
         }
       }
-      const first = flattenChunks(data.tree ?? [])[0]?.node
-      setActiveChunk(first ?? null)
+      setExpandedIds(expanded)
+      const first = focusNode ?? flattenChunks(roots, expanded)[0]?.node ?? null
+      if (first) await selectChunk(first)
+      else setActiveChunk(null)
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err))
     } finally { setLoading(false) }
-  }, [id, focusChunkId])
+  }, [id, focusChunkId, selectChunk])
 
   useEffect(() => { void load() }, [load])
 
-  const flatNodes = useMemo(() => flattenChunks(tree?.tree ?? []), [tree])
+  const flatNodes = useMemo(
+    () => flattenChunks(tree?.tree ?? [], expandedIds),
+    [tree, expandedIds],
+  )
+
+  const toggleExpand = (chunkId: number) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(chunkId)) next.delete(chunkId)
+      else next.add(chunkId)
+      return next
+    })
+  }
 
   const saveEdit = async () => {
     if (!activeChunk) return
@@ -180,16 +244,25 @@ export default function ChunkExplorer() {
   const total = (tree.parents ?? 0) + (tree.children ?? 0)
   const leafParents = (tree.tree ?? []).filter((p) => !hasChildren(p)).length
   const inCompare = (chunkId: number) => compareNodes.some((n) => n.chunk_id === chunkId)
-  const toggleCompare = (node: ChunkNode) => {
+  const toggleCompare = async (node: ChunkNode) => {
+    let full = node
+    if ((node.content?.length ?? 0) <= 200) {
+      try {
+        const res = await getChunk(node.chunk_id)
+        full = { ...node, ...res.chunk }
+      } catch {
+        /* 对比仍可用摘要 */
+      }
+    }
     setCompareNodes((prev) => {
-      if (prev.some((n) => n.chunk_id === node.chunk_id)) {
-        return prev.filter((n) => n.chunk_id !== node.chunk_id)
+      if (prev.some((n) => n.chunk_id === full.chunk_id)) {
+        return prev.filter((n) => n.chunk_id !== full.chunk_id)
       }
       if (prev.length >= 2) {
         message.info('最多对比 2 个分块，已替换最早选择的一个')
-        return [prev[1], node]
+        return [prev[1], full]
       }
-      return [...prev, node]
+      return [...prev, full]
     })
   }
 
@@ -226,7 +299,7 @@ export default function ChunkExplorer() {
         // 窄屏时上下堆叠：右栏（子块）是检索单元，不能因为窗口窄被挤成 0 宽度而"看不见"
         <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' }}>
           <Card
-            title={`分块（${flatNodes.length}）`}
+            title={`分块（可见 ${flatNodes.length} / 合计 ${total}）`}
             style={{ width: 400, flex: 'none' }}
             styles={{ body: { padding: 0, maxHeight: 'calc(100vh - 250px)', overflowY: 'auto' } }}
           >
@@ -235,9 +308,10 @@ export default function ChunkExplorer() {
               dataSource={flatNodes}
               renderItem={({ node, depth }) => {
                 const nodeChildren = childNodes(node)
+                const expanded = expandedIds.has(node.chunk_id)
                 return (
                   <List.Item
-                    onClick={() => { setActiveChunk(node); setEditing(false) }}
+                    onClick={() => { void selectChunk(node) }}
                     style={{
                       cursor: 'pointer',
                       paddingLeft: 12 + depth * 16,
@@ -247,7 +321,21 @@ export default function ChunkExplorer() {
                     <List.Item.Meta
                       title={
                         <Space size={6} wrap>
-                          <Typography.Text ellipsis style={{ maxWidth: 240 }}>
+                          {nodeChildren.length > 0 ? (
+                            <Button
+                              type="text"
+                              size="small"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                toggleExpand(node.chunk_id)
+                              }}
+                            >
+                              {expanded ? '▾' : '▸'}
+                            </Button>
+                          ) : (
+                            <span style={{ display: 'inline-block', width: 24 }} />
+                          )}
+                          <Typography.Text ellipsis style={{ maxWidth: 200 }}>
                             #{node.chunk_id} {node.heading_path || `seq ${node.seq}`}
                           </Typography.Text>
                           <Tag color={node.chunk_type === 'table' ? 'geekblue' : node.chunk_type === 'figure' ? 'purple' : undefined}>
@@ -262,7 +350,7 @@ export default function ChunkExplorer() {
                       }
                       description={
                         <Typography.Paragraph className="ekbs-ellipsis-2" style={{ marginBottom: 0, fontSize: 12 }}>
-                          {(node.content || '').slice(0, 160)}
+                          {previewText(node)}
                         </Typography.Paragraph>
                       }
                     />
@@ -279,7 +367,7 @@ export default function ChunkExplorer() {
             extra={
               activeChunk ? (
                 <Space wrap>
-                  <Button size="small" onClick={() => toggleCompare(activeChunk)}>
+                  <Button size="small" onClick={() => void toggleCompare(activeChunk)}>
                     {inCompare(activeChunk.chunk_id) ? '移出对比' : '加入对比'}
                   </Button>
                   {activeChunk.chunk_type === 'child' ? (
@@ -304,6 +392,8 @@ export default function ChunkExplorer() {
           >
             {!activeChunk ? (
               <Empty description="从左侧选择一个分块查看全文" />
+            ) : detailLoading && (activeChunk.content?.length ?? 0) <= 200 ? (
+              <Spin />
             ) : (
               <>
                 <Space size={6} wrap style={{ marginBottom: 12 }}>

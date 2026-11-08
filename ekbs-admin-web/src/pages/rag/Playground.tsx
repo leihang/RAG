@@ -13,6 +13,7 @@ import { useEffect, useState } from 'react'
 import {
   Alert, Button, Card, Descriptions, Form, Input, InputNumber, Radio, Select, Space, Switch, Table, Tag, Tooltip, Typography, message,
 } from 'antd'
+import AnswerMarkdown from '@/components/AnswerMarkdown'
 import ChunkPeekDrawer from '@/components/ChunkPeekDrawer'
 import ClearanceTag from '@/components/ClearanceTag'
 import StagesPanel from './StagesPanel'
@@ -491,9 +492,11 @@ export default function Playground() {
                 }
               />
             ) : null}
-            <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', marginTop: 12 }}>
-              {result.answer ?? '（后端未返回答案）'}
-            </Typography.Paragraph>
+            <AnswerMarkdown
+              text={result.answer}
+              empty="（后端未返回答案）"
+              style={{ marginTop: 12 }}
+            />
             <Space size={8} wrap>
               {result.model ? <Tag>模型 {result.model}</Tag> : null}
               {result.history_used ? <Tag color="blue">已用会话改写</Tag> : <Tag>单轮 / 未改写</Tag>}
@@ -507,16 +510,31 @@ export default function Playground() {
           </Card>
 
           {result.numeric ? (
-            <Card title="取数结果（mode=numeric）" style={{ marginTop: 12 }}>
+            <Card
+              title={
+                result.mode_used === 'structured_query'
+                  ? '结构化合计/查找（观测表）'
+                  : result.mode_used === 'table_rank'
+                    ? '表格排名（服务端排序）'
+                    : '取数结果（mode=numeric）'
+              }
+              style={{ marginTop: 12 }}
+            >
               <Alert
                 type={result.numeric.verified ? 'success' : 'warning'}
                 showIcon
                 message={
-                  result.numeric.verified
-                    ? `已通过抄写校验：${result.numeric.value ?? '-'} ${result.numeric.unit ?? ''}`
-                    : (result.refusal_reason === 'numeric_na'
-                        ? '返回 N/A（资料未直接给出该指标）'
-                        : '未通过抄写校验（值不在引用片段里，按拒答处理）')
+                  result.mode_used === 'structured_query' || result.mode_used === 'table_rank'
+                    ? (result.numeric.verified
+                        ? `服务端计算结果：${result.numeric.surface ?? result.numeric.value ?? '-'} ${result.numeric.unit ?? ''}`.trim()
+                        : (result.numeric.reason
+                            ? `未出数：${result.numeric.reason}`
+                            : '未出数'))
+                    : (result.numeric.verified
+                        ? `已通过抄写校验：${result.numeric.value ?? '-'} ${result.numeric.unit ?? ''}`
+                        : (result.refusal_reason === 'numeric_na'
+                            ? '返回 N/A（资料未直接给出该指标）'
+                            : '未通过抄写校验（值不在引用片段里，按拒答处理）'))
                 }
                 description={
                   <Space direction="vertical" size={2}>
@@ -684,6 +702,7 @@ export default function Playground() {
           <ContextCard
             contextChunks={result.context_chunks}
             contextTokens={result.context_tokens}
+            collapsedKeptIds={parseStages(result.stages).expand?.collapsedKeptIds}
             onOpenChunk={openChunk}
           />
 

@@ -10,7 +10,7 @@
  * 优雅降级：旧后端没有 `context_chunks` 时**整张卡不渲染**（不显示假数据）；
  * 只有后端明确给了空数组 `[]` 才显示空态。
  */
-import { Card, Space, Table, Tag, Tooltip, Typography } from 'antd'
+import { Alert, Card, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import { QuestionCircleOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import EmptyState from '@/components/EmptyState'
@@ -59,15 +59,26 @@ export interface ContextCardProps {
   contextChunks?: ContextChunk[] | null
   /** 后端 `context_tokens`；缺省时用各块 token_count 求和兜底 */
   contextTokens?: number | null
+  /**
+   * 精排 keep 后被同表/同父块折叠的叶子（来自 `stages.expand.collapsed_kept_ids`）。
+   * 用来解释「Rerank 保留 N / 上下文溯源只剩少数来源」——不是漏传给模型。
+   */
+  collapsedKeptIds?: number[] | null
   onOpenChunk?: (chunkId: number) => void
 }
 
-export default function ContextCard({ contextChunks, contextTokens, onOpenChunk }: ContextCardProps) {
+export default function ContextCard({
+  contextChunks,
+  contextTokens,
+  collapsedKeptIds,
+  onOpenChunk,
+}: ContextCardProps) {
   // 旧后端没有该字段：不渲染一张空卡，避免让用户以为「后端说没有上下文」
   if (contextChunks == null) return null
 
   const chunks = contextChunks
   const citedCount = chunks.filter((chunk) => chunk.cited).length
+  const collapsed = (collapsedKeptIds ?? []).filter((id) => Number.isFinite(id))
   const totalTokens =
     contextTokens ??
     chunks.reduce(
@@ -144,6 +155,15 @@ export default function ContextCard({ contextChunks, contextTokens, onOpenChunk 
         </Space>
       }
     >
+      {collapsed.length > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="与 Rerank「进扩展」条数不一致是预期"
+          description={`精排叶子 ${collapsed.join('、')} 与更高分叶子展开到同一父块/整表后被折叠；下表「来源」只溯到保留下来的精排块，表内容仍在上下文里。`}
+        />
+      ) : null}
       {chunks.length === 0 ? (
         <EmptyState description="本次请求没有记录模型上下文（后端可能未开启上下文记录）" />
       ) : (

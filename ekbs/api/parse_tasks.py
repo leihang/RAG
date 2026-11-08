@@ -761,6 +761,7 @@ async def vectorize_parse_task(
         fts=runtime.fts,
         figure_index=runtime.figure_index,
     )
+    ingest.answer_runtime = runtime
     try:
         result = await ingest.index_existing_document(task_id)
     except Exception as exc:

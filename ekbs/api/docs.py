@@ -805,6 +805,8 @@ def _perform_delete(
                 runtime, doc_row, doc_id, image_paths=image_paths, purge_raw=True,
             )
         with runtime.db.sync_connect() as conn:
+            # doc_recommend 建表时未带 ON DELETE CASCADE（存量库改不了 FK），硬删前先清。
+            conn.execute("DELETE FROM ekbs_doc_recommend WHERE doc_id = ?", (doc_id,))
             conn.execute("DELETE FROM ekbs_document WHERE doc_id = ?", (doc_id,))
             conn.execute(
                 "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "

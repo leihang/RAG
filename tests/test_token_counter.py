@@ -67,7 +67,10 @@ def test_qwen_counter_is_smaller_than_cl100k_for_chinese_prose() -> None:
     tiktoken = pytest.importorskip("tiktoken")
     text = "重庆卓越城市运营服务有限责任公司熙街管理处"
     qwen_count = count_tokens(text)
-    cl100k_count = len(tiktoken.get_encoding("cl100k_base").encode(text))
+    try:
+        cl100k_count = len(tiktoken.get_encoding("cl100k_base").encode(text))
+    except Exception as exc:  # noqa: BLE001 — 离线/代理拦下载时跳过，不挡本地门禁
+        pytest.skip(f"cl100k_base 词表不可用（需出网下载）: {type(exc).__name__}")
     assert qwen_count != cl100k_count
     assert qwen_count < cl100k_count, "中文散文上 Qwen 词表应比 cl100k 更少 token"
 

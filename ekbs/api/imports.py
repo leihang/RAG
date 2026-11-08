@@ -31,6 +31,7 @@ from ekbs.ingest.dir_import import (
     ensure_import_dir,
     list_children,
     list_descendant_dirs,
+    list_raw_top_dirs,
     raw_root,
     resolve_within_raw,
     scan_directory,
@@ -122,6 +123,9 @@ async def import_meta(
                 "SELECT status, COUNT(*) AS n FROM ekbs_document GROUP BY status"
             )
         }
+    raw_top_dirs = list_raw_top_dirs(
+        settings, kb_codes=[str(k["code"]) for k in kbs]
+    )
     return JSONResponse(
         {
             "raw_root": str(raw_root(settings)),
@@ -140,6 +144,8 @@ async def import_meta(
             "enqueue_limit": ENQUEUE_LIMIT,
             "knowledge_bases": kbs,
             "queue": queue,
+            # UI 目标树与 raw 对齐：无对应 kb.code 的顶层目录标 orphan
+            "raw_top_dirs": raw_top_dirs,
         }
     )
 

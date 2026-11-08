@@ -22,7 +22,11 @@ from typing import Any, Mapping, Sequence
 
 from ekbs.ingest.chunker import FigureInput, TableInput
 from ekbs.ingest.clean import clean_figure_text, clean_markdown
-from ekbs.ingest.seal_filter import partition_seal_figures, strip_figure_anchors
+from ekbs.ingest.seal_filter import (
+    partition_seal_figures,
+    seal_filter_applies,
+    strip_figure_anchors,
+)
 from ekbs.ingest.signature_crop import (
     append_handwrite_placeholder,
     is_handwriting_figure,
@@ -330,14 +334,16 @@ def prepare_scan_draft(
         pdf_pages = load_pdf_text_pages(Path(source_path))
         merged_md, text_stats = patch_markdown_from_pdf_pages(merged_md, pdf_pages)
         stats.update(text_stats)
-    # 先按原题注/画面丢章，再清洗留下的图注（清洗会抹掉「印章」字样）
-    kept_figures, dropped_seals = partition_seal_figures(list(figures), data_dir)
-    if dropped_seals:
-        stats["seal_figures_dropped"] = len(dropped_seals)
-        merged_md = strip_figure_anchors(
-            merged_md, {str(fig.figure_id or "") for fig in dropped_seals}
-        )
-        log.info("seal_figures_dropped", doc_id=doc_id, count=len(dropped_seals))
+    # 公章过滤只对扫描件/PDF/Word；复核草稿若来自 PPT 等则整段跳过。
+    kept_figures = list(figures)
+    if seal_filter_applies(source_path, engine=engine):
+        kept_figures, dropped_seals = partition_seal_figures(kept_figures, data_dir)
+        if dropped_seals:
+            stats["seal_figures_dropped"] = len(dropped_seals)
+            merged_md = strip_figure_anchors(
+                merged_md, {str(fig.figure_id or "") for fig in dropped_seals}
+            )
+            log.info("seal_figures_dropped", doc_id=doc_id, count=len(dropped_seals))
     cleaned_figures = [
         FigureInput(
             image_path=fig.image_path,
@@ -398,6 +404,11 @@ def upgrade_review_draft_seals(data_dir: Path, doc_id: int) -> dict[str, Any]:
     sidecar = load_review_sidecar(data_dir, doc_id)
     figures = figures_from_sidecar(sidecar)
     if not figures:
+        return {}
+    # 草稿无 source_path：用 sidecar.engine 判定（pptx/xlsx 跳过；旧稿缺引擎仍过滤）。
+    if not seal_filter_applies(
+        None, engine=sidecar.engine, default_when_unknown=True
+    ):
         return {}
     kept, dropped = partition_seal_figures(figures, data_dir)
     if not dropped:

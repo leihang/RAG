@@ -109,7 +109,9 @@ def resolve_answer_mode(
 
     * 显式 mode → 原样（管理台手动切换）；
     * ``auto``（默认）：``auto_numeric`` 开启且意图为 numeric → 取数，否则业务问答。
-      比较/结构化路由在 ``answer()`` 里于本函数之后按问句意图覆盖（仍写入 ``mode_used``）。
+      比较排名（table_rank）在 ``answer()`` 里于本函数之后按问句意图覆盖；
+      numeric 在 ``answer()`` 里一律先尝试 structured_plan（观测表白名单），
+      lookup 成功才以 structured_query 作答，失败再降级本模式取数。
     """
     req = (requested or MODE_AUTO).strip().lower()
     if req in _EXPLICIT_MODES:

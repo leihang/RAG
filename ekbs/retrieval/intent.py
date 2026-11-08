@@ -23,8 +23,14 @@ _NUMBERED_RE = re.compile(
     r"(?:^|[\s；;。])\s*"
     r"(?:\d{1,2}\s*[.、)）]|[（(]\d{1,2}[)）]|[一二三四五六七八九十]{1,2}\s*[、.])"
 )
-#: 连接词（要求两侧都足够长，避免把短语误拆）
-_CONJUNCTION_RE = re.compile(r"以及|还有|另外|分别|其次|然后")
+#: 连接词（要求两侧都足够长，避免把短语误拆）。
+#: **不含「分别」**：「预算、节约电费和回收期分别是多少」里的「分别」是「各自/分别对应」，
+#: 不是另起一问；拆开会得到孤儿子问「是多少？」（实测 IOT 改造三问）。
+_CONJUNCTION_RE = re.compile(r"以及|还有|另外|其次|然后")
+#: 「分别」后若只剩短谓语，整句保留（双保险；即便以后再把「分别」加回连接词也不误拆）
+_RESPECTIVELY_TAIL_RE = re.compile(
+    r"^(?:是多少|是什么|为多少|有哪些|如何|怎么样|怎么算|怎么申请)[？?。.!！]*$"
+)
 _QUESTION_MARK_RE = re.compile(r"[？?]+")
 _SEMICOLON_RE = re.compile(r"[；;]+")
 
@@ -105,6 +111,11 @@ class IntentSplitter:
 
     @staticmethod
     def _split_by_conjunction(text: str) -> list[str]:
+        # 「A、B和C分别是多少」：分别=各自对应，不是第二问
+        if "分别" in text:
+            head, _, tail = text.partition("分别")
+            if head.strip() and _RESPECTIVELY_TAIL_RE.match(tail.strip()):
+                return [text]
         parts = [p.strip() for p in _CONJUNCTION_RE.split(text)]
         # 连接词拆分的每段都必须够长，否则视为普通短语、不拆
         if len(parts) > 1 and all(len(p) >= 4 for p in parts):

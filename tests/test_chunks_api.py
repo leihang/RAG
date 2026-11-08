@@ -253,7 +253,9 @@ async def test_tree_nests_table_container_row_group_leaves(client, admin) -> Non
     assert all(c["faiss_row"] is not None for c in nested["children"]), "行组叶子是检索单元"
     for child in nested["children"]:
         assert len(str(child["content_head"])) <= 200, "content_head 仍截断到 200 字符"
-        assert str(child["content"]).startswith("表 1")
+        # 树接口不再带全文，content 与 content_head 同口径（右栏详情另取）
+        assert str(child["content"]) == str(child["content_head"])
+        assert str(child["content_head"]).startswith("表 1")
 
     standalone_node = next(n for n in after["tree"] if int(n["chunk_id"]) == standalone)
     assert standalone_node["is_container"] is False and standalone_node["children"] == []

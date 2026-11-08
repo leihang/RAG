@@ -42,11 +42,11 @@ def test_personal_raw_rel_uses_slash_not_dash() -> None:
 
 
 def test_personal_status_messages_say_processing_and_done() -> None:
-    """钉钉回执不带文件名，只说正在处理 / 处理完毕。"""
-    assert personal_accepted_message(title="九月汇报") == "正在处理"
+    """落盘后的回执说明解析中；成功/失败由 worker 再推一次。"""
+    assert "解析入库" in personal_accepted_message(title="九月汇报")
     assert personal_ready_message(title="九月汇报") == "处理完毕，可以使用了"
     assert personal_failed_message(title="九月汇报") == "处理失败，请换一份再发"
-    assert personal_duplicate_message(title="九月汇报", status="pending") == "正在处理"
+    assert "正在解析" in personal_duplicate_message(title="九月汇报", status="pending")
     assert personal_duplicate_message(title="九月汇报", status="published") == (
         "处理完毕，可以使用了"
     )
@@ -63,7 +63,7 @@ def test_register_personal_upload_message_is_processing(seeded) -> None:
         content=b"status-message-probe",
     )
     assert stored["created"] is True
-    assert stored["message"] == "正在处理"
+    assert "解析入库" in stored["message"]
     again = register_personal_upload(
         runtime.db,
         runtime.settings,
@@ -72,7 +72,7 @@ def test_register_personal_upload_message_is_processing(seeded) -> None:
         content=b"status-message-probe",
     )
     assert again["created"] is False
-    assert again["message"] == "正在处理"
+    assert "正在解析" in again["message"] or "私有库" in again["message"]
 
 
 def test_personal_owner_label_has_name_and_ids(seeded) -> None:

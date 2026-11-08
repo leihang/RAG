@@ -41,9 +41,10 @@ def _insert_qa(
                 "VALUES (?, ?, 'web', 'fp', 0)",
                 (session_id, user_id),
             )
+            # 与 AuditService.record_turn 一致：问题+引用都挂在 assistant 行
             conn.execute(
                 "INSERT INTO ekbs_qa_message(session_id, turn, role, question, answer, refused) "
-                "VALUES (?, 1, 'user', ?, 'x', 0)",
+                "VALUES (?, 1, 'assistant', ?, 'x', 0)",
                 (session_id, question),
             )
             message_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
@@ -123,3 +124,65 @@ async def test_recommend_questions_orders_doc_then_hot(seeded) -> None:
     assert "年假可以结转吗？" in questions, "热门(2)应上榜"
     # 代表问句(3) 必须排在热门(2)之前
     assert questions.index("年假怎么算？") < questions.index("年假可以结转吗？")
+
+
+async def test_recommend_focus_doc_ids_prefer_cited_doc(seeded) -> None:
+    """成功作答：focus 文档代表问优先于其他可见文档的代表问。"""
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+
+    handbook = _doc_id(runtime, title="员工手册（总则）")
+    hr_doc = _doc_id(runtime, title="年假管理制度")
+    # 手册更新更「新」时，无 focus 可能先推手册；带 focus=年假 必须先推年假
+    upsert_doc_recommend(runtime, doc_id=handbook, question="考勤怎么打卡？", rerank_score=0.9)
+    upsert_doc_recommend(runtime, doc_id=hr_doc, question="年假怎么算？", rerank_score=0.8)
+    with runtime.db.sync_connect() as conn:
+        conn.execute(
+            "UPDATE ekbs_document SET updated_at = datetime('now', '+1 day') WHERE doc_id = ?",
+            (handbook,),
+        )
+        conn.commit()
+
+    focused = recommend_questions(
+        runtime, alice, limit=3, focus_doc_ids=[hr_doc]
+    )
+    questions = [r["question"] for r in focused]
+    assert questions[0] == "年假怎么算？"
+    assert "考勤怎么打卡？" in questions  # 凑满 limit 时仍可回填全局可见池
+
+
+async def test_recommend_focus_drops_invisible_docs(seeded) -> None:
+    """focus 里塞不可见文档 id 也不能越权出现。"""
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+
+    hr_doc = _doc_id(runtime, title="年假管理制度")
+    fin_doc = _doc_id(runtime, title="财务保密制度")
+    upsert_doc_recommend(runtime, doc_id=hr_doc, question="年假怎么算？", rerank_score=0.8)
+    upsert_doc_recommend(runtime, doc_id=fin_doc, question="财务章谁管？", rerank_score=0.9)
+
+    recs = recommend_questions(
+        runtime, alice, limit=5, focus_doc_ids=[fin_doc, hr_doc]
+    )
+    questions = [r["question"] for r in recs]
+    assert "年假怎么算？" in questions
+    assert "财务章谁管？" not in questions
+
+
+async def test_recommend_dedupes_current_query(seeded) -> None:
+    """与当前问句相同的推荐要剔除。"""
+    runtime, _ = seeded
+    alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
+
+    hr_doc = _doc_id(runtime, title="年假管理制度")
+    upsert_doc_recommend(runtime, doc_id=hr_doc, question="年假怎么算？", rerank_score=0.8)
+
+    recs = recommend_questions(
+        runtime,
+        alice,
+        limit=3,
+        query="年假怎么算？",
+        focus_doc_ids=[hr_doc],
+    )
+    questions = [r["question"] for r in recs]
+    assert "年假怎么算？" not in questions

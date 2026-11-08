@@ -462,6 +462,8 @@ async def run_forever(runtime: Runtime) -> None:
         shards=runtime.shards, fts=runtime.fts,
         figure_index=runtime.figure_index,
     )
+    # 发布后自动生成/验证代表问句需要完整检索管线
+    ingest.answer_runtime = runtime
     stop = asyncio.Event()
 
     def _handle(signum: int, _frame: Any) -> None:
@@ -559,6 +561,7 @@ def main(argv: list[str] | None = None) -> int:
         shards=runtime.shards, fts=runtime.fts,
         figure_index=runtime.figure_index,
     )
+    ingest.answer_runtime = runtime
     try:
         if args.once:
             requeue_orphans(runtime)

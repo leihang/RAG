@@ -1,7 +1,10 @@
-"""扫描件公章过滤。
+"""扫描件 / PDF / Word 公章过滤。
 
 MinerU 常把红章、浅章抽成独立图片。正文清洗只删「盖有红色印章」这类字，
 图还在附图里。这里按题注/OCR 和画面把章丢掉，整页正文、二维码、示意图保留。
+
+**适用范围**（见 :func:`seal_filter_applies`）：只对扫描件、PDF、Word。
+PPT / Excel 多是现场照与截图，方图暖色会被误杀，入库管线不得对它们跑本过滤。
 """
 
 from __future__ import annotations
@@ -16,7 +19,41 @@ from PIL import Image
 _SEAL_WORD = re.compile(r"印章|公章|专用章|合同章|骑缝章")
 _ANCHOR = re.compile(r"(?m)^\[图片\s+(\S+)\][^\n]*(?:\n|$)")
 
+#: 公章过滤允许的后缀（与「扫描件」路径提示、MinerU 引擎并列）。
+_SEAL_FILTER_SUFFIXES = frozenset({"pdf", "doc", "docx", "png", "jpg", "jpeg"})
+#: 明确不跑公章过滤（现场照/截图为主）。
+_SEAL_FILTER_SKIP_SUFFIXES = frozenset({"ppt", "pptx", "xls", "xlsx", "xlsm"})
+
 T = TypeVar("T")
+
+
+def seal_filter_applies(
+    source_path: str | None,
+    *,
+    engine: str | None = None,
+    title: str | None = None,
+    default_when_unknown: bool = False,
+) -> bool:
+    """是否应对该来源的附图做公章丢弃。
+
+    * **开**：PDF / Word / 独立图片（MinerU）/ 路径或标题标明扫描件；
+    * **关**：PPT / Excel 等 —— 方形现场照、钉钉截图会被红章启发式误杀。
+    * ``default_when_unknown``：复核旧草稿常缺 engine/路径，默认仍按扫描件处理。
+    """
+    from ekbs.ingest.parser import normalize_suffix
+    from ekbs.ingest.scan_review import is_scan_source
+
+    suffix = normalize_suffix(str(source_path or ""))
+    eng = (engine or "").strip().lower()
+    if suffix in _SEAL_FILTER_SKIP_SUFFIXES or eng in _SEAL_FILTER_SKIP_SUFFIXES:
+        return False
+    if suffix in _SEAL_FILTER_SUFFIXES:
+        return True
+    if eng == "mineru" or eng in {"doc", "docx"}:
+        return True
+    if is_scan_source(source_path, title):
+        return True
+    return bool(default_when_unknown)
 
 
 def looks_like_seal(im: Image.Image, *, caption: str = "", ocr: str = "") -> bool:
@@ -52,11 +89,17 @@ def looks_like_seal(im: Image.Image, *, caption: str = "", ocr: str = "") -> boo
 def _red_seal(r: np.ndarray, g: np.ndarray, b: np.ndarray, ink: np.ndarray) -> bool:
     ink_n = int(ink.sum()) or 1
     ink_frac = float(ink.mean())
-    # 整幅都是红色（纯色块）没有白纸底，不是章。章是白纸上的红印。
-    if ink_frac <= 0.55:
-        red = ink & (r > g + 12) & (r > b + 12) & (r > 60)
-        if float(red.sum()) / ink_n >= 0.40 and ink_frac >= 0.008:
-            return True
+    # 章是白纸上的红印。满幅现场照（水印相机方图、橙红设备/墙砖）ink≈1，
+    # 旧逻辑把淡红阈值放在 ink 上限之外 → PPT 方形照片被当公章丢掉，同页只剩
+    # 其它图，看起来像「图挂错页」。
+    if ink_frac > 0.55:
+        return False
+    red = ink & (r > g + 12) & (r > b + 12) & (r > 60)
+    if float(red.sum()) / ink_n >= 0.40 and ink_frac >= 0.008:
+        return True
+    # 淡红章墨面积极小（白底粉圈）；钉钉截图等 UI 白底 ink 常 >0.2，不能走这条。
+    if ink_frac > 0.18:
+        return False
     faint = (r >= 220) & (r > g + 6) & (r > b + 6) & (g >= 180)
     return float(faint.mean()) >= 0.004
 

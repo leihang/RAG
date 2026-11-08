@@ -573,7 +573,7 @@ CREATE INDEX IF NOT EXISTS idx_metric_name_time ON ekbs_metric(name, created_at 
 
 -- 文档级「代表问句」（推荐问答 tier-3）：入库时人工确认、rerank 验证后可命中本档的代表问题。
 CREATE TABLE IF NOT EXISTS ekbs_doc_recommend (
-    doc_id       INTEGER PRIMARY KEY REFERENCES ekbs_document(doc_id),
+    doc_id       INTEGER PRIMARY KEY REFERENCES ekbs_document(doc_id) ON DELETE CASCADE,
     question     TEXT    NOT NULL,
     rerank_score REAL,                              -- 验证时的精排分数；空 = 未验证
     status       TEXT    NOT NULL DEFAULT 'verified',  -- pending|verified|rejected

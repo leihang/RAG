@@ -160,13 +160,37 @@ async def test_rewriter_strategy_off(runtime) -> None:
 
 
 async def test_rewriter_llm_strategy_skips_mock_provider(runtime) -> None:
-    """mock 模型会返回固定串，拿它当改写器只会污染查询 —— 因此自动退回启发式。"""
+    """mock 不可用时不回退 heuristic，直接原文进检索。"""
     mock = MockLLMProvider()
     rewriter = QueryRewriter(settings=runtime.settings, llm=mock, strategy_override="llm")
     history = [{"role": "user", "content": "年假有多少天"}]
     result = await rewriter.rewrite("那它需要提前几天申请", history)
-    assert result.strategy == "heuristic"
+    assert result.strategy == "llm_skipped"
+    assert result.rewritten == "那它需要提前几天申请"
     assert mock.calls == [], "不应把 mock 模型当改写器调用"
+
+
+async def test_rewriter_llm_failed_keeps_original(runtime) -> None:
+    """模型改写失败 → 原文进检索，不拼上一轮。"""
+
+    class BoomLLM:
+        class _Ref:
+            provider = "dashscope"
+            model = "qwen-max"
+
+        ref = _Ref()
+
+        async def generate(self, messages, **kwargs):
+            raise RuntimeError("boom")
+
+    rewriter = QueryRewriter(
+        settings=runtime.settings, llm=BoomLLM(), strategy_override="llm"
+    )
+    history = [{"role": "user", "content": "新东方1-3月用电量"}]
+    result = await rewriter.rewrite("提供一下2026年1-3月的", history)
+    assert result.strategy == "llm_failed"
+    assert result.rewritten == "提供一下2026年1-3月的"
+    assert result.used_history is False
 
 
 async def test_rewriter_llm_strategy_uses_real_provider(runtime) -> None:
@@ -177,16 +201,136 @@ async def test_rewriter_llm_strategy_uses_real_provider(runtime) -> None:
 
         ref = _Ref()
 
+        def __init__(self) -> None:
+            self.messages: list[list[dict[str, str]]] = []
+
         async def generate(self, messages, **kwargs):
             from ekbs.provider.base import LLMResult
 
+            self.messages.append([dict(m) for m in messages])
             return LLMResult(text="年假申请需要提前几天", model="qwen-max")
 
-    rewriter = QueryRewriter(settings=runtime.settings, llm=FakeLLM(), strategy_override="llm")
+    llm = FakeLLM()
+    rewriter = QueryRewriter(settings=runtime.settings, llm=llm, strategy_override="llm")
     history = [{"role": "user", "content": "年假有多少天"}]
     result = await rewriter.rewrite("那它需要提前几天申请", history)
     assert result.strategy == "llm"
     assert result.rewritten == "年假申请需要提前几天"
+    assert len(llm.messages[0]) == 2
+    assert llm.messages[0][0]["role"] == "system"
+    assert llm.messages[0][1]["role"] == "user"
+    system = llm.messages[0][0]["content"]
+    user = llm.messages[0][1]["content"]
+    # system：规则 + 示例；user：仅历史 + 最新问题
+    assert "【通用规则】" in system
+    assert system.index("【通用规则】") < system.index("【示例】")
+    assert system.index("【示例】") < system.index("【改写后的查询词】")
+    assert "【改写】" in system
+    assert "【扩写】" in system
+    assert "【改扩写】" in system
+    assert "青禾店2025年用水量" in system
+    assert "新东方" not in system
+    assert "桔子酒店" not in system
+    assert "只输出改写后的查询词" in system
+    assert "改写后的查询词：年假申请需要提前几天" in system
+    assert "对话历史（最近一轮）" in user
+    assert "最新问题：那它需要提前几天申请" in user
+    assert "【通用规则】" not in user
+
+
+async def test_rewriter_llm_history_window_is_last_round_only(runtime) -> None:
+    """改写 user 消息只拼最近 1 轮（最多 2 条）；更早轮次不得进入。"""
+
+    class FakeLLM:
+        class _Ref:
+            provider = "dashscope"
+            model = "qwen-max"
+
+        ref = _Ref()
+
+        def __init__(self) -> None:
+            self.messages: list[list[dict[str, str]]] = []
+
+        async def generate(self, messages, **kwargs):
+            from ekbs.provider.base import LLMResult
+
+            self.messages.append([dict(m) for m in messages])
+            return LLMResult(text="熙物联V5使用教程", model="qwen-max")
+
+    llm = FakeLLM()
+    rewriter = QueryRewriter(settings=runtime.settings, llm=llm, strategy_override="llm")
+    # 用不会出现在示例里的独特内容，避免与 prompt 模板示例撞车
+    history = [
+        {"role": "user", "content": "崔超是谁"},
+        {"role": "assistant", "content": "崔超简介 [1]"},
+        {"role": "user", "content": "雷航负责什么"},
+        {"role": "assistant", "content": "产品侧 [1]"},
+        {"role": "user", "content": "熙物联使用教程V4"},
+        {"role": "assistant", "content": "见教程第 1 页 [1]"},
+    ]
+    result = await rewriter.rewrite("V5版本呢", history)
+    assert result.strategy == "llm"
+    assert result.rewritten == "熙物联V5使用教程"
+    user = llm.messages[0][1]["content"]
+    after_history = user.split("对话历史（最近一轮）：", 1)[1]
+    history_section = after_history.split("最新问题：", 1)[0]
+    assert "熙物联使用教程V4" in history_section
+    assert "见教程第 1 页" in history_section
+    assert "崔超是谁" not in history_section
+    assert "雷航负责什么" not in history_section
+    assert "最新问题：V5版本呢" in user
+
+
+async def test_rewriter_llm_guard_rejects_foreign_entity(runtime) -> None:
+    """改写若抄进历史∪原话没有的主体，拒绝并回退（防 few-shot 污染）。"""
+
+    class FakeLLM:
+        class _Ref:
+            provider = "dashscope"
+            model = "qwen-max"
+
+        ref = _Ref()
+
+        async def generate(self, messages, **kwargs):
+            from ekbs.provider.base import LLMResult
+
+            return LLMResult(text="新东方2025年1-3月用电量", model="qwen-max")
+
+    rewriter = QueryRewriter(
+        settings=runtime.settings, llm=FakeLLM(), strategy_override="llm"
+    )
+    history = [
+        {"role": "user", "content": "桔子酒店2024年12月用水量"},
+        {"role": "assistant", "content": "桔子酒店2024年12月用水量为108 m³[2]。"},
+    ]
+    result = await rewriter.rewrite("2025年啦", history)
+    assert result.strategy in {"llm_rejected", "llm_guarded"}
+    assert "新东方" not in result.rewritten
+
+
+async def test_rewriter_llm_guard_accepts_history_entity(runtime) -> None:
+    class FakeLLM:
+        class _Ref:
+            provider = "dashscope"
+            model = "qwen-max"
+
+        ref = _Ref()
+
+        async def generate(self, messages, **kwargs):
+            from ekbs.provider.base import LLMResult
+
+            return LLMResult(text="桔子酒店2025年用水量", model="qwen-max")
+
+    rewriter = QueryRewriter(
+        settings=runtime.settings, llm=FakeLLM(), strategy_override="llm"
+    )
+    history = [
+        {"role": "user", "content": "桔子酒店2024年12月用水量"},
+        {"role": "assistant", "content": "108"},
+    ]
+    result = await rewriter.rewrite("2025年啦", history)
+    assert result.strategy == "llm"
+    assert result.rewritten == "桔子酒店2025年用水量"
 
 
 class _AngleRef:
@@ -230,7 +374,10 @@ async def test_fast_model_angles_are_shared_and_keep_original(runtime) -> None:
         "年假天数是如何规定的",
     ]
     assert result.dense_variants == result.sparse_variants
-    assert "对话历史" not in llm.prompts[0]
+    expand_prompt = llm.prompts[0]
+    assert "对话历史" not in expand_prompt
+    assert "【示例】" in expand_prompt
+    assert "年假天数是如何规定的" in expand_prompt
     assert rewriter.expand_variants("请问年假有多少天") == result.sparse_variants
     assert rewriter.expand_dense_variants("请问年假有多少天") == result.dense_variants
 
@@ -295,10 +442,10 @@ async def test_pipeline_multi_turn_records_rewrite_and_context(seeded) -> None:
 
 
 async def test_followup_history_never_enters_generation_prompt(seeded) -> None:
-    """会话历史只用于查询改写，绝不进生成 prompt（方向纠正：用户提示词修改）。
+    """会话历史只用于查询改写，绝不进生成 prompt。
 
-    追问轮里，改写后的查询已把上一轮主题并进去、召回对了块；生成端只吃
-    「系统提示 + 用户原问题」，不带任何历史 user/assistant 消息。
+    追问轮：改写把上一轮主题并进自包含问句；生成端吃「系统提示 + 改写后问句」
+    （与检索同一口径，避免原句丢年份/主体），仍不得带历史 user/assistant 消息。
     """
     runtime, _ = seeded
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
@@ -315,7 +462,9 @@ async def test_followup_history_never_enters_generation_prompt(seeded) -> None:
     assert roles[0] == "system"
     assert "assistant" not in roles, "生成 prompt 不得带历史 assistant 消息"
     user_contents = [m["content"] for m in last_messages if m["role"] == "user"]
-    assert user_contents == ["那它需要提前几天申请"], "生成 prompt 只能有当前问题，不能带历史"
+    assert user_contents == [second.rewritten_query], (
+        "生成 prompt 应用改写后问句（与检索一致），且不得带历史"
+    )
 
 
 async def test_answer_cache_is_partitioned_by_history(seeded) -> None:
@@ -441,6 +590,34 @@ async def test_rewriter_merges_period_followup_without_previous_question_noise(r
     result = await rewriter.rewrite("那1-5月啦", history)
     assert result.used_history is True
     assert result.rewritten == "2026年公司承担电费1-5月是多少"
+
+
+async def test_rewriter_merges_solicit_year_period_keep_entity_metric(runtime) -> None:
+    """「提供一下2026年1-3月的」须继承上一问主体，不能丢掉新东方/用电量。"""
+    from ekbs.session import _merge_followup
+
+    assert (
+        _merge_followup("新东方1-3月用电量", "提供一下2026年1-3月的")
+        == "新东方2026年1-3月用电量是多少"
+    )
+    rewriter = QueryRewriter(settings=runtime.settings)
+    history = [
+        {"role": "user", "content": "新东方1-3月用电量"},
+        {"role": "assistant", "content": "2025年…[1]"},
+    ]
+    result = await rewriter.rewrite("提供一下2026年1-3月的", history)
+    assert result.used_history is True
+    assert result.rewritten == "新东方2026年1-3月用电量是多少"
+
+
+async def test_rewriter_merges_short_entity_followup(runtime) -> None:
+    """「新东方的」继承上一问已钉死的年/期间/指标。"""
+    from ekbs.session import _merge_followup
+
+    assert (
+        _merge_followup("新东方2026年1-3月用电量是多少", "新东方的")
+        == "新东方2026年1-3月用电量是多少"
+    )
 
 
 async def test_rewriter_carries_year_for_period_question(runtime) -> None:

@@ -131,9 +131,9 @@ _STATUS_LABEL = {
 
 
 def personal_accepted_message(*, title: str = "") -> str:
-    """单聊刚收下文件：不回文件名，只说正在处理。"""
-    _ = title  # 调用方仍传 title；文案刻意不带文件名
-    return "正在处理"
+    """文件已落盘进私有库、等待 worker 解析时的回执。"""
+    _ = title  # 调用方仍传 title；钉钉侧已先发过带文件名的「已收到」
+    return "文件已收下，正在解析入库；完成后会再通知你。"
 
 
 def personal_ready_message(*, title: str = "") -> str:
@@ -154,7 +154,7 @@ def personal_duplicate_message(*, title: str = "", status: str = "") -> str:
     if str(status) == "published":
         return "处理完毕，可以使用了"
     if str(status) in {"pending", "parsing", "indexing"}:
-        return "正在处理"
+        return "文件已在私有库中，正在解析；完成后会再通知你。"
     return "文件已在私有库中"
 
 

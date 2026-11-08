@@ -110,7 +110,8 @@ bash scripts/ci.sh
 
 ### 5.1 检索阈值是校准过的，别乱动
 
-生产配置（cloud/deploy）的 `rerank.min_score = 0.65` 是用 16 份真实语料（28 正例 + 8 负例）实测校准的；
+生产配置（cloud/deploy）的 `rerank.min_score = 0.60`（2026-11-08 用户从校准值 0.65 下调，放行 PPT 短标题类；
+原 0.65 用 16 份真实语料 28 正例 + 8 负例校准，负例 max 0.608，降到 0.60 有漏放风险）。
 **dev 的 mock 配置是 0.30**（mock 精排量纲，代码默认值也是 0.30）。
 重新校准方法：`python -m ekbs.tools.eval_switch_sweep`。
 **改融合方式（如 `fusion: alpha`）后分数分布会变，必须重新校准**（README 发现 72 有完整数据）。

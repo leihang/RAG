@@ -152,6 +152,9 @@ def reset_corpus(runtime: Runtime, *, dry_run: bool = True) -> ResetReport:
 
     with runtime.db.sync_connect() as conn:
         conn.execute("DELETE FROM ekbs_chunk")
+        # 推荐问句表无 CASCADE，必须先于 document 删除
+        conn.execute("DELETE FROM ekbs_doc_recommend")
+        conn.execute("DELETE FROM ekbs_table_observation")
         conn.execute("DELETE FROM ekbs_document")
         conn.execute("DELETE FROM ekbs_acl_entry WHERE object_type = 'document'")
         conn.execute("DELETE FROM ekbs_cache")

@@ -329,6 +329,86 @@ def list_descendant_dirs(settings: Settings, rel: str = "") -> list[str]:
     return out
 
 
+def list_raw_top_dirs(
+    settings: Settings,
+    *,
+    kb_codes: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    """raw 根下一层目录清单，供 UI 与磁盘对齐（标出无对应知识库的孤儿目录）。
+
+    ``personal/`` 是个人库公共根，不按 orphan 处理；真正个人目录是 ``personal/<uid>``。
+    """
+    root = raw_root(settings)
+    if not root.exists():
+        return []
+    codes = {str(c).strip() for c in kb_codes if str(c).strip()}
+    personal_uids: set[str] = set()
+    for code in codes:
+        if code.startswith("personal-"):
+            uid = code.split("-", 1)[1]
+            if uid.isdigit():
+                personal_uids.add(uid)
+    out: list[dict[str, Any]] = []
+    try:
+        children = sorted(root.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return out
+    for child in children:
+        if child.name.startswith(".") or not child.is_dir():
+            continue
+        try:
+            child.resolve().relative_to(root.resolve())
+        except ValueError:
+            continue
+        name = child.name
+        if name == "personal":
+            # 展开 personal/<uid>，与个人库 code=personal-<uid> 对齐
+            try:
+                personal_kids = sorted(child.iterdir(), key=lambda p: p.name.lower())
+            except OSError:
+                personal_kids = []
+            for uid_dir in personal_kids:
+                if uid_dir.name.startswith(".") or not uid_dir.is_dir():
+                    continue
+                uid = uid_dir.name
+                matched = f"personal-{uid}" if uid in personal_uids else None
+                try:
+                    sub_count = sum(
+                        1
+                        for p in uid_dir.rglob("*")
+                        if p.is_dir() and not p.name.startswith(".")
+                    )
+                except OSError:
+                    sub_count = 0
+                out.append(
+                    {
+                        "name": f"personal/{uid}",
+                        "rel_path": f"personal/{uid}",
+                        "kb_code": matched,
+                        "orphan": matched is None,
+                        "subfolder_count": sub_count,
+                    }
+                )
+            continue
+        matched = name if name in codes else None
+        try:
+            sub_count = sum(
+                1 for p in child.rglob("*") if p.is_dir() and not p.name.startswith(".")
+            )
+        except OSError:
+            sub_count = 0
+        out.append(
+            {
+                "name": name,
+                "rel_path": name,
+                "kb_code": matched,
+                "orphan": matched is None,
+                "subfolder_count": sub_count,
+            }
+        )
+    return out
+
+
 def scan_directory(
     settings: Settings,
     db: Database,

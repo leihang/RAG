@@ -15,6 +15,9 @@ from ekbs.ingest.chunker import (
     TABLE_CONTAINER_MAX_TOKENS,
     TABLE_LEAF_TOKENS,
     TableInput,
+    _segments_by_relevant_header,
+    _table_parent_content,
+    _table_segment_marker,
     chunk_markdown,
     content_coverage,
     count_tokens,
@@ -124,7 +127,10 @@ def test_short_slide_page_child_does_not_duplicate_index() -> None:
         "1.能耗管理1-7用电量（工程部）\n"
         "总用电量累计:2026比2025增长1.76%。\n"
     )
-    result = chunk_markdown(md, doc_title="工程汇报")
+    result = chunk_markdown(
+        md, doc_title="工程汇报", source_path="工程汇报.pptx",
+        page_map=[(0, 4, 4)],
+    )
     assert result.parents
     parents = [n for n in result.nodes if n.chunk_type == "parent"]
     children = result.children
@@ -132,6 +138,73 @@ def test_short_slide_page_child_does_not_duplicate_index() -> None:
     assert children[0].parent_index == 0
     # 父容器覆盖子块（spec §3.1），但父块本身不是检索单元
     assert children[0].content.strip() in parents[0].content
+
+
+def test_pptx_chunks_hard_cut_by_page() -> None:
+    """幻灯片必须一页一块：短页也不能被 token 聚合捏进邻页。"""
+    from ekbs.ingest.chunker import FigureInput
+
+    pages = [
+        (1, "封面\n物业工程部10月工作报告"),
+        (11, "1.能耗管理\n换表完成"),
+        (14, "2.设备运维\n4、冷却塔填料更换（按合同约定完成3台更换）"),
+        (15, "5、水泵检修"),
+    ]
+    parts: list[str] = []
+    page_map: list[tuple[int, int, int]] = []
+    offset = 0
+    for page, body in pages:
+        block = f"# 第 {page} 页\n\n{body}\n\n"
+        page_map.append((offset, page, page))
+        parts.append(block)
+        offset += len(block)
+    md = "".join(parts)
+    result = chunk_markdown(
+        md,
+        page_map=page_map,
+        doc_title="工程汇报",
+        source_path="var/raw/工程汇报.pptx",
+        figures=[
+            FigureInput(
+                image_path="parse/1/img-14.png",
+                caption="2.设备运维",
+                page=14,
+                figure_id="img-14",
+            )
+        ],
+    )
+    children = result.children
+    assert len(children) == 4, [(c.page_from, c.page_to, c.content[:40]) for c in children]
+    assert [c.page_from for c in children] == [1, 11, 14, 15]
+    assert all(c.page_from == c.page_to for c in children)
+    # 填料只落在第 14 页子块，不被捏进邻页
+    filler = [c for c in children if "冷却塔填料" in c.content]
+    assert len(filler) == 1 and filler[0].page_from == 14
+    parents = [n for n in result.nodes if n.chunk_type == "parent"]
+    assert len(parents) == 4
+    assert all(p.page_from == p.page_to for p in parents)
+    fig = next(n for n in result.nodes if n.chunk_type == "figure")
+    assert fig.page_from == 14
+    parent = result.nodes[fig.parent_index]
+    assert parent.page_from == 14
+    assert "设备运维" in (fig.heading_path or "")
+
+
+def test_pptx_page_map_survives_clean_offset_drift() -> None:
+    """清洗改字后旧 page_map 偏移会漂；幻灯片应从「第 N 页」标题重扫。"""
+    md = (
+        "## 第 13 页\n\n2.设备运维\n台账清查\n\n"
+        "## 第 14 页\n\n2.设备运维\n4、冷却塔填料更换\n\n"
+        "## 第 15 页\n\n水泵检修\n"
+    )
+    # 故意给错偏移（模拟 clean_markdown 改短正文后的旧 map）
+    bad_map = [(0, 1, 1), (10, 2, 2), (20, 3, 3)]
+    result = chunk_markdown(
+        md, page_map=bad_map, doc_title="工程汇报", source_path="汇报.pptx"
+    )
+    filler = [c for c in result.children if "冷却塔填料" in c.content]
+    assert len(filler) == 1 and filler[0].page_from == 14
+    assert all(c.page_from == c.page_to for c in result.children)
 
 
 def test_short_document_children_are_size_based() -> None:
@@ -236,7 +309,8 @@ def test_major_heading_path_strips_nested_dotted() -> None:
 
 def test_long_clause_splits_but_short_ones_aggregate() -> None:
     """长条款在条内切开，短条款聚合成块 —— 切点仍落在条款边界，不拆行。"""
-    long_41 = "4.1 " + ("接班人应提前到岗并完成检查。" * 30)
+    # 约 880 token，超过 CHILD_MAX(500)，必须在条内切开
+    long_41 = "4.1 " + ("接班人应提前到岗并完成检查。" * 80)
     md = f"""# 交接班
 
 4． 制度
@@ -294,11 +368,11 @@ def test_pages_for_uses_last_marker_not_in_range() -> None:
 
 def test_chunk_markdown_does_not_collapse_later_pages_to_page_one() -> None:
     """回归开班典礼：后页内容不得被标成 page_from=1。"""
-    # 每页正文都超过 child_min，保证按页形成独立子块
+    # 每页正文都超过 child_min(300)，保证按页形成独立子块
     md = (
-        "# 开班典礼\n\n封面标题：开班典礼\n\n" + "封面介绍内容。" * 60 + "\n\n"
-        "# 导师介绍\n\n导师背景正文\n\n" + "导师背景说明。" * 60 + "\n\n"
-        "# 几种典型企业类别\n\n企业类别正文\n\n" + "企业类别说明。" * 60 + "\n"
+        "# 开班典礼\n\n封面标题：开班典礼\n\n" + "封面介绍内容。" * 100 + "\n\n"
+        "# 导师介绍\n\n导师背景正文\n\n" + "导师背景说明。" * 100 + "\n\n"
+        "# 几种典型企业类别\n\n企业类别正文\n\n" + "企业类别说明。" * 100 + "\n"
     )
     page_map = [
         (0, 1, 1),
@@ -694,9 +768,124 @@ def test_medium_table_splits_into_row_group_leaves_at_384_tokens() -> None:
 
 # --- 表格父容器硬上限 2048 + 超限分段（doc 206 表 3 暴露的缺口）--------------------
 #
-# 用户拍板：**容器 2048 + 超限分段展开** —— DB 里任何块 ≤2048；超限表格父容器按行
-# 分成几段（同表共用 `table_group`），检索命中任一叶子时由 `_expand_parents` 把整表
-# 全部分段展开回 prompt（内容完整）。叶子规则「无行重叠 + 每叶重复表头」不变。
+# 用户拍板：**容器 2048 + 超限分段** —— DB 里任何块 ≤2048；超限表格父容器按行
+# 分成几段（同表共用 `table_group`）。检索命中叶子时只扩直系父段，不把同组兄妹段
+# 一并塞进 prompt。叶子规则「无行重叠 + 每叶重复表头」不变。
+
+
+def test_header_segments_pack_to_container_budget_not_one_month_each() -> None:
+    """宽表按相关表头分段时：父块打满 2048，不「一个月一个 ~600 的小父块」。"""
+    # 每块约 500–600 token，旧逻辑会出 4 个父段；打满 2048 后应明显更少。
+    full_blocks: list[str] = []
+    leaf_blocks: list[str] = []
+    for month in range(1, 5):
+        header = (
+            f"相关表头: 户号 | 用量/2024-{month:02d} | 单价/2024-{month:02d} | "
+            f"金额/2024-{month:02d}"
+        )
+        # 单月约 600–750 token：2 个月可并进 2048，4 个月必须多于 1 段且少于 4 段
+        rows = "\n".join(
+            f"户号=H{i}; 用量/2024-{month:02d}={1000 + i}; "
+            f"单价/2024-{month:02d}=0.8; 金额/2024-{month:02d}={800 + i}.00"
+            + ("；说明" * 4)
+            for i in range(8)
+        )
+        block = f"表名: 熙丰用电\n{header}\n{rows}"
+        full_blocks.append(block)
+        for i in range(8):
+            leaf_blocks.append(
+                f"表名: 熙丰用电\n{header}\n"
+                f"户号=H{i}; 用量/2024-{month:02d}={1000 + i}; "
+                f"单价/2024-{month:02d}=0.8; 金额/2024-{month:02d}={800 + i}.00"
+            )
+        assert 450 <= count_tokens(block) <= 900, count_tokens(block)
+
+    segments = _segments_by_relevant_header(
+        full_blocks=full_blocks,
+        leaf_blocks=leaf_blocks,
+        section_path="文档 > 熙丰",
+        above="上文",
+        below="下文",
+    )
+    assert 1 < len(segments) < 4, (
+        f"4 个 ~550tok 月块应按 2048 合并，不应仍是 4 段；实际 {len(segments)} 段"
+    )
+    assert all(
+        count_tokens(seg.content) <= TABLE_CONTAINER_MAX_TOKENS for seg in segments
+    )
+    assert "本段为整表第 1/" in segments[0].content
+    # 每段都挂到叶子；叶子总数不丢
+    assert all(seg.leaves for seg in segments)
+    assert sum(len(seg.leaves) for seg in segments) == len(leaf_blocks)
+
+
+def test_header_segments_resplit_month_that_exceeds_parent_budget() -> None:
+    """单月正文已近 2048、加标题/段标记后越界时，必须按行再切，不得落库 >2048。"""
+    header = (
+        "相关表头: 序号 | 水卡号 | 水表号 | 用途 | 上月起度/2026-04 | "
+        "本月止度/2026-04 | 用量（m³）/2026-04 | 单价(元）/2026-04 | 金额(元)/2026-04"
+    )
+    preamble = (
+        "表名: 水费账单（熙街水费清单抄录）\n"
+        "核心实体: 水费账单（熙街水费清单抄录）\n"
+        f"{header}"
+    )
+
+    def _row(i: int) -> str:
+        return (
+            f"序号={i}; 水卡号=3000502{i:04d}; 水表号=190514{i:03d}; "
+            f"用途=四期消防绿化生活用水; "
+            f"上月起度/2026-04={8000 + i * 17}; 本月止度/2026-04={8200 + i * 19}; "
+            f"用量（m³）/2026-04={200 + i}; 单价(元）/2026-04=4.55; "
+            f"金额(元)/2026-04={910.0 + i * 3:.2f}"
+        )
+
+    # 先堆到裸块尽量接近 2048，再微垫到「加标题/段标记后必超」（线上水费月段同病）
+    rows: list[str] = []
+    block = preamble
+    i = 1
+    while True:
+        trial_rows = rows + [_row(i)]
+        trial = preamble + "\n" + "\n".join(trial_rows)
+        if count_tokens(trial) > TABLE_CONTAINER_MAX_TOKENS:
+            break
+        rows = trial_rows
+        block = trial
+        i += 1
+        assert i < 80, "构造失败：行太短，堆不出顶满预算的单月块"
+    assert rows, "至少要有一行数据"
+    pad = "；说明垫字"
+    while True:
+        shell = count_tokens(
+            _table_parent_content(
+                section_path="水费账单",
+                above="",
+                full_table=f"{_table_segment_marker(1, 2)}\n{block}",
+                below="",
+            )
+        )
+        if shell > TABLE_CONTAINER_MAX_TOKENS:
+            break
+        rows[-1] = rows[-1] + pad
+        block = preamble + "\n" + "\n".join(rows)
+        assert count_tokens(block) < TABLE_CONTAINER_MAX_TOKENS + 64
+
+    leaf_blocks = [f"{preamble}\n{rows[n]}" for n in range(len(rows))]
+    segments = _segments_by_relevant_header(
+        full_blocks=[block],
+        leaf_blocks=leaf_blocks,
+        section_path="水费账单",
+        above="",
+        below="",
+    )
+    assert len(segments) >= 2
+    assert all(
+        count_tokens(seg.content) <= TABLE_CONTAINER_MAX_TOKENS for seg in segments
+    )
+    assert sum(len(seg.leaves) for seg in segments) == len(leaf_blocks)
+    # 同叶不得挂到两段
+    leaf_ids = [id(leaf) for seg in segments for leaf in seg.leaves]
+    assert len(leaf_ids) == len(set(leaf_ids))
 
 
 def test_oversized_table_container_segments_and_every_segment_owns_leaves() -> None:

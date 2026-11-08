@@ -50,6 +50,18 @@ def test_conjunction_split_requires_long_parts(settings) -> None:
     assert len(short_parts) == 1
 
 
+def test_respectively_is_多少_not_split(settings) -> None:
+    """「预算、节约电费和回收期分别是多少」必须整句保留，不能拆出孤儿「是多少？」。"""
+    q = "熙街中央空调IOT节能改造的预算、预计年节约电费和投资回收期分别是多少？"
+    parts = _splitter(settings).split(q)
+    assert len(parts) == 1
+    assert parts[0].text == q
+    assert parts[0].source == "single"
+
+    assert len(_splitter(settings).split("改造预算和工期分别是多少")) == 1
+    assert len(_splitter(settings).split("电费、水费分别是什么")) == 1
+
+
 def test_max_questions_cap(settings) -> None:
     parts = _splitter(settings, max_questions=2).split("年假？病假？产假？婚假？")
     assert len(parts) == 2

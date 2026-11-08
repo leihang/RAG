@@ -10,6 +10,7 @@ ekbs-api 回环调用）。最要紧的三条：
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -27,9 +28,11 @@ from ekbs.dingtalk.client import (
     OTO_SEND_PATH,
     DingTalkOpenApiClient,
 )
+from ekbs.dingtalk import handler as dingtalk_handler
 from ekbs.dingtalk.handler import (
     ACK_OK,
     ACK_RETRY,
+    NO_PENDING_FIGURES_REPLY,
     RATE_LIMITED_REPLY,
     USER_NOT_FOUND_REPLY,
     InboundMessage,
@@ -43,6 +46,20 @@ from ekbs.ratelimit import RateLimiter
 DING_BASE = "https://api.dingtalk.com"
 API_BASE = "http://127.0.0.1:8000"
 API_URL = f"{API_BASE}/api/v1/qa/chat"
+
+
+def oto_body(call_or_param: dict | httpx.Request | object) -> str:
+    """兼容 sampleMarkdown（text）与 sampleText（content）。"""
+    if hasattr(call_or_param, "request"):
+        payload = json.loads(call_or_param.request.content)
+        param = json.loads(payload["msgParam"])
+    elif isinstance(call_or_param, dict) and "msgParam" in call_or_param:
+        param = json.loads(call_or_param["msgParam"])
+    elif isinstance(call_or_param, dict):
+        param = call_or_param
+    else:
+        param = {}
+    return str(param.get("text") or param.get("content") or "")
 
 
 class FakeTokenClient:
@@ -187,8 +204,7 @@ async def test_unknown_user_gets_polite_reply_without_asking_api(handler) -> Non
     code, _ = await handler.process({"data": payload(staff="ghost-user")})
     assert code == ACK_OK
     assert api.call_count == 0, "未知 userid 不该调用问答 API"
-    sent = json.loads(routes["oto"].calls[0].request.content)
-    assert USER_NOT_FOUND_REPLY in json.loads(sent["msgParam"])["content"]
+    assert USER_NOT_FOUND_REPLY in oto_body(routes["oto"].calls[0])
 
 
 @respx.mock
@@ -288,8 +304,7 @@ async def test_content_blocked_question_is_acked_with_reason(handler) -> None:
     )
     code, _ = await handler.process({"data": payload(text="公司绝密文件在哪")})
     assert code == ACK_OK
-    sent = json.loads(routes["oto"].calls[0].request.content)
-    assert "CONTENT_BLOCKED" in json.loads(sent["msgParam"])["content"]
+    assert "CONTENT_BLOCKED" in oto_body(routes["oto"].calls[0])
 
 
 @respx.mock
@@ -378,10 +393,7 @@ async def test_rate_limit_blocks_and_replies(handler, runtime) -> None:
     code, _ = await handler.process({"data": payload(msg_id="rl-2")})
     assert code == ACK_OK
     assert routes["oto"].call_count >= 1
-    replies = [
-        json.loads(json.loads(call.request.content)["msgParam"])["content"]
-        for call in routes["oto"].calls
-    ]
+    replies = [oto_body(call) for call in routes["oto"].calls]
     assert any(RATE_LIMITED_REPLY in text for text in replies)
 
 
@@ -423,6 +435,44 @@ def test_render_answer_strips_path_shows_heading_dedupes(handler) -> None:
     assert "4.7" in text
     assert text.count("参考资料") == 1
     assert text.count("\n[") == 2  # 同小节去重后仅两条
+
+
+def test_render_answer_keeps_markdown_table_with_blank_line(handler) -> None:
+    """AI 卡片路径保留管道表，并保证表前空行。"""
+    text = handler._render_answer(
+        "明细如下：\n| 项目 | 用量 |\n| --- | --- |\n| 活动用电 | 1343 |\n",
+        [],
+    )
+    assert "如下：\n\n| 项目 |" in text
+    assert "| 活动用电 |" in text
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_reply_text_converts_tables_to_labeled_blocks(handler) -> None:
+    """单聊优先 sampleMarkdown；管道表仍转栏目明示块（接近管理台可读性）。"""
+    from ekbs.dingtalk.client import MSG_KEY_MARKDOWN
+
+    routes = mock_dingtalk()
+    msg = InboundMessage.from_payload(payload(conversation_type="1", text="q"))
+    body = "明细：\n| 项目 | 9月用量 |\n| --- | --- |\n| 活动用电 | 1343.00 |\n"
+    ok = await handler._reply_text(msg, body)
+    assert ok is True
+    assert routes["oto"].called
+    assert not routes["group"].called
+    payload_json = json.loads(routes["oto"].calls.last.request.content.decode("utf-8"))
+    assert payload_json.get("msgKey") == MSG_KEY_MARKDOWN
+    msg_param = json.loads(payload_json["msgParam"])
+    sent_text = str(msg_param.get("text") or msg_param.get("content") or "")
+    assert "| 项目 |" not in sent_text
+    assert "#### 活动用电" in sent_text
+    assert "9月用量：1343.00" in sent_text
+    assert msg_param.get("title")
+
+
+def test_markdown_title_uses_first_line(handler) -> None:
+    assert handler._markdown_title("《方案》要点如下：\n\n- a") == "《方案》要点如下："
+    assert handler._markdown_title("   \n") == "知识库回答"
 
 
 @respx.mock
@@ -504,9 +554,108 @@ async def test_figure_attachments_trigger_image_reply(handler, cards) -> None:
 
 
 @respx.mock
+async def test_truncated_figures_hint_and_send_all(handler, cards, monkeypatch) -> None:
+    """首波超上限时提示「发全图」；用户回复后补发剩余。"""
+    monkeypatch.setattr(dingtalk_handler, "MAX_REPLY_IMAGES", 1)
+    png = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx"
+        b"\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND"
+        b"\xaeB`\x82"
+    )
+    figs = []
+    for i in (1, 2, 3):
+        rel = f"parse/68/images/demo-{i}.png"
+        path = handler.settings.data_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(png)
+        figs.append(
+            {
+                "chunk_id": 100 + i,
+                "figure_id": f"img-{i}",
+                "image_path": rel,
+                "doc_title": "工程汇报",
+                "page_from": i,
+            }
+        )
+    routes = mock_dingtalk(card_ok=False)
+    respx.post(f"{OAPI_BASE_URL}{MEDIA_UPLOAD_PATH}").mock(
+        return_value=httpx.Response(
+            200, json={"errcode": 0, "errmsg": "ok", "media_id": "media-batch"}
+        )
+    )
+    body = answer_body()
+    body["figure_attachments"] = figs
+    respx.post(API_URL).mock(return_value=httpx.Response(200, json=body))
+
+    code, _ = await handler.process(
+        {"data": payload(msg_id="msg-fig-trunc", text="创新突破有哪些")}
+    )
+    assert code == ACK_OK
+    text = oto_body(routes["oto"].calls[0])
+    assert "另有 2 张相关图片未发出" in text
+    assert "发全图" in text
+    image_sends = [
+        json.loads(call.request.content)
+        for call in routes["oto"].calls
+        if json.loads(call.request.content).get("msgKey") == MSG_KEY_IMAGE
+    ]
+    assert len(image_sends) == 1
+
+    def _text_bodies() -> list[str]:
+        out = []
+        for call in routes["oto"].calls:
+            body = json.loads(call.request.content)
+            if body.get("msgKey") == MSG_KEY_IMAGE:
+                continue
+            out.append(oto_body(call))
+        return out
+
+    code, _ = await handler.process(
+        {"data": payload(msg_id="msg-fig-more", text="发全图")}
+    )
+    assert code == ACK_OK
+    image_sends = [
+        json.loads(call.request.content)
+        for call in routes["oto"].calls
+        if json.loads(call.request.content).get("msgKey") == MSG_KEY_IMAGE
+    ]
+    # 首波 1 + 补发 1（上限仍为 1），还剩 1 张
+    assert len(image_sends) == 2
+    follow = _text_bodies()[-1]
+    assert "还剩 1 张" in follow
+
+    code, _ = await handler.process(
+        {"data": payload(msg_id="msg-fig-more-2", text="发全图")}
+    )
+    assert code == ACK_OK
+    image_sends = [
+        json.loads(call.request.content)
+        for call in routes["oto"].calls
+        if json.loads(call.request.content).get("msgKey") == MSG_KEY_IMAGE
+    ]
+    assert len(image_sends) == 3
+    done = _text_bodies()[-1]
+    assert "全部剩余" in done
+
+
+@respx.mock
+async def test_send_all_figures_without_pending(handler) -> None:
+    """无待补发缓存时，发全图给友好提示，不进问答。"""
+    routes = mock_dingtalk(card_ok=False)
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    code, _ = await handler.process(
+        {"data": payload(msg_id="msg-fig-none", text="发全图")}
+    )
+    assert code == ACK_OK
+    assert qa.call_count == 0
+    assert NO_PENDING_FIGURES_REPLY in oto_body(routes["oto"].calls[0])
+
+
+@respx.mock
 async def test_single_chat_file_enters_personal_library(handler) -> None:
-    """单聊发文件不进问答，改走私有库登记。"""
-    routes = mock_dingtalk()
+    """单聊发文件：先即时「已收到」，再登记私有库；不进问答。"""
+    routes = mock_dingtalk(card_ok=False)
     respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(
         return_value=httpx.Response(200, json={"downloadUrl": "https://files.example/note.txt"})
     )
@@ -514,7 +663,7 @@ async def test_single_chat_file_enters_personal_library(handler) -> None:
         return_value=httpx.Response(200, content="只有本人".encode())
     )
     api = respx.post(f"{API_BASE}/api/v1/personal/files").mock(
-        return_value=httpx.Response(200, json={"message": "已放入你的私有库：note。"})
+        return_value=httpx.Response(200, json={"message": "文件已收下，正在解析入库；完成后会再通知你。"})
     )
     qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
     body = payload(msg_id="file-1", text="", msgtype="file")
@@ -523,16 +672,17 @@ async def test_single_chat_file_enters_personal_library(handler) -> None:
     assert code == ACK_OK
     assert qa.call_count == 0
     assert api.call_count == 1
-    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
-    assert "私有库" in sent["content"]
+    texts = [oto_body(c) for c in routes["oto"].calls]
+    assert any("已收到「note.txt」" in t for t in texts)
+    assert any("解析入库" in t or "私有库" in t for t in texts)
 
 
 @respx.mock
 async def test_single_chat_file_over_configured_limit(handler, seeded) -> None:
-    """超限文案用 limits.max_file_size_mb，并接受钉钉 OSS 的 http 下载地址。"""
+    """超限：仍先即时回执，再告知未入库；接受钉钉 OSS 的 http 下载地址。"""
     runtime, _ = seeded
     runtime.settings.limits["max_file_size_mb"] = 1
-    routes = mock_dingtalk()
+    routes = mock_dingtalk(card_ok=False)
     blob = b"x" * (1 * 1024 * 1024 + 1)
     respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(
         return_value=httpx.Response(200, json={"downloadUrl": "http://files.example/big.txt"})
@@ -548,8 +698,69 @@ async def test_single_chat_file_over_configured_limit(handler, seeded) -> None:
     code, _ = await handler.process({"data": body})
     assert code == ACK_OK
     assert api.call_count == 0
-    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
-    assert sent["content"] == "文件超过 1 MB，私有库暂不接收。"
+    texts = [oto_body(c) for c in routes["oto"].calls]
+    assert any("已收到「big.txt」" in t for t in texts)
+    assert any("文件超过 1 MB，私有库暂不接收。" in t for t in texts)
+
+
+@respx.mock
+async def test_personal_file_download_failure_notifies_user(handler) -> None:
+    """下载失败也要有结果反馈（在「已收到」之后）。"""
+    routes = mock_dingtalk(card_ok=False)
+    respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(
+        return_value=httpx.Response(500, json={"errcode": 1, "errmsg": "down"})
+    )
+    body = payload(msg_id="file-fail", text="", msgtype="file")
+    body["content"] = {"downloadCode": "dc-fail", "fileName": "deck.pptx"}
+    code, _ = await handler.process({"data": body})
+    assert code == ACK_OK
+    texts = [oto_body(c) for c in routes["oto"].calls]
+    assert any("已收到「deck.pptx」" in t for t in texts)
+    assert any("没能从钉钉取到" in t or "处理失败" in t for t in texts)
+
+
+@respx.mock
+async def test_help_not_blocked_while_large_file_downloads(handler) -> None:
+    """大文件下载在锁外：同会话「帮助」不必等下载结束。"""
+    routes = mock_dingtalk(card_ok=False)
+    download_gate = asyncio.Event()
+    ack_seen = asyncio.Event()
+
+    async def slow_download(request: httpx.Request) -> httpx.Response:
+        ack_seen.set()
+        await download_gate.wait()
+        return httpx.Response(200, json={"downloadUrl": "https://files.example/deck.pptx"})
+
+    respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(side_effect=slow_download)
+    respx.get("https://files.example/deck.pptx").mock(
+        return_value=httpx.Response(200, content=b"pptx-bytes")
+    )
+    respx.post(f"{API_BASE}/api/v1/personal/files").mock(
+        return_value=httpx.Response(
+            200, json={"message": "文件已收下，正在解析入库；完成后会再通知你。"}
+        )
+    )
+    respx.get(f"{API_BASE}/api/v1/discovery/catalog?mode=help").mock(
+        return_value=httpx.Response(
+            200, json={"help_text": "帮助导览内容", "documents": [], "suggestions": []}
+        )
+    )
+    file_body = payload(msg_id="file-slow", text="", msgtype="file", conversation="cid-busy")
+    file_body["content"] = {"downloadCode": "dc-slow", "fileName": "deck.pptx"}
+    file_task = asyncio.create_task(handler.process({"data": file_body}))
+    await asyncio.wait_for(ack_seen.wait(), timeout=2.0)
+    help_code, _ = await handler.process(
+        {"data": payload(msg_id="help-during", text="帮助", conversation="cid-busy")}
+    )
+    assert help_code == ACK_OK
+    texts_mid = [oto_body(c) for c in routes["oto"].calls]
+    assert any("已收到「deck.pptx」" in t for t in texts_mid)
+    assert any("帮助导览内容" in t for t in texts_mid)
+    download_gate.set()
+    file_code, _ = await asyncio.wait_for(file_task, timeout=2.0)
+    assert file_code == ACK_OK
+    texts_end = [oto_body(c) for c in routes["oto"].calls]
+    assert any("解析入库" in t for t in texts_end)
 
 
 @respx.mock
@@ -577,8 +788,7 @@ async def test_personal_list_command_does_not_enter_qa(handler) -> None:
     code, _ = await handler.process({"data": payload(msg_id="plist-1", text="我的文件")})
     assert code == ACK_OK
     assert qa.call_count == 0
-    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
-    assert "私有库" in sent["content"]
+    assert "私有库" in oto_body(routes["oto"].calls[0])
 
 
 @respx.mock
@@ -744,8 +954,7 @@ async def test_greeting_returns_only_short_intro(handler) -> None:
     assert catalog.call_count == 0
     assert qa.call_count == 0
     assert routes["oto"].call_count == 1
-    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
-    assert sent["content"] == (
+    assert oto_body(routes["oto"].calls[0]) == (
         "你好，我是企业知识库助手。\n"
         "你可以直接问制度、合同、表格里的具体条款；也可以发送「帮助」"
     )
@@ -767,8 +976,7 @@ async def test_permission_command_uses_permissions_mode(handler) -> None:
     assert code == ACK_OK
     assert catalog.call_count == 1
     assert qa.call_count == 0
-    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
-    assert "可查文档" in sent["content"]
+    assert "可查文档" in oto_body(routes["oto"].calls[0])
 
 
 @respx.mock
@@ -785,8 +993,7 @@ async def test_example_command_uses_examples_mode(handler) -> None:
     assert code == ACK_OK
     assert catalog.call_count == 1
     assert qa.call_count == 0
-    sent = json.loads(json.loads(routes["oto"].calls[0].request.content)["msgParam"])
-    assert "问答示例" in sent["content"]
+    assert "问答示例" in oto_body(routes["oto"].calls[0])
 
 
 @respx.mock
@@ -795,10 +1002,9 @@ async def test_private_manage_and_send_source_commands_are_local(handler) -> Non
     qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
     for msg_id, text, expected in (
         ("manage-1", "管理个人私有文件", "单聊"),
-        ("source-1", "发原文", "发我《跑水预案》"),
+        ("source-1", "发原文", "发我工程部10月工作汇报ppt原件"),
     ):
         code, _ = await handler.process({"data": payload(msg_id=msg_id, text=text)})
         assert code == ACK_OK
-        sent = json.loads(json.loads(routes["oto"].calls[-1].request.content)["msgParam"])
-        assert expected in sent["content"]
+        assert expected in oto_body(routes["oto"].calls[-1])
     assert qa.call_count == 0

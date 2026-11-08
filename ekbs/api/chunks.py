@@ -203,14 +203,18 @@ async def chunk_tree(
         ).fetchone()
         if doc is None:
             raise HTTPException(status_code=404, detail="document_not_found")
+        # 树接口只回 content_head：能耗类电子表格可达五千+块，全文会把管理台卡死。
+        # 右栏点开再走 /chunks/{id} 取全文。
         rows = conn.execute(
             "SELECT chunk_id, doc_id, parent_id, chunk_type, seq, heading_path, page_from, page_to, "
             "token_count, shard_id, faiss_row, figure_id, image_path, "
-            "substr(content, 1, 200) AS content_head, content "
+            "substr(content, 1, 200) AS content_head "
             "FROM ekbs_chunk WHERE doc_id = ? ORDER BY seq",
             (doc_id,),
         ).fetchall()
     items = [dict(r) for r in rows]
+    for item in items:
+        item["content"] = str(item.get("content_head") or "")
     _annotate_figure_mm(runtime, items)
     by_id = {int(item["chunk_id"]): item for item in items}
     children_by_parent: dict[int, list[dict[str, Any]]] = {}

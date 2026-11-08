@@ -23,6 +23,7 @@ from ekbs.discovery import (
     is_greeting_command,
     is_permission_command,
     is_personal_manage_command,
+    is_send_all_figures_command,
     is_send_source_command,
     display_doc_title,
     file_request_hint,
@@ -39,7 +40,7 @@ from ekbs.dingtalk.client import DingTalkOpenApiClient
 from ekbs.idempotency import IdempotencyGuard
 from ekbs.ratelimit import RateLimiter
 from tests.conftest import TEST_INTERNAL_TOKEN, user_id_of
-from tests.test_dingtalk_handler import FakeTokenClient, mock_dingtalk, payload
+from tests.test_dingtalk_handler import FakeTokenClient, mock_dingtalk, oto_body, payload
 
 API_BASE = "http://127.0.0.1:8000"
 CATALOG_URL = f"{API_BASE}/api/v1/discovery/catalog"
@@ -335,8 +336,7 @@ async def test_dingtalk_help_uses_catalog_not_qa(seeded) -> None:
     assert catalog.call_count == 1
     assert qa.call_count == 0
     assert routes["oto"].call_count == 1
-    sent = json.loads(routes["oto"].calls[0].request.content)
-    assert "年假有多少天" in json.loads(sent["msgParam"])["content"]
+    assert "年假有多少天" in oto_body(routes["oto"].calls[0])
 
 
 @respx.mock
@@ -381,8 +381,7 @@ async def test_permission_question_lists_docs_not_retrieval(seeded) -> None:
     assert code == ACK_OK
     assert catalog.call_count == 1
     assert qa.call_count == 0
-    sent = json.loads(routes["oto"].calls[0].request.content)
-    assert "熙物联使用教程V4" in json.loads(sent["msgParam"])["content"]
+    assert "熙物联使用教程V4" in oto_body(routes["oto"].calls[0])
 
 
 @respx.mock
@@ -445,7 +444,7 @@ async def test_named_file_is_sent_not_summarized(seeded) -> None:
     assert param["fileName"] == "熙物联使用教程V4.docx"
     assert param["fileType"] == "docx"
     texts = [
-        json.loads(json.loads(call.request.content)["msgParam"]).get("content", "")
+        oto_body(call)
         for call in routes["oto"].calls
         if json.loads(call.request.content).get("msgKey") != MSG_KEY_FILE
     ]
@@ -490,8 +489,7 @@ async def test_dingtalk_refusal_appends_suggestions_if_missing(seeded) -> None:
     code, _ = await handler.process({"data": payload(text="火星政策", msg_id="refuse-1")})
     assert code == ACK_OK
     assert routes["oto"].call_count == 1
-    sent = json.loads(routes["oto"].calls[0].request.content)
-    content = json.loads(sent["msgParam"])["content"]
+    content = oto_body(routes["oto"].calls[0])
     assert "你可以试试问" in content
     assert "年假有多少天" in content
 
@@ -514,9 +512,11 @@ def test_friendly_title_hides_document_codes() -> None:
 
 def test_short_help_lists_exactly_four_commands() -> None:
     text = format_help_text_short([])
-    assert text.startswith("可用命令")
+    assert text.startswith("直接发送文字：")
+    assert "1. 查询权限" in text
     for command in ("查询权限", "问答示例", "管理个人私有文件", "发原文"):
         assert command in text
+    assert "可用命令" not in text
     assert "可用功能" not in text
     assert "文档清单" not in text
     assert "XJWY-" not in text
@@ -528,8 +528,11 @@ def test_command_predicates() -> None:
     assert is_example_command("问答示例")
     assert is_personal_manage_command("管理个人私有文件")
     assert is_send_source_command("发原文")
+    assert is_send_all_figures_command("发全图")
+    assert is_send_all_figures_command("补发图片")
     assert not is_permission_command("权限是什么")
     assert not is_example_command("举个例子说明")
+    assert not is_send_all_figures_command("把图片发我看看有什么")
 
 
 def test_command_outputs_are_names_only() -> None:
@@ -544,7 +547,7 @@ def test_command_outputs_are_names_only() -> None:
     assert "跑水事件里环境部第一时间做什么" in examples
     assert "答案" not in examples
     assert "私有库" in format_private_manage_text()
-    assert "发我《跑水预案》" in format_send_source_text()
+    assert "发我工程部10月工作汇报ppt原件" in format_send_source_text()
 
 
 def test_document_list_text_uses_friendly_titles() -> None:
@@ -570,8 +573,8 @@ async def test_catalog_help_and_docs_modes(client, seeded) -> None:
     )
     assert help_resp.status_code == 200
     help_text = help_resp.json()["help_text"]
-    assert help_text.startswith("可用命令")
-    assert "查询权限" in help_text and "问答示例" in help_text
+    assert help_text.startswith("直接发送文字：")
+    assert "1. 查询权限" in help_text and "问答示例" in help_text
     assert "文档清单" not in help_text
     assert "当前可见的文档" not in help_text
 

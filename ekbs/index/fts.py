@@ -114,12 +114,57 @@ def tokenize_for_fts(text: str) -> str:
     return " ".join(_analyze(text))
 
 
+#: 查询侧停用：单字虚词/系词进 OR 会把半个库捞进来（「是/的/换」），冲掉「填料」真命中。
+#: 写入侧仍保留原文分词，避免旧索引与重建口径分叉。
+_QUERY_STOP_TOKENS = frozenset(
+    {
+        "是",
+        "的",
+        "了",
+        "吗",
+        "呢",
+        "啊",
+        "吧",
+        "么",
+        "在",
+        "和",
+        "与",
+        "或",
+        "及",
+        "等",
+        "被",
+        "把",
+        "对",
+        "就",
+        "都",
+        "也",
+        "很",
+        "还",
+        "又",
+        "而",
+        "与",
+        "什么",
+        "怎么",
+        "如何",
+        "多少",
+        "一下",
+        "请问",
+    }
+)
+
+
 def to_match_query(text: str) -> str:
-    """构造 FTS5 MATCH 查询串：每个词加双引号（防语法注入），词间 OR。"""
+    """构造 FTS5 MATCH 查询串：每个词加双引号（防语法注入），词间 OR。
+
+    有实质词时丢掉停用词；若过滤后为空（问句全是虚词）再退回全部分词，避免 MATCH 空串。
+    """
     tokens = _analyze(text)
     if not tokens:
         return ""
-    return " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens)
+    kept = [t for t in tokens if t not in _QUERY_STOP_TOKENS and len(t) >= 2]
+    if not kept:
+        kept = [t for t in tokens if t not in _QUERY_STOP_TOKENS] or list(tokens)
+    return " OR ".join('"' + token.replace('"', '""') + '"' for token in kept)
 
 
 @dataclass(frozen=True)

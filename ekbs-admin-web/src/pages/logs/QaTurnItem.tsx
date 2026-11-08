@@ -11,6 +11,7 @@
 import { Alert, Card, Descriptions, Divider, Flex, Space, Tag, Tooltip, Typography } from 'antd'
 import { FileSearchOutlined, WarningOutlined } from '@ant-design/icons'
 import { Link } from 'react-router-dom'
+import AnswerMarkdown from '@/components/AnswerMarkdown'
 import FigureThumb from '@/components/FigureThumb'
 import { formatMs, formatTime } from '@/utils/format'
 import { citationSourceOf, textOrDash, turnRefusedOf, type QaCitation, type QaTurn } from './qaLogHelpers'
@@ -154,9 +155,7 @@ export default function QaTurnItem({ turn }: QaTurnItemProps) {
         ) : null}
         <Descriptions.Item label="答案">
           {turn.answer ? (
-            <Typography.Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>
-              {turn.answer}
-            </Typography.Paragraph>
+            <AnswerMarkdown text={turn.answer} style={{ marginBottom: 0 }} />
           ) : (
             <Typography.Text type="secondary">该轮无答案文本（拒答或未生成）</Typography.Text>
           )}

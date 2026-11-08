@@ -35,9 +35,13 @@ export const getDocument = async (docId: number): Promise<DocumentItem> =>
 export const fetchDocumentSource = (docId: number) =>
   http.get(`/docs/documents/${docId}/source`, { responseType: 'blob' }) as Promise<Blob>
 
-/** Word / Excel / PPT / 文本原件转成的 HTML，嵌进对照左栏。 */
+/** Word / Excel / PPT / 文本原件转成的 HTML，嵌进对照左栏。
+ *  失败由对照页左栏展示，不弹全局 toast（大 PPT 超限等是预期可降级场景）。 */
 export const fetchDocumentSourcePreview = (docId: number) =>
-  http.get(`/docs/documents/${docId}/source-preview`, { responseType: 'text' }) as Promise<string>
+  http.get(`/docs/documents/${docId}/source-preview`, {
+    responseType: 'text',
+    skipErrorToast: true,
+  }) as Promise<string>
 
 export const updateDocument = (docId: number, body: Record<string, unknown>) =>
   http.put(`/docs/documents/${docId}`, body) as Promise<unknown>

@@ -107,6 +107,34 @@ def build_query_expand_llm(settings: Settings, secrets: Secrets) -> LLMProvider 
     return _build_compatible_llm(cfg, secrets, what="查询扩写")
 
 
+def build_query_rewrite_llm(settings: Settings, secrets: Secrets) -> LLMProvider | None:
+    """多轮上下文改写模型。未配 ``query_rewrite.model`` 时返回 None（调用方用回答 LLM）。
+
+    与回答模型解耦：改写更吃指令遵循，可单独换稍强/专用模型而不抬高整路问答成本。
+    """
+    raw = (settings.retrieval.model_extra or {}).get("query_rewrite") or {}
+    if not isinstance(raw, dict):
+        return None
+    model = str(raw.get("model") or "").strip()
+    if not model:
+        return None
+    parent = settings.models.llm
+    updates = {
+        "model": model,
+        "fallback": parent.fallback.model_copy(update={"provider": "", "model": ""}),
+    }
+    if raw.get("provider"):
+        updates["provider"] = str(raw["provider"]).strip()
+    if raw.get("base_url"):
+        updates["base_url"] = str(raw["base_url"]).strip()
+    if raw.get("timeout_s") is not None:
+        updates["timeout_s"] = int(raw["timeout_s"])
+    if raw.get("max_tokens") is not None:
+        updates["max_tokens"] = int(raw["max_tokens"])
+    cfg = parent.model_copy(update=updates)
+    return _build_compatible_llm(cfg, secrets, what="查询改写")
+
+
 def _build_compatible_llm(cfg, secrets: Secrets, *, what: str) -> LLMProvider:
     """按 `LLMCfg` 构造一个 OpenAI 兼容的对话模型（文本 LLM 与视觉模型共用）。
 

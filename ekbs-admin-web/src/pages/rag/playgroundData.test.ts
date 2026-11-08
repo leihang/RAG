@@ -69,6 +69,9 @@ const REAL_STAGES = {
   expand: {
     enabled: true,
     deduped: 1,
+    kept_leaf_ids: [35276, 35277, 35284, 35282],
+    represented_source_ids: [35277, 35284],
+    collapsed_kept_ids: [35282],
     expanded: [
       {
         context_chunk_id: 35274,
@@ -109,6 +112,7 @@ describe('parseStages 逐跳解析', () => {
     expect(stages.c5?.dropped).toEqual([7711])
     expect(stages.expand?.enabled).toBe(true)
     expect(stages.expand?.deduped).toBe(1)
+    expect(stages.expand?.collapsedKeptIds).toEqual([35282])
     expect(stages.expand?.expanded[0]).toEqual({
       context_chunk_id: 35274,
       source_chunk_id: 35277,
@@ -129,18 +133,29 @@ describe('parseStages 逐跳解析', () => {
     // 同一表容器的多个来源在扩展阶段已去重（deduped=1），只剩分数最高的来源
     expect(expand?.expanded[1].context_chunk_id).toBe(35281)
     expect(expand?.expanded[1].source_chunk_id).toBe(35284)
+    expect(expand?.keptLeafIds).toEqual([35276, 35277, 35284, 35282])
+    expect(expand?.collapsedKeptIds).toEqual([35282])
   })
 
   it('expand 为空列表也保留段落（后端明确说「没扩展」，与「没有这段」不同）', () => {
     const stages = parseStages({ expand: { enabled: false, deduped: 0, expanded: [] } })
     expect(stageSectionKeys(stages)).toContain('expand')
-    expect(stages.expand).toEqual({ enabled: false, deduped: 0, expanded: [] })
+    expect(stages.expand).toEqual({
+      enabled: false,
+      deduped: 0,
+      keptLeafIds: [],
+      representedSourceIds: [],
+      collapsedKeptIds: [],
+      expanded: [],
+    })
   })
 
   it('expand 行缺字段时局部为 null，不抛错', () => {
     const expand = parseStages({ expand: { expanded: [{ context_chunk_id: 35274 }] } }).expand
     expect(expand?.enabled).toBeNull()
     expect(expand?.deduped).toBeNull()
+    expect(expand?.keptLeafIds).toEqual([])
+    expect(expand?.collapsedKeptIds).toEqual([])
     expect(expand?.expanded[0]).toEqual({
       context_chunk_id: 35274,
       source_chunk_id: null,

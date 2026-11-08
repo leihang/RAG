@@ -302,7 +302,10 @@ def _strip_title_rows(matrix: list[list[str]]) -> tuple[list[str], list[list[str
     return titles, matrix
 
 
-_DATE_CELL_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+#: 表头账期：全日或月（归一后只保留 ``YYYY-MM``）
+_DATE_CELL_RE = re.compile(r"^\d{4}-\d{2}(?:-\d{2})?$")
+_FULL_DATE_CELL_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_MONTH_CELL_RE = re.compile(r"^(\d{4})-(\d{2})$")
 
 
 def _row_mostly_numeric(row: Sequence[str]) -> bool:
@@ -330,7 +333,7 @@ def _excel_serials_look_like_calendar(serials: list[int]) -> bool:
 
 
 def _row_looks_like_date_header(row: Sequence[str]) -> bool:
-    """日期子表头：已是 YYYY-MM-DD，或 General 序列号呈按月间隔。"""
+    """日期子表头：已是账期 ``YYYY-MM`` / ``YYYY-MM-DD``，或序列号呈按月间隔。"""
     cells = [str(c).strip() for c in row]
     dates = [c for c in cells if _DATE_CELL_RE.match(c)]
     if len(dates) >= 2:
@@ -340,17 +343,31 @@ def _row_looks_like_date_header(row: Sequence[str]) -> bool:
 
 
 def _coerce_date_cell(text: str) -> str:
+    """表头账期格子 → ``YYYY-MM``（月序列不要带日）。"""
     raw = str(text or "").strip()
-    if _DATE_CELL_RE.match(raw):
-        return raw
+    full = _FULL_DATE_CELL_RE.match(raw)
+    if full:
+        return f"{full.group(1)}-{full.group(2)}"
+    month = _MONTH_CELL_RE.match(raw)
+    if month:
+        return f"{month.group(1)}-{month.group(2)}"
     if _is_excel_date_serial_text(raw):
         try:
             from openpyxl.utils.datetime import from_excel
 
-            return from_excel(int(raw)).strftime("%Y-%m-%d")
+            return from_excel(int(raw)).strftime("%Y-%m")
         except Exception:
             return raw
     return ""
+
+
+def normalize_header_period(raw: str) -> str:
+    """列名后缀 / observation.period：``YYYY-MM-DD`` → ``YYYY-MM``，其余原样。"""
+    text = str(raw or "").strip()
+    full = _FULL_DATE_CELL_RE.match(text)
+    if full:
+        return f"{full.group(1)}-{full.group(2)}"
+    return text
 
 
 def _forward_fill_date_row(row: Sequence[str], width: int) -> list[str]:
@@ -375,7 +392,7 @@ def _forward_fill_date_row(row: Sequence[str], width: int) -> list[str]:
 
 
 def _apply_date_row_to_headers(headers: list[str], date_row: Sequence[str]) -> list[str]:
-    """字段名行 + 上方日期行 → ``上月起度/2024-01-01``。"""
+    """字段名行 + 上方日期行 → ``上月起度/2024-01``。"""
     filled = _forward_fill_date_row(date_row, len(headers))
     out: list[str] = []
     for i, header in enumerate(headers):
@@ -385,6 +402,56 @@ def _apply_date_row_to_headers(headers: list[str], date_row: Sequence[str]) -> l
         else:
             out.append(header)
     return out
+
+
+def _has_repeated_header_band(top: Sequence[str]) -> bool:
+    """顶行是否有连续相同标签（xlsx 横向合并填充后的典型形态）。"""
+    run = 1
+    for i in range(1, len(top)):
+        if top[i] and top[i] == top[i - 1]:
+            run += 1
+            if run >= 2:
+                return True
+        else:
+            run = 1
+    return False
+
+
+def _looks_like_field_name_row(values: Sequence[str]) -> bool:
+    """子行像字段名（短、少数字），不像「营运部 / 合格 / 2026-10-01」数据行。"""
+    if _row_mostly_numeric(values):
+        return False
+    filled = [str(c).strip() for c in values if str(c).strip()]
+    if len(filled) < 2:
+        return False
+    if sum(1 for c in filled if len(c) <= 20) < 2:
+        return False
+    digitish = sum(1 for c in filled if sum(ch.isdigit() for ch in c) >= 2)
+    return digitish < max(1, len(filled) // 2)
+
+
+def _can_merge_two_header_rows(top: Sequence[str], sub: Sequence[str]) -> bool:
+    """两行能否合成父子表头。
+
+    经典信号：顶行有空列、子行正好补上。
+    xlsx 横向合并填充后顶行往往**没有空列**（整段都是「项目（收入成本均含税）」），
+    但子行仍是「项目 / 取数账套 / 取数科目 / 项目明细」——也要合并，否则上级费用名
+    全部塌成同一个键，问答定位错列。须同时有「连续同文案带宽」+「子行像字段名」，
+    避免把首行数据误吃成子表头。
+    """
+    if not top or _row_mostly_numeric(sub):
+        return False
+    filled = [i for i, c in enumerate(sub) if c]
+    if any(not top[i] and sub[i] for i in filled):
+        return True
+    if not _has_repeated_header_band(top) or not _looks_like_field_name_row(sub):
+        return False
+    differ = sum(
+        1
+        for i, label in enumerate(sub)
+        if label and i < len(top) and top[i] and label != top[i]
+    )
+    return differ >= 2
 
 
 def _split_header_rows(
@@ -398,13 +465,7 @@ def _split_header_rows(
     width = max(len(top), len(sub))
     top += [""] * (width - len(top))
     sub += [""] * (width - len(sub))
-    # 仅当第一行有空列、第二行恰好补上这些列时，才认为是两行表头
-    filled = [i for i, c in enumerate(sub) if c]
-    if not top or not any(not top[i] and sub[i] for i in filled):
-        return [h or f"列{i+1}" for i, h in enumerate(top)], list(rows[1:])
-    # 气费账单事故：顶行 `"" | 起度 | 止度…`，下一行已是 `锅炉 | 379749 | …`。
-    # 空首列触发合并后「相关表头」变成读数。子行半数以上数字 → 当作数据，不合并。
-    if _row_mostly_numeric(sub):
+    if not _can_merge_two_header_rows(top, sub):
         return [h or f"列{i+1}" for i, h in enumerate(top)], list(rows[1:])
     headers: list[str] = []
     #: 上一列的主表头。横向合并（colspan）的从格在矩阵里是空串，若不继承，
@@ -426,17 +487,18 @@ def _resolve_headers_and_data(
     matrix: list[list[str]],
     *,
     header_row_count: int = 0,
-) -> tuple[bool, list[str], list[list[str]]]:
-    """确定 (form_like, headers, data_rows)。
+) -> tuple[bool, list[str], list[list[str]], str]:
+    """确定 (form_like, headers, data_rows, section)。
 
     ``header_row_count``：解析层写入的连续 ``<th>`` 行数（日期行+字段名行）。>0 时
     直接消费，不再 `_pick_header_index` 二次猜测。
+    ``section``：合并伪表头修复时回收的分节名（酒店/餐饮），否则空串。
     """
     form_like = _looks_like_form(matrix)
     if form_like:
         # 表单不伪造表头：保留所有行，列名用列序号，行内仍是原值（标签在值里）。
         headers = [f"列{i + 1}" for i in range(max(len(r) for r in matrix))]
-        return True, headers, matrix
+        return True, headers, matrix, ""
 
     date_rows: list[list[str]] = []
     if header_row_count > 0:
@@ -493,7 +555,64 @@ def _resolve_headers_and_data(
     if not data_rows:
         data_rows = [matrix[0]]
         headers = [f"列{i + 1}" for i in range(len(matrix[0]))]
-    return False, headers, data_rows
+    # 列名里若已带 ``/YYYY-MM-DD``（旧串/手工矩阵），收成 ``/YYYY-MM``
+    headers = [_normalize_dated_header_label(h) for h in headers]
+    headers, section = _repair_month_series_headers(headers, data_rows)
+    return False, headers, data_rows, section
+
+
+def _normalize_dated_header_label(header: str) -> str:
+    text = str(header or "")
+    if "/" not in text:
+        return text
+    # 单位里带斜杠（KW/h）时不能 split("/", 1)，只收尾部账期
+    match = re.search(r"(20\d{2}-\d{2})(?:-\d{2})?\s*$", text)
+    if match:
+        base = text[: match.start()].rstrip("/").strip() or text
+        return f"{base}/{normalize_header_period(match.group(1))}"
+    base, suffix = text.split("/", 1)
+    return f"{base}/{normalize_header_period(suffix)}"
+
+
+def _repair_month_series_headers(
+    headers: list[str], data_rows: list[list[str]]
+) -> tuple[list[str], str]:
+    """修复「整行合并表头」丢失月份名：15 列、后 12 列是数值时补 1月..12月。
+
+    实测「大户用电监视」：xlsx 合并表头把 15 个 <th> 都填成「酒店」，
+    序列化后变成 ``酒店=三期3幢…; 酒店=嘛嘛公寓; 酒店=2026年; 酒店=84445…``，
+    模型能看到数字却不知道哪一列是 1 月，于是回答“未提供 1—9 月数据”。
+
+    返回 ``(新表头, 分节名)``：分节名（酒店/餐饮…）写入题注供 ``类别=`` 熔叶，
+    身份列用铺号/用户名而非「字段1/字段2」。
+    """
+    width = len(headers)
+    if width < 13:
+        return headers, ""
+    labels = {str(h).strip() for h in headers if str(h).strip()}
+    if len(labels) > 1:
+        return headers, ""
+    section = next(iter(labels)) if labels else ""
+    # 后 12 列至少一半非空数字，才认定是月份序列；避免误伤其它重复表头表。
+    numeric_tail = 0
+    for row in data_rows:
+        tail = row[-12:]
+        numeric_tail += sum(1 for value in tail if _is_numeric_cell(value))
+    if numeric_tail < 6:
+        return headers, ""
+    prefix_count = width - 12
+    # 最后一列身份列若是年份（2024年/2025年/2026年），命名成“年度”。
+    year_like = 0
+    if prefix_count and data_rows:
+        year_like = sum(
+            1 for row in data_rows
+            if len(row) >= prefix_count and re.search(r"20\d{2}", str(row[prefix_count - 1]))
+        )
+    if prefix_count and year_like >= max(1, len(data_rows) // 2):
+        prefix = [*_identity_header_names(prefix_count - 1), "年度"]
+    else:
+        prefix = _identity_header_names(prefix_count)
+    return [*prefix, *[f"{month}月" for month in range(1, 13)]], section
 
 
 def _drop_empty_columns(
@@ -993,10 +1112,14 @@ def _prepare_information_blocks(
         base = caption.strip()
         caption = f"{base}（{title_text}）" if base else title_text
     # 剥掉标题行后，显式 th 计数要扣掉已剥行数（标题常被标成合并单元格 td，一般是 0）。
-    form_like, headers, data_rows = _resolve_headers_and_data(
+    form_like, headers, data_rows, section = _resolve_headers_and_data(
         matrix, header_row_count=header_row_count
     )
     headers, data_rows = _drop_empty_columns(headers, data_rows)
+    # 合并伪表头「酒店|酒店|…」修好后，把分节名写回题注，熔叶才能带 ``类别=酒店``。
+    if section and section not in (caption or ""):
+        base = (caption or "").strip()
+        caption = f"{base}（/ {section}）" if base else section
     preamble = _build_preamble(caption, table_id, headers, form_like)
     return caption, preamble, form_like, headers, data_rows
 

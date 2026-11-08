@@ -346,6 +346,6 @@ async def test_metadata_scan_answers_unnamed_year_query(seeded) -> None:
 def test_prompt_forbids_model_calculation() -> None:
     from ekbs.retrieval.pipeline import SYSTEM_PROMPT
 
-    assert "不得自行计算或汇总" in SYSTEM_PROMPT
-    assert "不要累加月份" in SYSTEM_PROMPT
-    assert "不要用年度合计代替部分期间" in SYSTEM_PROMPT
+    assert "禁止任何计算" in SYSTEM_PROMPT
+    assert "不要相加" in SYSTEM_PROMPT or "不要汇总" in SYSTEM_PROMPT
+    assert "资料未直接提供该合计" in SYSTEM_PROMPT

@@ -44,6 +44,7 @@ import type {
   ImportPreviewItem,
   ImportRunResp,
   ImportScanResp,
+  RawTopDir,
 } from '@/api/types'
 import { formatBytes } from '@/utils/format'
 import { buildKbTargetTree, isPersonalCode, parseKbTarget, personalOwnerId, rawRootForKb } from '@/components/kbTargetTree'
@@ -82,6 +83,7 @@ export default function ImportDirs() {
   const [meta, setMeta] = useState<ImportMeta | null>(null)
   const [kbs, setKbs] = useState<ImportKbItem[]>([])
   const [kbLevels, setKbLevels] = useState<Record<number, number>>({})
+  const [orphanRawDirs, setOrphanRawDirs] = useState<RawTopDir[]>([])
   const [metaLoading, setMetaLoading] = useState(true)
   const [metaError, setMetaError] = useState<string | null>(null)
 
@@ -129,6 +131,9 @@ export default function ImportDirs() {
         setFolderLevel(null)
       }
     } catch (err) {
+      // 知识库刚建好、raw 下还没有同名目录时：落到空列表并显示当前目标路径，避免卡在上一次目录
+      setCwd(rel)
+      setParentRel(rel.includes('/') ? rel.split('/').slice(0, -1).join('/') : (rel ? '' : null))
       setDirs([])
       setFolderLevel(null)
       setDirsError(describeImportError(err))
@@ -189,10 +194,6 @@ export default function ImportDirs() {
   }
 
   useEffect(() => {
-    void enterDir('')
-  }, [enterDir])
-
-  useEffect(() => {
     let alive = true
     void Promise.all([
       getImportMeta(),
@@ -202,7 +203,7 @@ export default function ImportDirs() {
       // 绝不把导入卡在这一个字段上（原则 P3：权威判定始终在后端）。
       listKnowledgeBases().catch(() => null),
     ])
-      .then(([m, kbResp]) => {
+      .then(async ([m, kbResp]) => {
         if (!alive) return
         const levels: Record<number, number> = {}
         for (const k of kbResp?.items ?? []) levels[k.kb_id] = Number(k.default_level)
@@ -210,6 +211,7 @@ export default function ImportDirs() {
         setKbLevels(levels)
         const list = m.knowledge_bases ?? []
         setKbs(list)
+        setOrphanRawDirs((m.raw_top_dirs ?? []).filter((row) => row.orphan))
         const first = list[0]
         if (first != null) {
           setKbId(first.kb_id)
@@ -221,6 +223,10 @@ export default function ImportDirs() {
           } else {
             setLevel(pickLevel(first.default_level, levels[first.kb_id]))
           }
+          // 进入该库在 raw 下的根目录，使目录浏览与目标库一致
+          await enterDir(rawRootForKb(first.code))
+        } else {
+          await enterDir('')
         }
       })
       .catch((err) => {
@@ -232,7 +238,7 @@ export default function ImportDirs() {
     return () => {
       alive = false
     }
-  }, [])
+  }, [enterDir])
 
   const doScan = async () => {
     setScanning(true)
@@ -408,6 +414,22 @@ export default function ImportDirs() {
         <Alert type="error" showIcon message="导入配置加载失败" description={metaError} />
       ) : null}
 
+      {orphanRawDirs.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="raw 中有未登记知识库的顶层目录"
+          description={
+            <span>
+              下列目录在磁盘上，但没有同名知识库 code，上传页目标树不会挂它们的子文件夹：
+              {' '}
+              {orphanRawDirs.map((row) => row.rel_path).join('、')}
+              。可在本页直接进入浏览/导入，或到上传页「登记为知识库」。
+            </span>
+          }
+        />
+      ) : null}
+
       <Card title="1. 目标与范围">
         <Space size={24} wrap align="start">
           <div>
@@ -417,11 +439,11 @@ export default function ImportDirs() {
               value={kbId == null ? undefined : `kb:${kbId}`}
               loading={metaLoading}
               treeData={buildKbTargetTree(kbs, {}, personalOwnerText)}
-              treeDefaultExpandAll={false}
+              treeDefaultExpandAll
               treeNodeFilterProp="title"
               showSearch
               styles={{ popup: { root: { maxHeight: 360, overflow: 'auto' } } }}
-              placeholder={metaLoading ? '正在加载知识库…' : kbs.length ? '展开后选择知识库' : '还没有知识库，先去上传页新建'}
+              placeholder={metaLoading ? '正在加载知识库…' : kbs.length ? '选择知识库' : '还没有知识库，先去上传页新建'}
               onChange={(raw) => {
                 const parsed = parseKbTarget(raw == null ? undefined : String(raw))
                 const id = parsed?.kbId
@@ -438,6 +460,8 @@ export default function ImportDirs() {
                   setViewerUserIds([])
                 }
                 setRunResp(null)
+                // 切换目标库时同步进入该库的 raw 根，浏览目录与库内一致
+                if (next?.code) void enterDir(rawRootForKb(next.code))
               }}
             />
           </div>

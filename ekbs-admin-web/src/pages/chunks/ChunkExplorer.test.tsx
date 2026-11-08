@@ -8,13 +8,16 @@
  */
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const api = vi.hoisted(() => ({ getChunkTree: vi.fn() }))
+const api = vi.hoisted(() => ({
+  getChunkTree: vi.fn(),
+  getChunk: vi.fn(),
+}))
 
 vi.mock('@/api/parse', () => ({
   getChunkTree: api.getChunkTree,
-  getChunk: vi.fn(),
+  getChunk: (chunkId: number) => api.getChunk(chunkId),
   updateChunk: vi.fn(),
   splitChunk: vi.fn(),
   mergeChunk: vi.fn(),
@@ -32,6 +35,26 @@ function mount() {
     </MemoryRouter>,
   )
 }
+
+function findInTree(nodes: unknown[] | undefined, chunkId: number): Record<string, unknown> | null {
+  for (const raw of nodes ?? []) {
+    const node = raw as { chunk_id?: number; children?: unknown[] }
+    if (node.chunk_id === chunkId) return node as Record<string, unknown>
+    const hit = findInTree(node.children, chunkId)
+    if (hit) return hit
+  }
+  return null
+}
+
+beforeEach(() => {
+  api.getChunk.mockImplementation(async (chunkId: number) => {
+    const results = api.getChunkTree.mock.results
+    const last = results.length ? results[results.length - 1]?.value : undefined
+    const data = last instanceof Promise ? await last : last
+    const node = findInTree(data?.tree, chunkId) ?? { chunk_id: chunkId }
+    return { chunk: { ...node, content: String(node.content ?? `全文#${chunkId}`) } }
+  })
+})
 
 describe('分块预览的向量标签', () => {
   it('父块（有子块、faiss_row 为空）显示「上下文块」，不是「未入向量」', async () => {
@@ -109,7 +132,7 @@ describe('分块预览的向量标签', () => {
     })
 
     mount()
-    await waitFor(() => expect(screen.getByText('分块（3）')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/分块（可见 3/)).toBeInTheDocument())
     expect(screen.getAllByText(/子块A内容/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/子块B内容/).length).toBeGreaterThan(0)
   })
@@ -243,9 +266,11 @@ describe('分块全文对比', () => {
     mount()
     await waitFor(() => expect(screen.getAllByText('第一段完整内容').length).toBeGreaterThan(0))
     fireEvent.click(screen.getByText('加入对比'))
+    await waitFor(() => expect(screen.getByRole('button', { name: /对比已选（1\/2）/ })).toBeInTheDocument())
     fireEvent.click(screen.getByText(/#32/))
+    await waitFor(() => expect(screen.getByText('加入对比')).toBeInTheDocument())
     fireEvent.click(screen.getByText('加入对比'))
-    const button = screen.getByRole('button', { name: /对比已选（2\/2）/ })
+    const button = await screen.findByRole('button', { name: /对比已选（2\/2）/ })
     expect(button).toBeEnabled()
     fireEvent.click(button)
     expect(await screen.findByText('分块对比（全文）')).toBeInTheDocument()

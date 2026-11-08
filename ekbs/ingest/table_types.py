@@ -27,8 +27,14 @@ _AMOUNT_HEADER_RE = re.compile(
 _LEDGER_KEY_RE = re.compile(
     r"(合同号|合同编号|资产编号|流水号|单号|工单号|设备编号|资产号)"
 )
-_ACCOUNT_HEADER_RE = re.compile(r"(户号|户名|账号|客户号|水卡|用户编号|表号)")
-_PERIOD_COL_RE = re.compile(r"(月份|账期|期间|年月|所属期|抄表月)")
+_ACCOUNT_HEADER_RE = re.compile(
+    r"(户号|户名|账号|客户号|水卡|用户编号|表号|费用承担对象|承担对象)"
+)
+_PERIOD_COL_RE = re.compile(r"(月份|账期|期间|年月|所属期|抄表月|抄表日期)")
+#: 户内抄表明细：按名取列，列数常 >15；不得因列宽被踢出收费明细。
+_METER_BEARER_RE = re.compile(r"(费用承担对象|承担对象)")
+_METER_USAGE_RE = re.compile(r"(合计用量|用量)")
+_METER_PRICE_RE = re.compile(r"(单价)")
 _FINANCIAL_CAPTION_RE = re.compile(
     r"(利润表|资产负债表|损益表|现金流量表|财报|财务报表|科目余额)"
 )
@@ -167,11 +173,25 @@ def _looks_financial(
     return total_hits >= 1 and period_cols >= 1
 
 
+def _looks_meter_reading(headers: Sequence[str]) -> bool:
+    """户内/能源抄表明细：费用承担对象 + 合计用量 + 单价（按名映射，允许宽表）。"""
+    texts = [str(h) for h in headers]
+    has_bearer = any(_METER_BEARER_RE.search(h) for h in texts)
+    has_usage = any(_METER_USAGE_RE.search(h) for h in texts)
+    has_price = any(_METER_PRICE_RE.search(h) for h in texts)
+    return has_bearer and has_usage and has_price
+
+
 def _looks_fee_detail(
     headers: Sequence[str],
     data_rows: Sequence[Sequence[str]],
 ) -> bool:
-    """收费明细：少列 + 金额/用量；有户号类列时行数门槛更低。"""
+    """收费明细：少列 + 金额/用量；有户号类列时行数门槛更低。
+
+    户内抄表明细列数常 17+，用签名列识别，**不**走 ``n_cols > 15`` 上限。
+    """
+    if _looks_meter_reading(headers):
+        return len(data_rows) >= 1
     n_rows, n_cols = len(data_rows), len(headers)
     if n_rows < 3 or n_cols > 15 or n_cols < 3:
         return False

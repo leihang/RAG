@@ -15,7 +15,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
+# Word/Excel/文本：整份转 HTML，过大则页面放不下。
 _MAX_BYTES = 30 * 1024 * 1024
+# PPT 预览只抽幻灯片文字（不嵌底图），工程汇报类原件常 40–70MB，单独放宽。
+_MAX_SLIDE_BYTES = 80 * 1024 * 1024
 
 _WORD = {".doc", ".docx", ".rtf", ".odt"}
 _SHEET = {".xls", ".xlsx"}
@@ -51,8 +54,10 @@ def render_office_preview(path: Path) -> str:
         size = path.stat().st_size
     except OSError as exc:
         raise OfficePreviewError("原件无法读取") from exc
-    if size > _MAX_BYTES:
-        raise OfficePreviewError("原件超过 30MB，页面里放不下")
+    limit = _MAX_SLIDE_BYTES if suffix in _SLIDE else _MAX_BYTES
+    if size > limit:
+        limit_mb = limit // (1024 * 1024)
+        raise OfficePreviewError(f"原件超过 {limit_mb}MB，页面里放不下")
 
     if suffix in _WORD:
         body = _word_html(path)

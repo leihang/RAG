@@ -151,6 +151,18 @@ class RetrievalCfg(_Section):
     #: 多意图拆分（P0）：多子问输入时每子问独立召回 + 配额精排
     intent_split: IntentSplitCfg = Field(default_factory=IntentSplitCfg)
     parent_expand: bool = True
+    #: 正文父（``chunk_type=parent``）下挂的 ``table`` 叶子如何进 prompt。
+    #:
+    #: Word/PDF 抽出的表常挂在正文父下，表块自带周围段落；若 child 已扩成父块再
+    #: 加上表叶，会把同一段话送两遍（中央空调方案实测：父 761 字 + 三表叶重复叙事）。
+    #:
+    #: * ``parent_only``：表叶也升到正文父（只送父；表内独有明细若父文只有
+    #:   ``[表格 N]`` 锚点会丢，需靠父文已写摘要或改 ``leaf_only``）
+    #: * ``leaf_only``：只留表叶（不升父；适合父文只有锚点、数字全在表里）
+    #: * ``both``：父 + 表叶都留（旧行为，重复最多）
+    #:
+    #: 超限表分段（父也是 ``table``）不受此键影响，仍为「叶子 + 直系父段」。
+    prose_table_mode: str = "parent_only"
     cache: RetrievalCacheCfg = Field(default_factory=RetrievalCacheCfg)
     #: 融合策略：``rrf``（默认，只用名次）| ``alpha``（α·向量 + (1-α)·稀疏，课程 18）
     fusion: str = "rrf"
@@ -236,7 +248,7 @@ class LLMCfg(_Section):
     version: str | None = None
     temperature: float = 0.1
     top_p: float = 0.8
-    max_tokens: int = 2048
+    max_tokens: int = 8192
     #: 思考强度（DeepSeek V4.1 等支持）：空=不发送；none=关闭思考，降低首 token 延迟。
     #: 只对主模型/fallback 生效，不污染取数/视觉；DashScope 兼容端点按需透传。
     reasoning_effort: str = ""

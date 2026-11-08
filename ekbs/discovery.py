@@ -257,6 +257,20 @@ _PERSONAL_MANAGE_COMMANDS = frozenset(
 _SEND_SOURCE_COMMANDS = frozenset(
     {"发原文", "我要原文", "怎么发原文", "发原文件", "原文怎么发"}
 )
+#: 上一轮因上限未发完的图片：用户主动要剩余原图
+_SEND_ALL_FIGURES_COMMANDS = frozenset(
+    {
+        "发全图",
+        "全部图片",
+        "发全部图片",
+        "剩下的图片",
+        "剩余图片",
+        "补发图片",
+        "补发图",
+        "继续发图",
+        "发剩余图片",
+    }
+)
 
 
 def _compact_command(text: str) -> str:
@@ -277,6 +291,10 @@ def is_personal_manage_command(text: str) -> bool:
 
 def is_send_source_command(text: str) -> bool:
     return _compact_command(text) in _SEND_SOURCE_COMMANDS
+
+
+def is_send_all_figures_command(text: str) -> bool:
+    return _compact_command(text) in _SEND_ALL_FIGURES_COMMANDS
 
 
 def friendly_title(title: str | None) -> str:
@@ -812,13 +830,13 @@ def format_help_text_short(
     *,
     group_chat: bool = False,
 ) -> str:
-    """P0 帮助：唯一入口；只给四个命令 + 一个直接提问示例。"""
+    """P0 帮助：唯一入口；版式对齐问答回复（小节标题 + 有序列表）。"""
     lines = [
-        "可用命令（直接发送中文命令）：",
-        "· 查询权限",
-        "· 问答示例 — 按你的权限生成示例问答",
-        "· 管理个人私有文件（仅单聊：直接发文件入库；删除说「删除我的文件 标题」）",
-        "· 发原文（直接说：发我《跑水预案》）",
+        "直接发送文字：",
+        "1. 查询权限",
+        "2. 问答示例 — 按你的权限生成示例问答",
+        "3. 管理个人私有文件（仅单聊：直接发文件入库；删除说「删除我的文件 标题」）",
+        "4. 发原文（直接说：发我工程部10月工作汇报ppt原件）",
         "",
         "也可以直接提问，例如：跑水事件环境部先做什么？",
     ]
@@ -869,7 +887,7 @@ def format_private_manage_text() -> str:
 
 
 def format_send_source_text() -> str:
-    return "直接说：发我《跑水预案》"
+    return "直接说：发我工程部10月工作汇报ppt原件"
 
 
 def format_document_list_text(documents: list[dict[str, Any]]) -> str:

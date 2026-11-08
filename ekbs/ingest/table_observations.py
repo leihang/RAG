@@ -26,6 +26,7 @@ from ekbs.ingest.table_serialize import (
     _prepare_information_blocks,
     coerce_rows_with_headers,
     detect_month_series_layout,
+    normalize_header_period,
 )
 from ekbs.ingest.table_types import TableType
 from ekbs.logging import get_logger
@@ -37,6 +38,25 @@ _PERIOD_HEADER_RE = re.compile(
     r"同比|环比|增减|变动|"
     r"20\d{2}\s*年|(?:1[0-2]|[1-9])\s*月)"
 )
+#: 宽表头 ``用量(KW/h)/2026-02``：不能 ``split("/", 1)``——会在 ``KW/h`` 的斜杠处截断，
+#: 把 period 写成 ``h)/2026-02``（doc 235 熙丰用电差异行实测）。
+_HEADER_PERIOD_RE = re.compile(r"(20\d{2}-\d{2})(?:-\d{2})?\s*$")
+
+
+def _period_from_metric_header(header: str) -> str:
+    """从表头取出账期 ``YYYY-MM``（容忍 ``用量(KW/h)/2026-02`` 这类内含斜杠的单位）。"""
+    text = str(header or "").strip()
+    match = _HEADER_PERIOD_RE.search(text)
+    if not match:
+        return ""
+    return normalize_header_period(match.group(1))
+
+
+def _metric_name_from_header(header: str, hint: str) -> str:
+    """表头去掉账期后缀后的指标名；``用量(KW/h)/2026-02`` → ``用量(KW/h)``。"""
+    text = str(header or "").strip()
+    text = _HEADER_PERIOD_RE.sub("", text).rstrip("/").strip()
+    return text or hint
 
 
 @dataclass(frozen=True)
@@ -330,6 +350,167 @@ def _melt_month_layout(
     return out
 
 
+def _parse_usage_cell(raw: str) -> float:
+    """合计用量：退铺/空 → 0；禁止因非数值静默丢行。"""
+    text = (raw or "").strip()
+    if not text or text in {"退铺", "-", "—", "None", "null"}:
+        return 0.0
+    # 千分位逗号可剥；``0.04,0.77`` 不是用量（落在单价列）
+    if re.fullmatch(r"-?\d{1,3}(,\d{3})+(\.\d+)?", text):
+        text = text.replace(",", "")
+    elif "," in text or "，" in text:
+        return 0.0
+    number = _parse_metric_number(text)
+    return float(number) if number is not None else 0.0
+
+
+def _parse_price_cells(raw: str) -> list[float]:
+    """单价：支持 ``0.04,0.77`` 一格两价；``float`` 直接抛错的坑在这里消化。"""
+    text = (raw or "").strip()
+    if not text:
+        return []
+    parts = re.split(r"[,，/;；]+", text) if re.search(r"[,，/;；]", text) else [text]
+    out: list[float] = []
+    for part in parts:
+        number = _parse_metric_number(part.strip())
+        if number is not None:
+            out.append(float(number))
+    return out
+
+
+def _classify_utility_kind(meter_name: str, prices: Sequence[float]) -> str | None:
+    """电/水分类：单价数值特征优先，表名关键词仅作补充。
+
+    生产踩坑：只认表名含「电表/充电」会漏掉「总表/空调/专配/纯编号」等电表
+    （实测 345 条、约 40.6 万度；嘛嘛公寓总表 58678 度即此盲区）。
+    全表单价簇里 ``< 1.5`` 的均为电价（0.84/0.53/0.77/…），``≥ 1.5`` 为水价
+    （3.5/4.55/5.2）。
+    """
+    meter = meter_name or ""
+    if any(k in meter for k in ("水表", "用水", "消防水", "绿化水")):
+        return "water"
+    if prices and any(p < 1.5 for p in prices):
+        return "electric"
+    if prices and all(p >= 1.5 for p in prices):
+        return "water"
+    if any(k in meter for k in ("电表", "充电", "用电", "电度")):
+        return "electric"
+    # 总表/空调/专配/纯编号：无单价时不敢妄断
+    return None
+
+
+def _period_from_meter_date(raw: str) -> str:
+    """抄表日期 → 账期 ``YYYY-MM``。
+
+    月初抄表（日≤5）用量归属上月，便于与「大户用电监视」9 月列对账
+    （``2026-10-01`` → ``2026-09``）。
+    """
+    text = (raw or "").strip().replace("/", "-")
+    match = re.match(r"(20\d{2})-(\d{1,2})-(\d{1,2})", text)
+    if not match:
+        match = re.match(r"(20\d{2})-(\d{1,2})$", text)
+        if match:
+            return f"{match.group(1)}-{int(match.group(2)):02d}"
+        return text[:7] if text else ""
+    year, month, day = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    if day <= 5:
+        if month == 1:
+            year, month = year - 1, 12
+        else:
+            month -= 1
+    return f"{year}-{month:02d}"
+
+
+def _observations_meter_reading(
+    *,
+    caption: str,
+    table_id: str,
+    headers: list[str],
+    data_rows: list[list[str]],
+) -> list[TableObservation]:
+    """户内抄表明细：按名取列 → 清洗 → 电/水分类 → 按费用承担对象写用量观测。"""
+    from ekbs.ingest.table_types import _looks_meter_reading
+
+    if not _looks_meter_reading(headers):
+        return []
+    bearer_col = _find_col(headers, ("费用承担对象", "承担对象"))
+    usage_col = _find_col(headers, ("合计用量", "用量"))
+    price_col = _find_col(headers, ("单价（元）", "单价(元）", "单价"))
+    meter_col = _find_col(headers, ("表计名称", "表名", "表计编号"))
+    date_col = _find_col(headers, ("抄表日期", "抄表月", "账期"))
+    amount_col = _find_col(headers, ("金额（元）", "金额(元)", "金额"))
+    if bearer_col is None or usage_col is None:
+        return []
+
+    out: list[TableObservation] = []
+    for row_idx, row in enumerate(data_rows):
+        def cell(idx: int | None) -> str:
+            if idx is None or idx >= len(row):
+                return ""
+            return str(row[idx]).strip()
+
+        bearer = cell(bearer_col)
+        usage_raw = cell(usage_col)
+        price_raw = cell(price_col)
+        meter = cell(meter_col)
+        # 关键字段全空 → 跳过
+        if not bearer and not usage_raw and not meter:
+            continue
+        if not bearer:
+            continue
+        prices = _parse_price_cells(price_raw)
+        kind = _classify_utility_kind(meter, prices)
+        if kind is None:
+            continue
+        usage = _parse_usage_cell(usage_raw)
+        period = _period_from_meter_date(cell(date_col))
+        metric = "用电量" if kind == "electric" else "用水量"
+        attrs = {
+            str(headers[i]): str(row[i]).strip() if i < len(row) else ""
+            for i in range(len(headers))
+        }
+        attrs["caption"] = caption
+        attrs["utility_kind"] = kind
+        if prices:
+            attrs["unit_price"] = ",".join(str(p) for p in prices)
+        out.append(
+            TableObservation(
+                table_id=table_id,
+                table_type="B",
+                entity_key=bearer,
+                entity_label=bearer,
+                period=period,
+                metric=metric,
+                value=usage,
+                value_surface=usage_raw or str(usage),
+                attrs_json=_attrs_json(attrs),
+                source_row=row_idx,
+            )
+        )
+        amount_raw = cell(amount_col)
+        if amount_raw:
+            amount = _parse_metric_number(amount_raw.replace(",", ""))
+            if amount is None and prices:
+                # 双价格无法稳乘；有现成金额列才写
+                amount = _parse_metric_number(amount_raw)
+            if amount is not None:
+                out.append(
+                    TableObservation(
+                        table_id=table_id,
+                        table_type="B",
+                        entity_key=bearer,
+                        entity_label=bearer,
+                        period=period,
+                        metric="电费" if kind == "electric" else "水费",
+                        value=float(amount),
+                        value_surface=amount_raw,
+                        attrs_json=_attrs_json(attrs),
+                        source_row=row_idx,
+                    )
+                )
+    return out
+
+
 def _observations_fee_detail(
     *,
     caption: str,
@@ -337,18 +518,36 @@ def _observations_fee_detail(
     headers: list[str],
     data_rows: list[list[str]],
 ) -> list[TableObservation]:
+    from ekbs.ingest.table_types import _looks_meter_reading
+
+    if _looks_meter_reading(headers):
+        return _observations_meter_reading(
+            caption=caption, table_id=table_id, headers=headers, data_rows=data_rows
+        )
     account_col = _find_col(
-        headers, ("户号", "户名", "账号", "客户号", "水卡", "用户编号", "表号", "用户")
+        headers,
+        (
+            "费用承担对象",
+            "承担对象",
+            "户号",
+            "户名",
+            "账号",
+            "客户号",
+            "水卡",
+            "用户编号",
+            "表号",
+            "用户",
+        ),
     )
     # 「金额」必须先于「费用」，避免命中「费用项」列
     amount_col = _find_col(
         headers, ("金额", "实收", "欠费", "电费", "水费", "气费", "费用")
     )
     period_col = _find_col(
-        headers, ("月份", "账期", "期间", "年月", "所属期", "抄表月")
+        headers, ("月份", "账期", "期间", "年月", "所属期", "抄表月", "抄表日期")
     )
     fee_item_col = _find_col(headers, ("费用项", "费项", "费用名称", "项目", "科目"))
-    usage_col = _find_col(headers, ("用量", "数量", "度数"))
+    usage_col = _find_col(headers, ("合计用量", "用量", "数量", "度数"))
 
     out: list[TableObservation] = []
     for row_idx, row in enumerate(data_rows):
@@ -358,7 +557,7 @@ def _observations_fee_detail(
             return str(row[idx]).strip()
 
         account = cell(account_col) or cell(0)
-        period = cell(period_col)
+        period = normalize_header_period(cell(period_col))
         fee_item = cell(fee_item_col) or (caption.strip() or "金额")
         amount_raw = cell(amount_col) if amount_col is not None else ""
         usage_raw = cell(usage_col) if usage_col is not None else ""
@@ -568,17 +767,16 @@ def _observations_wide_bill(
     for slice_headers, slice_rows in _iter_metric_group_slices(headers, data_rows):
         period = ""
         for h in slice_headers[id_n:]:
-            if "/" in str(h):
-                period = str(h).split("/", 1)[-1].strip()
-                if period:
-                    break
+            period = _period_from_metric_header(str(h))
+            if period:
+                break
         # 一组内可写多指标（金额、用量…），避免问答只能命中其中一个
         metric_cols: list[tuple[int, str]] = []
         for hint in ("金额", "费用", "实收", "用量", "数量", "单价"):
             col = _find_col(slice_headers, (hint,))
             if col is None or col < id_n:
                 continue
-            name = str(slice_headers[col]).split("/", 1)[0].strip() or hint
+            name = _metric_name_from_header(str(slice_headers[col]), hint)
             if any(c == col for c, _ in metric_cols):
                 continue
             metric_cols.append((col, name))

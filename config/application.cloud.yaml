@@ -65,11 +65,16 @@ retrieval:
     #   经查是**精排对『只有小节标题』的证据打分偏低**，不是召回缺口（该块稠密命中、RRF 第 3、
     #   精排第 2）—— 见 README §四 第 74 条。
     #   复现：python -m ekbs.tools.eval_switch_sweep（输出含负例分布）
-    min_score: 0.65
+    # 2026-11-08 用户下调至 0.60：放行 PPT 短标题类证据（如「化粪池月度检查」top≈0.642）。
+    # ⚠️ 会重新暴露校准里那条负例漏放风险（max 0.608）；接受误答率换误拒率。
+    min_score: 0.60
     # 多子问（P2）配额：每子问保底块数 / 多子问最终 keep 上限
     per_question_min: 1
     keep_cap: 15
   parent_expand: true
+  # 正文父下挂的 table：parent_only=只送父（默认，避免父+表叶叙事重复）；
+  # leaf_only=只送表叶；both=旧行为（父+表叶都留）。超限表分段不受影响。
+  prose_table_mode: parent_only
   # 融合：rrf | alpha（α·向量+(1-α)·BM25，课程 18 可调）
   #
   # 2026-10-02 用 16 份真实语料 + 两套金标题集实测（含"同义改写集"——原题集 top 分中位 0.980 已饱和，
@@ -84,7 +89,7 @@ retrieval:
   # 作为"精确编号/金额"类查询的保险（原题集里那些编号/金额题在 1.0 下也只是持平，无证据有害）。
   # ⚠️ 语料仅 16 份，扩语料后应按同一套题复测（python -m ekbs.tools.eval_switch_sweep）。
   fusion: alpha
-  hybrid_alpha: 0.75  # α=稠密权重；关键词/BM25 权重=1-α=25%（原 15%）
+  hybrid_alpha: 0.70  # α=稠密权重；关键词/BM25 权重=1-α=30%（原 25%）
   # **仅电子表格**（xlsx/xls/xlsm，一行=一条记录）：表格一行一个块、表头每块重复
   # （RAGFlow spreadsheet 口径）。Word/PDF/PPT 的表行不是记录，一律按 384 token
   # 行组叶子切（避免 55~115 token 的碎块，实测 doc 205）；来源判定在 ingest/chunker.py。
@@ -109,12 +114,12 @@ retrieval:
     strategy: rules
     max_questions: 5
   # 查询改写（00 §2.1 的第一步，多轮对话时启用）；策略：off | heuristic | llm
-  # heuristic：含指代 / 追问展开用语（详细、继续…）/ 过短时并入上一轮问题
-  # llm：用云端模型按模板改写成自包含查询
+  # llm：按模板改写成自包含查询；失败/校验拒绝时原文进检索（校验拒绝可回退启发式合并）。
+  # model：可选，与回答 LLM 解耦；不配则共用 models.llm。
   # expand_*：检索前用快速模型把这一句再写成 2 个角度，关键词和向量共用。
-  # 失败则退回规则变体。不使用回答模型 qwen-max。
   query_rewrite:
-    strategy: heuristic
+    strategy: llm
+    # model: qwen-plus   # 可选：单独指定改写模型
     expand_model: qwen-turbo
     expand_timeout_s: 8
     expand_max_tokens: 64
@@ -161,10 +166,11 @@ models:
     reasoning_effort: none
     temperature: 0.1
     top_p: 0.8
-    max_tokens: 2048
-    # 输入上限：模型窗口 30,720，本地 Qwen 计数 × 最坏偏差 1.19 ⇒ 取 20,000
-    # （云端约 23.8k，留 ~23% 余量）。超预算时的裁剪优先级：最旧轮次 → 排名最低的块 → 截断。
-    max_input_tokens: 20000
+    # 2048 偏紧：预算明细/多表对照答案易被 length 截断；DeepSeek 输出上限远高于此。
+    max_tokens: 8192
+    # 输入上限：deepseek-v4.1-flash 窗口约 1M；取 20 万，给输出/偏差留余量。
+    # 超预算裁剪：最旧轮次 → 排名最低的块 → 截断最后一块。
+    max_input_tokens: 200000
     timeout_s: 120
     max_retries: 2
     fallback:              # 主模型不可用时启用（00 §2.3）；开发环境无 fallback
@@ -263,6 +269,8 @@ qa:
   # 统一策略：auto 一律 prose（与管理台默认一致）；取数模式只由显式 mode=numeric 触发。
   # 避免同一个问题在钉钉/管理台因为意图分类不同而回答形态不一致。
   auto_numeric: false
+  # 发布后自动 LLM 生成 + rerank 验证代表问句（tier-3）；免复核的电子表格也依赖此开关
+  auto_doc_recommend: true
 
 # ---------- 上传行为（05 §6.5）----------
 upload:

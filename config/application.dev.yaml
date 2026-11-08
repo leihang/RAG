@@ -44,6 +44,7 @@ retrieval:
     per_question_min: 1
     keep_cap: 15
   parent_expand: true
+  prose_table_mode: parent_only
   # 与生产一致（README §七：dev 与生产的检索参数逐字一致，只差 provider）。
   # 选 alpha/0.85 的实测依据见 config/application.cloud.yaml 同字段注释（README §四 第 75 条）。
   fusion: alpha
@@ -101,10 +102,9 @@ models:
     model: mock-llm-v1
     temperature: 0.1
     top_p: 0.8
-    max_tokens: 2048
-    # 输入上限：模型窗口 30,720，本地 Qwen 计数 × 最坏偏差 1.19 ⇒ 取 20,000
-    # （云端约 23.8k，留 ~23% 余量）。超预算时的裁剪优先级：最旧轮次 → 排名最低的块 → 截断。
-    max_input_tokens: 20000
+    max_tokens: 8192
+    # 与 cloud 对齐：20 万（mock 不计费；真实路径同 deepseek 窗口余量策略）
+    max_input_tokens: 200000
     timeout_s: 120
     max_retries: 2
     fallback:              # 主模型不可用时启用（00 §2.3）；开发环境无 fallback
@@ -184,6 +184,7 @@ session:
 
 qa:
   auto_numeric: true
+  auto_doc_recommend: true
 
 # ---------- 上传行为（05 §6.5）----------
 upload:

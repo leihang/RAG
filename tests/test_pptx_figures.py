@@ -313,3 +313,56 @@ def test_small_images_do_not_consume_ocr_budget(sample_pptx: Path, tmp_path: Pat
 
     assert len(calls) == 2, calls
     assert any(f.ocr_text for f in parsed.figures), "跳过的小图不该吃掉预算"
+
+
+def test_pptx_strips_repeated_logo_and_keeps_unique_content(tmp_path: Path) -> None:
+    """跨页重复的小 logo / 装饰底图不进 figures；每页独有的内容图保留。"""
+    from pptx.util import Inches
+
+    pptx = pytest.importorskip("pptx")
+    logo = tmp_path / "logo.png"
+    decor = tmp_path / "decor.png"
+    asset = tmp_path / "asset.png"
+    photo = tmp_path / "photo.png"
+    # 体积不同 → 内容哈希不同
+    logo.write_bytes(_tiny_png(b"\xff\x00\x00") + b"logo")
+    decor.write_bytes(_tiny_png(b"\x00\xff\x00") + b"decor")
+    asset.write_bytes(_tiny_png(b"\xff\xff\x00") + b"asset-2x")
+    photo.write_bytes(_tiny_png(b"\x00\x00\xff") + b"photo-content")
+
+    deck = pptx.Presentation()
+    # 标准 16:9
+    deck.slide_width = Inches(13.333)
+    deck.slide_height = Inches(7.5)
+    layout = deck.slide_layouts[5]
+    for index in range(4):
+        slide = deck.slides.add_slide(layout)
+        slide.shapes.title.text = f"第{index + 1}页"
+        # 角标 logo：每页都有、版面占比很小
+        pic = slide.shapes.add_picture(
+            str(logo), Inches(0.2), Inches(0.1), width=Inches(0.8), height=Inches(0.35)
+        )
+        pic._element._nvXxPr.cNvPr.set("descr", "熙街LOGO（X4）")
+        # 装饰底图块：多页重复、中等占比
+        slide.shapes.add_picture(
+            str(decor), Inches(0), Inches(0), width=Inches(4.5), height=Inches(2.8)
+        )
+        # 设计导出素材名：跨页但不一定达到 25% 阈值
+        asset_pic = slide.shapes.add_picture(
+            str(asset), Inches(8), Inches(4), width=Inches(4), height=Inches(3)
+        )
+        asset_pic._element._nvXxPr.cNvPr.set("descr", "5506745资源 1@2x")
+        # 仅第 2 页放一张正文图
+        if index == 1:
+            slide.shapes.add_picture(
+                str(photo), Inches(5), Inches(2), width=Inches(4), height=Inches(3)
+            )
+
+    path = tmp_path / "chrome.pptx"
+    deck.save(str(path))
+    parsed = parse_file(path, assets_dir=tmp_path / "parse" / "1")
+    assert len(parsed.figures) == 1, [(f.name, f.caption) for f in parsed.figures]
+    assert parsed.figures[0].page == 2
+    # 落盘文件也只有内容图（logo/decor/资源@2x 不应写入 images/）
+    written = sorted(p.name for p in (tmp_path / "parse" / "1" / "images").glob("*"))
+    assert len(written) == 1, written

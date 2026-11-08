@@ -251,8 +251,23 @@ async def qa_chat(
     from ekbs.discovery import format_refusal_hints
     from ekbs.recommend import recommend_questions
 
+    # 成功作答：用本轮引用文档优先抽推荐（仍过权限）；拒答不传 focus，走拒答导流。
+    focus_doc_ids: list[int] | None = None
+    if not answer.refused:
+        seen_docs: set[int] = set()
+        focus_doc_ids = []
+        for cite in answer.citations or []:
+            doc_id = int(getattr(cite, "doc_id", 0) or 0)
+            if doc_id > 0 and doc_id not in seen_docs:
+                seen_docs.add(doc_id)
+                focus_doc_ids.append(doc_id)
     suggested = recommend_questions(
-        runtime, perm, limit=3, query=safe_question, for_refusal=answer.refused
+        runtime,
+        perm,
+        limit=3,
+        query=safe_question,
+        for_refusal=answer.refused,
+        focus_doc_ids=focus_doc_ids,
     )
     if answer.refused:
         hint = format_refusal_hints(suggested)

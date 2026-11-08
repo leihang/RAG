@@ -88,6 +88,8 @@ export const fetchParseDraftFigure = (
   http.get(`/parse/tasks/${taskId}/figures/${figureId}`, {
     params: { enhance: opts.enhance === false ? 0 : 1 },
     responseType: 'blob',
+    // 清洗后图号漂移/缺图时缩略图自己显示「图不可用」，不要弹全局异常
+    skipErrorToast: true,
   }) as Promise<Blob>
 
 export interface DraftAssetSave {

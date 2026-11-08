@@ -14,11 +14,31 @@ from ekbs.ingest.scan_review import (
     save_review_draft,
     upgrade_review_draft_seals,
 )
-from ekbs.ingest.seal_filter import is_seal_image, looks_like_seal, strip_figure_anchors
+from ekbs.ingest.seal_filter import (
+    is_seal_image,
+    looks_like_seal,
+    seal_filter_applies,
+    strip_figure_anchors,
+)
 
 
 def _save(path: Path, arr: np.ndarray) -> None:
     Image.fromarray(arr.astype(np.uint8)).save(path)
+
+
+def test_seal_filter_applies_only_scan_pdf_word() -> None:
+    assert seal_filter_applies("合同.pdf")
+    assert seal_filter_applies("制度.docx")
+    assert seal_filter_applies("扫描件/说明.doc")
+    assert seal_filter_applies("page.png")
+    assert seal_filter_applies("x.unknown", engine="mineru")
+    assert seal_filter_applies("资料/扫描件/纪要.txt")
+    assert not seal_filter_applies("汇报.pptx")
+    assert not seal_filter_applies("能耗.xlsx")
+    assert not seal_filter_applies("deck.ppt", engine="pptx")
+    assert not seal_filter_applies(None, engine="xlsx")
+    assert seal_filter_applies(None, default_when_unknown=True)
+    assert not seal_filter_applies(None)
 
 
 def test_red_seal_dropped(tmp_path: Path) -> None:
@@ -41,6 +61,37 @@ def test_faint_red_seal_dropped(tmp_path: Path) -> None:
     path = tmp_path / "faint.png"
     _save(path, arr)
     assert looks_like_seal(Image.open(path))
+
+
+def test_square_field_photo_with_warm_tones_kept(tmp_path: Path) -> None:
+    """水印相机方图：满幅场景 + 暖色设备，不得当公章丢掉。
+
+    回归：工程部 PPT 第 30 页化粪池检查照（756×756）曾被 ``_red_seal`` 淡红
+    分支误杀，同页只剩小广告清除照，表现为「图与页文不对」。
+    """
+    rng = np.random.default_rng(0)
+    # 满幅铺底（路面/墙），ink_frac ≈ 1
+    arr = rng.integers(40, 120, size=(256, 256, 3), dtype=np.uint8)
+    # 局部暖色（手持检测仪橙色外壳一类）
+    arr[80:140, 90:150] = (230, 120, 40)
+    # 角落少量近白（水印条）
+    arr[0:24, 0:120] = (245, 245, 245)
+    path = tmp_path / "field_square.png"
+    _save(path, arr)
+    assert not looks_like_seal(Image.open(path))
+
+
+def test_chat_screenshot_with_white_ui_kept(tmp_path: Path) -> None:
+    """钉钉白底截图（含粉边/头像暖色）不是公章。"""
+    arr = np.full((240, 220, 3), 250, dtype=np.uint8)
+    # 聊天气泡与正文块
+    arr[40:100, 30:190] = (235, 235, 235)
+    arr[110:200, 40:180] = (60, 70, 80)
+    # 局部暖色（头像/按钮）
+    arr[20:50, 20:50] = (240, 200, 190)
+    path = tmp_path / "chat.png"
+    _save(path, arr)
+    assert not looks_like_seal(Image.open(path))
 
 
 def test_qr_and_text_page_kept(tmp_path: Path) -> None:

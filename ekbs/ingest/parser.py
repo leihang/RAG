@@ -144,6 +144,8 @@ def normalize_suffix(filename: str) -> str:
 #: 纯文本分支，解析产物里根本不产生 ``ParsedTable`` —— 给一个不会产出表格的来源开
 #: 行级分块没有意义（真要支持 csv 表格，先让解析层把它当表解析，再来改这里）。
 SPREADSHEET_SUFFIXES: frozenset[str] = frozenset({"xlsx", "xls", "xlsm"})
+#: 幻灯片：一页=一个检索/挂图单元，不能按 token 把多页短幻灯片捏在一起。
+SLIDE_SUFFIXES: frozenset[str] = frozenset({"ppt", "pptx"})
 
 
 def is_spreadsheet_source(path: str) -> bool:
@@ -155,6 +157,11 @@ def is_spreadsheet_source(path: str) -> bool:
     必须回到行组，不能因为忘传参数就退化成碎块。
     """
     return normalize_suffix(str(path)) in SPREADSHEET_SUFFIXES
+
+
+def is_slide_source(path: str) -> bool:
+    """来源是否是**幻灯片**（一页一屏）—— 子块/父块都必须硬按页切开。"""
+    return normalize_suffix(str(path)) in SLIDE_SUFFIXES
 
 
 def parse_file(
@@ -1136,6 +1143,89 @@ def _is_section_title_row(values: list[str]) -> bool:
     return len(nonempty) == 1 and len(nonempty[0]) <= 40 and len(str(values)) >= 1
 
 
+_MONTH_HEADER_CELL_RE = re.compile(r"^(1[0-2]|[1-9])\s*月$")
+
+
+def _is_month_series_header_row(values: Sequence[str]) -> bool:
+    """真表头：至少 6 个「N月」列（大户用电监视：铺号|用户名|年度|1月…12月）。"""
+    months = sum(
+        1 for v in values if _MONTH_HEADER_CELL_RE.match(str(v).strip())
+    )
+    return months >= 6
+
+
+def _row_nonempty_width(values: Sequence[str]) -> int:
+    last = -1
+    for i, value in enumerate(values):
+        if str(value).strip():
+            last = i
+    return last + 1
+
+
+def _header_text_numeric_contrast(
+    header: Sequence[str], below: Sequence[str]
+) -> int:
+    """表头文字列下方同列是数字的列数（与 ``_pick_header_index`` 同口径）。"""
+    from ekbs.ingest.table_serialize import _is_numeric_cell
+
+    contrast = 0
+    for i, raw in enumerate(header):
+        value = str(raw).strip()
+        if not value or _is_numeric_cell(value):
+            continue
+        if i < len(below) and _is_numeric_cell(str(below[i]).strip()):
+            contrast += 1
+    return contrast
+
+
+def _widths_compatible_for_inherit(
+    header: Sequence[str], rows: Sequence[Sequence[str]]
+) -> bool:
+    """同 Sheet 继承：列宽明显不同则视为新表，不互借表头。"""
+    hw = _row_nonempty_width(header)
+    if hw <= 0 or not rows:
+        return False
+    widths = [
+        _row_nonempty_width(row)
+        for row in rows
+        if any(str(c).strip() for c in row)
+    ]
+    if not widths:
+        return False
+    return abs(hw - max(widths[:5])) <= 2
+
+
+def _sheet_canonical_month_header(
+    blocks: Sequence[Sequence[tuple[int, list[str]]]],
+) -> list[str] | None:
+    """整表只认一次月份序列真表头，供后续无表头分节段继承。"""
+    for block in blocks:
+        for _row_n, values in block:
+            if _is_month_series_header_row(values):
+                return [str(v) for v in values]
+    return None
+
+
+def _block_header_is_reliable(
+    rows: list[list[str]],
+    header_abs: int | None,
+    row_nums: list[int],
+    *,
+    listobject_pinned: bool,
+) -> bool:
+    """本段是否有可独立使用的真表头（ListObject / 月份序列 / contrast≥2）。"""
+    if header_abs is None or header_abs not in row_nums:
+        return False
+    if listobject_pinned:
+        return True
+    idx = row_nums.index(header_abs)
+    header_vals = rows[idx]
+    if _is_month_series_header_row(header_vals):
+        return True
+    below = rows[idx + 1] if idx + 1 < len(rows) else []
+    return _header_text_numeric_contrast(header_vals, below) >= 2
+
+
 def _excel_serials_look_like_calendar(serials: list[int]) -> bool:
     """多个 Excel 序列号是否像「按月铺开的日期表头」（相邻差约 28–31 天）。
 
@@ -1149,26 +1239,42 @@ def _excel_serials_look_like_calendar(serials: list[int]) -> bool:
     return monthish >= max(1, (len(diffs) + 1) // 2)
 
 
+_HEADER_FULL_DATE_RE = re.compile(r"^(20\d{2})-(\d{2})-(\d{2})$")
+
+
 def _convert_date_serials_in_header(values: list[str]) -> list[str]:
-    """无日期格式的 Excel 日期序列号 → ``YYYY-MM-DD``。
+    """表头月序列 → 账期 ``YYYY-MM``（不要写成带日的 ``YYYY-MM-DD``）。
+
+    业务表（水费/熙丰/用电分析）表头是「按月」账期；Excel 里常是月初/月末序列号
+    或已带日期格式的单元格。写成 ``2026-01-31`` 会让 LLM 当成具体日，且
+    observation.period 出现 ``2026-01`` / ``2026-01-31`` 双口径。
 
     触发条件（任一）：
-    * 本行含“日期/date”（原口径，用电分析「金额 日期」行）；
-    * 或本行 ≥2 个序列号呈按月间隔（水费/熙丰：日期在上一行、字段名在下一行，
-      日期行本身没有「日期」二字，旧逻辑会把 45292 当成「上月起度」的值）。
+    * 本行含“日期/date”（用电分析「金额 日期」行）；
+    * 本行 ≥2 个序列号呈按月间隔；
+    * 本行 ≥2 个已是 ``YYYY-MM-DD`` 的格子（``_xlsx_cell_text`` 先写出全日）。
     """
     serial_nums = [
         int(str(v).strip())
         for v in values
         if str(v).strip().isdigit() and 20000 <= int(str(v).strip()) <= 80000
     ]
+    full_dates = [
+        str(v).strip()
+        for v in values
+        if _HEADER_FULL_DATE_RE.match(str(v).strip())
+    ]
     has_date_word = any(("日期" in str(v)) or ("date" in str(v).lower()) for v in values)
     calendar_like = len(serial_nums) >= 2 and _excel_serials_look_like_calendar(serial_nums)
-    if not has_date_word and not calendar_like:
+    if not has_date_word and not calendar_like and len(full_dates) < 2:
         return values
     out = list(values)
     for i, value in enumerate(out):
         text = str(value).strip()
+        matched = _HEADER_FULL_DATE_RE.match(text)
+        if matched:
+            out[i] = f"{matched.group(1)}-{matched.group(2)}"
+            continue
         if not text.isdigit():
             continue
         n = int(text)
@@ -1178,7 +1284,7 @@ def _convert_date_serials_in_header(values: list[str]) -> list[str]:
         try:
             from openpyxl.utils.datetime import from_excel
 
-            out[i] = from_excel(n).strftime("%Y-%m-%d")
+            out[i] = from_excel(n).strftime("%Y-%m")
         except Exception:
             continue
     return out
@@ -1425,14 +1531,26 @@ def _xlsx_span_maps(
     return masters, covered
 
 
+def _xlsx_looks_like_field_subheader(values: Sequence[str]) -> bool:
+    """主表头下一行是否像字段子表头（项目 / 取数账套 / 取数科目 / 项目明细）。
+
+    不能把首行数据（含账套号 ``1102/1103``）误收进 ``<th>``，否则列名错位。
+    """
+    from ekbs.ingest.table_serialize import _looks_like_field_name_row
+
+    return _looks_like_field_name_row(values)
+
+
 def _xlsx_collect_header_rows(
     rows_with_nums: list[tuple[int, list[str]]],
     header_abs: int | None,
 ) -> list[int]:
-    """字段名行 + 紧邻上方的日期子表头 → 显式多行表头（均标 ``<th>``）。
+    """字段名行 + 紧邻上方的日期子表头 + 紧邻下方的字段子表头 → 显式多行 ``<th>``。
 
     水费/熙丰：日期行在字段名行之上；气费：``抄表日期`` 行在 ``起度`` 行之上。
-    解析阶段钉死，序列化只消费 ``<th>``，避免二次猜测把读数并进表头。
+    预算分月：主行 ``项目（收入成本均含税）`` 横向合并，下一行才是
+    ``项目|取数账套|取数科目|项目明细``——必须标 ``<th>``，否则纵向合并区把子行
+    首列跳过，整行左移，上级费用名全部塌成同一个键。
     """
     from ekbs.ingest.table_serialize import _row_looks_like_date_header
 
@@ -1452,7 +1570,60 @@ def _xlsx_collect_header_rows(
             rows_with_nums[look] = (_n, converted)
         else:
             break
+    if hi + 1 < len(rows_with_nums):
+        below_n, below_vals = rows_with_nums[hi + 1]
+        if _xlsx_looks_like_field_subheader(below_vals):
+            header_rows.append(below_n)
     return header_rows
+
+
+def _xlsx_block_html_width(
+    sheet: Any,
+    rows_with_nums: list[tuple[int, list[str]]],
+    injected_header: Sequence[str] | None,
+) -> int:
+    width = 0
+    for row_number, values in rows_with_nums:
+        width = max(width, len(values))
+        for col in range(1, max(len(values), 1) + 1):
+            try:
+                if sheet.cell(row_number, col).value is not None:
+                    width = max(width, col)
+            except Exception:
+                pass
+    if injected_header:
+        width = max(width, len(injected_header))
+    return width
+
+
+def _xlsx_row_texts_for_html(
+    sheet: Any,
+    rows_with_nums: list[tuple[int, list[str]]],
+    *,
+    width: int,
+    header_set: set[int],
+) -> dict[int, list[str]]:
+    """预计算块内单元格文本（表头优先用已转换值，避免 sheet 再读丢转换）。"""
+    preset: dict[int, list[str]] = {
+        n: list(vals) for n, vals in rows_with_nums if n in header_set
+    }
+    row_texts: dict[int, list[str]] = {}
+    for row_number, _values in rows_with_nums:
+        if row_number in preset:
+            raw = list(preset[row_number])
+            if len(raw) < width:
+                raw.extend(
+                    _xlsx_cell_text(sheet.cell(row_number, col))
+                    for col in range(len(raw) + 1, width + 1)
+                )
+            row_texts[row_number] = _convert_date_serials_in_header(raw[:width])
+        else:
+            raw = [
+                _xlsx_cell_text(sheet.cell(row_number, col))
+                for col in range(1, width + 1)
+            ]
+            row_texts[row_number] = _convert_date_serials_in_header(raw)
+    return row_texts
 
 
 def _xlsx_rows_to_html(
@@ -1461,6 +1632,7 @@ def _xlsx_rows_to_html(
     *,
     header_row: int | None = None,
     header_rows: Sequence[int] | None = None,
+    injected_header: Sequence[str] | None = None,
 ) -> str:
     """把 Excel 数据块还原成带 colspan/rowspan 的 HTML 表格（复核页对照用）。
 
@@ -1471,15 +1643,12 @@ def _xlsx_rows_to_html(
 
     ``header_rows``：多级表头（日期行 + 字段名行）全部标 ``<th>``；兼容旧参数
     ``header_row``（单行）。
+    ``injected_header``：同 Sheet 无表头分节段继承的真表头（合成 ``<th>``，不在 sheet 上）。
     """
-    if not rows_with_nums:
+    if not rows_with_nums and not injected_header:
         return ""
     row_numbers = [n for n, _values in rows_with_nums]
-    width = 0
-    for row_number, _values in rows_with_nums:
-        for col in range(1, max(len(_values), 1) + 1):
-            if sheet.cell(row_number, col).value is not None:
-                width = max(width, col)
+    width = _xlsx_block_html_width(sheet, rows_with_nums, injected_header)
     if width <= 0:
         return ""
 
@@ -1487,25 +1656,27 @@ def _xlsx_rows_to_html(
     if header_row is not None:
         header_set.add(int(header_row))
 
-    masters, covered = _xlsx_span_maps(sheet, row_numbers, width)
-    # 预计算的块内文本（含日期序列转换）；表头行优先用它，避免 sheet 再读丢转换。
-    preset: dict[int, list[str]] = {
-        n: list(vals) for n, vals in rows_with_nums if n in header_set
-    }
-    row_texts: dict[int, list[str]] = {}
-    for row_number in row_numbers:
-        if row_number in preset:
-            raw = list(preset[row_number])
-            if len(raw) < width:
-                raw.extend(
-                    _xlsx_cell_text(sheet.cell(row_number, col))
-                    for col in range(len(raw) + 1, width + 1)
-                )
-            row_texts[row_number] = _convert_date_serials_in_header(raw[:width])
-        else:
-            raw = [_xlsx_cell_text(sheet.cell(row_number, col)) for col in range(1, width + 1)]
-            row_texts[row_number] = _convert_date_serials_in_header(raw)
+    masters, covered = (
+        _xlsx_span_maps(sheet, row_numbers, width) if row_numbers else ({}, set())
+    )
+    row_texts = _xlsx_row_texts_for_html(
+        sheet, rows_with_nums, width=width, header_set=header_set
+    )
     rows_html: list[str] = []
+    if injected_header:
+        inj = [str(v) for v in injected_header]
+        if len(inj) < width:
+            inj.extend([""] * (width - len(inj)))
+        inj_html = _xlsx_emit_html_row(
+            row_number=0,
+            width=width,
+            texts=inj[:width],
+            is_header=True,
+            covered=set(),
+            masters={},
+        )
+        if inj_html:
+            rows_html.append(inj_html)
     for row_number in row_numbers:
         row_html = _xlsx_emit_html_row(
             row_number=row_number,
@@ -1567,6 +1738,99 @@ def xlsx_sheet_html(sheet: Any, *, header_row: int | None = None) -> str:
     return _xlsx_rows_to_html(sheet, rows_with_nums, header_row=header_row)
 
 
+class _BlockHeaderPlan(NamedTuple):
+    rows_with_nums: list[tuple[int, list[str]]]
+    header_abs: int | None
+    header_abs_list: list[int]
+    injected_header: list[str] | None
+    section_name: str
+    last_true_header: list[str] | None
+    form_like: bool
+
+
+def _xlsx_plan_block_header(
+    sheet: Any,
+    rows_with_nums: list[tuple[int, list[str]]],
+    table_header_rows: list[int],
+    last_true_header: list[str] | None,
+) -> _BlockHeaderPlan:
+    """单段：自有真表头 / 继承同 Sheet 真表头 / 弱启发式。"""
+    from ekbs.ingest.table_serialize import _looks_like_form, _pick_header_index
+
+    rows = [values for _n, values in rows_with_nums]
+    row_nums = [n for n, _values in rows_with_nums]
+    form_like = _looks_like_form(rows)
+    header_abs: int | None = None
+    listobject_pinned = False
+    if not form_like:
+        in_block = [n for n in table_header_rows if n in row_nums]
+        if in_block:
+            header_abs = in_block[0]
+            listobject_pinned = True
+        else:
+            idx = _pick_header_index(rows)
+            if 0 <= idx < len(row_nums):
+                header_abs = row_nums[idx]
+
+    own_reliable = _block_header_is_reliable(
+        rows, header_abs, row_nums, listobject_pinned=listobject_pinned
+    )
+    section_at_top = bool(rows) and _is_section_title_row(rows[0])
+    rows_for_width = rows[1:] if section_at_top and len(rows) > 1 else rows
+    should_inherit = (
+        not form_like
+        and last_true_header is not None
+        and not own_reliable
+        and _widths_compatible_for_inherit(last_true_header, rows_for_width)
+        and (section_at_top or header_abs is not None)
+    )
+
+    section_name = ""
+    injected_header: list[str] | None = None
+    header_abs_list: list[int] = []
+    next_true = last_true_header
+
+    if should_inherit:
+        assert last_true_header is not None
+        if section_at_top:
+            section_name = next(
+                (str(v).strip() for v in rows[0] if str(v).strip()), ""
+            )
+            rows_with_nums = list(rows_with_nums[1:])
+        return _BlockHeaderPlan(
+            rows_with_nums=rows_with_nums,
+            header_abs=None,
+            header_abs_list=[],
+            injected_header=list(last_true_header),
+            section_name=section_name,
+            last_true_header=next_true,
+            form_like=form_like,
+        )
+
+    if header_abs is not None:
+        _fill_xlsx_merged_header(sheet, rows_with_nums, header_abs)
+        rows_with_nums = [(n, list(v)) for n, v in rows_with_nums]
+    header_abs_list = _xlsx_collect_header_rows(rows_with_nums, header_abs)
+    for hr in header_abs_list:
+        if hr != header_abs:
+            _fill_xlsx_merged_header(sheet, rows_with_nums, hr)
+    if header_abs_list:
+        rows_with_nums = [(n, list(v)) for n, v in rows_with_nums]
+    row_nums = [n for n, _values in rows_with_nums]
+    if own_reliable and header_abs in row_nums:
+        hi = row_nums.index(header_abs)
+        next_true = [str(v) for v in rows_with_nums[hi][1]]
+    return _BlockHeaderPlan(
+        rows_with_nums=rows_with_nums,
+        header_abs=header_abs,
+        header_abs_list=header_abs_list,
+        injected_header=injected_header,
+        section_name=section_name,
+        last_true_header=next_true,
+        form_like=form_like,
+    )
+
+
 def _xlsx_serialize_blocks(
     sheet: Any,
     merged_blocks: list[list[tuple[int, list[str]]]],
@@ -1574,43 +1838,39 @@ def _xlsx_serialize_blocks(
     state: _XlsxState,
     sheet_index: int,
 ) -> None:
-    """逐块确定表头（ListObject > 结构启发式）→ 填合并表头 → 按图片锚点拆段 → 出表格。"""
-    from ekbs.ingest.table_serialize import _looks_like_form, _pick_header_index
+    """逐块确定表头（ListObject > 结构启发式）→ 填合并表头 → 按图片锚点拆段 → 出表格。
 
+    同 Sheet 多表时：有真表头直读；无表头（仅分节标题/弱对比）则**继承**最近真表头，
+    分节名进题注，禁止把「酒店」等分区标题当列名做合并填充。
+    """
     anchor_rows = _xlsx_image_anchor_rows(sheet)
+    last_true_header = _sheet_canonical_month_header(merged_blocks)
     for block_index, rows_with_nums in enumerate(merged_blocks, start=1):
-        rows = [values for _n, values in rows_with_nums]
+        plan = _xlsx_plan_block_header(
+            sheet, rows_with_nums, table_header_rows, last_true_header
+        )
+        last_true_header = plan.last_true_header
+        rows_with_nums = plan.rows_with_nums
         row_nums = [n for n, _values in rows_with_nums]
-        form_like = _looks_like_form(rows)
-        header_abs: int | None = None
-        if not form_like:
-            in_block = [n for n in table_header_rows if n in row_nums]
-            if in_block:
-                header_abs = in_block[0]
-            else:
-                idx = _pick_header_index(rows)
-                if 0 <= idx < len(row_nums):
-                    header_abs = row_nums[idx]
-        if header_abs is not None:
-            _fill_xlsx_merged_header(sheet, rows_with_nums, header_abs)
-            rows_with_nums = [(n, list(v)) for n, v in rows_with_nums]
-        header_abs_list = _xlsx_collect_header_rows(rows_with_nums, header_abs)
-        for hr in header_abs_list:
-            if hr != header_abs:
-                _fill_xlsx_merged_header(sheet, rows_with_nums, hr)
-        if header_abs_list:
-            rows_with_nums = [(n, list(v)) for n, v in rows_with_nums]
+        header_abs = plan.header_abs
+        header_abs_list = plan.header_abs_list
         header_idx = row_nums.index(header_abs) if header_abs in row_nums else 0
-        if not form_like and header_abs is not None:
-            parts = _split_rows_at_image_anchors(rows_with_nums, header_idx, anchor_rows)
+        if not plan.form_like and header_abs is not None:
+            parts = _split_rows_at_image_anchors(
+                rows_with_nums, header_idx, anchor_rows
+            )
         else:
-            parts = [rows_with_nums]
+            parts = [rows_with_nums] if rows_with_nums else []
         for part_index, part in enumerate(parts, start=1):
             part_nums = {n for n, _v in part}
             part_headers = [n for n in header_abs_list if n in part_nums]
             part_header = header_abs if header_abs in part_nums else None
             body = _xlsx_rows_to_html(
-                sheet, part, header_row=part_header, header_rows=part_headers or None
+                sheet,
+                part,
+                header_row=part_header,
+                header_rows=part_headers or None,
+                injected_header=plan.injected_header,
             )
             if not body:
                 continue
@@ -1619,7 +1879,12 @@ def _xlsx_serialize_blocks(
                 sheet.title if len(merged_blocks) == 1
                 else f"{sheet.title}（第{block_index}段）"
             )
-            caption = base_caption if len(parts) == 1 else f"{base_caption}（图片段{part_index}）"
+            if plan.section_name:
+                base_caption = f"{base_caption}（/ {plan.section_name}）"
+            caption = (
+                base_caption if len(parts) == 1
+                else f"{base_caption}（图片段{part_index}）"
+            )
             state.tables.append(
                 ParsedTable(
                     body=body,
@@ -1907,17 +2172,60 @@ class _PptxState:
 
     assets_dir: Path | None
     log_file: str
+    slide_width: int
+    slide_height: int
     figures: list[ParsedFigure] = field(default_factory=list)
     tables: list[ParsedTable] = field(default_factory=list)
     ocr_budget: list[int] = field(default_factory=lambda: [_figure_ocr_budget()])
     seen_images: set[str] = field(default_factory=set)
     table_seq: int = 0
     skipped_pictures: int = 0
+    skipped_decorative: int = 0
+    #: 先收集再清洗：跨页 logo/底图要等全稿扫描完才能判定
+    picture_candidates: list["_PptxPictureCandidate"] = field(default_factory=list)
+    #: page → [(figure_index, blob_size)]，供无字图题注兜底
+    textless_by_page: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
 
 
-def _pptx_register_picture(shape: Any, state: _PptxState, number: int,
-                           textless: list[tuple[int, int]]) -> None:
-    """抽 shape 的图片；断链的链接图只告警、不崩。"""
+@dataclass(frozen=True)
+class _PptxPictureCandidate:
+    """幻灯片上的一次图片放置（同一文件可多页重复）。"""
+
+    digest: str
+    blob: bytes
+    ext: str
+    page: int
+    caption: str
+    rotate_degrees: float
+    area_ratio: float
+    cover_w: float
+    cover_h: float
+    blob_size: int
+
+
+def _pptx_shape_geometry(
+    shape: Any, *, slide_width: int, slide_height: int
+) -> tuple[float, float, float]:
+    """返回 ``(area_ratio, cover_w, cover_h)``；读不到尺寸时按 0。"""
+    try:
+        width = abs(int(getattr(shape, "width", 0) or 0))
+        height = abs(int(getattr(shape, "height", 0) or 0))
+    except Exception:
+        return 0.0, 0.0, 0.0
+    if slide_width <= 0 or slide_height <= 0 or width <= 0 or height <= 0:
+        return 0.0, 0.0, 0.0
+    cover_w = min(1.0, width / float(slide_width))
+    cover_h = min(1.0, height / float(slide_height))
+    area_ratio = min(1.0, (width * height) / float(slide_width * slide_height))
+    return area_ratio, cover_w, cover_h
+
+
+def _pptx_collect_picture(
+    shape: Any, state: _PptxState, number: int
+) -> None:
+    """收集候选图；断链的链接图只告警、不崩。真正落盘在清洗之后。"""
+    import hashlib
+
     from pptx.enum.shapes import MSO_SHAPE_TYPE
 
     picture = _pptx_shape_picture(shape)
@@ -1927,16 +2235,25 @@ def _pptx_register_picture(shape: Any, state: _PptxState, number: int,
             rotate = float(getattr(shape, "rotation", 0.0) or 0.0)
         except Exception:
             rotate = 0.0
-        added = _register_figure_blob(
-            blob, ext,
-            assets_dir=state.assets_dir, figures=state.figures, seen=state.seen_images,
-            caption=_alt_text(shape), page=number, ocr_budget=state.ocr_budget,
-            log_file=state.log_file, rotate_degrees=rotate,
+        area_ratio, cover_w, cover_h = _pptx_shape_geometry(
+            shape, slide_width=state.slide_width, slide_height=state.slide_height
         )
-        if added and not state.figures[-1].caption and not state.figures[-1].ocr_text:
-            textless.append((len(state.figures) - 1, len(blob)))
+        digest = hashlib.sha256(blob).hexdigest()
+        state.picture_candidates.append(
+            _PptxPictureCandidate(
+                digest=digest,
+                blob=blob,
+                ext=str(ext),
+                page=number,
+                caption=_alt_text(shape),
+                rotate_degrees=rotate,
+                area_ratio=area_ratio,
+                cover_w=cover_w,
+                cover_h=cover_h,
+                blob_size=len(blob),
+            )
+        )
         return
-    # 明确是图片类形状但读不出字节（断链的链接图等）
     try:
         shape_type = shape.shape_type
     except Exception:
@@ -1944,6 +2261,102 @@ def _pptx_register_picture(shape: Any, state: _PptxState, number: int,
     if shape_type in {MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.LINKED_PICTURE}:
         state.skipped_pictures += 1
         log.warning("pptx_picture_unreadable", slide=number, shape_type=str(shape_type))
+
+
+#: Alt Text / 导出文件名里的版式噪声：``熙街LOGO…``、``5506745资源 1@2x``
+_PPTX_DECORATIVE_CAPTION_RE = re.compile(
+    r"(?i)logo|底图|背景|水印|watermark|装饰|素材|@\d+x|资源\s*\d"
+)
+
+
+def _pptx_caption_looks_decorative(*captions: str) -> bool:
+    return any(
+        _PPTX_DECORATIVE_CAPTION_RE.search((caption or "").strip())
+        for caption in captions
+        if (caption or "").strip()
+    )
+
+
+def _pptx_select_content_digests(
+    candidates: Sequence[_PptxPictureCandidate], *, slide_count: int
+) -> set[str]:
+    """丢掉跨页 logo/底图，保留正文插图。
+
+    实测《2026年10月工作汇报-工程.pptx》：
+    * 页眉 logo 36/36 页；
+    * 装饰底图 / ``…资源 1@2x`` 跨 6+ 页；
+    * zip 母版里还有无页码的 1920×1080 底图。
+    若不清洗会进 review 的 figures 与多模态索引。
+    """
+    if not candidates:
+        return set()
+    by_digest: dict[str, list[_PptxPictureCandidate]] = {}
+    for item in candidates:
+        by_digest.setdefault(item.digest, []).append(item)
+
+    n_slides = max(1, int(slide_count))
+    # ≥约 1/6 页（至少 3 页）视为版式铬；短稿仍要求至少 3 页，避免两页正文图互杀
+    repeat_cut = max(3, (n_slides + 5) // 6)
+    keep: set[str] = set()
+    for digest, items in by_digest.items():
+        pages = {item.page for item in items}
+        min_area = min(item.area_ratio for item in items)
+        max_cover_w = max(item.cover_w for item in items)
+        max_cover_h = max(item.cover_h for item in items)
+        captions = tuple(item.caption for item in items)
+        # 整页铺底
+        if max_cover_w >= 0.85 and max_cover_h >= 0.85:
+            continue
+        # 小面积 + 多页：页眉 logo（面积常 <2%；单页正文小图保留）
+        if min_area < 0.025 and len(pages) >= 3:
+            continue
+        # 版式装饰：跨很多页重复（底图/角标）
+        if len(pages) >= repeat_cut:
+            continue
+        # 题注已写明 LOGO / 资源@2x 等，且不止一页出现 → 模板素材
+        if len(pages) >= 2 and _pptx_caption_looks_decorative(*captions):
+            continue
+        # 单页但题注就是 LOGO（封面角标只贴一页的情况）
+        if len(pages) == 1 and _pptx_caption_looks_decorative(*captions) and min_area < 0.35:
+            continue
+        # 像素级小图且跨页：与 docx 页眉 logo 同口径（不单凭像素杀单页内容图）
+        if len(pages) >= 3 and _docx_raster_is_decorative(items[0].blob):
+            continue
+        keep.add(digest)
+    return keep
+
+
+def _pptx_commit_pictures(state: _PptxState, *, slide_count: int) -> None:
+    """按清洗结果落盘；每页无字图仍只给最大的一张补页标题。"""
+    keep = _pptx_select_content_digests(
+        state.picture_candidates, slide_count=slide_count
+    )
+    all_digests = {item.digest for item in state.picture_candidates}
+    state.skipped_decorative = len(all_digests) - len(keep)
+    # 同一 digest 只登记首次出现页
+    state.textless_by_page = {}
+    for item in state.picture_candidates:
+        if item.digest not in keep:
+            continue
+        added = _register_figure_blob(
+            item.blob,
+            item.ext,
+            assets_dir=state.assets_dir,
+            figures=state.figures,
+            seen=state.seen_images,
+            caption=item.caption,
+            page=item.page,
+            ocr_budget=state.ocr_budget,
+            log_file=state.log_file,
+            rotate_degrees=item.rotate_degrees,
+        )
+        if not added:
+            continue
+        figure = state.figures[-1]
+        if not figure.caption and not figure.ocr_text:
+            state.textless_by_page.setdefault(item.page, []).append(
+                (len(state.figures) - 1, item.blob_size)
+            )
 
 
 def _pptx_append_content(shape: Any, state: _PptxState, number: int, lines: list[str]) -> None:
@@ -1978,34 +2391,42 @@ def _pptx_append_content(shape: Any, state: _PptxState, number: int, lines: list
             lines.append(f"[表格 {state.table_seq}]{(' ' + title) if title else ''}".rstrip())
 
 
-def _pptx_ingest_shape(shape: Any, state: _PptxState, number: int,
-                       lines: list[str], textless: list[tuple[int, int]]) -> None:
-    _pptx_register_picture(shape, state, number, textless)
+def _pptx_ingest_shape(shape: Any, state: _PptxState, number: int, lines: list[str]) -> None:
+    _pptx_collect_picture(shape, state, number)
     _pptx_append_content(shape, state, number, lines)
 
 
 def _pptx_slide_lines(slide: Any, number: int, portrait: bool, state: _PptxState) -> list[str]:
-    """抽一页：页标题 + 形状内容 + 备注 + 无字图题注兜底。"""
+    """抽一页：页标题 + 形状内容 + 备注（图片落盘在全稿清洗后）。"""
     lines = [f"## 第 {number} 页" + ("（竖向）" if portrait else "")]
-    textless: list[tuple[int, int]] = []
     for shape in _iter_shapes(slide.shapes):
-        _pptx_ingest_shape(shape, state, number, lines, textless)
+        _pptx_ingest_shape(shape, state, number, lines)
     notes = getattr(slide, "notes_slide", None)
     if notes is not None:
         note_text = (notes.notes_text_frame.text or "").strip()
         if note_text:
             lines.append(f"（备注）{note_text}")
-    if textless:
-        page_title = next((ln.strip() for ln in lines[1:] if ln.strip()), "")
-        if page_title:
-            biggest = max(textless, key=lambda item: item[1])[0]
-            state.figures[biggest].caption = page_title
-            log.info(
-                "pptx_figure_caption_fallback", slide=number,
-                figure=state.figures[biggest].figure_id, caption=page_title,
-                textless=len(textless),
-            )
     return lines
+
+
+def _pptx_apply_caption_fallbacks(pages: Sequence[str], state: _PptxState) -> None:
+    """无字图继承所在页标题；每页只补最大的一张，避免同页刷屏。"""
+    for page_number, textless in state.textless_by_page.items():
+        if not textless or page_number < 1 or page_number > len(pages):
+            continue
+        page_lines = (pages[page_number - 1] or "").splitlines()
+        page_title = next((ln.strip() for ln in page_lines[1:] if ln.strip()), "")
+        if not page_title:
+            continue
+        biggest = max(textless, key=lambda item: item[1])[0]
+        state.figures[biggest].caption = page_title
+        log.info(
+            "pptx_figure_caption_fallback",
+            slide=page_number,
+            figure=state.figures[biggest].figure_id,
+            caption=page_title,
+            textless=len(textless),
+        )
 
 
 def _parse_pptx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument:
@@ -2020,8 +2441,10 @@ def _parse_pptx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
     * ``PLACEHOLDER`` 里插入的图（``shape.image`` 可读时）；
     * ``GROUP`` 组合内的图（递归 ``_iter_shapes``）；
     * 形状 ``rotation`` / EXIF 竖拍 —— 落盘前矫正；
-    * ``ppt/media/`` zip 兜底（母版/版式漏扫时）；
     * 图表（``CHART``）→ ``ParsedTable``（数值表，不是截图）。
+
+    **清洗**：跨页重复的页眉 logo / 装饰底图、整页铺底图不进 ``figures``；
+    不再把 ``ppt/media/`` 母版图无差别 zip 兜底进来（那正是底图/logo 来源）。
 
     竖向幻灯片（``slide_height > slide_width``）在页标题标 ``（竖向）``，便于检索区分。
 
@@ -2038,23 +2461,26 @@ def _parse_pptx(path: Path, *, assets_dir: Path | None = None) -> ParsedDocument
         presentation.slide_height and presentation.slide_width
         and presentation.slide_height > presentation.slide_width
     )
-    state = _PptxState(assets_dir=assets_dir, log_file=path.name)
+    state = _PptxState(
+        assets_dir=assets_dir,
+        log_file=path.name,
+        slide_width=int(presentation.slide_width or 0),
+        slide_height=int(presentation.slide_height or 0),
+    )
     pages = [
         "\n".join(_pptx_slide_lines(slide, number, portrait, state))
         for number, slide in enumerate(presentation.slides, start=1)
     ]
-    # zip 兜底：母版/版式/漏扫形状里的 media
-    for blob, ext in _ooxml_media_blobs(path, prefix="ppt/media/"):
-        _register_figure_blob(
-            blob, ext,
-            assets_dir=state.assets_dir, figures=state.figures, seen=state.seen_images,
-            caption=path.stem if portrait else "", page=None, ocr_budget=state.ocr_budget,
-            log_file=state.log_file,
-        )
-    if state.figures or state.skipped_pictures:
+    _pptx_commit_pictures(state, slide_count=len(pages))
+    _pptx_apply_caption_fallbacks(pages, state)
+    if state.figures or state.skipped_pictures or state.skipped_decorative:
         log.info(
-            "pptx_figures_extracted", file=path.name, figures=len(state.figures),
-            unreadable=state.skipped_pictures, portrait=portrait,
+            "pptx_figures_extracted",
+            file=path.name,
+            figures=len(state.figures),
+            unreadable=state.skipped_pictures,
+            skipped_decorative=state.skipped_decorative,
+            portrait=portrait,
             ocr_budget=_figure_ocr_budget(),
         )
     markdown = "\n\n".join(pages)

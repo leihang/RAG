@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,6 +61,7 @@ from ekbs.discovery import (
     is_help_command,
     is_permission_command,
     is_personal_manage_command,
+    is_send_all_figures_command,
     is_send_source_command,
     is_personal_list_command,
     personal_delete_title,
@@ -71,8 +73,11 @@ log = get_logger(component="dingtalk.handler")
 
 #: ACK 码：SDK 直接把它回发给钉钉
 ACK_OK = 200
-#: 答案引用里最多再发几张原图（上传+单聊各一次，控制耗时）
-MAX_REPLY_IMAGES = 3
+#: 每轮最多再发几张原图（超出缓存，提示用户「发全图」补发）
+MAX_REPLY_IMAGES = 8
+#: 未发完图片在 ekbs_cache 里保留多久（秒）
+PENDING_FIGURES_TTL_SECONDS = 2 * 3600
+PENDING_FIGURES_KEY_PREFIX = "ekbs:dt:pending_figs:"
 ACK_RETRY = 500
 
 #: 官方错误码 20001：调用量超量，回调体没有 text/content
@@ -81,6 +86,7 @@ ERR_CODE_MESSAGE_QUOTA = "20001"
 USER_NOT_FOUND_REPLY = "未找到你的企业账号，请联系管理员同步组织架构后再试。"
 RATE_LIMITED_REPLY = "你的提问过于频繁，请稍后再试。"
 SERVICE_ERROR_REPLY = "知识库服务暂时不可用，请稍后重试。"
+NO_PENDING_FIGURES_REPLY = "当前没有待补发的图片。需要的话可以再问一次相关问题。"
 
 
 @dataclass
@@ -268,6 +274,8 @@ class StreamMessageHandler:
             return ReplyResult(True, reason="group_chat_disabled")
 
         # ②~⑤ 在同会话串行锁内完成（08 §3.2 per-user FIFO：多轮上下文顺序的前提）
+        # 大文件入库不占锁：先即时回执，下载/登记在锁外做，避免「帮助」被 50MB 下载堵死。
+        pending_personal_upload: tuple[InboundMessage, int] | None = None
         async with self._conv_lock(message.conversation_id or message.sender_staff_id):
             await asyncio.to_thread(self.inbox.mark_processing, message.msg_id)
 
@@ -296,7 +304,16 @@ class StreamMessageHandler:
             if intro:
                 await self._reply_text(message, intro)
 
-            if is_greeting_command(message.text):
+            if message.download_code:
+                filename = (message.file_name or "").strip() or "未命名文件"
+                await self._reply_text(
+                    message,
+                    f"已收到「{filename}」，正在下载并放入私有库；"
+                    "完成后会再通知你。期间可以继续发「帮助」或提问。",
+                )
+                pending_personal_upload = (message, user_id)
+                # 立刻出锁去做下载/登记，避免占住会话通道
+            elif is_greeting_command(message.text):
                 # P0：纯问候只回一句介绍；帮助/文档另行触发，不在首屏堆清单。
                 if not intro:
                     await self._reply_text(
@@ -309,20 +326,26 @@ class StreamMessageHandler:
                     )
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="greeting")
-
-            if is_personal_manage_command(message.text):
+            elif is_personal_manage_command(message.text):
                 reply = format_private_manage_text()
                 await self._reply_text(message, reply)
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="personal_manage_help", answer=reply)
 
-            if is_send_source_command(message.text):
+            elif is_send_source_command(message.text):
                 reply = format_send_source_text()
                 await self._reply_text(message, reply)
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="send_source_help", answer=reply)
 
-            if is_permission_command(message.text):
+            elif is_send_all_figures_command(message.text):
+                reply = await self._reply_pending_figures(message)
+                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                return ReplyResult(
+                    True, replied=True, via="text", reason="send_all_figures", answer=reply
+                )
+
+            elif is_permission_command(message.text):
                 status, payload = await self._discovery_catalog(
                     user_id=user_id,
                     conversation_type=message.conversation_type,
@@ -336,7 +359,7 @@ class StreamMessageHandler:
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="permission", answer=reply)
 
-            if is_example_command(message.text):
+            elif is_example_command(message.text):
                 status, payload = await self._discovery_catalog(
                     user_id=user_id,
                     conversation_type=message.conversation_type,
@@ -350,13 +373,7 @@ class StreamMessageHandler:
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="examples", answer=reply)
 
-            if message.download_code:
-                reply = await self._accept_personal_file(message, user_id)
-                await self._reply_text(message, reply)
-                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
-                return ReplyResult(True, replied=True, via="text", reason="personal_upload", answer=reply)
-
-            if message.is_group and (
+            elif message.is_group and (
                 is_personal_list_command(message.text)
                 or personal_delete_title(message.text) is not None
             ):
@@ -366,7 +383,7 @@ class StreamMessageHandler:
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="personal_group_blocked", answer=reply)
 
-            if is_personal_list_command(message.text):
+            elif is_personal_list_command(message.text):
                 status, payload = await self._api_request(
                     "GET", "/api/v1/personal/files", user_id=user_id
                 )
@@ -380,8 +397,7 @@ class StreamMessageHandler:
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="personal_list", answer=text)
 
-            delete_title = personal_delete_title(message.text)
-            if delete_title is not None:
+            elif (delete_title := personal_delete_title(message.text)) is not None:
                 status, payload = await self._api_request(
                     "POST",
                     "/api/v1/personal/files/delete",
@@ -399,7 +415,7 @@ class StreamMessageHandler:
                 return ReplyResult(True, replied=True, via="text", reason="personal_delete", answer=text)
 
             # ③.5 D22-P0：欢迎/帮助短路 —— 可见文档 + 示例问（过 ACL，不进问答）
-            if is_help_command(message.text):
+            elif is_help_command(message.text):
                 status, payload = await self._discovery_catalog(
                     user_id=user_id,
                     conversation_type=message.conversation_type,
@@ -420,7 +436,7 @@ class StreamMessageHandler:
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="help", answer=help_text)
 
-            if is_document_list_command(message.text) or is_catalog_query(message.text):
+            elif is_document_list_command(message.text) or is_catalog_query(message.text):
                 status, payload = await self._discovery_catalog(
                     user_id=user_id,
                     doc_limit=80,
@@ -442,7 +458,7 @@ class StreamMessageHandler:
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="catalog", answer=help_text)
 
-            if file_request_hint(message.text):
+            elif file_request_hint(message.text):
                 status, payload = await self._api_request(
                     "POST",
                     "/api/v1/discovery/file",
@@ -465,59 +481,93 @@ class StreamMessageHandler:
                     True, replied=True, via="file", reason="file", answer=sent_text
                 )
 
-            # ④ 调问答 API（服务端算权限与指纹）
-            status, payload = await self._ask_api(message, user_id=user_id)
-            if status == 0:
-                # 可重试：状态机登记 failed + 退避；钉钉重投与恢复扫描都能再受理
-                await asyncio.to_thread(
-                    self.inbox.mark_failed, message.msg_id, "api_unreachable"
-                )
-                return ReplyResult(False, reason="api_unreachable")
-            if status == 400:
-                detail = str(payload.get("detail") or "问题被内容安全策略拦截")
-                await self._reply_text(message, detail)
-                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
-                return ReplyResult(True, replied=True, via="text", reason="content_blocked")
-            if status >= 500:
-                await asyncio.to_thread(
-                    self.inbox.mark_failed, message.msg_id, f"api_error_{status}"
-                )
-                return ReplyResult(False, reason=f"api_error_{status}")
+            elif pending_personal_upload is not None:
+                # 文件已即时回执；下载/登记在锁外继续，此处不再进问答
+                pass
 
-            answer = str(payload.get("answer") or "")
-            citations = payload.get("citations") or []
-            figure_attachments = payload.get("figure_attachments") or []
-            if payload.get("refused"):
-                text = answer or "未找到可靠依据。"
-                # 后端已可能把 suggested_questions 拼进 answer；若只有结构化字段则补一段
-                if "你可以试试问" not in text:
-                    hints = payload.get("suggested_questions") or []
-                    if hints:
-                        lines = ["", "你可以试试问："]
-                        for i, q in enumerate(list(hints)[:3], 1):
-                            lines.append(f"{i}. {q}")
-                        text = text.rstrip() + "\n".join(lines)
-                await self._reply_text(message, text)
-                # 拒答也可能带回源图（例如文字说「资料无图」但 figure 块其实在）
+            else:
+                # ④ 调问答 API（服务端算权限与指纹）
+                status, payload = await self._ask_api(message, user_id=user_id)
+                if status == 0:
+                    # 可重试：状态机登记 failed + 退避；钉钉重投与恢复扫描都能再受理
+                    await asyncio.to_thread(
+                        self.inbox.mark_failed, message.msg_id, "api_unreachable"
+                    )
+                    return ReplyResult(False, reason="api_unreachable")
+                if status == 400:
+                    detail = str(payload.get("detail") or "问题被内容安全策略拦截")
+                    await self._reply_text(message, detail)
+                    await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                    return ReplyResult(True, replied=True, via="text", reason="content_blocked")
+                if status >= 500:
+                    await asyncio.to_thread(
+                        self.inbox.mark_failed, message.msg_id, f"api_error_{status}"
+                    )
+                    return ReplyResult(False, reason=f"api_error_{status}")
+
+                answer = str(payload.get("answer") or "")
+                citations = payload.get("citations") or []
+                figure_attachments = payload.get("figure_attachments") or []
+                if payload.get("refused"):
+                    text = answer or "未找到可靠依据。"
+                    # 后端已可能把 suggested_questions 拼进 answer；若只有结构化字段则补一段
+                    if "你可以试试问" not in text:
+                        hints = payload.get("suggested_questions") or []
+                        if hints:
+                            lines = ["", "你可以试试问："]
+                            for i, q in enumerate(list(hints)[:3], 1):
+                                lines.append(f"{i}. {q}")
+                            text = text.rstrip() + "\n".join(lines)
+                    text = self._with_figure_remainder_hint(text, figure_attachments, citations)
+                    await self._reply_text(message, text)
+                    # 拒答也可能带回源图（例如文字说「资料无图」但 figure 块其实在）
+                    await self._reply_cited_images(message, citations, figure_attachments)
+                    await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                    return ReplyResult(True, replied=True, via="text", reason="refused", answer=text)
+
+                # ⑤ 回复：取数成功时答案已含「值+依据」；再附参考资料与 2~3 条推荐问；有图则再发原图
+                rendered = self._render_answer(answer, citations)
+                rendered = self._with_suggestions(
+                    rendered, payload.get("suggested_questions") or []
+                )
+                rendered = self._with_figure_remainder_hint(
+                    rendered, figure_attachments, citations
+                )
+                if await self._reply_with_card(message, rendered):
+                    await self._reply_cited_images(message, citations, figure_attachments)
+                    await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                    return ReplyResult(True, replied=True, via="card", answer=rendered)
+                # 无 AI 卡片模板时：OTO 走 sampleMarkdown（接近管理台排版），失败再 sampleText
+                replied = await self._reply_text(message, rendered)
                 await self._reply_cited_images(message, citations, figure_attachments)
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
-                return ReplyResult(True, replied=True, via="text", reason="refused", answer=text)
+                return ReplyResult(
+                    True,
+                    replied=replied,
+                    via="markdown" if replied else "none",
+                    answer=rendered,
+                )
 
-            # ⑤ 回复：取数成功时答案已含「值+依据」；再附参考资料与 2~3 条推荐问；有图则再发原图
-            rendered = self._render_answer(answer, citations)
-            rendered = self._with_suggestions(
-                rendered, payload.get("suggested_questions") or []
+        if pending_personal_upload is not None:
+            upload_message, upload_user_id = pending_personal_upload
+            try:
+                reply = await self._accept_personal_file(upload_message, upload_user_id)
+            except Exception as exc:  # noqa: BLE001 — 下载/入库失败也要回用户一句
+                log.warning(
+                    "dingtalk_personal_upload_failed",
+                    error=f"{type(exc).__name__}: {exc}"[:200],
+                    msg_id=upload_message.msg_id,
+                )
+                reply = "文件处理失败，请稍后再发一次；也可以先发「帮助」查看用法。"
+            await self._reply_text(upload_message, reply)
+            await asyncio.to_thread(self.inbox.mark_done, upload_message.msg_id)
+            return ReplyResult(
+                True,
+                replied=True,
+                via="text",
+                reason="personal_upload",
+                answer=reply,
             )
-            if await self._reply_with_card(message, rendered):
-                await self._reply_cited_images(message, citations, figure_attachments)
-                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
-                return ReplyResult(True, replied=True, via="card", answer=rendered)
-            await self._reply_text(message, rendered)
-            await self._reply_cited_images(message, citations, figure_attachments)
-            await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
-            return ReplyResult(True, replied=True,
-                               via="markdown" if message.is_group else "text",
-                               answer=rendered)
 
     # ------------------------------------------------------------------
     # 崩溃恢复（D16：启动时与周期任务各调一次，见 ekbs/stream.py）
@@ -622,14 +672,21 @@ class StreamMessageHandler:
         return response.status_code, payload if isinstance(payload, dict) else {}
 
     async def _accept_personal_file(self, message: InboundMessage, user_id: int) -> str:
-        """单聊文件进入本人私有库。群里不收，避免把私人文件摊在群里。"""
+        """单聊文件进入本人私有库。群里不收，避免把私人文件摊在群里。
+
+        调用方应已发过「已收到」即时回执；本方法只负责下载/登记后的结果句。
+        """
         if message.is_group:
             return "私有库只收单聊文件。请打开和机器人的单独会话，再把文件发过来。"
+        if self.cards is None:
+            return "文件通道未就绪，请稍后再发一次。"
         try:
             content = await self.cards.download_message_file(message.download_code)
         except Exception as exc:  # noqa: BLE001 - 下载失败要回一句人话，不能掉进问答
             log.warning("dingtalk_personal_download_failed", error=str(exc)[:160])
             return "没能从钉钉取到这个文件，请再发一次。"
+        if not content:
+            return "收到的文件是空的，没有存入私有库。"
         if personal_upload_exceeds(len(content), self.settings):
             return personal_upload_reject_text(self.settings) + "。"
         filename = message.file_name or "未命名文件"
@@ -642,9 +699,16 @@ class StreamMessageHandler:
                 "content_base64": base64.b64encode(content).decode("ascii"),
             },
         )
-        if status == 0 or status >= 500:
+        if status == 0:
+            return "私有库暂时连不上，文件没有存入，请稍后再发一次。"
+        if status >= 500:
             return "私有库暂时存不进去，请稍后再发一次。"
-        return str(payload.get("message") or "已放入你的私有库。")
+        if status >= 400:
+            return str(payload.get("message") or "文件未能放入私有库，请换一份再发。")
+        return str(
+            payload.get("message")
+            or "文件已收下，正在解析入库；完成后会再通知你。"
+        )
 
     async def _discovery_catalog(
         self,
@@ -704,8 +768,14 @@ class StreamMessageHandler:
 
         展示规则：去路径前缀的文档名 + 末级小节（heading_path）；同文档同小节去重，
         避免「五条都是同一文件名」的无信息引用列表。
+
+        管道表：AI 卡片支持 Markdown 表，但表头前必须空一行（见
+        ``normalize_answer_markdown_tables``）；本方法再做一次规范化，防止缓存/旧答漏空行。
         """
-        lines = [answer.strip()] if answer.strip() else []
+        from ekbs.retrieval.answer_table_format import normalize_answer_markdown_tables
+
+        body = normalize_answer_markdown_tables(answer).strip()
+        lines = [body] if body else []
         if citations:
             lines.append("")
             lines.append("参考资料：")
@@ -782,21 +852,49 @@ class StreamMessageHandler:
                 pass
             return False
 
+    @staticmethod
+    def _markdown_title(text: str, *, fallback: str = "知识库回答") -> str:
+        """sampleMarkdown 的 title 是首屏透出文案；取首行并去掉标记。"""
+        from ekbs.dingtalk.markdown_format import markdown_preview_title
+
+        return markdown_preview_title(text, fallback=fallback)
+
     async def _reply_text(self, message: InboundMessage, text: str) -> bool:
-        """普通消息回复：群聊用 markdown（必须 @ 到人），单聊用文本。"""
+        """单聊回复（生产主路径：群聊已禁用，卡片模板空时走这里）。
+
+        优先 ``sampleMarkdown``（官方子集：标题/加粗/列表/引用/链接），
+        按 https://open.dingtalk.com/document/development/robot-message-type
+        收成可渲染排版；管道表转栏目块，``【节】`` 升为四级标题。
+        Markdown 发送失败再降级 ``sampleText``。
+        """
+        from ekbs.dingtalk.markdown_format import format_for_sample_markdown
+
         if self.cards is None:
             log.info("dingtalk_reply_skipped_no_client", conversation=message.conversation_id)
             return False
+        if message.is_group:
+            # 入口已拦截群聊；此处兜底，避免误发群。
+            log.info("dingtalk_reply_text_skipped_group", conversation=message.conversation_id)
+            return False
+        body = format_for_sample_markdown(text)
+        title = self._markdown_title(body)
         try:
-            if message.is_group:
-                await self.cards.send_group_message(
-                    message.conversation_id, MSG_KEY_MARKDOWN,
-                    markdown_msg_param("知识库助手", text),
-                )
-            else:
-                await self.cards.send_oto_message(
-                    [message.sender_staff_id], MSG_KEY_TEXT, text_msg_param(text)
-                )
+            await self.cards.send_oto_message(
+                [message.sender_staff_id],
+                MSG_KEY_MARKDOWN,
+                markdown_msg_param(title, body),
+            )
+            return True
+        except Exception as md_exc:
+            log.warning(
+                "dingtalk_markdown_reply_failed",
+                error=str(md_exc)[:160],
+                fallback="sampleText",
+            )
+        try:
+            await self.cards.send_oto_message(
+                [message.sender_staff_id], MSG_KEY_TEXT, text_msg_param(body)
+            )
             return True
         except Exception as exc:
             log.error("dingtalk_reply_failed", error=str(exc))
@@ -831,37 +929,122 @@ class StreamMessageHandler:
         await self._reply_text(message, text)
         return text
 
-    async def _reply_cited_images(
-        self,
-        message: InboundMessage,
+    @staticmethod
+    def _figure_image_candidates(
         citations: Sequence[dict[str, Any]],
         figure_attachments: Sequence[dict[str, Any]] | None = None,
-    ) -> int:
-        """把 figure 原图发到钉钉（先 media/upload，再 sampleImageMsg）。
-
-        优先 ``figure_attachments``（找图意图时后端汇总的上下文图），否则用引用里的图。
-        """
-        if self.cards is None:
-            return 0
-        candidates: list[dict[str, Any]] = list(figure_attachments or [])
-        if not candidates:
-            candidates = [
+    ) -> list[dict[str, Any]]:
+        """去重后的待发图列表：优先后端 ``figure_attachments``，否则引用里的图。"""
+        raw: list[dict[str, Any]] = list(figure_attachments or [])
+        if not raw:
+            raw = [
                 c
                 for c in citations
                 if c.get("figure_id") or c.get("image_path")
             ]
-        if not candidates:
-            return 0
-        data_dir = Path(self.settings.data_dir)
-        sent = 0
+        out: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for item in candidates:
-            if sent >= MAX_REPLY_IMAGES:
-                break
+        for item in raw:
             rel = str(item.get("image_path") or "").strip()
             if not rel or rel in seen:
                 continue
             seen.add(rel)
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _figure_remainder_hint(remaining: int) -> str:
+        if remaining <= 0:
+            return ""
+        return (
+            f"\n\n另有 {remaining} 张相关图片未发出，"
+            "如需全部图片请回复「发全图」。"
+        )
+
+    def _with_figure_remainder_hint(
+        self,
+        text: str,
+        figure_attachments: Sequence[dict[str, Any]] | None,
+        citations: Sequence[dict[str, Any]],
+    ) -> str:
+        candidates = self._figure_image_candidates(citations, figure_attachments)
+        remaining = max(0, len(candidates) - MAX_REPLY_IMAGES)
+        hint = self._figure_remainder_hint(remaining)
+        if not hint:
+            return text
+        return (text or "").rstrip() + hint
+
+    def _pending_figures_key(self, message: InboundMessage) -> str:
+        conv = message.conversation_id or ""
+        staff = message.sender_staff_id or ""
+        return f"{PENDING_FIGURES_KEY_PREFIX}{conv}:{staff}"
+
+    def _load_pending_figures(self, message: InboundMessage) -> list[dict[str, Any]]:
+        key = self._pending_figures_key(message)
+        with self.db.sync_connect() as conn:
+            row = conn.execute(
+                "SELECT value, expires_at FROM ekbs_cache WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+        if row is None or int(row["expires_at"]) < int(time.time()):
+            return []
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return []
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict) and item.get("image_path")]
+
+    def _save_pending_figures(
+        self, message: InboundMessage, items: Sequence[dict[str, Any]]
+    ) -> None:
+        key = self._pending_figures_key(message)
+        with self.db.sync_connect() as conn:
+            if not items:
+                conn.execute("DELETE FROM ekbs_cache WHERE cache_key = ?", (key,))
+            else:
+                slim = [
+                    {
+                        "image_path": str(item.get("image_path") or ""),
+                        "figure_id": str(item.get("figure_id") or ""),
+                        "doc_title": str(item.get("doc_title") or ""),
+                        "page_from": item.get("page_from"),
+                        "page_to": item.get("page_to"),
+                        "chunk_id": item.get("chunk_id"),
+                    }
+                    for item in items
+                    if str(item.get("image_path") or "").strip()
+                ]
+                conn.execute(
+                    "INSERT INTO ekbs_cache(cache_key, value, expires_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(cache_key) DO UPDATE SET value = excluded.value, "
+                    "expires_at = excluded.expires_at",
+                    (
+                        key,
+                        json.dumps({"items": slim}, ensure_ascii=False),
+                        int(time.time()) + PENDING_FIGURES_TTL_SECONDS,
+                    ),
+                )
+            conn.commit()
+
+    async def _send_image_batch(
+        self, message: InboundMessage, items: Sequence[dict[str, Any]]
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """按上限发送一批图片；返回 ``(已发送数, 仍未发出的列表)``。"""
+        if self.cards is None or not items:
+            return 0, list(items)
+        data_dir = Path(self.settings.data_dir)
+        sent = 0
+        deferred: list[dict[str, Any]] = []
+        idx = 0
+        while idx < len(items) and sent < MAX_REPLY_IMAGES:
+            item = items[idx]
+            idx += 1
+            rel = str(item.get("image_path") or "").strip()
+            if not rel:
+                continue
             abs_path = (data_dir / rel).resolve()
             try:
                 abs_path.relative_to(data_dir.resolve())
@@ -882,9 +1065,62 @@ class StreamMessageHandler:
                 sent += 1
             except Exception as exc:  # noqa: BLE001 — 单张失败不拖垮整条答复
                 log.warning("dingtalk_image_reply_failed", path=rel, error=str(exc)[:160])
+                deferred.append(item)
+        remaining = deferred + list(items[idx:])
+        return sent, remaining
+
+    async def _reply_cited_images(
+        self,
+        message: InboundMessage,
+        citations: Sequence[dict[str, Any]],
+        figure_attachments: Sequence[dict[str, Any]] | None = None,
+    ) -> int:
+        """把 figure 原图发到钉钉（先 media/upload，再 sampleImageMsg）。
+
+        优先 ``figure_attachments``；超出 ``MAX_REPLY_IMAGES`` 的写入待补发缓存。
+        """
+        candidates = self._figure_image_candidates(citations, figure_attachments)
+        if not candidates:
+            self._save_pending_figures(message, [])
+            return 0
+        sent, remaining = await self._send_image_batch(message, candidates)
+        self._save_pending_figures(message, remaining)
         if sent:
-            log.info("dingtalk_images_replied", count=sent, msg_id=message.msg_id)
+            log.info(
+                "dingtalk_images_replied",
+                count=sent,
+                remaining=len(remaining),
+                msg_id=message.msg_id,
+            )
         return sent
+
+    async def _reply_pending_figures(self, message: InboundMessage) -> str:
+        """用户回复「发全图」：继续发上一轮未发完的图片。"""
+        pending = self._load_pending_figures(message)
+        if not pending:
+            await self._reply_text(message, NO_PENDING_FIGURES_REPLY)
+            return NO_PENDING_FIGURES_REPLY
+        sent, remaining = await self._send_image_batch(message, pending)
+        self._save_pending_figures(message, remaining)
+        if sent == 0 and remaining:
+            reply = "图片补发失败，请稍后再试「发全图」。"
+            await self._reply_text(message, reply)
+            return reply
+        if remaining:
+            reply = (
+                f"已补发 {sent} 张，还剩 {len(remaining)} 张。"
+                "继续回复「发全图」可再发一批。"
+            )
+        else:
+            reply = f"已补发全部剩余图片（{sent} 张）。"
+        await self._reply_text(message, reply)
+        log.info(
+            "dingtalk_pending_figures_replied",
+            sent=sent,
+            remaining=len(remaining),
+            msg_id=message.msg_id,
+        )
+        return reply
 
 
 def make_handler(

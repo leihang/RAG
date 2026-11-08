@@ -15,7 +15,7 @@
  *   rrf:    { k, fused: [{chunk_id, score}] },
  *   rerank: { enabled, requested_top_n, keep, min_score, scores: [{chunk_id, rerank_score}] },
  *   c5:     { kept: number[], dropped: number[] },
- *   expand: { enabled, deduped,
+ *   expand: { enabled, deduped, kept_leaf_ids, represented_source_ids, collapsed_kept_ids,
  *             expanded: [{context_chunk_id, source_chunk_id, chunk_type, heading_path,
  *                         rerank_score, rerank_rank}] },
  * }
@@ -123,6 +123,15 @@ export interface ExpandRow {
 export interface ExpandStage {
   enabled: boolean | null
   deduped: number | null
+  /** 进入扩展前的精排 keep 叶子 */
+  keptLeafIds: number[]
+  /** 扩展+去重后仍作为 source 出现的叶子 */
+  representedSourceIds: number[]
+  /**
+   * 精排保留但被同父块/同表折叠掉的叶子（内容已在上下文，溯源不再指向它们）。
+   * 这是「Rerank 保留 5 / 上下文只溯到 2」的常见原因，不是漏召回。
+   */
+  collapsedKeptIds: number[]
   expanded: ExpandRow[]
 }
 
@@ -216,6 +225,9 @@ function parseExpand(value: unknown): ExpandStage | null {
   return {
     enabled: bool(value.enabled),
     deduped: num(value.deduped),
+    keptLeafIds: numList(value.kept_leaf_ids),
+    representedSourceIds: numList(value.represented_source_ids),
+    collapsedKeptIds: numList(value.collapsed_kept_ids),
     expanded: recordList(value.expanded).map((row) => ({
       context_chunk_id: num(row.context_chunk_id),
       source_chunk_id: num(row.source_chunk_id),

@@ -294,31 +294,31 @@ async def debug_retrieve(
         "stages": result.stage_debug,
         "chunks": _chunk_views_with_source_rank(result),
     }
-    # 上下文扩展（父块/整表）**在精排之后**发生：精排只给检索单元打分，父块/表容器
-    # 本来就不在候选里。把「上下文块 ← 精排来源 + 精排名次」显式暴露，调试台/审计
-    # 才不会把从没参与 rerank 的父块 id 误当成召回来源（doc 205 的 35274 ← 35277）。
-    ranks = _rerank_rank_map(result)
-    params = (result.stage_debug.get("params") or {}) if result.stage_debug else {}
-    expanded_entries: list[dict[str, Any]] = []
-    for chunk in result.chunks:
-        source_id = getattr(chunk, "expanded_from", None)
-        if source_id is None:
-            continue
-        expanded_entries.append(
-            {
-                "context_chunk_id": chunk.chunk_id,
-                "source_chunk_id": source_id,
-                "chunk_type": chunk.chunk_type,
-                "heading_path": chunk.heading_path,
-                "rerank_score": chunk.rerank_score,
-                "rerank_rank": ranks.get(int(source_id)),
-            }
-        )
-    result.stage_debug["expand"] = {
-        "enabled": bool(params.get("parent_expand")),
-        "deduped": result.deduped_chunks,
-        "expanded": expanded_entries,
-    }
+    # 上下文扩展明细优先用 pipeline 在 collect_debug 时写入的 stages.expand
+    #（含 collapsed_kept_ids）。旧路径/拒答提前返回时可能没有，这里兜底补一份。
+    if not (result.stage_debug or {}).get("expand"):
+        ranks = _rerank_rank_map(result)
+        params = (result.stage_debug.get("params") or {}) if result.stage_debug else {}
+        expanded_entries: list[dict[str, Any]] = []
+        for chunk in result.chunks:
+            source_id = getattr(chunk, "expanded_from", None)
+            if source_id is None:
+                continue
+            expanded_entries.append(
+                {
+                    "context_chunk_id": chunk.chunk_id,
+                    "source_chunk_id": source_id,
+                    "chunk_type": chunk.chunk_type,
+                    "heading_path": chunk.heading_path,
+                    "rerank_score": chunk.rerank_score,
+                    "rerank_rank": ranks.get(int(source_id)),
+                }
+            )
+        result.stage_debug["expand"] = {
+            "enabled": bool(params.get("parent_expand")),
+            "deduped": result.deduped_chunks,
+            "expanded": expanded_entries,
+        }
     await _record_history(
         runtime,
         {

@@ -26,7 +26,12 @@ from ekbs.logging import configure_logging, get_logger
 from ekbs.permission.acl import DocumentGate
 from ekbs.permission.context import PermContext
 from ekbs.permission.router import ShardRouter
-from ekbs.provider.registry import Providers, build_providers, build_query_expand_llm
+from ekbs.provider.registry import (
+    Providers,
+    build_providers,
+    build_query_expand_llm,
+    build_query_rewrite_llm,
+)
 from ekbs.ratelimit import RateLimiter
 from ekbs.retrieval.pipeline import RetrievalPipeline
 from ekbs.security import ContentGuard
@@ -131,8 +136,10 @@ class Runtime:
 
         sessions = SessionStore(db, settings)
         expand_llm = build_query_expand_llm(settings, secrets)
+        # 未配 query_rewrite.model 时与回答共用 LLM；配了则改写单独一条链路。
+        rewrite_llm = build_query_rewrite_llm(settings, secrets) or providers.llm
         rewriter = QueryRewriter(
-            settings=settings, llm=providers.llm, expand_llm=expand_llm,
+            settings=settings, llm=rewrite_llm, expand_llm=expand_llm,
         )
         authz = AuthzService(db)
         content_guard = ContentGuard(
@@ -162,6 +169,7 @@ class Runtime:
             query_expand=(
                 expand_llm.ref.ident if expand_llm is not None else "rules"
             ),
+            query_rewrite=rewrite_llm.ref.ident,
             corpus_egress_ack=settings.permission.corpus_egress_ack,
             l3_ingest_enabled=settings.permission.l3_ingest_enabled,
         )

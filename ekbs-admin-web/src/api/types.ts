@@ -251,6 +251,15 @@ export interface ImportKbItem {
   default_level?: number
 }
 
+/** raw 根下一层（个人库展开为 personal/<uid>），用于 UI 与磁盘对齐。 */
+export interface RawTopDir {
+  name: string
+  rel_path: string
+  kb_code: string | null
+  orphan: boolean
+  subfolder_count: number
+}
+
 export interface ImportMeta {
   raw_root?: string
   /** 目录导入放行的后缀（= 解析器 `SUFFIX_ENGINES` 全量） */
@@ -263,6 +272,8 @@ export interface ImportMeta {
   enqueue_limit?: number
   knowledge_bases?: ImportKbItem[]
   queue?: Record<string, number>
+  /** 磁盘 raw 顶层目录；orphan=true 表示没有同 code 知识库，上传目标树里不会出现 */
+  raw_top_dirs?: RawTopDir[]
 }
 
 /** `GET /import/dirs` 的一层子目录。**注意**没有 `rel_under`（那个只出现在 `recursive=true` 的扁平列表里）。 */

@@ -96,6 +96,8 @@ export default function DocumentUpload() {
   const [allowed, setAllowed] = useState<string[]>(FALLBACK_EXT)
   const [kbs, setKbs] = useState<KbRow[]>([])
   const [foldersByKb, setFoldersByKb] = useState<Record<number, DestFolder[]>>({})
+  /** raw 上有、但没有同 code 知识库的顶层目录 —— 不会出现在目标树里，需要提示登记。 */
+  const [orphanRawDirs, setOrphanRawDirs] = useState<{ name: string; rel_path: string; subfolder_count: number }[]>([])
   // 「加载中」与「加载完了但一个库都没有」必须分开：清库之后列表为空是**合法状态**，
   // 早期用 `loading={!kbs.length}` 会让首次启动永远转圈，看不到「去新建」的提示。
   const [kbLoaded, setKbLoaded] = useState(false)
@@ -271,6 +273,12 @@ export default function DocumentUpload() {
             document_count?: number
           }[]
           upload?: { chunk_size_mb?: number; concurrent?: number; max_retry?: number }
+          raw_top_dirs?: {
+            name: string
+            rel_path: string
+            orphan?: boolean
+            subfolder_count?: number
+          }[]
         }
         // 并发与重试的默认值来自服务端配置（方案 §6.5 的 upload.*），
         // 界面上只是"允许临时调小"，不再写死
@@ -280,6 +288,15 @@ export default function DocumentUpload() {
         if (m.upload_extensions?.length) setAllowed(m.upload_extensions)
         const list = m.knowledge_bases ?? []
         setKbs(list)
+        setOrphanRawDirs(
+          (m.raw_top_dirs ?? [])
+            .filter((row) => row.orphan)
+            .map((row) => ({
+              name: row.name,
+              rel_path: row.rel_path,
+              subfolder_count: Number(row.subfolder_count || 0),
+            })),
+        )
         setKbLoaded(true)
         // 空列表是合法状态（首次部署、清库后）：此时不设置 kb_id，
         // 由必填校验提示用户去点「新建」，而不是卡在"正在加载"上。
@@ -591,7 +608,10 @@ export default function DocumentUpload() {
       const created = await createKnowledgeBase(v)
       message.success(`已创建知识库「${created.name}」`)
       setKbs((prev) => [...prev, created])
+      setOrphanRawDirs((prev) => prev.filter((row) => row.name !== created.code && row.rel_path !== created.code))
       form.setFieldValue('kb_id', created.kb_id)
+      form.setFieldValue('dest_folder', '')
+      void loadDestFolders(created.kb_id)
       setKbModalOpen(false)
       kbForm.resetFields()
     } catch (err) {
@@ -825,7 +845,7 @@ export default function DocumentUpload() {
               <TreeSelect
                 style={{ width: 'calc(100% - 160px)' }}
                 treeData={targetTree}
-                treeDefaultExpandAll={false}
+                treeDefaultExpandAll
                 treeNodeFilterProp="title"
                 showSearch
                 allowClear
@@ -835,7 +855,7 @@ export default function DocumentUpload() {
                   !kbLoaded
                     ? '正在加载知识库列表…'
                     : kbs.length
-                      ? '展开后选择知识库或文件夹'
+                      ? '选择知识库或文件夹（与 raw 下目录一致）'
                       : '还没有知识库，点右边「新建」'
                 }
                 value={formatKbTarget(watchedKbId, watchedDest)}
@@ -848,6 +868,45 @@ export default function DocumentUpload() {
                 管理
               </Button>
             </Space.Compact>
+            {orphanRawDirs.length > 0 ? (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ marginTop: 8 }}
+                message="raw 里有未登记的文件夹，不会出现在上方选项中"
+                description={
+                  <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                    <Typography.Text type="secondary">
+                      目标树只挂「知识库 code = raw 顶层目录名」下的子文件夹。下列目录已在磁盘上，但没有同名知识库：
+                    </Typography.Text>
+                    {orphanRawDirs.map((row) => (
+                      <Space key={row.rel_path} wrap>
+                        <Typography.Text code>{row.rel_path}</Typography.Text>
+                        <Typography.Text type="secondary">
+                          {row.subfolder_count ? `${row.subfolder_count} 个子文件夹` : '空目录或仅有文件'}
+                        </Typography.Text>
+                        {!row.rel_path.startsWith('personal/') ? (
+                          <Button
+                            size="small"
+                            type="link"
+                            onClick={() => {
+                              kbForm.setFieldsValue({
+                                code: row.name,
+                                name: row.name,
+                                default_level: 2,
+                              })
+                              setKbModalOpen(true)
+                            }}
+                          >
+                            登记为知识库
+                          </Button>
+                        ) : null}
+                      </Space>
+                    ))}
+                  </Space>
+                }
+              />
+            ) : null}
           </Form.Item>
           <Form.Item
             name="kb_id"

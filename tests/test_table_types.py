@@ -40,6 +40,60 @@ def test_classify_fee_detail_as_b() -> None:
     assert classify_table_type(caption="收费明细", rows=rows) == "B"
 
 
+def test_classify_meter_reading_wide_as_b() -> None:
+    """户内抄表明细 17 列：按费用承担对象签名识别为 B，不得因列宽变 unknown。"""
+    headers = [
+        "项目名称",
+        "资源编号",
+        "费用承担对象",
+        "表计编号",
+        "表计名称",
+        "抄表日期",
+        "起数",
+        "止数",
+        "旧表用量",
+        "倍率",
+        "损耗",
+        "合计用量",
+        "单价（元）",
+        "金额（元）",
+        "抄表来源",
+        "操作人",
+        "操作时间",
+    ]
+    data = [
+        "熙街",
+        "公区",
+        "重庆嘛嘛公寓管理有限公司",
+        "SG-1",
+        "SG-0601184986（嘛嘛公寓总表）",
+        "2026-10-01",
+        "1",
+        "2",
+        "",
+        "1",
+        "",
+        "58678",
+        "0.54",
+        "1",
+        "",
+        "财务",
+        "2026-10-09",
+    ]
+    # 宽表需显式 header_row_count；HTML body 路径由 coerce 识别表头
+    assert (
+        classify_table_type(caption="模板", rows=[headers, data], header_row_count=1)
+        == "B"
+    )
+    cells = "".join(f"<th>{h}</th>" for h in headers)
+    body = (
+        f"<table><tr>{cells}</tr><tr>"
+        + "".join(f"<td>{c}</td>" for c in data)
+        + "</tr></table>"
+    )
+    assert classify_table_type(caption="模板", body=body) == "B"
+
+
 def test_classify_financial_as_c() -> None:
     rows = [
         ["科目", "本期金额", "本年累计"],

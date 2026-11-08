@@ -34,3 +34,11 @@ def test_content_and_query_share_the_same_code_set() -> None:
     matched = {part.strip('"') for part in to_match_query(text).split(" OR ")}
     assert {"xjwy-gc-01-01", "2026-11-03"} <= written
     assert {"xjwy-gc-01-01", "2026-11-03"} <= matched
+
+
+def test_match_query_drops_stopwords_when_content_tokens_remain() -> None:
+    """「是/的/换」不得进 OR，否则稀疏路被虚词冲掉「填料」真命中。"""
+    matched = {part.strip('"') for part in to_match_query("冷却塔填料是几月换的").split(" OR ")}
+    assert "冷却塔" in matched or "填料" in matched
+    assert "是" not in matched
+    assert "的" not in matched

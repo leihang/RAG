@@ -2,18 +2,25 @@ import { http } from './client'
 
 export interface NumericAnswer {
   value?: number | null
+  /** 展示用数字串（结构化合计/取数抄写后的原文形态） */
+  surface?: string
   unit?: string
   page?: number | null
   quote?: string
   indicator?: string
   reason?: string
-  /** 是否通过「抄写校验」（值必须逐字来自 quote 所在原文片段） */
+  /**
+   * 取数：是否通过「抄写校验」（值须逐字来自 quote 片段）。
+   * 结构化合计/表格排名：服务端算完即 true，不适用抄写校验文案。
+   */
   verified?: boolean
   cite_index?: number | null
   /** 口径限定词（年份/期间/表名…）：必须能从引用片段里逐字核到 */
   scope?: string
   /** 同一行标签下的**其它数值**（如 2024 年那一行）——有就说明存在口径歧义，需人工确认 */
   alternatives?: { value?: number; label?: string; chunk_id?: number; doc_title?: string; page?: number | null }[]
+  op?: string
+  rows_touched?: number
 }
 
 export interface DebugQueryBody {

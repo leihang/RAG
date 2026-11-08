@@ -34,7 +34,11 @@ from ekbs.ingest.code_chunker import chunk_code, display_source_path, is_code_so
 from ekbs.ingest.retrievable import RETRIEVABLE_PREDICATE, retrievable_chunk_ids
 from ekbs.ingest import token_calib
 from ekbs.ingest.clean import clean_figure_text, clean_markdown, clean_profile_for_path
-from ekbs.ingest.seal_filter import partition_seal_figures, strip_figure_anchors
+from ekbs.ingest.seal_filter import (
+    partition_seal_figures,
+    seal_filter_applies,
+    strip_figure_anchors,
+)
 from ekbs.ingest.parser import parse_cn_dates
 from ekbs.ingest.table_merge import merge_continued_tables
 from ekbs.ingest.chunker import (
@@ -315,7 +319,8 @@ class IngestPipeline:
         tables = tables_list
         if merge_stats:
             log.info("tables_merged_for_ingest", title=title, **merge_stats)
-        if figures:
+        # 公章过滤只对扫描件/PDF/Word；PPT 现场照会被方图暖色误杀。
+        if figures and seal_filter_applies(source_path, title=title):
             kept_figures, dropped_seals = partition_seal_figures(
                 list(figures), self.settings.data_dir
             )
@@ -498,6 +503,8 @@ class IngestPipeline:
             self._publish(doc_id, page_count=None, status="failed")
             raise
 
+        await self._auto_doc_recommend(doc_id)
+
         result = IngestResult(
             doc_id=doc_id,
             shard_id=shard_id,
@@ -609,6 +616,7 @@ class IngestPipeline:
             fts_ms=round(fts_ms, 1),
             publish_ms=round(publish_ms, 1),
         )
+        await self._auto_doc_recommend(doc_id)
         result = IngestResult(
             doc_id=doc_id,
             shard_id=shard_id,
@@ -1011,6 +1019,43 @@ class IngestPipeline:
                 (status, page_count, None, doc_id),
             )
             conn.commit()
+
+    async def _auto_doc_recommend(self, doc_id: int) -> None:
+        """发布成功后补 tier-3 代表问句；失败只打日志，不回滚入库。
+
+        调用方（worker / 管理台 approve）应先设 ``self.answer_runtime = Runtime``，
+        以便 rerank 验证；缺省时仍会 LLM 生成并落 ``pending``。
+        """
+        try:
+            from ekbs.recommend import ensure_doc_recommend_after_publish
+
+            rt = getattr(self, "answer_runtime", None)
+            if rt is None:
+                class _RecRuntime:
+                    pass
+
+                rt = _RecRuntime()
+                rt.db = self.db
+                rt.settings = self.settings
+                rt.providers = self.providers
+
+                class _NoPipeline:
+                    async def retrieve(self, *_a, **_k):  # noqa: ANN001
+                        return type("R", (), {"chunks": []})()
+
+                rt.pipeline = _NoPipeline()
+            outcome = await ensure_doc_recommend_after_publish(rt, int(doc_id))
+            log.info(
+                "doc_recommend_after_publish",
+                doc_id=doc_id,
+                **{k: v for k, v in outcome.items() if k != "doc_id"},
+            )
+        except Exception as exc:  # noqa: BLE001 - 推荐失败不得拖垮入库
+            log.warning(
+                "doc_recommend_after_publish_failed",
+                doc_id=doc_id,
+                error=str(exc)[:200],
+            )
 
 
 def _page_count(page_map: Sequence[tuple[int, int, int]] | None) -> int | None:

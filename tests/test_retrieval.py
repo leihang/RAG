@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from ekbs.retrieval.pipeline import (
@@ -288,7 +290,7 @@ async def test_parent_expansion_keeps_clause_heading(seeded) -> None:
 def test_table_row_group_expands_into_table_parent() -> None:
     """大表行组命中 → 扩成表父块（上文 + 整表 + 下文），标题保留命中的表名路径。
 
-    小表（整表一块、``parent_id`` 指向正文父块）不展开：展开会把它换成不含表格的正文。
+    正文父下挂小表由 ``prose_table_mode`` 控制（默认 parent_only）。
     """
     from ekbs.retrieval.pipeline import RetrievalPipeline
 
@@ -326,16 +328,17 @@ def test_table_row_group_expands_into_table_parent() -> None:
         user_id = "u1"
 
     pipeline = object.__new__(RetrievalPipeline)
+    pipeline.settings = SimpleNamespace(retrieval=SimpleNamespace(prose_table_mode="parent_only"))
     pipeline.load_chunks = lambda ids: {
         c.chunk_id: c for c in (container, prose_parent) if c.chunk_id in ids
     }
     pipeline.gate = _Gate()
 
     expanded = pipeline._expand_parents([row_group], _Perm())
-    assert expanded and expanded[0].chunk_id == 10, "行组叶子应扩成表父块"
-    assert expanded[0].chunk_type == "table"
-    assert "以上记录保存三年" in expanded[0].content, "下文结论应进上下文"
-    assert expanded[0].heading_path == row_group.heading_path, "表名路径标题必须保留"
+    assert [c.chunk_id for c in expanded] == [11, 10], "表段：叶子在前 + 直系父段"
+    assert expanded[1].chunk_type == "table"
+    assert "以上记录保存三年" in expanded[1].content, "下文结论应进上下文"
+    assert expanded[1].heading_path == row_group.heading_path, "表名路径标题必须保留"
 
     small = RetrievedChunk(
         chunk_id=13,
@@ -346,8 +349,15 @@ def test_table_row_group_expands_into_table_parent() -> None:
         chunk_type="table",
         parent_chunk_id=12,
     )
+    # 默认 prose_table_mode=parent_only：正文父下挂小表也升到父（避免父+表叶重复）
+    pipeline.settings = SimpleNamespace(retrieval=SimpleNamespace(prose_table_mode="parent_only"))
     expanded2 = pipeline._expand_parents([small], _Perm())
-    assert expanded2[0].content == small.content, "小表不得展开（parent 是正文父块）"
+    assert expanded2[0].chunk_id == 12, "parent_only：正文父下挂表应升到父"
+    assert expanded2[0].content == prose_parent.content
+
+    pipeline.settings = SimpleNamespace(retrieval=SimpleNamespace(prose_table_mode="leaf_only"))
+    expanded_leaf = pipeline._expand_parents([small], _Perm())
+    assert expanded_leaf[0].content == small.content, "leaf_only：正文父下挂表只留表叶"
 
 
 async def test_irrelevant_query_is_refused(seeded) -> None:

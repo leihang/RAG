@@ -45,9 +45,63 @@ _ANGLE_PROMPT = (
     "你是检索查询扩写助手。根据用户这一个问题，写2条不同角度、但信息需求相同的问法，"
     "用来提高检索召回。\n"
     "只输出2行，每行一条问法。不要编号，不要解释。\n"
-    "不要添加问题里没有的人名、制度名、编号。\n\n"
+    "不要添加问题里没有的人名、制度名、编号。\n"
+    "\n"
+    "【示例】\n"
+    "用户问题：年假有多少天\n"
+    "年假天数是如何规定的\n"
+    "员工可休年假几天\n"
+    "\n"
     "用户问题：{question}"
 )
+
+#: 改写 system 角色：规则 + 异形示例（禁止与线上热实体/高频追问同构）+ 输出约束。
+#: 真题（历史/最新问题）只放 user，避免 few-shot 与本题抢注意力。
+_REWRITE_SYSTEM_PROMPT = (
+    "【通用规则】\n"
+    "把用户的最新问题改写成一个不依赖上下文、可独立检索的查询词。\n"
+    "保留主体（商户/表名/人名）、指标（用电量/用水量等）、年份与月份期间；"
+    "不要汇总或计算；不要添加历史里没有的实体或指标；"
+    "若最新问题本身已完整自包含，原样保留即可。\n"
+    "\n"
+    "【示例】\n"
+    "【改写】\n"
+    "历史一轮：\n"
+    "user: 青禾店2024年12月用水量\n"
+    "assistant: 108\n"
+    "最新问题：2025年啦\n"
+    "改写后的查询词：青禾店2025年用水量\n"
+    "\n"
+    "【扩写】\n"
+    "历史一轮：\n"
+    "user: （无）\n"
+    "assistant: （无）\n"
+    "最新问题：财务专用章保管\n"
+    "改写后的查询词：财务专用章由谁保管\n"
+    "\n"
+    "【改扩写】\n"
+    "历史一轮：\n"
+    "user: 年假有多少天\n"
+    "assistant: 5 天 [1]\n"
+    "最新问题：那它需要提前几天申请\n"
+    "改写后的查询词：年假申请需要提前几天\n"
+    "\n"
+    "【改写后的查询词】\n"
+    "只输出改写后的查询词本身：单行、无解释、无引号、不多行。"
+)
+
+_REWRITE_USER_TEMPLATE = (
+    "对话历史（最近一轮）：\n{history}\n\n"
+    "最新问题：{question}"
+)
+
+#: 改写结果里允许出现、不必强制来自历史的计量/时间类词
+_REWRITE_METRIC_OK = frozenset({
+    "用电量", "用水量", "用气量", "电费", "水费", "气费", "热费", "用量", "金额",
+    "合计", "总计", "多少", "几天", "申请", "提前", "需要", "保管", "由谁",
+    "是多少", "是什么", "如何", "怎么",
+})
+_REWRITE_ENTITY_FLAGS = frozenset({"n", "nr", "ns", "nt", "nz", "nw", "eng", "nrt"})
 
 #: 需要上下文的指代词。必须是分词后的整词，不能用子串
 #: （「其他」里的「他」、「应该」里的「该」都不是指代）。
@@ -231,10 +285,10 @@ class QueryRewriter:
     llm: Any | None = None
     #: 快速模型，只负责把一条问法扩成两个角度。不参与回答，也不读对话历史。
     expand_llm: Any | None = None
-    prompt_template: str = (
-        "把用户的最新问题改写成一个不依赖上下文、可独立检索的查询。"
-        "只输出改写后的查询本身，不要解释。\n\n对话历史：\n{history}\n\n最新问题：{question}"
-    )
+    #: 兼容旧测试/调试：完整可见模板（system + user 占位）；真正调用走分角色消息。
+    prompt_template: str = _REWRITE_SYSTEM_PROMPT + "\n\n" + _REWRITE_USER_TEMPLATE
+    system_prompt: str = _REWRITE_SYSTEM_PROMPT
+    user_template: str = _REWRITE_USER_TEMPLATE
     enabled: bool = True
     strategy_override: str | None = None
     _last: RewriteResult | None = field(default=None, init=False, repr=False)
@@ -271,9 +325,37 @@ class QueryRewriter:
         if strategy == "off":
             result = RewriteResult(question, question, "off", used_history=False)
             return self._fill_variants(result)
-        if strategy == "llm" and self.llm is not None and not _is_mock(self.llm):
+        # llm：只走模型改写；失败/mock/无模型 → **原文进检索**，绝不回退 heuristic。
+        if strategy == "llm":
+            if self.llm is None or _is_mock(self.llm):
+                result = RewriteResult(
+                    question, question, "llm_skipped", used_history=False
+                )
+                return self._fill_variants(result)
             rewritten = await self._rewrite_with_llm(question, history)
             if rewritten:
+                allowed = _rewrite_allowed_text(question, history)
+                if _rewrite_has_unknown_entity(rewritten, allowed):
+                    log.warning(
+                        "query_rewrite_guard_reject",
+                        rewritten=rewritten[:80],
+                        question=question[:80],
+                    )
+                    guarded = _merge_followup(
+                        previous_question, question, _history_year(history)
+                    )
+                    if (
+                        guarded != question
+                        and not _rewrite_has_unknown_entity(guarded, allowed)
+                    ):
+                        result = RewriteResult(
+                            question, guarded, "llm_guarded", used_history=True
+                        )
+                        return self._fill_variants(result)
+                    result = RewriteResult(
+                        question, question, "llm_rejected", used_history=False
+                    )
+                    return self._fill_variants(result)
                 result = RewriteResult(question, rewritten, "llm", used_history=True)
                 return self._fill_variants(result)
             result = RewriteResult(question, question, "llm_failed", used_history=False)
@@ -338,10 +420,15 @@ class QueryRewriter:
         return ""
 
     async def _rewrite_with_llm(self, question: str, history: Sequence[dict[str, str]]) -> str:
-        rendered = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in list(history)[-6:])
-        prompt = self.prompt_template.format(history=rendered, question=question)
+        # 只喂最近 1 轮（通常 user+assistant 共 2 条；不足则有多少用多少）
+        rendered = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in list(history)[-2:])
+        user_content = self.user_template.format(history=rendered, question=question)
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_content},
+        ]
         try:
-            result = await self.llm.generate([{"role": "user", "content": prompt}])
+            result = await self.llm.generate(messages)
         except Exception as exc:
             log.warning("query_rewrite_failed", error=str(exc))
             return ""
@@ -503,6 +590,41 @@ def _keyword_focus(text: str) -> str:
     return cleaned.strip(" ，,。？?！!")
 
 
+def _rewrite_allowed_text(question: str, history: Sequence[dict[str, str]]) -> str:
+    """改写校验语料：最近一轮历史 ∪ 当前原话。"""
+    parts = [str(m.get("content", "") or "") for m in list(history)[-2:]]
+    parts.append(question or "")
+    return "\n".join(parts)
+
+
+def _rewrite_has_unknown_entity(rewritten: str, allowed: str) -> bool:
+    """改写结果是否引入了历史∪原话里没有的主体词（防 few-shot 抄实体）。"""
+    text = (rewritten or "").strip()
+    if not text:
+        return True
+    haystack = allowed or ""
+    for word, flag in _pos_tokens(text):
+        token = (word or "").strip()
+        if len(token) < 2:
+            continue
+        if token.isdigit() or re.fullmatch(r"20\d{2}年?", token):
+            continue
+        if token in _REWRITE_METRIC_OK:
+            continue
+        if _token_is_anaphora(token):
+            continue
+        if _PERIOD_FOLLOW_RE.fullmatch(token) or _YEAR_RE.fullmatch(token):
+            continue
+        is_entity = flag in _REWRITE_ENTITY_FLAGS or (
+            flag.startswith("n") and len(token) >= 2
+        )
+        if not is_entity:
+            continue
+        if token not in haystack:
+            return True
+    return False
+
+
 def _pos_tokens(text: str) -> list[tuple[str, str]]:
     """jieba 词和词性。先加载用户词典，和检索分词用同一套词。"""
     import jieba.posseg as pseg
@@ -552,6 +674,10 @@ _PERIOD_FOLLOW_RE = re.compile(
 )
 _QUESTION_TAIL_RE = re.compile(r"(是多少|多少|几|合计|总计|总共|多大|呢|啦|吗|？|\?)+$")
 _YEAR_RE = re.compile(r"20\d{2}\s*年")
+_METRIC_TAIL_RE = re.compile(
+    r"(用电量|用水量|用气量|电费|水费|气费|热费|用量|金额)$"
+)
+_SOLICIT_HEAD_RE = re.compile(r"^(提供|给我|查一下|看看|发一下|再给|换成|换成)")
 
 
 def _period_of(text: str) -> str:
@@ -567,6 +693,40 @@ def _history_year(history: Sequence[dict[str, str]]) -> str:
     return ""
 
 
+def _split_entity_metric(previous: str) -> tuple[str, str]:
+    """上一问去掉年/期间/尾问后，拆成（主体, 指标）。"""
+    base = _QUESTION_TAIL_RE.sub("", previous or "").strip()
+    base = _YEAR_RE.sub("", base)
+    base = _PERIOD_FOLLOW_RE.sub("", base)
+    base = re.sub(r"\s+", "", base).strip(" ，,的")
+    match = _METRIC_TAIL_RE.search(base)
+    if match:
+        return base[: match.start()].strip(), match.group(1)
+    return base, ""
+
+
+def _is_incomplete_period_ask(question: str) -> bool:
+    """「提供一下2026年1-3月的」：有期间，但缺可检索主体/指标。"""
+    text = (question or "").strip()
+    if not text or not _period_of(text):
+        return False
+    if _SOLICIT_HEAD_RE.match(text):
+        return True
+    if text.endswith(("的", "呢", "吧")) and not _METRIC_TAIL_RE.search(
+        _QUESTION_TAIL_RE.sub("", text)
+    ):
+        return True
+    return False
+
+
+def _compose_topic_period(
+    entity: str, metric: str, year: str, period: str
+) -> str:
+    period_body = _YEAR_RE.sub("", period or "").strip()
+    parts = [entity, year, period_body, metric]
+    return "".join(p for p in parts if p) + "是多少"
+
+
 def _merge_followup(previous: str, question: str, fallback_year: str = "") -> str:
     """把「那 1-5 月啦」这类期间追问合并成可独立检索的一句话。
 
@@ -579,6 +739,13 @@ def _merge_followup(previous: str, question: str, fallback_year: str = "") -> st
     previous_year_match = _YEAR_RE.search(previous)
     previous_year_text = previous_year_match.group(0) if previous_year_match else fallback_year
     current_has_year = bool(_YEAR_RE.search(question))
+    # 「提供一下2026年1-3月的」：带走上一问的主体+指标，换上当前年/期间
+    if _is_incomplete_period_ask(question):
+        entity, metric = _split_entity_metric(previous)
+        year_m = _YEAR_RE.search(question)
+        year_t = year_m.group(0) if year_m else previous_year_text
+        if entity or metric:
+            return _compose_topic_period(entity, metric, year_t, current_period)
     # 只补期间、没有主题：用上一问的主体 + 当前期间。
     if _needs_context(question) and current_period and not current_has_year:
         base = _QUESTION_TAIL_RE.sub("", previous).strip()
@@ -587,6 +754,16 @@ def _merge_followup(previous: str, question: str, fallback_year: str = "") -> st
     # 自包含但漏了年份：只对带期间的追问补上一轮年份。
     if current_period and not current_has_year and previous_year_text:
         return f"{previous_year_text}{question}"
+    # 「新东方的」：短主体追问，继承上一问的年/期间/指标
+    if _needs_context(question) and not current_period:
+        entity_now = _QUESTION_TAIL_RE.sub("", question).strip().rstrip("的")
+        cjk_n = len(re.findall(r"[\u4e00-\u9fff]", entity_now))
+        if 1 <= cjk_n <= 6:
+            _prev_entity, metric = _split_entity_metric(previous)
+            year_t = previous_year_text
+            period = _period_of(previous)
+            if metric or period:
+                return _compose_topic_period(entity_now, metric, year_t, period)
     if _needs_context(question):
         return f"{previous} {question}"
     return question

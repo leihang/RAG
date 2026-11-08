@@ -159,3 +159,223 @@ async def test_factual_intent_attaches_bound_figures(seeded) -> None:
     )
     assert result.figure_attachments
     assert result.figure_attachments[0]["chunk_id"] == 11
+
+
+async def test_figure_attachments_lock_to_text_hit_page(seeded) -> None:
+    """页 → 文字 → 同页图：别页题注即使有「工程部」等字样也不得抢回源。"""
+    runtime, _ = seeded
+    body = RetrievedChunk(
+        chunk_id=30,
+        doc_id=1,
+        shard_id="kb_all_L1",
+        content="第30页\n化粪池月度检查 小广告检查清除",
+        chunk_type="child",
+        doc_title="工程部/2026年10月工作汇报-工程",
+        page_from=30,
+        page_to=30,
+    )
+    same_page = RetrievedChunk(
+        chunk_id=301,
+        doc_id=1,
+        shard_id="kb_all_L1",
+        content="[图片]",
+        chunk_type="figure",
+        doc_title="工程部/2026年10月工作汇报-工程",
+        page_from=30,
+        page_to=30,
+        figure_id="fig-30",
+        image_path="parse/1/images/30.png",
+        heading_path="第 30 页",
+    )
+    other_page = RetrievedChunk(
+        chunk_id=111,
+        doc_id=1,
+        shard_id="kb_all_L1",
+        content="[图片]",
+        chunk_type="figure",
+        doc_title="工程部/2026年10月工作汇报-工程",
+        page_from=11,
+        page_to=11,
+        figure_id="fig-11",
+        image_path="parse/1/images/11.png",
+        heading_path="1.能耗管理（工程部）",
+    )
+    result = AnswerResult(
+        answer="第30页有化粪池月度检查",
+        citations=[],
+        retrieval=RetrievalResult(
+            query="化粪池月度检查情况",
+            chunks=[body, same_page, other_page],
+        ),
+        model="mock",
+        rewritten_query="工程部2026年10月工作汇报化粪池月度检查情况",
+        intent="factual",
+    )
+    runtime.pipeline._apply_figure_adjustments(
+        result,
+        result.retrieval,
+        intent="factual",
+        question="工程部2026年10月工作汇报，化粪池月度检查情况",
+    )
+    assert [a["chunk_id"] for a in result.figure_attachments] == [301]
+    assert result.figure_attachments[0]["page_from"] == 30
+
+
+async def test_figure_attachments_cover_each_cited_page(seeded) -> None:
+    """多页文字引用：每页先挂 1 张，再补同页其余图，不被「页数=张数」卡死。"""
+    runtime, _ = seeded
+    texts = []
+    figs = []
+    cites = []
+    for i, page in enumerate((27, 28, 29, 30, 31), start=1):
+        texts.append(
+            RetrievedChunk(
+                chunk_id=page,
+                doc_id=1,
+                shard_id="kb_all_L1",
+                content=f"第{page}页\n8. 创新、突破、专项主导\n事项{page}",
+                chunk_type="parent",
+                doc_title="工程部/2026年10月工作汇报-工程",
+                page_from=page,
+                page_to=page,
+            )
+        )
+        # 每页 2 张，共 10 张；应全部进入 attachments（上限 16）
+        for j in (0, 1):
+            figs.append(
+                RetrievedChunk(
+                    chunk_id=page * 10 + j,
+                    doc_id=1,
+                    shard_id="kb_all_L1",
+                    content="[图片]",
+                    chunk_type="figure",
+                    doc_title="工程部/2026年10月工作汇报-工程",
+                    page_from=page,
+                    page_to=page,
+                    figure_id=f"fig-{page}-{j}",
+                    image_path=f"parse/1/images/{page}-{j}.png",
+                    parent_chunk_id=page,
+                    heading_path=f"第 {page} 页",
+                )
+            )
+        cites.append(
+            Citation(
+                cite_index=i,
+                chunk_id=page,
+                doc_id=1,
+                doc_title="工程部/2026年10月工作汇报-工程",
+                doc_version="v1",
+                heading_path=f"第 {page} 页",
+                page_from=page,
+                page_to=page,
+                rerank_score=0.9,
+                acl_result="pass",
+                page_check="pass",
+            )
+        )
+    result = AnswerResult(
+        answer="创新突破含多项[1][2][3][4][5]",
+        citations=cites,
+        retrieval=RetrievalResult(
+            query="创新突破有些什么工作内容",
+            chunks=[*texts, *figs],
+        ),
+        model="mock",
+        rewritten_query="2026年10月工程部汇报 创新突破工作内容",
+        intent="factual",
+    )
+    runtime.pipeline._apply_figure_adjustments(
+        result,
+        result.retrieval,
+        intent="factual",
+        question="2026年10月工程部汇报ppt，创新突破有些什么工作内容",
+    )
+    pages = sorted({int(a["page_from"]) for a in result.figure_attachments})
+    assert pages == [27, 28, 29, 30, 31]
+    assert len(result.figure_attachments) == 10
+
+
+async def test_figure_attachments_follow_model_citation_not_rerank_mix(seeded) -> None:
+    """模型只 cite 第30页时，即使上下文混入第20页（广告灯箱）也只发第30页图。"""
+    runtime, _ = seeded
+    page30 = RetrievedChunk(
+        chunk_id=30,
+        doc_id=1,
+        shard_id="kb_all_L1",
+        content="第30页\n小广告检查清除",
+        chunk_type="parent",
+        doc_title="工程部/2026年10月工作汇报-工程",
+        page_from=30,
+        page_to=30,
+    )
+    page20 = RetrievedChunk(
+        chunk_id=20,
+        doc_id=1,
+        shard_id="kb_all_L1",
+        content="第20页\n商户及公共广告灯箱安全整改复查",
+        chunk_type="parent",
+        doc_title="工程部/2026年10月工作汇报-工程",
+        page_from=20,
+        page_to=20,
+    )
+    fig30 = RetrievedChunk(
+        chunk_id=301,
+        doc_id=1,
+        shard_id="kb_all_L1",
+        content="[图片]",
+        chunk_type="figure",
+        doc_title="工程部/2026年10月工作汇报-工程",
+        page_from=30,
+        page_to=30,
+        figure_id="fig-30",
+        image_path="parse/1/images/30.png",
+        parent_chunk_id=30,
+        heading_path="第 30 页",
+    )
+    fig20 = RetrievedChunk(
+        chunk_id=201,
+        doc_id=1,
+        shard_id="kb_all_L1",
+        content="[图片]",
+        chunk_type="figure",
+        doc_title="工程部/2026年10月工作汇报-工程",
+        page_from=20,
+        page_to=20,
+        figure_id="fig-20",
+        image_path="parse/1/images/20.png",
+        parent_chunk_id=20,
+        heading_path="第 20 页",
+    )
+    result = AnswerResult(
+        answer="第30页列有小广告检查清除[1]",
+        citations=[
+            Citation(
+                cite_index=1,
+                chunk_id=30,
+                doc_id=1,
+                doc_title="工程部/2026年10月工作汇报-工程",
+                doc_version="v1",
+                heading_path="第 30 页",
+                page_from=30,
+                page_to=30,
+                rerank_score=0.9,
+                acl_result="pass",
+                page_check="pass",
+            )
+        ],
+        retrieval=RetrievalResult(
+            query="小广告清除内容",
+            chunks=[page30, page20, fig30, fig20],
+        ),
+        model="mock",
+        rewritten_query="工程部2026年10月工作汇报小广告清除内容",
+        intent="factual",
+    )
+    runtime.pipeline._apply_figure_adjustments(
+        result,
+        result.retrieval,
+        intent="factual",
+        question="工程部2026年10月工作汇报，小广告清除内容",
+    )
+    assert [a["chunk_id"] for a in result.figure_attachments] == [301]
+    assert result.figure_attachments[0]["page_from"] == 30

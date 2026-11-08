@@ -268,6 +268,69 @@ def test_xlsx_merged_header_inherits_master(tmp_path) -> None:
     assert "列2" not in text.split("相关表头:", 1)[1].split("\n", 1)[0]
 
 
+def test_xlsx_two_level_budget_headers_keep_parent_fee_name(tmp_path) -> None:
+    """预算分月两级表头：子列名保留，上级费用名可定位（不塌成同一键）。
+
+    复现：A2:A3 + B2:E2 合并成「项目（收入成本均含税）」，第 3 行才是
+    项目|取数账套|取数科目|项目明细。旧逻辑子行未标 th → 纵向合并跳过 A3 →
+    整行左移，五列全叫同一个名字，问「上级费用名称」必然答错。
+    """
+    from openpyxl import Workbook
+    from ekbs.ingest.parser import parse_file
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "2026年度预算模板"
+    ws.merge_cells("A2:A3")
+    ws.merge_cells("B2:E2")
+    ws.merge_cells("F2:F3")
+    ws["A2"] = "项目（收入成本均含税）"
+    ws["B2"] = "项目（收入成本均含税）"
+    ws["F2"] = "2026年度计划金额"
+    ws["B3"] = "项目"
+    ws["C3"] = "取数账套"
+    ws["D3"] = "取数科目"
+    ws["E3"] = "项目明细"
+    ws["A4"] = "六、工程费用"
+    ws["B4"] = "2、工程维护及日常维修材料费"
+    ws["C4"] = "1204"
+    ws["D4"] = "销售费用-其他设备维修费"
+    ws["E4"] = "街区应急维修、给排水管网等费用"
+    ws["F4"] = 90000
+    path = tmp_path / "budget_headers.xlsx"
+    wb.save(path)
+    doc = parse_file(path)
+    assert doc.tables
+    blocks = serialize_table_body(caption=doc.tables[0].caption, body=doc.tables[0].body)
+    text = "\n".join(blocks)
+    header_line = next(line for line in text.splitlines() if line.startswith("相关表头:"))
+    assert "取数科目" in header_line
+    assert "项目明细" in header_line
+    # 五列不再是同一个裸键；子列名挂在父标签下
+    assert "/取数科目" in header_line or header_line.split("|")[3].strip().endswith("取数科目")
+    assert "取数科目=销售费用-其他设备维修费" in text or "项目（收入成本均含税）/取数科目=销售费用-其他设备维修费" in text
+    assert "项目明细=街区应急维修、给排水管网等费用" in text or "项目（收入成本均含税）/项目明细=街区应急维修、给排水管网等费用" in text
+
+
+def test_filled_two_level_headers_merge_without_empty_top() -> None:
+    """xlsx 合并填充后顶行无空列，仍应按子行合成父子表头。"""
+    rows = [
+        [
+            "项目（收入成本均含税）",
+            "项目（收入成本均含税）",
+            "项目（收入成本均含税）",
+            "项目（收入成本均含税）",
+            "2026年度计划金额",
+        ],
+        ["项目（收入成本均含税）", "项目", "取数账套", "取数科目", "2026年度计划金额"],
+        ["六、工程费用", "2、维护费", "1204", "销售费用-其他设备维修费", "90000"],
+    ]
+    blocks = serialize_information_blocks(caption="预算", rows=rows, header_row_count=2)
+    text = blocks[0]
+    assert "取数科目" in text
+    assert "取数科目=销售费用-其他设备维修费" in text or "项目（收入成本均含税）/取数科目=销售费用-其他设备维修费" in text
+
+
 def test_single_row_table_does_not_crash_header_scan() -> None:
     blocks = serialize_information_blocks(caption="单行", rows=[["只有一行"]])
     assert blocks and "只有一行" in blocks[0]
@@ -317,6 +380,54 @@ def test_single_cell_section_title_splits_sheet(tmp_path) -> None:
     assert any("1月=24506" in t for t in texts)
 
 
+def test_sectioned_month_series_inherits_sheet_header(tmp_path) -> None:
+    """同 Sheet 仅首段有真表头时，后续「酒店」分节必须继承列名，不能当伪表头。
+
+    复现大户用电监视：真表头只出现一次，后面餐饮/酒店只有单格分区标题；
+    旧逻辑把「酒店」当 header 再合并填充 → ``酒店=铺号; 酒店=用户名; …``。
+    """
+    from openpyxl import Workbook
+    from ekbs.ingest.parser import parse_file
+
+    months = [f"{m}月" for m in range(1, 13)]
+    header = ["铺号", "用户名", "年度", *months]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "大户用电监视"
+    ws.append(["用电大户用量监视（度）"])
+    ws.append(header)
+    ws.append(["(2A-1)", "海豚电竞", "2026年", *([str(i) for i in range(1, 13)])])
+    ws.append(["酒店"])
+    hotel_row = ["(3幢)", "嘛嘛公寓", "2026年", *[str(1000 + m) for m in range(1, 13)]]
+    hotel_row[3 + 8] = "91645"  # 铺号|用户名|年度 之后第 9 个月
+    ws.append(hotel_row)
+    # 合并「酒店」跨多列：旧路径会把整行 th 填成酒店
+    ws.merge_cells(start_row=4, start_column=1, end_row=4, end_column=15)
+    path = tmp_path / "dashu.xlsx"
+    wb.save(path)
+
+    doc = parse_file(path)
+    hotel_tables = [t for t in doc.tables if "酒店" in (t.caption or "")]
+    assert hotel_tables, f"captions={[t.caption for t in doc.tables]}"
+    hotel = hotel_tables[0]
+    assert "（/ 酒店）" in hotel.caption or "/ 酒店" in hotel.caption
+    # 解析 HTML 表头必须已是真列名，不依赖 serialize 侧 repair
+    assert "<th>用户名</th>" in hotel.body
+    assert "<th>9月</th>" in hotel.body
+    assert hotel.body.count("<th>酒店</th>") == 0
+
+    texts = [
+        serialize_table_body(caption=t.caption, body=t.body)[0]
+        for t in doc.tables
+        if "酒店" in (t.caption or "")
+    ]
+    joined = "\n".join(texts)
+    assert "用户名=嘛嘛公寓" in joined
+    assert "9月=91645" in joined or "用电量=91645" in joined
+    assert "酒店=铺号" not in joined
+    assert "酒店=嘛嘛公寓" not in joined
+
+
 def test_xlsx_date_cell_converted_from_serial(tmp_path) -> None:
     """Excel 日期单元格不能以序列号 46295 入库，应转为可读日期。"""
     from datetime import date
@@ -336,11 +447,12 @@ def test_xlsx_date_cell_converted_from_serial(tmp_path) -> None:
     doc = parse_file(path)
     body = doc.tables[0].body
     assert "46295" not in body
-    assert "2026-09-30" in body
+    assert "2026-09" in body
+    assert "2026-09-30" not in body
 
 
 def test_general_format_date_serials_in_date_header(tmp_path) -> None:
-    """日期行里的 General 格式序列号（46295）也应转日期。"""
+    """日期行里的 General 格式序列号（46295）也应转成账期 YYYY-MM。"""
     from openpyxl import Workbook
     from ekbs.ingest.parser import parse_file
 
@@ -353,11 +465,13 @@ def test_general_format_date_serials_in_date_header(tmp_path) -> None:
     wb.save(path)
     doc = parse_file(path)
     body = doc.tables[0].body
-    assert "46295" not in body and "2026-09-30" in body
+    assert "46295" not in body
+    assert "2026-09" in body
+    assert "2026-09-30" not in body
 
 
 def test_calendar_serial_row_without_date_word_converts(tmp_path) -> None:
-    """水费/熙丰：日期行没有「日期」二字，但序列号按月间隔 → 仍转成 YYYY-MM-DD。"""
+    """水费/熙丰：日期行没有「日期」二字，但序列号按月间隔 → 账期 YYYY-MM（不带日）。"""
     from openpyxl import Workbook
     from ekbs.ingest.parser import parse_file
 
@@ -373,7 +487,42 @@ def test_calendar_serial_row_without_date_word_converts(tmp_path) -> None:
     doc = parse_file(path)
     body = doc.tables[0].body
     assert "45292" not in body
-    assert "2024-01-01" in body
+    assert "2024-01" in body
+    assert "2024-01-01" not in body
+
+
+def test_month_end_date_formatted_header_collapses_to_yyyy_mm(tmp_path) -> None:
+    """日期格式单元格若是月末（熙丰常见），表头仍归一成 YYYY-MM，不要 2026-01-31。"""
+    from datetime import date
+
+    from openpyxl import Workbook
+    from ekbs.ingest.parser import parse_file
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "熙丰用电"
+    ws.append(
+        [
+            "户号",
+            date(2026, 1, 31),
+            "",
+            "",
+            date(2026, 2, 28),
+            "",
+            "",
+        ]
+    )
+    for cell in (ws.cell(1, 2), ws.cell(1, 5)):
+        cell.number_format = "YYYY-MM-DD"
+    ws.append(["户号", "用量", "单价", "金额", "用量", "单价", "金额"])
+    ws.append(["差异", 1, 1, 1987.86, 1, 1, 270.98])
+    path = tmp_path / "xifeng_month_end.xlsx"
+    wb.save(path)
+    body = parse_file(path).tables[0].body
+    assert "2026-01" in body
+    assert "2026-02" in body
+    assert "2026-01-31" not in body
+    assert "2026-02-28" not in body
 
 
 def test_date_row_above_labels_merges_into_headers() -> None:
@@ -389,13 +538,14 @@ def test_date_row_above_labels_merges_into_headers() -> None:
     blocks = serialize_information_blocks(caption="水费账单", rows=rows)
     text = "\n".join(blocks)
     assert "上月起度=45292" not in text
-    assert "上月起度/2024-01-01" in text
-    assert "上月起度/2024-02-01" in text
+    assert "上月起度/2024-01" in text
+    assert "上月起度/2024-02" in text
+    assert "2024-01-01" not in text
     assert "用途=绿化" in text
     assert all("相关表头:" in b for b in blocks)
     # 每块相关表头不得拖着另一月的整组列
     assert all(
-        not ("上月起度/2024-01-01" in b and "上月起度/2024-02-01" in b) for b in blocks
+        not ("上月起度/2024-01" in b and "上月起度/2024-02" in b) for b in blocks
     ), blocks
 
 
@@ -436,7 +586,8 @@ def test_wide_row_chunks_split_by_column_windows() -> None:
 
     assert len(blocks) > 1, "12 个月宽行必须拆成多块"
     assert all(count_tokens(b) <= 384 for b in blocks), [count_tokens(b) for b in blocks]
-    assert any("上月起度/2024-01-01" in b for b in blocks)
+    assert any("上月起度/2024-01" in b for b in blocks)
+    assert not any("上月起度/2024-01-01" in b for b in blocks)
 
 
 # --- Word/PowerPoint 合并单元格（colspan / rowspan）的网格还原 -------------------
@@ -673,3 +824,39 @@ def test_month_wide_without_year_column_does_not_melt() -> None:
         caption="大户用电", rows=rows, row_chunks=True, default_year="2026"
     )
     assert any("月份=9" in b and "用电量=200" in b for b in melted)
+
+
+def test_uniform_merged_month_header_gets_month_labels() -> None:
+    """合并表头整行都是“酒店”时，后 12 列要恢复成 1月..12月。
+
+    实证：大户用电监视（第4段）2026 年行是
+    84445/29905/50263/.../58678，但表头全是“酒店”，模型不知道列含义。
+    """
+    html = (
+        "<table><tr>"
+        + "".join("<th>酒店</th>" for _ in range(15))
+        + "</tr><tr>"
+        + "".join(
+            f"<td>{v}</td>"
+            for v in ["三期3幢", "嘛嘛公寓", "2026年", *range(1, 13)]
+        )
+        + "</tr></table>"
+    )
+    blocks = serialize_table_body(caption="大户用电监视", body=html)
+    text = "\n".join(blocks)
+    assert "相关表头:" in text
+    assert "1月" in text and "12月" in text
+    assert "年度=2026年" in text
+    assert "1月=1" in text and "9月=9" in text
+    # 不得再出现「酒店=三期3幢; 酒店=嘛嘛公寓; 酒店=2026年」
+    assert "酒店=三期" not in text
+    assert "铺号=三期3幢" in text and "用户名=嘛嘛公寓" in text
+
+    # tidy 长叶子：身份列 + 类别=酒店
+    melted = serialize_table_body(
+        caption="大户用电监视（第4段）", body=html, row_chunks=True
+    )
+    leaf = "\n".join(melted)
+    assert "类别=酒店" in leaf
+    assert "铺号=三期3幢" in leaf
+    assert "相关表头: 酒店 | 酒店" not in leaf
