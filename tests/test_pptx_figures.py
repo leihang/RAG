@@ -27,7 +27,7 @@ from ekbs.ingest.parser import MSO_SHAPE_TYPE_GROUP, ParsedDocument, _iter_shape
 
 
 def _tiny_png(color: bytes) -> bytes:
-    """手工拼一个 1×1 RGB PNG（不引 Pillow：只为了给 python-pptx 一个真图片）。"""
+    """手工拼一个 1×1 RGB PNG（装饰小图 / logo 用例专用）。"""
 
     def chunk(tag: bytes, data: bytes) -> bytes:
         return (
@@ -46,14 +46,27 @@ def _tiny_png(color: bytes) -> bytes:
     )
 
 
+def _content_png(color: bytes, *, size: int = 160) -> bytes:
+    """边长 ≥ ``DECORATIVE_MAX_EDGE`` 的正文图，避免被 figure_quality 当 logo 丢掉。"""
+    from io import BytesIO
+
+    from PIL import Image
+
+    r, g, b = color[0], color[1], color[2]
+    image = Image.new("RGB", (int(size), int(size)), (r, g, b))
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 @pytest.fixture
 def sample_pptx(tmp_path: Path) -> Path:
     """2 页、2 张唯一图片：红图在第 1 页出现 2 次、第 2 页再出现 1 次；蓝图只在第 2 页。"""
     pptx = pytest.importorskip("pptx")
     red = tmp_path / "red.png"
     blue = tmp_path / "blue.png"
-    red.write_bytes(_tiny_png(b"\xff\x00\x00"))
-    blue.write_bytes(_tiny_png(b"\x00\x00\xff"))
+    red.write_bytes(_content_png(b"\xff\x00\x00"))
+    blue.write_bytes(_content_png(b"\x00\x00\xff"))
 
     deck = pptx.Presentation()
     layout = deck.slide_layouts[5]  # 只要标题，避免占位符干扰
@@ -164,26 +177,13 @@ def test_only_largest_textless_figure_per_page_gets_title(tmp_path: Path) -> Non
     否则一页 6 张图就会造出 6 个内容几乎相同的块（都只有页标题），把检索结果挤满 ——
     `chunker` 当初跳过无文字图片，防的正是这件事。
     """
-    import struct
-    import zlib
-
     pptx = pytest.importorskip("pptx")
-
-    def png(size_pad: int, color: bytes) -> bytes:
-        def chunk(tag: bytes, data: bytes) -> bytes:
-            return (struct.pack(">I", len(data)) + tag + data
-                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
-
-        raw = b"\x00" + color + b"\x00" * size_pad  # 用填充把体积做大，模拟"大图"
-        return (b"\x89PNG\r\n\x1a\n"
-                + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1 + size_pad // 3, 8, 2, 0, 0, 0))
-                + chunk(b"IDAT", zlib.compress(raw))
-                + chunk(b"IEND", b""))
 
     small = tmp_path / "small.png"
     big = tmp_path / "big.png"
-    small.write_bytes(png(100, b"\x00\xff\x00"))
-    big.write_bytes(png(9000, b"\xff\x00\x00"))
+    # 两张都过装饰阈值；像素边长拉开差距，只给最大那张补页标题
+    small.write_bytes(_content_png(b"\x00\xff\x00", size=160))
+    big.write_bytes(_content_png(b"\xff\x00\x00", size=320))
 
     deck = pptx.Presentation()
     slide = deck.slides.add_slide(deck.slide_layouts[5])
@@ -328,7 +328,8 @@ def test_pptx_strips_repeated_logo_and_keeps_unique_content(tmp_path: Path) -> N
     logo.write_bytes(_tiny_png(b"\xff\x00\x00") + b"logo")
     decor.write_bytes(_tiny_png(b"\x00\xff\x00") + b"decor")
     asset.write_bytes(_tiny_png(b"\xff\xff\x00") + b"asset-2x")
-    photo.write_bytes(_tiny_png(b"\x00\x00\xff") + b"photo-content")
+    # 正文图必须过装饰尺寸闸；logo/decor/asset 仍用 1×1 被丢掉
+    photo.write_bytes(_content_png(b"\x00\x00\xff") + b"photo-content")
 
     deck = pptx.Presentation()
     # 标准 16:9

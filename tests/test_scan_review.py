@@ -114,11 +114,10 @@ def test_prepare_and_upgrade_merge_continued_tables(tmp_path: Path) -> None:
 async def client(seeded):
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as instance:
-            yield instance, runtime
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as instance:
+        yield instance, runtime
 
 
 def _grant_admin(runtime) -> int:

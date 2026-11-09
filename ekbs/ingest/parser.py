@@ -23,9 +23,13 @@ from html.parser import HTMLParser
 from pathlib import Path, PurePath
 from typing import Any, Iterator, NamedTuple, Sequence
 
+from ekbs.ingest.figure_quality import DECORATIVE_MAX_EDGE
 from ekbs.logging import get_logger
 
 log = get_logger(component="parser")
+
+#: 兼容旧测试/调用名；阈值以 ``figure_quality.DECORATIVE_MAX_EDGE`` 为准
+_DOCX_DECORATIVE_MAX_EDGE = DECORATIVE_MAX_EDGE
 
 
 class ParserUnavailable(RuntimeError):
@@ -429,10 +433,6 @@ def parse_header_meta(lines: Sequence[str]) -> dict[str, str]:
     return meta
 
 
-#: 页眉装饰小图阈值：短边与长边都偏小时视为 logo，不进正文 figure
-_DOCX_DECORATIVE_MAX_EDGE = 120
-
-
 def _collapse_docx_row_cells(cells: Sequence[str]) -> list[str]:
     """页眉表常合并单元格，相邻重复值压成一条（``文件名称|书名|书名`` → ``文件名称|书名``）。"""
     out: list[str] = []
@@ -479,7 +479,7 @@ def _logical_row_cells(row: Any) -> list[str]:
         spans.append(1)
 
     cells: list[str] = []
-    for text, span in zip(texts, spans):
+    for text, span in zip(texts, spans, strict=False):
         cells.append(text)
         cells.extend([""] * (span - 1))
     return cells
@@ -891,18 +891,9 @@ def _docx_header_meta(document: Any) -> tuple[list[str], int | None]:
 
 def _docx_raster_is_decorative(blob: bytes, *, max_edge: int = _DOCX_DECORATIVE_MAX_EDGE) -> bool:
     """页眉 logo 一类小图：进 figure 只会污染检索（实测设备编号指导书 89×26）。"""
-    try:
-        from io import BytesIO
+    from ekbs.ingest.figure_quality import is_decorative_raster
 
-        from PIL import Image
-    except Exception:  # pragma: no cover
-        return False
-    try:
-        with Image.open(BytesIO(blob)) as image:
-            width, height = image.size
-    except Exception:  # noqa: BLE001
-        return False
-    return max(int(width), int(height)) < int(max_edge)
+    return is_decorative_raster(blob, max_edge=max_edge)
 
 
 @dataclass
@@ -936,7 +927,10 @@ def _docx_nearby_caption(recent_texts: list[str]) -> str:
 
 
 def _register_docx_figure(state: _DocxState, blob: bytes, ext: str, caption: str) -> None:
-    """落盘一张图；无字图先记账，等全部抽完再统一挂题注。"""
+    """落盘一张图；无字图先记账，等全部抽完再统一挂题注。
+
+    装饰/壳页过滤在 ``_register_figure_blob``（全格式统一门），此处不再特判。
+    """
     added = _register_figure_blob(
         blob, ext,
         assets_dir=state.assets_dir, figures=state.figures, seen=state.seen_images,
@@ -1010,11 +1004,12 @@ def _walk_docx_body(document: Any, state: _DocxState, qn: Any) -> None:
 
 
 def _collect_docx_fallback_images(path: Path, document: Any, state: _DocxState) -> None:
-    """兜底扫图：正文关系、页眉/页脚 part、zip media 三处，漏一处等于丢图。"""
+    """兜底扫图：正文关系、页眉/页脚 part、zip media 三处，漏一处等于丢图。
+
+    装饰过滤统一在 ``_register_docx_figure``（有题注的 logo 也丢）。
+    """
     # 1) 正文遍历漏掉的关系图（页眉/页脚/文本框等）
     for blob, ext, caption in _docx_images_from_rels(document):
-        if not (caption or "").strip() and _docx_raster_is_decorative(blob):
-            continue
         _register_docx_figure(state, blob, ext, caption)
     # 2) 页眉/页脚的图挂在 **header/footer part** 的关系上，不在 document.part.rels；
     #    实测交接班制度等 docx 的 logo 只在 word/header1.xml → word/media/，正文 blip=0。
@@ -1033,13 +1028,9 @@ def _collect_docx_fallback_images(path: Path, document: Any, state: _DocxState) 
             if element is None:
                 continue
             for blob, ext, caption in _docx_images_in_element(element, part):
-                if not (caption or "").strip() and _docx_raster_is_decorative(blob):
-                    continue
                 _register_docx_figure(state, blob, ext, caption)
     # 3) zip 级兜底：任何 part 漏扫时仍能从 word/media/ 捞到栅格图（与 xlsx 同口径）
     for blob, ext in _ooxml_media_blobs(path, prefix="word/media/"):
-        if _docx_raster_is_decorative(blob):
-            continue
         _register_docx_figure(state, blob, ext, "")
 
 
@@ -1234,7 +1225,7 @@ def _excel_serials_look_like_calendar(serials: list[int]) -> bool:
     uniq = sorted(set(serials))
     if len(uniq) < 2:
         return False
-    diffs = [b - a for a, b in zip(uniq, uniq[1:])]
+    diffs = [b - a for a, b in zip(uniq, uniq[1:], strict=False)]
     monthish = sum(1 for d in diffs if 27 <= d <= 32)
     return monthish >= max(1, (len(diffs) + 1) // 2)
 
@@ -1332,10 +1323,8 @@ def _xlsx_number_text(value: Any, number_format: str) -> str | None:
     if re.search(r"[eE][+-]0", fmt):
         return None
     positive = fmt.split(";", 1)[0]
-    if "(" in fmt and ";" in fmt:  # (0.00) 负数段：括号表示负
-        negative = fmt.split(";", 1)[1]
-    else:
-        negative = ""
+    # (0.00) 负数段：括号表示负
+    negative = fmt.split(";", 1)[1] if "(" in fmt and ";" in fmt else ""
     match = _NUMBER_FORMAT_RE.search(positive)
     if not match:
         return None
@@ -2978,14 +2967,27 @@ def _register_figure_blob(
     ``rotate_degrees``：形状/控件上的显示旋转（PPT ``shape.rotation``），落盘时矫正，
     避免竖放照片被按横图 OCR。去重在矫正之后做，这样「同一张手机竖拍、
     EXIF 方向不同」只会进索引一次。
+
+    质量门（装饰小图 / 近空白壳页）在去重之后、落盘之前统一执行，
+    避免各格式入口各写一套「有题注就放行」的漏洞。
     """
     import hashlib
+
+    from ekbs.ingest.figure_quality import should_drop_figure_bytes
 
     if not blob:
         return False
     normalized, ext_norm = _normalize_raster_bytes(
         blob, ext, rotate_degrees=rotate_degrees
     )
+    drop_reason = should_drop_figure_bytes(normalized)
+    if drop_reason:
+        log.info(
+            "figure_quality_dropped",
+            file=log_file or None,
+            reason=drop_reason,
+        )
+        return False
     digest = hashlib.sha256(normalized).hexdigest()
     if digest in seen:
         return False
@@ -3536,6 +3538,7 @@ def _append_table_block(state: _MineruState, block: dict, page: int, emit) -> No
 
 
 def _append_image_block(state: _MineruState, block: dict, page: int, emit) -> None:
+    from ekbs.ingest.figure_quality import should_drop_figure_path
     from ekbs.ingest.seal_filter import is_seal_image
 
     img = str(block.get("img_path") or "").strip()
@@ -3552,6 +3555,16 @@ def _append_image_block(state: _MineruState, block: dict, page: int, emit) -> No
         emit(f"![{caption or '图片'}]({img})" if img else (caption or "（图片）"))
         return
     image_file = state.assets_dir / managed
+    quality_reason = should_drop_figure_path(image_file)
+    if quality_reason:
+        log.info(
+            "figure_quality_dropped",
+            file=state.path.name,
+            img=managed,
+            page=page,
+            reason=quality_reason,
+        )
+        return
     # 先按画面/题注丢掉公章，避免对印章浪费 OCR，也不写进附图
     if is_seal_image(image_file, caption=caption):
         log.info("seal_figure_dropped", file=state.path.name, img=managed, page=page)

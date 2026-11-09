@@ -13,8 +13,6 @@
 
 from __future__ import annotations
 
-import struct
-import zlib
 from pathlib import Path
 
 import pytest
@@ -26,22 +24,17 @@ from ekbs.worker import process_once
 from tests.test_import_api import open_compliance
 
 
-def _tiny_png(color: bytes) -> bytes:
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(data))
-            + tag
-            + data
-            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        )
+def _content_png(color: bytes, *, size: int = 160) -> bytes:
+    """边长过装饰闸的正文图（1×1 会被 figure_quality 丢掉）。"""
+    from io import BytesIO
 
-    raw = b"\x00" + color
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
-        + chunk(b"IDAT", zlib.compress(raw))
-        + chunk(b"IEND", b"")
-    )
+    from PIL import Image
+
+    r, g, b = color[0], color[1], color[2]
+    image = Image.new("RGB", (size, size), (r, g, b))
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 @pytest.fixture(autouse=True)
@@ -62,7 +55,7 @@ async def test_pptx_with_picture_yields_figure_chunk(runtime, seeded, tmp_path: 
 
     pptx = pytest.importorskip("pptx")
     red = tmp_path / "red.png"
-    red.write_bytes(_tiny_png(b"\xff\x00\x00"))
+    red.write_bytes(_content_png(b"\xff\x00\x00"))
     deck = pptx.Presentation()
     slide = deck.slides.add_slide(deck.slide_layouts[5])
     slide.shapes.title.text = "现场照片"

@@ -49,7 +49,8 @@ def test_pptx_portrait_slide_marked_and_picture_extracted(tmp_path: Path) -> Non
     from pptx.util import Inches
 
     png = tmp_path / "v.png"
-    png.write_bytes(_tiny_png(b"\x00\xff\x00", width=2, height=4))
+    # 边长须 ≥ decorative 阈值，否则入库质量门会当 logo 丢掉
+    png.write_bytes(_tiny_png(b"\x00\xff\x00", width=80, height=160))
 
     deck = pptx.Presentation()
     # 竖向画布：高 > 宽
@@ -74,9 +75,9 @@ def test_pptx_rotated_picture_persisted_upright(tmp_path: Path) -> None:
     from pptx.util import Inches
     from PIL import Image
 
-    # 横图，形状旋转 90° → 落盘后应变竖（高≥宽）
+    # 横图，形状旋转 90° → 落盘后应变竖（高≥宽）；边长过装饰闸
     png = tmp_path / "wide.png"
-    png.write_bytes(_tiny_png(b"\xff\x00\x00", width=8, height=2))
+    png.write_bytes(_tiny_png(b"\xff\x00\x00", width=160, height=40))
 
     deck = pptx.Presentation()
     slide = deck.slides.add_slide(deck.slide_layouts[6])
@@ -121,8 +122,8 @@ def test_exif_orientation_normalized_on_persist(tmp_path: Path) -> None:
     """手机竖拍 JPEG：像素横向存储 + EXIF Orientation=6 → 落盘后直立。"""
     from PIL import Image
 
-    # 宽>高的像素，标记为 Orientation 6（显示时应旋转为高>宽）
-    img = Image.new("RGB", (20, 8), (0, 128, 255))
+    # 宽>高的像素，标记为 Orientation 6（显示时应旋转为高>宽）；边长过装饰闸
+    img = Image.new("RGB", (200, 80), (0, 128, 255))
     buf = io.BytesIO()
     # Pillow 用 exif 字典写 Orientation
     exif = img.getexif()
@@ -145,7 +146,7 @@ def test_exif_orientation_normalized_on_persist(tmp_path: Path) -> None:
 def test_docx_vml_imagedata_extracted(tmp_path: Path) -> None:
     """旧式 ``w:pict`` / ``v:imagedata`` 也应抽到（zip 注入夹具）。"""
     docx = pytest.importorskip("docx")
-    png_bytes = _tiny_png(b"\x11\x22\x33")
+    png_bytes = _tiny_png(b"\x11\x22\x33", width=160, height=120)
 
     document = docx.Document()
     document.add_paragraph("正文")

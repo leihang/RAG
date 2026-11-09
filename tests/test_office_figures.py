@@ -183,8 +183,9 @@ def test_docx_extracts_embedded_pictures(tmp_path: Path) -> None:
     docx = pytest.importorskip("docx")
     red = tmp_path / "red.png"
     blue = tmp_path / "blue.png"
-    red.write_bytes(_tiny_png(b"\xff\x00\x00"))
-    blue.write_bytes(_tiny_png(b"\x00\x00\xff"))
+    # 真实照片量级；1×1 会被装饰小图阈值丢掉
+    red.write_bytes(_png_bytes(400, 300, b"\xff\x00\x00"))
+    blue.write_bytes(_png_bytes(400, 300, b"\x00\x00\xff"))
 
     document = docx.Document()
     document.add_heading("现场照片", level=1)
@@ -207,6 +208,31 @@ def test_docx_extracts_embedded_pictures(tmp_path: Path) -> None:
     assert "现场照片" in parsed.markdown
 
 
+def test_docx_skips_decorative_logo_even_with_caption(tmp_path: Path) -> None:
+    """页眉角标即使附近有公司名题注，也不得进 figure（手册 50×40 污染回源）。"""
+    docx = pytest.importorskip("docx")
+    logo = tmp_path / "logo.png"
+    photo = tmp_path / "photo.png"
+    logo.write_bytes(_png_bytes(50, 40, b"\x11\x22\x33"))
+    photo.write_bytes(_png_bytes(800, 600, b"\x44\x55\x66"))
+
+    document = docx.Document()
+    document.add_paragraph("重庆卓越城市运营服务有限责任公司熙街管理处")
+    document.add_picture(str(logo))
+    document.add_heading("照明巡检路线图", level=1)
+    document.add_picture(str(photo))
+    path = tmp_path / "handbook.docx"
+    document.save(str(path))
+
+    assets = tmp_path / "parse" / "logo"
+    parsed = parse_file(path, assets_dir=assets)
+    assert len(parsed.figures) == 1, [f.name for f in parsed.figures]
+    from PIL import Image
+
+    with Image.open(assets / parsed.figures[0].name) as im:
+        assert im.size == (800, 600)
+
+
 def test_docx_without_assets_dir_keeps_text(tmp_path: Path) -> None:
     docx = pytest.importorskip("docx")
     img = tmp_path / "x.png"
@@ -227,7 +253,7 @@ def test_xlsx_extracts_embedded_pictures(tmp_path: Path) -> None:
     from openpyxl.drawing.image import Image as XLImage
 
     png = tmp_path / "chart.png"
-    png.write_bytes(_tiny_png(b"\x00\xff\x00"))
+    png.write_bytes(_png_bytes(400, 300, b"\x00\xff\x00"))
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -251,7 +277,7 @@ def test_xlsx_extracts_embedded_pictures(tmp_path: Path) -> None:
 
 def test_markdown_local_images_and_pipe_tables(tmp_path: Path) -> None:
     img = tmp_path / "photo.png"
-    img.write_bytes(_tiny_png(b"\x11\x22\x33"))
+    img.write_bytes(_png_bytes(400, 300, b"\x11\x22\x33"))
     md = tmp_path / "note.md"
     md.write_text(
         "# 巡检\n\n"
