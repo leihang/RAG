@@ -223,6 +223,142 @@ def _citation_views(runtime: Any, citations: list[Any]) -> list[dict[str, Any]]:
     return views
 
 
+#: 耗时条次要信息（管理台折叠面板页脚）
+_PIPELINE_MONITOR_STEPS: tuple[tuple[str, str], ...] = (
+    ("rewrite", "改写"),
+    ("embed", "向量化"),
+    ("recall", "召回"),
+    ("rerank", "精排"),
+    ("expand", "扩展"),
+    ("generate", "生成"),
+    ("ttft", "TTFT"),
+    ("wall", "墙钟"),
+)
+
+
+def _pipeline_monitor(answer: Any, *, query: str, answer_text: str | None = None) -> dict[str, Any]:
+    """管理台全过程监控：**内容流**（问题 → 改写 → rerank 块 → 回答）+ 次要耗时。
+
+    前端用 Collapse 按条目折叠查看；耗时只作页脚旁注，不是主视图。
+    """
+    retrieval = getattr(answer, "retrieval", None)
+    stage = dict(getattr(retrieval, "stage_debug", None) or {})
+    fusion = dict(stage.get("fusion") or {})
+    variants = [
+        str(v).strip()
+        for v in list(fusion.get("multi_query") or [])
+        if str(v).strip()
+    ]
+    rewritten = str(getattr(answer, "rewritten_query", "") or "").strip()
+    if rewritten and rewritten not in variants:
+        variants = [rewritten, *[v for v in variants if v != rewritten]]
+
+    rerank_stage = dict(stage.get("rerank") or {})
+    keep = rerank_stage.get("keep")
+    min_score = rerank_stage.get("min_score")
+    keep_n = int(keep) if isinstance(keep, (int, float)) else None
+    min_s = float(min_score) if isinstance(min_score, (int, float)) else None
+    by_id = {
+        int(c.chunk_id): c
+        for c in list(getattr(retrieval, "chunks", None) or [])
+        if getattr(c, "chunk_id", None) is not None
+    }
+    for c in list(getattr(answer, "context_chunks", None) or []):
+        cid = getattr(c, "chunk_id", None)
+        if cid is not None and int(cid) not in by_id:
+            by_id[int(cid)] = c
+
+    rerank_chunks: list[dict[str, Any]] = []
+    for index, row in enumerate(list(rerank_stage.get("scores") or [])):
+        if not isinstance(row, dict):
+            continue
+        cid_raw = row.get("chunk_id")
+        if cid_raw is None:
+            continue
+        cid = int(cid_raw)
+        score_raw = row.get("rerank_score")
+        score = float(score_raw) if isinstance(score_raw, (int, float)) else None
+        chunk = by_id.get(cid)
+        below = min_s is not None and score is not None and score < min_s
+        over_keep = keep_n is not None and index >= keep_n
+        if below:
+            decision = "below_threshold"
+        elif over_keep:
+            decision = "over_keep"
+        elif score is not None:
+            decision = "kept"
+        else:
+            decision = "unknown"
+        preview = str(row.get("preview") or "").strip()
+        if not preview and chunk is not None:
+            preview = (getattr(chunk, "content", None) or "").strip()[:280]
+        rerank_chunks.append(
+            {
+                "rank": index + 1,
+                "chunk_id": cid,
+                "rerank_score": score,
+                "doc_title": row.get("doc_title")
+                or getattr(chunk, "doc_title", None)
+                or "",
+                "heading_path": row.get("heading_path")
+                or getattr(chunk, "heading_path", None)
+                or "",
+                "chunk_type": row.get("chunk_type")
+                or getattr(chunk, "chunk_type", None)
+                or "",
+                "preview": preview,
+                "decision": decision,
+            }
+        )
+
+    timings = dict(getattr(answer, "pipeline_timings_ms", None) or {})
+    if not timings:
+        retrieve = dict(getattr(retrieval, "timings_ms", None) or {})
+        timings = {
+            "rewrite": 0.0,
+            "embed": float(retrieve.get("embed") or 0),
+            "recall": float(retrieve.get("recall") or 0),
+            "rerank": float(retrieve.get("rerank") or 0),
+            "expand": float(retrieve.get("expand") or 0),
+            "generate": float(getattr(answer, "total_ms", 0) or 0),
+            "ttft": float(getattr(answer, "ttft_ms", 0) or 0),
+            "wall": float(getattr(answer, "total_ms", 0) or 0),
+        }
+    steps = [
+        {"key": key, "label": label, "ms": float(timings[key])}
+        for key, label in _PIPELINE_MONITOR_STEPS
+        if key in timings
+    ]
+    text = answer_text if answer_text is not None else str(getattr(answer, "answer", "") or "")
+    return {
+        "question": query,
+        "rewrite": {
+            "original": query,
+            "rewritten": rewritten or query,
+            "history_used": bool(getattr(answer, "history_used", False)),
+            "variants": variants,
+        },
+        "rerank_chunks": rerank_chunks,
+        "rerank_meta": {
+            "enabled": rerank_stage.get("enabled"),
+            "keep": keep_n,
+            "min_score": min_s,
+            "count": len(rerank_chunks),
+        },
+        "answer": text,
+        "refused": bool(getattr(answer, "refused", False)),
+        "refusal_reason": getattr(answer, "refusal_reason", None),
+        "intent": getattr(answer, "intent", None),
+        "mode_used": getattr(answer, "mode_used", None),
+        "model": getattr(answer, "model", None),
+        "cache_hit": "answer_cache_hit" in list(getattr(answer, "degraded", None) or []),
+        "prompt_tokens": int(getattr(answer, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(answer, "completion_tokens", 0) or 0),
+        "steps": steps,
+        "timings_ms": timings,
+    }
+
+
 async def _record_history(runtime: Any, entry: dict[str, Any]) -> None:
     """调试历史（`ekbs_cache` 环形缓冲；Schema 无专用表，见模块 docstring）。"""
     history = await runtime.cache.get(HISTORY_KEY)
@@ -441,10 +577,22 @@ async def debug_query(
             # cited=false 只表示模型没引用它，不代表它没被发送。
             "context_chunks": context_chunks,
             "context_tokens": sum(item["token_count"] for item in context_chunks),
-            "figure_attachments": list(answer.figure_attachments or []),
+            "available_figures": list(
+                answer.available_figures or answer.figure_attachments or []
+            ),
+            "figure_attachments": list(
+                answer.available_figures or answer.figure_attachments or []
+            ),
             "faithfulness": answer.faithfulness,
             "stages": result.stage_debug,
-            "timings_ms": {**result.timings_ms, "generate_ms": answer.ttft_ms},
+            "pipeline_monitor": _pipeline_monitor(
+                answer, query=payload.query, answer_text=answer_text
+            ),
+            "timings_ms": {
+                **result.timings_ms,
+                **(answer.pipeline_timings_ms or {}),
+                "generate_ms": answer.ttft_ms,
+            },
         }
     )
 
@@ -531,7 +679,12 @@ async def debug_simulate(
             "citations": _citation_views(runtime, answer.citations),
             "context_chunks": context_chunks,
             "context_tokens": sum(item["token_count"] for item in context_chunks),
-            "figure_attachments": list(answer.figure_attachments or []),
+            "available_figures": list(
+                answer.available_figures or answer.figure_attachments or []
+            ),
+            "figure_attachments": list(
+                answer.available_figures or answer.figure_attachments or []
+            ),
             "degraded": [*result.degraded, *answer.degraded],
             "mode": payload.mode,
             "mode_used": answer.mode_used,
@@ -539,7 +692,14 @@ async def debug_simulate(
             "numeric": answer.numeric,
             "faithfulness": answer.faithfulness,
             "stages": result.stage_debug,
-            "timings_ms": {**result.timings_ms, "generate_ms": answer.ttft_ms},
+            "pipeline_monitor": _pipeline_monitor(
+                answer, query=payload.query, answer_text=answer.answer
+            ),
+            "timings_ms": {
+                **result.timings_ms,
+                **(answer.pipeline_timings_ms or {}),
+                "generate_ms": answer.ttft_ms,
+            },
             "chunks": [_chunk_view(chunk) for chunk in result.chunks],
         }
     )

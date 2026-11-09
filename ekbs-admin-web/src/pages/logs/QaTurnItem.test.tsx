@@ -1,10 +1,5 @@
 /**
- * 会话详情里的引用溯源展示。
- *
- * 文档 205 实测：引用 [2] 的 `chunk_id=35274` 是**整篇父块上下文**（实际喂给 LLM 的块），
- * 它由精排块 `35277`（精排 #2）扩展而来。旧展示只有一个 chunk id，用户无法判断
- * 「这块到底在不在精排候选里」。有 `source_chunk_id` 时必须显示 `#上下文块 ← #精排块`；
- * 旧数据没有该列时保持原样（不编造来源）。
+ * 会话详情里的引用溯源与全过程折叠展示。
  */
 import { fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
@@ -35,6 +30,20 @@ function renderTurn(turn: QaTurn) {
   )
 }
 
+describe('QaTurnItem 全过程折叠', () => {
+  it('四段：问题 / 改写 / Rerank引用 / 回答', () => {
+    renderTurn({
+      ...BASE_TURN,
+      rewrittenQuery: '能耗管理员职责',
+    })
+    expect(screen.getByText(/① 用户问题/)).toBeInTheDocument()
+    expect(screen.getByText(/② 提示词改写/)).toBeInTheDocument()
+    expect(screen.getByText(/③ Rerank \/ 引用块/)).toBeInTheDocument()
+    expect(screen.getByText(/④ 输出回答/)).toBeInTheDocument()
+    expect(screen.getAllByText('能耗管理员职责').length).toBeGreaterThan(0)
+  })
+})
+
 describe('QaTurnItem 引用的精排来源', () => {
   it('有 sourceChunkId 时显示 `#上下文块 ← #精排块`，并附 tooltip 说明', async () => {
     renderTurn({
@@ -42,11 +51,10 @@ describe('QaTurnItem 引用的精排来源', () => {
       citations: [{ citeIndex: 2, chunkId: 35274, sourceChunkId: 35277, docId: 205 }],
     })
 
-    // 35274 = 整篇父块（喂给 LLM 的上下文），35277 = 精排 #2 的检索单元
-    const label = screen.getByText('#35274 ← #35277')
+    const label = screen.getAllByText('#35274 ← #35277')[0]
     expect(label).toBeInTheDocument()
 
-    fireEvent.mouseOver(label)
+    fireEvent.mouseOver(screen.getByText(/分块 id：/))
     expect(
       await screen.findByText('上下文块（由精排块 #35277 扩展）'),
     ).toBeInTheDocument()
@@ -58,7 +66,8 @@ describe('QaTurnItem 引用的精排来源', () => {
       citations: [{ citeIndex: 1, chunkId: 35280, docId: 205 }],
     })
 
-    expect(screen.getByText('分块 id：#35280')).toBeInTheDocument()
+    expect(screen.getByText('分块 id：')).toBeInTheDocument()
+    expect(screen.getAllByText('#35280').length).toBeGreaterThan(0)
     expect(screen.queryByText(/#\d+ ← #\d+/)).toBeNull()
   })
 
@@ -72,11 +81,10 @@ describe('QaTurnItem 引用的精排来源', () => {
   })
 })
 
-describe('QaTurnItem 模型上下文行（引用 ≠ 上下文）', () => {
-  it('显示该轮全部上下文块：被引用的标 [引用]，未引用的标 [仅上下文]', () => {
+describe('QaTurnItem 模型上下文（引用 ≠ 上下文）', () => {
+  it('仅上下文块单独列出', () => {
     renderTurn({
       ...BASE_TURN,
-      // 实测 doc 205：prompt 3 块，只有前 2 块被引用
       citations: [
         { citeIndex: 1, chunkId: 35280, docId: 205 },
         { citeIndex: 2, chunkId: 35274, sourceChunkId: 35277, docId: 205 },
@@ -84,33 +92,28 @@ describe('QaTurnItem 模型上下文行（引用 ≠ 上下文）', () => {
       contextChunkIds: [35280, 35274, 35281],
     })
 
-    expect(screen.getByText('模型上下文（3 块）：')).toBeInTheDocument()
-    expect(screen.getByText('#35280[引用]')).toBeInTheDocument()
-    expect(screen.getByText('#35274[引用]')).toBeInTheDocument()
-    // 35281 没进引用，但同样推给了模型 —— 这一行就是它存在的证据
-    expect(screen.getByText('#35281[仅上下文]')).toBeInTheDocument()
+    expect(screen.getByText(/仅进模型上下文、未写入引用（1）/)).toBeInTheDocument()
+    expect(screen.getByText('#35281')).toBeInTheDocument()
   })
 
-  it('重复的上下文 id 只显示一次（顺序按后端存的顺序）', () => {
+  it('重复的上下文 id 只计一次', () => {
     renderTurn({
       ...BASE_TURN,
       citations: [{ citeIndex: 1, chunkId: 35280, docId: 205 }],
       contextChunkIds: [35280, 35274, 35280],
     })
 
-    expect(screen.getByText('模型上下文（2 块）：')).toBeInTheDocument()
-    expect(screen.getByText('#35280[引用]')).toBeInTheDocument()
-    expect(screen.getByText('#35274[仅上下文]')).toBeInTheDocument()
+    expect(screen.getByText(/仅进模型上下文、未写入引用（1）/)).toBeInTheDocument()
+    expect(screen.getByText('#35274')).toBeInTheDocument()
   })
 
-  it('历史行没有 context_chunk_ids 时整行不渲染（旧页面行为不变）', () => {
+  it('历史行没有 context_chunk_ids 时不渲染仅上下文区', () => {
     renderTurn({
       ...BASE_TURN,
       citations: [{ citeIndex: 1, chunkId: 35280, docId: 205 }],
       contextChunkIds: [],
     })
 
-    expect(screen.queryByText(/模型上下文/)).toBeNull()
-    expect(screen.queryByText(/#\d+\[(引用|仅上下文)\]/)).toBeNull()
+    expect(screen.queryByText(/仅进模型上下文/)).toBeNull()
   })
 })

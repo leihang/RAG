@@ -284,16 +284,84 @@ export const STAGE_TITLES: Record<string, string> = {
 
 /** 后端实际写过的耗时键（`pipeline.py` + `playground.py`）。 */
 const TIMING_LABELS: Record<string, string> = {
+  rewrite: '查询改写',
   embed: '向量化',
   recall: '双路召回',
   rerank: '精排 Rerank',
   expand: '父块回溯',
+  retrieve_total: '检索合计',
   total: '检索总耗时',
-  generate_ms: '生成首字',
+  generate: 'LLM 生成',
+  generate_ms: '生成首字（旧键）',
+  ttft: '首字时延',
+  wall: '端到端墙钟',
 }
 
-/** 阶段展示顺序（与方案 05 §4.7 的跳数一致）。 */
-const TIMING_ORDER = ['embed', 'recall', 'rerank', 'expand', 'total', 'generate_ms']
+/** 阶段展示顺序（提问 → 出答案；旧键 generate_ms/total 仍兼容）。 */
+const TIMING_ORDER = [
+  'rewrite',
+  'embed',
+  'recall',
+  'rerank',
+  'expand',
+  'retrieve_total',
+  'total',
+  'generate',
+  'ttft',
+  'generate_ms',
+  'wall',
+]
+
+// ---------------------------------------------------------------------------
+// pipeline_monitor（管理台全过程监控：问题→改写→rerank→回答）
+// ---------------------------------------------------------------------------
+
+export interface PipelineMonitorStep {
+  key: string
+  label: string
+  ms: number
+}
+
+export interface PipelineRerankChunk {
+  rank: number
+  chunk_id: number
+  rerank_score: number | null
+  doc_title: string
+  heading_path: string
+  chunk_type: string
+  preview: string
+  decision: 'kept' | 'below_threshold' | 'over_keep' | 'unknown' | string
+}
+
+export interface PipelineMonitorPayload {
+  question?: string
+  rewrite?: {
+    original: string
+    rewritten: string
+    history_used: boolean
+    variants: string[]
+  }
+  rerank_chunks?: PipelineRerankChunk[]
+  rerank_meta?: {
+    enabled?: boolean | null
+    keep?: number | null
+    min_score?: number | null
+    count?: number
+  }
+  answer?: string
+  refused?: boolean
+  refusal_reason?: string | null
+  steps?: PipelineMonitorStep[]
+  timings_ms?: Record<string, number>
+  intent?: string | null
+  mode_used?: string | null
+  model?: string | null
+  rewritten_query?: string | null
+  history_used?: boolean
+  cache_hit?: boolean
+  prompt_tokens?: number
+  completion_tokens?: number
+}
 
 export interface TimingRow {
   key: string

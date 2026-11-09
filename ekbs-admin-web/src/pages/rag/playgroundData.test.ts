@@ -207,17 +207,21 @@ describe('parseStages 逐跳解析', () => {
 })
 
 describe('timingRows 耗时表', () => {
-  it('已知键排成方案 §4.7 的链路顺序并给中文名，未知键排在后面', () => {
+  it('已知键排成提问→答案链路顺序并给中文名，未知键排在后面', () => {
     const rows = timingRows({
       generate_ms: 911,
+      rewrite: 120,
+      wall: 3200,
       rerank: 462,
       embed: 341,
       total: 2184,
       extra_stage: 7,
     })
-    expect(rows.map((row) => row.key)).toEqual(['embed', 'rerank', 'total', 'generate_ms', 'extra_stage'])
-    expect(rows[0].label).toBe('向量化')
-    expect(rows[4].label).toBe('extra_stage')
+    expect(rows.map((row) => row.key)).toEqual([
+      'rewrite', 'embed', 'rerank', 'total', 'generate_ms', 'wall', 'extra_stage',
+    ])
+    expect(rows[0].label).toBe('查询改写')
+    expect(rows[6].label).toBe('extra_stage')
   })
 
   it('没有耗时数据时是空表（不补零）', () => {

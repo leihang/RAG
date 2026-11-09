@@ -17,6 +17,7 @@ import AnswerMarkdown from '@/components/AnswerMarkdown'
 import ChunkPeekDrawer from '@/components/ChunkPeekDrawer'
 import ClearanceTag from '@/components/ClearanceTag'
 import StagesPanel from './StagesPanel'
+import PipelineMonitor from './PipelineMonitor'
 import ContextCard from './ContextCard'
 import FigureThumb from '@/components/FigureThumb'
 import { faithfulnessBanner, parseStages } from './playgroundData'
@@ -28,7 +29,6 @@ import { searchDocumentChunks } from '@/api/parse'
 import type { ChunkNode, DocumentItem } from '@/api/types'
 import { listUsers } from '@/api/iam'
 import { debugQuery, debugShards, debugSimulate, type DebugQueryResp, type Citation, type SimulateResp } from '@/api/rag'
-import { formatMs } from '@/utils/format'
 
 interface ShardInfo {
   user_id: number
@@ -465,7 +465,12 @@ export default function Playground() {
               />
             </Card>
           ) : null}
-          <Card title="答案">
+          <PipelineMonitor
+            monitor={result.pipeline_monitor}
+            onOpenChunk={openChunk}
+          />
+
+          <Card title="答案" style={{ marginTop: 12 }}>
             {result.refused ? (
               <Alert
                 type="warning"
@@ -503,9 +508,6 @@ export default function Playground() {
               {result.rewritten_query && result.rewritten_query !== result.query ? (
                 <Tag color="purple">检索串：{result.rewritten_query}</Tag>
               ) : null}
-              {result.timings_ms ? Object.entries(result.timings_ms).map(([k, v]) => (
-                <Tag key={k}>{k} {formatMs(v)}</Tag>
-              )) : null}
             </Space>
           </Card>
 

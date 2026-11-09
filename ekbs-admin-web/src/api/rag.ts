@@ -141,6 +141,43 @@ export interface DebugQueryResp {
   numeric?: NumericAnswer | null
   faithfulness?: FaithfulnessReport | null
   stages?: unknown
+  /** 提问 → 改写 → rerank 块 → 回答（管理台全过程折叠监控） */
+  pipeline_monitor?: {
+    question?: string
+    rewrite?: {
+      original: string
+      rewritten: string
+      history_used: boolean
+      variants: string[]
+    }
+    rerank_chunks?: {
+      rank: number
+      chunk_id: number
+      rerank_score: number | null
+      doc_title: string
+      heading_path: string
+      chunk_type: string
+      preview: string
+      decision: string
+    }[]
+    rerank_meta?: {
+      enabled?: boolean | null
+      keep?: number | null
+      min_score?: number | null
+      count?: number
+    }
+    answer?: string
+    refused?: boolean
+    refusal_reason?: string | null
+    steps?: { key: string; label: string; ms: number }[]
+    timings_ms?: Record<string, number>
+    intent?: string | null
+    mode_used?: string | null
+    model?: string | null
+    cache_hit?: boolean
+    prompt_tokens?: number
+    completion_tokens?: number
+  } | null
   timings_ms?: Record<string, number>
 }
 

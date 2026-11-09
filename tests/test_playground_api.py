@@ -51,12 +51,11 @@ def playground_headers(seeded):
 async def client(seeded):
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as instance:
-            instance.runtime = runtime  # type: ignore[attr-defined]
-            yield instance
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as instance:
+        instance.runtime = runtime  # type: ignore[attr-defined]
+        yield instance
 
 
 async def test_playground_requires_permission(client, seeded) -> None:
@@ -182,6 +181,17 @@ async def test_debug_query_returns_answer_and_stages(client, playground_headers)
     assert body.get("history_used") is False
     assert body.get("rewritten_query") == "年假有多少天"
     assert body.get("session_id"), "完整作答应落审计并回传 session_id"
+    # 全过程监控：问题 → 改写 → rerank 块 → 回答（折叠条目）
+    monitor = body["pipeline_monitor"]
+    assert monitor["question"] == "年假有多少天"
+    assert monitor["rewrite"]["rewritten"]
+    assert isinstance(monitor["rerank_chunks"], list)
+    assert monitor["answer"]
+    assert "wall" in monitor["timings_ms"]
+    assert "rewrite" in body["timings_ms"] and "wall" in body["timings_ms"]
+    if monitor["rerank_chunks"]:
+        top = monitor["rerank_chunks"][0]
+        assert top["rank"] == 1 and "chunk_id" in top and "decision" in top
 
 
 async def test_debug_query_exposes_model_context(client, playground_headers) -> None:

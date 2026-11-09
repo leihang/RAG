@@ -38,7 +38,8 @@ export default function FigureThumb({
     setUrl(null)
     setFailed(null)
     http
-      .get(`/assets/figure/${chunkId}`, { responseType: 'blob' })
+      // 历史引用的图可能已删：404/403 由组件内静默提示，勿弹全局「对象不存在」
+      .get(`/assets/figure/${chunkId}`, { responseType: 'blob', skipErrorToast: true })
       .then((res) => {
         if (revoked) return
         objectUrl = URL.createObjectURL(res as unknown as Blob)
