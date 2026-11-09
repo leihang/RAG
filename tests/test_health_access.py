@@ -24,13 +24,12 @@ async def loopback(seeded):
     """本机直连客户端（等价于在服务器上跑 smoke.sh）。"""
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app, client=("127.0.0.1", 51234)),
-            base_url="http://testserver",
-        ) as client:
-            client.app = app  # type: ignore[attr-defined]
-            yield client
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51234)),
+        base_url="http://testserver",
+    ) as client:
+        client.app = app  # type: ignore[attr-defined]
+        yield client
 
 
 @pytest.fixture
@@ -38,13 +37,12 @@ async def remote(seeded):
     """外部来源客户端（内网另一台机器）。"""
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app, client=("10.0.0.9", 51234)),
-            base_url="http://testserver",
-        ) as client:
-            client.app = app  # type: ignore[attr-defined]
-            yield client
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app, client=("10.0.0.9", 51234)),
+        base_url="http://testserver",
+    ) as client:
+        client.app = app  # type: ignore[attr-defined]
+        yield client
 
 
 async def test_probes_stay_public_from_remote(remote) -> None:
@@ -71,14 +69,13 @@ async def test_health_deps_rejects_proxied_request(seeded) -> None:
     """经反向代理时 client.host 是回环 —— 必须靠 X-Forwarded-For 判为外部来源。"""
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app, client=("127.0.0.1", 51234)),
-            base_url="http://testserver",
-        ) as proxied:
-            response = await proxied.get(
-                "/health/deps", headers={"X-Forwarded-For": "203.0.113.7"}
-            )
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51234)),
+        base_url="http://testserver",
+    ) as proxied:
+        response = await proxied.get(
+            "/health/deps", headers={"X-Forwarded-For": "203.0.113.7"}
+        )
     assert response.status_code == 401
 
 

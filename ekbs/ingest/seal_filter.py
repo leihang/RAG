@@ -80,10 +80,13 @@ def looks_like_seal(im: Image.Image, *, caption: str = "", ocr: str = "") -> boo
     if square and _red_seal(r, g, b, ink):
         return True
     # 扫描件里红章经常被抽成灰度圆印：白底、四角空白、墨迹铺到外圈
-    if square and white_frac >= 0.72 and 0.003 <= ink_frac <= 0.40:
-        if _corners_blank(near_white) and _ink_on_rim(ink):
-            return True
-    return False
+    return bool(
+        square
+        and white_frac >= 0.72
+        and 0.003 <= ink_frac <= 0.40
+        and _corners_blank(near_white)
+        and _ink_on_rim(ink)
+    )
 
 
 def _red_seal(r: np.ndarray, g: np.ndarray, b: np.ndarray, ink: np.ndarray) -> bool:

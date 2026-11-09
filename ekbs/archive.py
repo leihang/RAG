@@ -217,7 +217,8 @@ class AuditArchiver:
         path = self.archive_dir / f"{table}-{stamp}.jsonl"
         with path.open("w", encoding="utf-8") as handle:
             for row in rows:
-                handle.write(json.dumps({k: row[k] for k in row.keys()}, ensure_ascii=False))
+                # sqlite3.Row 迭代的是值不是列名
+                handle.write(json.dumps({k: row[k] for k in row.keys()}, ensure_ascii=False))  # noqa: SIM118
                 handle.write("\n")
         return path
 

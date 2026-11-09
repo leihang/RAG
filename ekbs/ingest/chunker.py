@@ -512,17 +512,19 @@ def _table_adjacent_prose(
         idx = next((i for i, line in enumerate(lines) if marker in line), None)
         if idx is None:
             return "", ""
+        # 默认参数绑定当前迭代的 lines，避免闭包捕获循环变量（B023）
+        section_lines = lines
 
-        def _collect(indices: range) -> str:
+        def _collect(indices: range, bound_lines: list[str] = section_lines) -> str:
             parts: list[str] = []
             for i in indices:
-                line = lines[i].strip()
+                line = bound_lines[i].strip()
                 if not line or _is_boundary(line):
                     break
                 parts.append(line)
             return " ".join(parts).strip()[:max_chars]
 
-        return _collect(range(idx - 1, -1, -1)), _collect(range(idx + 1, len(lines)))
+        return _collect(range(idx - 1, -1, -1)), _collect(range(idx + 1, len(section_lines)))
     return "", ""
 
 

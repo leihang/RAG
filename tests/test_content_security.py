@@ -121,11 +121,10 @@ def test_filter_match_deduplicates() -> None:
 async def client(seeded):
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as instance:
-            yield instance
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as instance:
+        yield instance
 
 
 @pytest.fixture

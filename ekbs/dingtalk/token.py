@@ -145,7 +145,9 @@ class DingTalkTokenClient:
                 else f"获取钉钉 access_token 失败：{exc}"
             )
             log.error("dingtalk_token_failed", fatal=fatal, error=str(exc))
-            raise ConfigError(detail) if fatal else ModelUnavailable(detail)
+            if fatal:
+                raise ConfigError(detail) from exc
+            raise ModelUnavailable(detail) from exc
         finally:
             if owned:
                 await client.aclose()

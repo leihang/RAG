@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -52,10 +53,8 @@ def find_web_dir(settings) -> Path | None:
     env_dir = os.environ.get("EKBS_ADMIN_WEB_DIR")
     if env_dir:
         candidates.append(Path(env_dir))
-    try:
+    with contextlib.suppress(Exception):  # pragma: no cover - 配置异常时跳过
         candidates.append(Path(settings.data_dir).parent / "web")
-    except Exception:  # pragma: no cover - 配置异常时跳过
-        pass
     candidates.append(PROD_WEB_DIR)
     candidates.append(REPO_WEB_DIR)
 

@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import json
 import shutil
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
@@ -382,7 +383,7 @@ def _set_status(runtime: Any, doc_id: int, status: str, *, operator_id: int, rea
         )
         version = bump_policy_version(conn, reason=f"api:status:{doc_id}->{status}")
         conn.commit()
-    runtime.shards  # 索引不因状态变化而改动（召回侧按 status 过滤）
+    # 索引不因状态变化而改动（召回侧按 status 过滤）
     log.info("document_status_changed", doc_id=doc_id, status=status, policy_version=version)
 
 
@@ -523,10 +524,9 @@ def _purge_figure_caption_cache(runtime: Any, stems: set[str], *, doc_id: int) -
 
 def _under_root(path: Path, root: Path) -> Path | None:
     """若 ``path`` 落在 ``root`` 内返回相对路径，否则 ``None``。"""
-    try:
-        return path.resolve().relative_to(root.resolve())
-    except Exception:
-        return None
+    from ekbs.ingest.path_sanitize import relative_under
+
+    return relative_under(path, root)
 
 
 def _cleanup_empty_parents(start: Path, *, stop_at: Path) -> None:
@@ -764,8 +764,20 @@ def _drop_document_index(runtime: Any, doc_id: int) -> tuple[list[int], list[str
             from ekbs.ingest.table_observations import delete_observations_for_doc
 
             delete_observations_for_doc(conn, doc_id)
-        except Exception:  # noqa: BLE001 — 观测表缺失时不阻断删文档
-            pass
+        except sqlite3.OperationalError as exc:
+            # 观测表缺失时不阻断删文档（旧库/未迁移）
+            log.warning(
+                "delete_observations_skipped",
+                doc_id=doc_id,
+                error=str(exc)[:200],
+            )
+        except Exception as exc:
+            log.warning(
+                "delete_observations_failed",
+                doc_id=doc_id,
+                error=str(exc)[:200],
+            )
+            raise
         conn.execute("DELETE FROM ekbs_chunk WHERE doc_id = ?", (doc_id,))
         conn.commit()
     return chunk_ids, shards
@@ -1008,13 +1020,9 @@ def safe_relative_name(filename: str) -> str:
     保留它才能把目录结构带进库；但 ``filename`` 是客户端给的，
     所以必须自己挡：绝对路径、``..`` 段、空段、以点开头的段一律剔除。
     """
-    parts: list[str] = []
-    for raw in str(filename or "").replace("\\", "/").split("/"):
-        seg = raw.strip()
-        if not seg or seg in {".", ".."} or seg.startswith("."):
-            continue
-        parts.append(seg)
-    return "/".join(parts) or "未命名"
+    from ekbs.ingest.path_sanitize import safe_upload_relative
+
+    return safe_upload_relative(filename)
 
 
 class UploadInit(BaseModel):
@@ -1258,8 +1266,8 @@ async def upload_chunk(
     request: Request,
     index: int | None = Form(default=None),
     chunk_index: int | None = Form(default=None),
-    file: UploadFile | None = File(default=None),
-    chunk: UploadFile | None = File(default=None),
+    file: UploadFile | None = File(default=None),  # noqa: B008 — FastAPI 依赖注入惯用写法
+    chunk: UploadFile | None = File(default=None),  # noqa: B008
     authorization: str | None = Header(default=None),
     x_internal_token: str | None = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
     x_internal_user_id: str | None = Header(default=None, alias=INTERNAL_USER_HEADER),

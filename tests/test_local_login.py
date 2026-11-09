@@ -34,13 +34,12 @@ async def client(seeded):
     """回环来源的客户端（等价于"人在服务器本机"）。"""
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app, client=("127.0.0.1", 51234)),
-            base_url="http://testserver",
-        ) as instance:
-            instance.app = app  # type: ignore[attr-defined]
-            yield instance
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51234)),
+        base_url="http://testserver",
+    ) as instance:
+        instance.app = app  # type: ignore[attr-defined]
+        yield instance
 
 
 async def _client_with_host(seeded, host: str):
@@ -169,11 +168,10 @@ async def test_local_login_rejected_from_remote_address(seeded) -> None:
     runtime, _ = seeded
     _make_account(runtime, username="opsadmin")
     app, remote = await _client_with_host(seeded, "10.0.0.9")
-    async with app.router.lifespan_context(app):
-        async with remote:
-            response = await remote.post(
-                "/api/v1/auth/local-login", json={"username": "opsadmin", "password": PASSWORD}
-            )
+    async with app.router.lifespan_context(app), remote:
+        response = await remote.post(
+            "/api/v1/auth/local-login", json={"username": "opsadmin", "password": PASSWORD}
+        )
     assert response.status_code == 403
     assert "本机" in response.json()["detail"]
 
@@ -183,16 +181,15 @@ async def test_local_login_rejected_when_proxied(seeded) -> None:
     runtime, _ = seeded
     _make_account(runtime, username="opsadmin")
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app, client=("127.0.0.1", 51234)),
-            base_url="http://testserver",
-        ) as proxied:
-            response = await proxied.post(
-                "/api/v1/auth/local-login",
-                json={"username": "opsadmin", "password": PASSWORD},
-                headers={"X-Forwarded-For": "203.0.113.7"},
-            )
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51234)),
+        base_url="http://testserver",
+    ) as proxied:
+        response = await proxied.post(
+            "/api/v1/auth/local-login",
+            json={"username": "opsadmin", "password": PASSWORD},
+            headers={"X-Forwarded-For": "203.0.113.7"},
+        )
     assert response.status_code == 403, "代理来源必须被拒，否则等于把内网所有人都当成'本机'"
 
 
@@ -202,11 +199,10 @@ async def test_local_login_allow_remote_switch(seeded) -> None:
     _make_account(runtime, username="opsadmin")
     app, remote = await _client_with_host(seeded, "10.0.0.9")
     runtime.settings.security["local_login_allow_remote"] = True
-    async with app.router.lifespan_context(app):
-        async with remote:
-            response = await remote.post(
-                "/api/v1/auth/local-login", json={"username": "opsadmin", "password": PASSWORD}
-            )
+    async with app.router.lifespan_context(app), remote:
+        response = await remote.post(
+            "/api/v1/auth/local-login", json={"username": "opsadmin", "password": PASSWORD}
+        )
     assert response.status_code == 200
 
 

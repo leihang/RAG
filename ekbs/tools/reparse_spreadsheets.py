@@ -13,7 +13,8 @@ import sys
 from pathlib import Path
 
 from ekbs.config import load_settings
-from ekbs.ingest.chunker import FigureInput, TableInput
+from ekbs.ingest.chunker import TableInput
+from ekbs.ingest.figure_input import figure_inputs_from_parsed
 from ekbs.ingest.parser import parse_file
 from ekbs.ingest.pipeline import IngestPipeline
 from ekbs.logging import configure_logging, get_logger
@@ -55,13 +56,11 @@ async def _run(apply: bool, doc_ids: list[int] | None) -> int:
             try:
                 assets_dir = settings.data_paths()["parse"] / str(doc_id)
                 parsed = await asyncio.to_thread(parse_file, source, assets_dir=assets_dir)
-                figures = [
-                    FigureInput(
-                        image_path=str((assets_dir / f.name).relative_to(settings.data_dir)),
-                        caption=f.caption, ocr_text=f.ocr_text, page=f.page, figure_id=f.figure_id,
-                    )
-                    for f in parsed.figures
-                ]
+                figures = figure_inputs_from_parsed(
+                    parsed.figures,
+                    data_dir=settings.data_dir,
+                    assets_dir=assets_dir,
+                )
                 tables = [
                     TableInput(
                         body=t.body, caption=t.caption, page=t.page, table_id=t.table_id,

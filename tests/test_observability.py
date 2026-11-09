@@ -28,7 +28,7 @@ def _write_metric(runtime, name: str, values: list[float], *, labels: dict | Non
     """往 ekbs_metric 写历史采样（模拟采集作业已经写过的数据）。"""
     seconds_ago = seconds_ago or [len(values) - index for index in range(len(values))]
     with runtime.db.sync_connect() as conn:
-        for value, age in zip(values, seconds_ago):
+        for value, age in zip(values, seconds_ago, strict=False):
             conn.execute(
                 "INSERT INTO ekbs_metric(name, value, labels, created_at) "
                 "VALUES (?, ?, ?, datetime('now', ?))",

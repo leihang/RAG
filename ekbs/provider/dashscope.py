@@ -496,39 +496,38 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         url = f"{self.base_url}{COMPATIBLE_PATH}/chat/completions"
         body = self._body(messages, stream=True, model=self.ref.model)
         timeout = httpx.Timeout(self.timeout_s, connect=10.0, read=self.timeout_s)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream(
-                "POST", url, json=body, headers=_auth_headers(self.api_key)
-            ) as response:
-                if response.status_code >= 400:
-                    await response.aread()
-                    error = CloudError(
-                        provider=self.ref.provider, endpoint="chat/completions",
-                        status_code=response.status_code,
-                        message=(response.text or "")[:300],
-                        retryable=response.status_code in {429, 500, 503},
-                    )
-                    raise to_provider_error(error, "llm")
-                emitted = False
-                async for line in response.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    import json
+        async with httpx.AsyncClient(timeout=timeout) as client, client.stream(
+            "POST", url, json=body, headers=_auth_headers(self.api_key)
+        ) as response:
+            if response.status_code >= 400:
+                await response.aread()
+                error = CloudError(
+                    provider=self.ref.provider, endpoint="chat/completions",
+                    status_code=response.status_code,
+                    message=(response.text or "")[:300],
+                    retryable=response.status_code in {429, 500, 503},
+                )
+                raise to_provider_error(error, "llm")
+            emitted = False
+            async for line in response.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                import json
 
-                    try:
-                        chunk = json.loads(data)
-                    except ValueError:
-                        continue
-                    for choice in chunk.get("choices") or []:
-                        piece = (choice.get("delta") or {}).get("content")
-                        if piece:
-                            emitted = True
-                            yield str(piece)
-                if not emitted:
-                    log.warning("llm_stream_empty", model=self.ref.model)
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                for choice in chunk.get("choices") or []:
+                    piece = (choice.get("delta") or {}).get("content")
+                    if piece:
+                        emitted = True
+                        yield str(piece)
+            if not emitted:
+                log.warning("llm_stream_empty", model=self.ref.model)
 
 
 # ---------------------------------------------------------------------------

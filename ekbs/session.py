@@ -712,11 +712,7 @@ def _is_incomplete_period_ask(question: str) -> bool:
         return False
     if _SOLICIT_HEAD_RE.match(text):
         return True
-    if text.endswith(("的", "呢", "吧")) and not _METRIC_TAIL_RE.search(
-        _QUESTION_TAIL_RE.sub("", text)
-    ):
-        return True
-    return False
+    return bool(text.endswith(("的", "呢", "吧")) and not _METRIC_TAIL_RE.search(_QUESTION_TAIL_RE.sub("", text)))
 
 
 def _compose_topic_period(

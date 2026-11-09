@@ -331,10 +331,7 @@ def assess_parse_quality(
     table_nonempty = sum(1 for c in table_rows if str(c.get("content") or "").strip())
     table_count = len(table_rows)
     table_rate: float | None
-    if table_count == 0:
-        table_rate = None
-    else:
-        table_rate = table_nonempty / table_count
+    table_rate = None if table_count == 0 else table_nonempty / table_count
 
     report = ParseQuality(
         doc_id=doc_id,
@@ -362,19 +359,16 @@ def assess_parse_quality(
 
     garbled_ok = rate <= thr.garbled_rate_max
     empty_ok: bool | None
-    if slide_based or not pages_applicable:
-        # 幻灯片类（.ppt/.pptx）**不做空页率准出**：幻灯片以图/标题为主，
-        # 拿"页面正文长度"这条为页面型文档设计的准出线去卡它是**指标误用**
-        # （实测 doc 33 的章节过渡页反复触发假警报）。
-        # 记 N/A 而不是 True —— 不假装它通过了，报告里写清为什么。
+    # 幻灯片类（.ppt/.pptx）**不做空页率准出**：幻灯片以图/标题为主，
+    # 拿"页面正文长度"这条为页面型文档设计的准出线去卡它是**指标误用**
+    # （实测 doc 33 的章节过渡页反复触发假警报）。
+    # 记 N/A 而不是 True —— 不假装它通过了，报告里写清为什么。
+    if slide_based or not pages_applicable:  # noqa: SIM108 — 保留分支注释可读性
         empty_ok = None
     else:
         empty_ok = empty_rate <= thr.empty_page_rate_max
     table_ok: bool | None
-    if table_rate is None:
-        table_ok = None
-    else:
-        table_ok = table_rate >= thr.table_survival_min
+    table_ok = None if table_rate is None else table_rate >= thr.table_survival_min
 
     report.checks = {
         "garbled_ok": garbled_ok,

@@ -23,7 +23,7 @@ HOT_DAYS = 90
 HOT_MIN_COUNT = 2
 
 
-def _normalize_question(text: str) -> str:
+def _normalize_recommend_question(text: str) -> str:
     """推荐去重用：去空白与常见标点，大小写不敏感。"""
     q = (text or "").strip().lower()
     q = re.sub(r"[\s\?？!！。．，,、；;：:\"'“”‘’]+", "", q)
@@ -72,8 +72,8 @@ def hot_questions(
     with runtime.db.sync_connect() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [
-        {"question": str(r["question"]).strip(), "source": "hot", "count": int(r["cnt"])}
-        for r in rows
+        {"question": str(row["question"]).strip(), "source": "hot", "count": int(row["cnt"])}
+        for row in rows
     ]
 
 
@@ -131,13 +131,13 @@ def doc_recommend_questions(
         ).fetchall()
     return [
         {
-            "question": str(r["question"]).strip(),
+            "question": str(row["question"]).strip(),
             "source": "doc",
-            "doc_id": int(r["doc_id"]),
-            "doc_title": str(r["doc_title"] or ""),
-            "rerank_score": r["rerank_score"],
+            "doc_id": int(row["doc_id"]),
+            "doc_title": str(row["doc_title"] or ""),
+            "rerank_score": row["rerank_score"],
         }
-        for r in rows
+        for row in rows
     ]
 
 
@@ -155,7 +155,12 @@ async def generate_doc_question(runtime: Any, *, title: str, summary: str) -> st
     ]
     try:
         result = await runtime.providers.llm.generate(messages)
-    except Exception:
+    except Exception as exc:
+        log.warning(
+            "doc_recommend_llm_failed",
+            title=str(title or "")[:120],
+            error=str(exc)[:200],
+        )
         return None
     text = (result.text or "").strip()
     return text or None
@@ -194,12 +199,12 @@ def _perm_for_doc(runtime: Any, doc_id: int) -> PermContext | None:
     """用文档自身分片构造可见权限，避免入库自动验证时被操作者 ACL 挡住。"""
     with runtime.db.sync_connect() as conn:
         shards = [
-            str(r[0])
-            for r in conn.execute(
+            str(row[0])
+            for row in conn.execute(
                 "SELECT DISTINCT shard_id FROM ekbs_chunk WHERE doc_id = ? AND shard_id IS NOT NULL",
                 (doc_id,),
             ).fetchall()
-            if r[0]
+            if row[0]
         ]
         kb_row = conn.execute(
             "SELECT kb_id FROM ekbs_document WHERE doc_id = ?", (doc_id,)
@@ -324,7 +329,7 @@ def _extend_recommendations(
         q = str(item.get("question") or "").strip()
         if not q or q in seen:
             continue
-        if query_norm and _normalize_question(q) == query_norm:
+        if query_norm and _normalize_recommend_question(q) == query_norm:
             continue
         seen.add(q)
         out.append(item)
@@ -349,7 +354,7 @@ def recommend_questions(
     """
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    query_norm = _normalize_question(query)
+    query_norm = _normalize_recommend_question(query)
     focus = [int(d) for d in (focus_doc_ids or ()) if int(d) > 0]
 
     # 本轮引用优先（仍过可见文档交集，越权 id 不会进结果）

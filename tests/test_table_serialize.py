@@ -59,7 +59,7 @@ def test_span_serializer_spans_are_contiguous_and_cover_every_row_once() -> None
     assert [(span[1], span[2]) for span in per_row] == [(i, i) for i in range(40)]
     assert len(spans) > 1, "200 token 预算下 41 行必须切成多段"
     assert spans[0][1] == 0
-    for prev, cur in zip(spans, spans[1:]):
+    for prev, cur in zip(spans, spans[1:], strict=False):
         assert cur[1] == prev[2] + 1, f"数据行必须连续覆盖、无重叠：{prev} → {cur}"
     assert spans[-1][2] == 39
 

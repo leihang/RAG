@@ -154,18 +154,17 @@ async def test_upload_init_enforces_scope(seeded, level, depts, expect_status, r
     hr_manager = await _grant(seeded, "demo_alice", "kb_admin")
     _, app, client = await _client(seeded)
     headers = {"X-Internal-Token": TEST_INTERNAL_TOKEN, "X-Internal-User-Id": str(hr_manager)}
-    async with app.router.lifespan_context(app):
-        async with client as c:
-            response = await c.post(
-                "/api/v1/docs/upload/init",
-                headers=headers,
-                json={
-                    "filename": "制度.pdf",
-                    "size_bytes": 1024,
-                    "level": level,
-                    "visible_dept_ids": depts,
-                },
-            )
+    async with app.router.lifespan_context(app), client as c:
+        response = await c.post(
+            "/api/v1/docs/upload/init",
+            headers=headers,
+            json={
+                "filename": "制度.pdf",
+                "size_bytes": 1024,
+                "level": level,
+                "visible_dept_ids": depts,
+            },
+        )
     assert response.status_code == expect_status, response.text
     if reason:
         assert reason in response.json()["detail"]
@@ -180,17 +179,16 @@ async def test_register_document_enforces_scope(seeded) -> None:
     raw = runtime.settings.data_paths()["raw"]
     source = raw / "越权登记.md"
     source.write_text("# 财务制度\n\n正文", encoding="utf-8")
-    async with app.router.lifespan_context(app):
-        async with client as c:
-            response = await c.post(
-                "/api/v1/docs/documents",
-                headers=headers,
-                json={
-                    "title": "越权登记",
-                    "kb_id": 1,
-                    "level": 2,
-                    "visible_dept_ids": ["103"],
-                    "source_path": str(source),
-                },
-            )
+    async with app.router.lifespan_context(app), client as c:
+        response = await c.post(
+            "/api/v1/docs/documents",
+            headers=headers,
+            json={
+                "title": "越权登记",
+                "kb_id": 1,
+                "level": 2,
+                "visible_dept_ids": ["103"],
+                "source_path": str(source),
+            },
+        )
     assert response.status_code in (200, 201), response.text

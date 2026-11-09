@@ -434,7 +434,7 @@ class PermissionChangeService:
             assigned = self.shards.upsert(
                 target_shard, [chunk_id for chunk_id, _ in children], np.asarray(vectors, dtype="float32")
             )
-            new_rows = dict(zip([chunk_id for chunk_id, _ in children], assigned))
+            new_rows = dict(zip([chunk_id for chunk_id, _ in children], assigned, strict=False))
 
         with self.db.sync_connect() as conn:
             current = conn.execute(

@@ -271,11 +271,7 @@ def _dedupe_entities(
     by_entity: dict[str, TidyMetricRow] = {}
     for row in rows:
         prev = by_entity.get(row.entity)
-        if prev is None:
-            by_entity[row.entity] = row
-        elif prefer_min and row.value < prev.value:
-            by_entity[row.entity] = row
-        elif not prefer_min and row.value > prev.value:
+        if prev is None or prefer_min and row.value < prev.value or not prefer_min and row.value > prev.value:
             by_entity[row.entity] = row
     return list(by_entity.values())
 

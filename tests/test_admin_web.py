@@ -139,8 +139,7 @@ async def test_dev_users_shape(client, seeded) -> None:
 
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
             resp = await c.get("/api/v1/auth/dev-users")
     assert resp.status_code == 200, resp.text
     items = resp.json()["items"]
@@ -170,8 +169,7 @@ async def test_dev_users_skip_dingtalk_directory(seeded) -> None:
             ).fetchone()["user_id"]
         )
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
             listed = await c.get("/api/v1/auth/dev-users")
             denied = await c.post("/api/v1/auth/dev-token", json={"user_id": outsider})
     assert listed.status_code == 200
@@ -194,8 +192,7 @@ def test_dev_users_is_404_in_production(seeded) -> None:
 
     async def run() -> int:
         app = create_app(runtime.settings)
-        async with app.router.lifespan_context(app):
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
+        async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
                 resp = await c.get("/api/v1/auth/dev-users")
                 return resp.status_code
 
@@ -238,8 +235,7 @@ async def test_upload_init_accepts_awkward_xlsx_names(seeded) -> None:
     set_clearance(runtime, uid, 4)
     headers = {"X-Internal-Token": TEST_INTERNAL_TOKEN, "X-Internal-User-Id": str(uid)}
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
             for name in ("报表.xlsx", "报表.xlsx ", "报表．xlsx", "报表.xlsx.", "  报表.XLSX"):
                 resp = await c.post(
                     "/api/v1/docs/upload/init",
@@ -259,8 +255,7 @@ async def test_upload_init_still_rejects_truly_unsupported(seeded) -> None:
     uid = user_id_of(runtime.db, "demo_carol")
     headers = {"X-Internal-Token": TEST_INTERNAL_TOKEN, "X-Internal-User-Id": str(uid)}
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
             # `.html` 自 2026-10-03 起已支持（标准库解析）—— 不能再当"真不支持"的例子；
             # 换成仍无解析分支的 `.ppt`（白名单里有、解析器没有 → 上传接口 422）
             for name in ("木马.exe", "演示.ppt ", "培训.ppt．", "没有后缀"):
@@ -293,8 +288,7 @@ async def test_frontend_facing_response_shapes(seeded) -> None:
     uid = user_id_of(runtime.db, "demo_carol")
     headers = {"X-Internal-Token": TEST_INTERNAL_TOKEN, "X-Internal-User-Id": str(uid)}
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
             # 列表：扁平的 items
             lst = (await c.get("/api/v1/docs/documents?limit=1", headers=headers)).json()
             assert {"items", "total"} <= set(lst)
@@ -363,25 +357,24 @@ async def test_upload_without_kb_is_rejected_with_actionable_message(seeded) -> 
     """
 
     runtime, app, client, headers = await _upload_client(seeded)
-    async with app.router.lifespan_context(app):
-        async with client as c:
-            init = await c.post(
-                "/api/v1/docs/upload/init",
-                headers=headers,
-                json={"filename": "预算表.xlsx", "size_bytes": 4, "level": 2, "visible_dept_ids": ["102"]},
-            )
-            assert init.status_code == 200, init.text
-            upload_id = init.json()["upload_id"]
-            await c.post(
-                f"/api/v1/docs/upload/{upload_id}/chunk",
-                headers=headers,
-                files={"file": ("预算表.xlsx", b"abcd", "application/octet-stream")},
-                data={"index": "0"},
-            )
-            done = await c.post(f"/api/v1/docs/upload/{upload_id}/complete", headers=headers)
-            assert done.status_code == 422
-            detail = done.json()["detail"]
-            assert "kb_id" in detail and "kb_code" in detail, detail
+    async with app.router.lifespan_context(app), client as c:
+        init = await c.post(
+            "/api/v1/docs/upload/init",
+            headers=headers,
+            json={"filename": "预算表.xlsx", "size_bytes": 4, "level": 2, "visible_dept_ids": ["102"]},
+        )
+        assert init.status_code == 200, init.text
+        upload_id = init.json()["upload_id"]
+        await c.post(
+            f"/api/v1/docs/upload/{upload_id}/chunk",
+            headers=headers,
+            files={"file": ("预算表.xlsx", b"abcd", "application/octet-stream")},
+            data={"index": "0"},
+        )
+        done = await c.post(f"/api/v1/docs/upload/{upload_id}/complete", headers=headers)
+        assert done.status_code == 422
+        detail = done.json()["detail"]
+        assert "kb_id" in detail and "kb_code" in detail, detail
 
 
 async def test_upload_preserves_folder_structure(seeded) -> None:
@@ -392,34 +385,33 @@ async def test_upload_preserves_folder_structure(seeded) -> None:
     """
 
     runtime, app, client, headers = await _upload_client(seeded)
-    async with app.router.lifespan_context(app):
-        async with client as c:
-            body = b"col1,col2\n1,2\n"
-            rel = "制度/2026/预算表.xlsx"
-            init = await c.post(
-                "/api/v1/docs/upload/init",
-                headers=headers,
-                json={
-                    "filename": rel,
-                    "title": "制度/2026/预算表",
-                    "size_bytes": len(body),
-                    "kb_id": 1,
-                    "level": 1,
-                },
-            )
-            assert init.status_code == 200, init.text
-            upload_id = init.json()["upload_id"]
-            await c.post(
-                f"/api/v1/docs/upload/{upload_id}/chunk",
-                headers=headers,
-                files={"file": ("part0", body, "application/octet-stream")},
-                data={"index": "0"},
-            )
-            done = await c.post(f"/api/v1/docs/upload/{upload_id}/complete", headers=headers)
-            assert done.status_code == 200, done.text
-            path = done.json()["path"]
-            assert path.endswith("制度/2026/预算表.xlsx"), path
-            doc_id = done.json()["doc_id"]
+    async with app.router.lifespan_context(app), client as c:
+        body = b"col1,col2\n1,2\n"
+        rel = "制度/2026/预算表.xlsx"
+        init = await c.post(
+            "/api/v1/docs/upload/init",
+            headers=headers,
+            json={
+                "filename": rel,
+                "title": "制度/2026/预算表",
+                "size_bytes": len(body),
+                "kb_id": 1,
+                "level": 1,
+            },
+        )
+        assert init.status_code == 200, init.text
+        upload_id = init.json()["upload_id"]
+        await c.post(
+            f"/api/v1/docs/upload/{upload_id}/chunk",
+            headers=headers,
+            files={"file": ("part0", body, "application/octet-stream")},
+            data={"index": "0"},
+        )
+        done = await c.post(f"/api/v1/docs/upload/{upload_id}/complete", headers=headers)
+        assert done.status_code == 200, done.text
+        path = done.json()["path"]
+        assert path.endswith("制度/2026/预算表.xlsx"), path
+        doc_id = done.json()["doc_id"]
 
     with runtime.db.sync_connect() as conn:
         row = conn.execute(
@@ -431,7 +423,10 @@ async def test_upload_preserves_folder_structure(seeded) -> None:
 
 def test_safe_relative_name_blocks_escapes() -> None:
     """相对路径是客户端给的，必须自己挡：绝对路径、`..`、隐藏段。"""
+    from pathlib import Path
+
     from ekbs.api.docs import safe_relative_name
+    from ekbs.ingest.path_sanitize import relative_under, safe_upload_relative
 
     assert safe_relative_name("制度/2026/预算表.xlsx") == "制度/2026/预算表.xlsx"
     assert safe_relative_name("../../etc/passwd") == "etc/passwd"
@@ -440,6 +435,13 @@ def test_safe_relative_name_blocks_escapes() -> None:
     assert safe_relative_name(".hidden/x") == "x"
     assert safe_relative_name("..") == "未命名"
     assert safe_relative_name("") == "未命名"
+    assert safe_upload_relative("制度/../x.md") == "制度/x.md"
+
+    root = Path("/tmp/ekbs-path-sanitize-root")
+    root.mkdir(parents=True, exist_ok=True)
+    inside = root / "a" / "b.txt"
+    assert relative_under(inside, root) == Path("a/b.txt")
+    assert relative_under(Path("/tmp/elsewhere/x"), root) is None
 
 
 async def test_failed_upload_leaves_no_orphan_file(seeded) -> None:
@@ -461,22 +463,21 @@ async def test_failed_upload_leaves_no_orphan_file(seeded) -> None:
     raw_dir = Path(runtime.settings.data_paths()["raw"]) / digest[:16]
     assert not raw_dir.exists(), "前置条件：该内容此前不该存在"
 
-    async with app.router.lifespan_context(app):
-        async with client as c:
-            init = await c.post(
-                "/api/v1/docs/upload/init",
-                headers=headers,
-                json={"filename": "孤儿检查.xlsx", "size_bytes": len(body), "level": 2, "visible_dept_ids": ["102"]},
-            )
-            upload_id = init.json()["upload_id"]
-            await c.post(
-                f"/api/v1/docs/upload/{upload_id}/chunk",
-                headers=headers,
-                files={"file": ("part0", body, "application/octet-stream")},
-                data={"index": "0"},
-            )
-            done = await c.post(f"/api/v1/docs/upload/{upload_id}/complete", headers=headers)
-            assert done.status_code == 422  # 没给 kb_id
+    async with app.router.lifespan_context(app), client as c:
+        init = await c.post(
+            "/api/v1/docs/upload/init",
+            headers=headers,
+            json={"filename": "孤儿检查.xlsx", "size_bytes": len(body), "level": 2, "visible_dept_ids": ["102"]},
+        )
+        upload_id = init.json()["upload_id"]
+        await c.post(
+            f"/api/v1/docs/upload/{upload_id}/chunk",
+            headers=headers,
+            files={"file": ("part0", body, "application/octet-stream")},
+            data={"index": "0"},
+        )
+        done = await c.post(f"/api/v1/docs/upload/{upload_id}/complete", headers=headers)
+        assert done.status_code == 422  # 没给 kb_id
     assert normalize_suffix("孤儿检查.xlsx") == "xlsx"
     assert not raw_dir.exists(), f"失败的 422 上传在 raw 里留下了孤儿文件：{raw_dir}"
 
@@ -499,25 +500,24 @@ async def test_upload_hash_is_streamed_not_whole_file(seeded, monkeypatch) -> No
     monkeypatch.setattr(Path, "read_bytes", _boom)
 
     body = b"streamed-hash-check" * 100
-    async with app.router.lifespan_context(app):
-        async with client as c:
-            init = await c.post(
-                "/api/v1/docs/upload/init",
-                headers=headers,
-                json={"filename": "流式哈希.xlsx", "size_bytes": len(body), "kb_id": 1, "level": 1},
-            )
-            upload_id = init.json()["upload_id"]
-            await c.post(
-                f"/api/v1/docs/upload/{upload_id}/chunk",
-                headers=headers,
-                files={"file": ("part0", body, "application/octet-stream")},
-                data={"index": "0"},
-            )
-            done = await c.post(f"/api/v1/docs/upload/{upload_id}/complete", headers=headers)
-            assert done.status_code == 200, done.text
-            import hashlib
+    async with app.router.lifespan_context(app), client as c:
+        init = await c.post(
+            "/api/v1/docs/upload/init",
+            headers=headers,
+            json={"filename": "流式哈希.xlsx", "size_bytes": len(body), "kb_id": 1, "level": 1},
+        )
+        upload_id = init.json()["upload_id"]
+        await c.post(
+            f"/api/v1/docs/upload/{upload_id}/chunk",
+            headers=headers,
+            files={"file": ("part0", body, "application/octet-stream")},
+            data={"index": "0"},
+        )
+        done = await c.post(f"/api/v1/docs/upload/{upload_id}/complete", headers=headers)
+        assert done.status_code == 200, done.text
+        import hashlib
 
-            assert done.json()["checksum"] == hashlib.sha256(body).hexdigest()
+        assert done.json()["checksum"] == hashlib.sha256(body).hexdigest()
 
 
 async def test_upload_rejects_l2_without_dept_up_front(seeded) -> None:
@@ -531,39 +531,38 @@ async def test_upload_rejects_l2_without_dept_up_front(seeded) -> None:
     runtime, app, client, headers = await _upload_client(seeded)
     # 显式关闭 L4 闸，不依赖配置文件默认值（2026-10-09 测试期配置已全开）
     runtime.settings.permission.l4_enabled = False
-    async with app.router.lifespan_context(app):
-        async with client as c:
-            # L2 无部门 → 立刻 422，且原因可操作
-            bad = await c.post(
-                "/api/v1/docs/upload/init",
-                headers=headers,
-                json={"filename": "内部资料.xlsx", "size_bytes": 10, "kb_id": 1, "level": 2},
-            )
-            assert bad.status_code == 422, bad.text
-            detail = bad.json()["detail"]
-            assert "部门" in detail or "visible_dept_ids" in detail, detail
+    async with app.router.lifespan_context(app), client as c:
+        # L2 无部门 → 立刻 422，且原因可操作
+        bad = await c.post(
+            "/api/v1/docs/upload/init",
+            headers=headers,
+            json={"filename": "内部资料.xlsx", "size_bytes": 10, "kb_id": 1, "level": 2},
+        )
+        assert bad.status_code == 422, bad.text
+        detail = bad.json()["detail"]
+        assert "部门" in detail or "visible_dept_ids" in detail, detail
 
-            # L2 + 给了部门 → 放行
-            ok = await c.post(
-                "/api/v1/docs/upload/init",
-                headers=headers,
-                json={
-                    "filename": "内部资料.xlsx", "size_bytes": 10, "kb_id": 1,
-                    "level": 2, "visible_dept_ids": ["102"],
-                },
-            )
-            assert ok.status_code == 200, ok.text
+        # L2 + 给了部门 → 放行
+        ok = await c.post(
+            "/api/v1/docs/upload/init",
+            headers=headers,
+            json={
+                "filename": "内部资料.xlsx", "size_bytes": 10, "kb_id": 1,
+                "level": 2, "visible_dept_ids": ["102"],
+            },
+        )
+        assert ok.status_code == 200, ok.text
 
-            # L4 未开启（l4_enabled 默认 false）→ 也应在入口拒
-            l4 = await c.post(
-                "/api/v1/docs/upload/init",
-                headers=headers,
-                json={
-                    "filename": "绝密.xlsx", "size_bytes": 10, "kb_id": 1,
-                    "level": 4, "visible_dept_ids": ["102"],
-                },
-            )
-            assert l4.status_code == 422, l4.text
+        # L4 未开启（l4_enabled 默认 false）→ 也应在入口拒
+        l4 = await c.post(
+            "/api/v1/docs/upload/init",
+            headers=headers,
+            json={
+                "filename": "绝密.xlsx", "size_bytes": 10, "kb_id": 1,
+                "level": 4, "visible_dept_ids": ["102"],
+            },
+        )
+        assert l4.status_code == 422, l4.text
 
 
 def test_scan_reports_missing_dept_as_blocker(seeded) -> None:
@@ -597,8 +596,7 @@ async def test_kb_crud_and_delete_guard(seeded) -> None:
     uid = user_id_of(runtime.db, "demo_carol")   # kb_admin 有 kb:knowledge_base:* 权限点
     headers = {"X-Internal-Token": TEST_INTERNAL_TOKEN, "X-Internal-User-Id": str(uid)}
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
             listed = await c.get("/api/v1/kb/knowledge-bases", headers=headers)
             assert listed.status_code == 200, listed.text
             assert listed.json()["total"] >= 1
@@ -672,26 +670,25 @@ async def test_upload_lands_under_kb_code_not_sha_dir(seeded) -> None:
 
     runtime, app, client, headers = await _upload_client(seeded)
     body = b"kb-layout-check"
-    async with app.router.lifespan_context(app):
-        async with client as c:
-            init = await c.post(
-                "/api/v1/docs/upload/init",
-                headers=headers,
-                json={
-                    "filename": "制度/年假.md", "title": "制度/年假",
-                    "size_bytes": len(body), "kb_id": 1, "level": 1,
-                },
-            )
-            upload_id = init.json()["upload_id"]
-            await c.post(
-                f"/api/v1/docs/upload/{upload_id}/chunk",
-                headers=headers,
-                files={"file": ("p0", body, "application/octet-stream")},
-                data={"index": "0"},
-            )
-            done = await c.post(f"/api/v1/docs/upload/{upload_id}/complete", headers=headers)
-            assert done.status_code == 200, done.text
-            path = Path(done.json()["path"])
+    async with app.router.lifespan_context(app), client as c:
+        init = await c.post(
+            "/api/v1/docs/upload/init",
+            headers=headers,
+            json={
+                "filename": "制度/年假.md", "title": "制度/年假",
+                "size_bytes": len(body), "kb_id": 1, "level": 1,
+            },
+        )
+        upload_id = init.json()["upload_id"]
+        await c.post(
+            f"/api/v1/docs/upload/{upload_id}/chunk",
+            headers=headers,
+            files={"file": ("p0", body, "application/octet-stream")},
+            data={"index": "0"},
+        )
+        done = await c.post(f"/api/v1/docs/upload/{upload_id}/complete", headers=headers)
+        assert done.status_code == 200, done.text
+        path = Path(done.json()["path"])
     raw_root = Path(runtime.settings.data_paths()["raw"])
     rel = path.relative_to(raw_root)
     # 第一段必须是知识库 code（可读），不是 16 位十六进制
@@ -734,15 +731,14 @@ async def test_chunk_size_hint_comes_from_config(seeded) -> None:
     runtime, app, client, headers = await _upload_client(seeded)
     expected = int(runtime.settings.upload.chunk_size_mb) * 1024 * 1024
     assert expected == 8 * 1024 * 1024
-    async with app.router.lifespan_context(app):
-        async with client as c:
-            init = await c.post(
-                "/api/v1/docs/upload/init",
-                headers=headers,
-                json={"filename": "分片大小.xlsx", "size_bytes": 10, "kb_id": 1, "level": 1},
-            )
-            assert init.status_code == 200, init.text
-            assert init.json()["chunk_size_hint"] == expected
+    async with app.router.lifespan_context(app), client as c:
+        init = await c.post(
+            "/api/v1/docs/upload/init",
+            headers=headers,
+            json={"filename": "分片大小.xlsx", "size_bytes": 10, "kb_id": 1, "level": 1},
+        )
+        assert init.status_code == 200, init.text
+        assert init.json()["chunk_size_hint"] == expected
 
 
 async def test_import_meta_exposes_upload_defaults(seeded) -> None:
@@ -755,8 +751,7 @@ async def test_import_meta_exposes_upload_defaults(seeded) -> None:
     uid = user_id_of(runtime.db, "demo_carol")
     headers = {"X-Internal-Token": TEST_INTERNAL_TOKEN, "X-Internal-User-Id": str(uid)}
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
             meta = (await c.get("/api/v1/import/meta", headers=headers)).json()
     up = meta.get("upload") or {}
     assert up.get("chunk_size_mb") == 8

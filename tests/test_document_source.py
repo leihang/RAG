@@ -14,12 +14,11 @@ from tests.test_admin_api import grant_role, headers_for
 async def client(seeded):
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as instance:
-            instance.runtime = runtime  # type: ignore[attr-defined]
-            yield instance
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as instance:
+        instance.runtime = runtime  # type: ignore[attr-defined]
+        yield instance
 
 
 def _plant_source(runtime, doc_id: int, *, name: str = "合同.pdf", body: bytes = b"%PDF-1.4 mock") -> str:

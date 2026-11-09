@@ -28,12 +28,11 @@ def headers_for(user_id: int) -> dict[str, str]:
 async def client(seeded):
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as instance:
-            instance.runtime = runtime  # type: ignore[attr-defined]
-            yield instance
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as instance:
+        instance.runtime = runtime  # type: ignore[attr-defined]
+        yield instance
 
 
 @pytest.fixture
@@ -415,6 +414,47 @@ async def test_batch_delete_really_deletes(client, kb_admin) -> None:
     assert again.status_code == 200
     assert again.json()["succeeded"] == 0
     assert again.json()["results"][0]["ok"] is False
+
+
+async def test_hard_delete_clears_doc_recommend_fk(client, kb_admin) -> None:
+    """回收站永久删除：存量 ``ekbs_doc_recommend`` 无 CASCADE 时也必须能硬删。
+
+    回归：管理台批量永久删除对有代表问的文档报 ``FOREIGN KEY constraint failed``。
+    """
+    runtime, _, headers = kb_admin
+    with runtime.db.sync_connect() as conn:
+        doc_id = int(
+            conn.execute("SELECT doc_id FROM ekbs_document ORDER BY doc_id LIMIT 1").fetchone()[
+                "doc_id"
+            ]
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO ekbs_doc_recommend(doc_id, question, rerank_score, status) "
+            "VALUES (?, '回归：硬删前有代表问', 0.9, 'verified')",
+            (doc_id,),
+        )
+        conn.commit()
+
+    soft = await client.delete(f"/api/v1/docs/documents/{doc_id}", headers=headers)
+    assert soft.status_code == 200, soft.text
+    hard = await client.delete(
+        f"/api/v1/docs/documents/{doc_id}?hard=true", headers=headers
+    )
+    assert hard.status_code == 200, hard.text
+    assert hard.json()["mode"] == "hard"
+    with runtime.db.sync_connect() as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM ekbs_document WHERE doc_id = ?", (doc_id,)
+            ).fetchone()["c"]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM ekbs_doc_recommend WHERE doc_id = ?", (doc_id,)
+            ).fetchone()["c"]
+            == 0
+        )
 
 
 async def test_hard_delete_removes_disk_artifacts(client, kb_admin, tmp_path) -> None:

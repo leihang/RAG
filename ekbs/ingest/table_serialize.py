@@ -106,11 +106,11 @@ def _expand_spans(raw_rows: Sequence[Sequence[dict[str, Any]]]) -> list[list[str
         cells: dict[int, str] = {}
         column = 0
 
-        def consume_pending() -> None:
+        def consume_pending(bound_cells: dict[int, str] = cells) -> None:
             nonlocal column
             while column in pending and pending[column][1] > 0:
                 text, remain = pending[column]
-                cells[column] = text
+                bound_cells[column] = text
                 pending[column] = (text, remain - 1)
                 column += 1
 
@@ -327,7 +327,7 @@ def _excel_serials_look_like_calendar(serials: list[int]) -> bool:
     uniq = sorted(set(serials))
     if len(uniq) < 2:
         return False
-    diffs = [b - a for a, b in zip(uniq, uniq[1:])]
+    diffs = [b - a for a, b in zip(uniq, uniq[1:], strict=False)]
     monthish = sum(1 for d in diffs if 27 <= d <= 32)
     return monthish >= max(1, (len(diffs) + 1) // 2)
 
@@ -1080,9 +1080,7 @@ def _chunk_by_budget(
             current_lines = [*preamble, line]
         else:
             current_lines.append(line)
-    if len(current_lines) > len(preamble):
-        blocks.append("\n".join(current_lines))
-    elif not blocks and data_rows:
+    if len(current_lines) > len(preamble) or not blocks and data_rows:
         blocks.append("\n".join(current_lines))
     return blocks
 

@@ -76,12 +76,11 @@ def make_raw_files(runtime, layout: dict[str, str]) -> None:
 async def client(seeded):
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as instance:
-            instance.runtime = runtime  # type: ignore[attr-defined]
-            yield instance
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as instance:
+        instance.runtime = runtime  # type: ignore[attr-defined]
+        yield instance
 
 
 # ---------------------------------------------------------------------------

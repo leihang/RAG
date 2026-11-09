@@ -203,7 +203,7 @@ class ShardIndex:
         scores, labels = self.index.search(query, min(int(top_k), int(self.index.ntotal)))
         return [
             (int(label), float(score))
-            for label, score in zip(labels[0], scores[0])
+            for label, score in zip(labels[0], scores[0], strict=False)
             if int(label) >= 0
         ]
 
@@ -288,7 +288,13 @@ class SegmentedShard:
                 continue
             try:
                 index = ShardIndex.load(self.shard_id, path, expected_dim=self.dim)
-            except Exception:
+            except Exception as exc:
+                log.warning(
+                    "faiss_segment_load_failed",
+                    shard_id=self.shard_id,
+                    path=str(path),
+                    error=str(exc)[:200],
+                )
                 continue
             if index.vector_count <= 0:
                 continue
@@ -384,7 +390,7 @@ class SegmentedShard:
             ]
         kept_infos = []
         kept_segments = []
-        for info, index in zip(self.manifest.segments, self.segments):
+        for info, index in zip(self.manifest.segments, self.segments, strict=False):
             if index.vector_count == 0:
                 path = self.dir / info.path
                 if path.exists():
@@ -415,7 +421,7 @@ class SegmentedShard:
                 self.active.save()
         self.manifest.segments = [
             SegmentInfo(**{**i.__dict__, "count": seg.vector_count})
-            for i, seg in zip(self.manifest.segments, self.segments)
+            for i, seg in zip(self.manifest.segments, self.segments, strict=False)
         ]
         self._prune_empty()
         self.manifest.version += 1
@@ -427,7 +433,7 @@ class SegmentedShard:
         limit = int(max_segments if max_segments is not None else self.manager.settings.index.segment.compaction_max_segments)
         if len(self.segments) <= limit:
             return {"compacted": False, "segments_before": len(self.segments)}
-        pairs = list(zip(self.manifest.segments, self.segments))
+        pairs = list(zip(self.manifest.segments, self.segments, strict=False))
         pairs.sort(key=lambda pair: pair[1].vector_count, reverse=True)
         keep_info, keep_idx = pairs[0]
         merge_pairs = pairs[1:]
@@ -727,7 +733,7 @@ class ShardIndexManager:
                 conn.executemany(
                     "UPDATE ekbs_chunk SET faiss_row = ?, embedding_fingerprint = ?, shard_id = ? "
                     "WHERE chunk_id = ?",
-                    [(row, self.fingerprint, shard_id, int(cid)) for row, cid in zip(labels, chunk_ids)],
+                    [(row, self.fingerprint, shard_id, int(cid)) for row, cid in zip(labels, chunk_ids, strict=False)],
                 )
                 conn.execute(
                     "UPDATE ekbs_shard SET vector_count = ?, embedding_fingerprint = ?, dim = ?, "
@@ -750,7 +756,7 @@ class ShardIndexManager:
                 "WHERE chunk_id = ?",
                 [
                     (row, self.fingerprint, shard_id, int(chunk_id))
-                    for row, chunk_id in zip(rows, chunk_ids)
+                    for row, chunk_id in zip(rows, chunk_ids, strict=False)
                 ],
             )
             conn.execute(
@@ -777,7 +783,7 @@ class ShardIndexManager:
                 conn.executemany(
                     "UPDATE ekbs_chunk SET faiss_row = ?, embedding_fingerprint = ?, shard_id = ? "
                     "WHERE chunk_id = ?",
-                    [(label, self.fingerprint, shard_id, int(cid)) for label, cid in zip(labels, chunk_ids)],
+                    [(label, self.fingerprint, shard_id, int(cid)) for label, cid in zip(labels, chunk_ids, strict=False)],
                 )
                 conn.execute(
                     "UPDATE ekbs_shard SET vector_count = ?, embedding_fingerprint = ?, dim = ?, "
@@ -797,7 +803,7 @@ class ShardIndexManager:
                 "WHERE chunk_id = ?",
                 [
                     (label, self.fingerprint, shard_id, int(chunk_id))
-                    for label, chunk_id in zip(labels, chunk_ids)
+                    for label, chunk_id in zip(labels, chunk_ids, strict=False)
                 ],
             )
             conn.execute(

@@ -324,12 +324,11 @@ async def test_adapter_app_reports_not_ready_honestly(settings) -> None:
 
     # ① 配置关闭
     app = create_adapter_app(settings, Secrets({"EKBS_INTERNAL_TOKEN": "t"}))
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://adapter"
-        ) as client:
-            live = await client.get("/livez")
-            ready = await client.get("/readyz")
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://adapter"
+    ) as client:
+        live = await client.get("/livez")
+        ready = await client.get("/readyz")
     assert live.status_code == 200
     assert ready.status_code == 503
     body = ready.json()
@@ -339,11 +338,10 @@ async def test_adapter_app_reports_not_ready_honestly(settings) -> None:
     # ② 开着但缺凭据
     settings.dingtalk["stream_enabled"] = True
     app = create_adapter_app(settings, Secrets({"EKBS_INTERNAL_TOKEN": "t"}))
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://adapter"
-        ) as client:
-            ready = await client.get("/readyz")
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://adapter"
+    ) as client:
+        ready = await client.get("/readyz")
     assert ready.status_code == 503
     assert "凭据" in ready.json()["reason"]
 

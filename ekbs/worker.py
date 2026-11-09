@@ -35,8 +35,9 @@ from typing import Any, TextIO
 
 from ekbs.config import load_settings
 from ekbs.errors import ConfigError
-from ekbs.ingest.chunker import FigureInput, TableInput
+from ekbs.ingest.chunker import TableInput
 from ekbs.ingest.figure_caption import caption_images
+from ekbs.ingest.figure_input import figure_inputs_from_parsed
 from ekbs.ingest.parser import ParserUnavailable, parse_file
 from ekbs.ingest.pipeline import IngestPipeline
 from ekbs.ingest.scan_review import (
@@ -59,6 +60,7 @@ from ekbs.personal import (
 )
 from ekbs.logging import get_logger
 from ekbs.runtime import Runtime
+import contextlib
 
 log = get_logger(component="worker")
 
@@ -135,7 +137,8 @@ def _acquire_worker_lock(lock_path: Path) -> TextIO | None:
     inode 分裂靠 :func:`_reject_if_peer_workers` 兜底（在 ``main`` 里、抢锁成功后调用）。
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "a+", encoding="utf-8")
+    # 句柄必须跨请求保持打开以维持 flock；不能用 with 提前关掉
+    fh = open(lock_path, "a+", encoding="utf-8")  # noqa: SIM115
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -277,17 +280,13 @@ async def process_once(runtime: Runtime, ingest: IngestPipeline) -> bool:
                         concurrency=runtime.settings.parse.figure_caption_concurrency,
                     )
 
-        figures = [
-            FigureInput(
-                image_path=str((assets_dir / item.name).relative_to(runtime.settings.data_dir)),
-                # 视觉模型描述优先；Alt Text 实测多是素材名
-                caption=captions.get(item.name) or item.caption,
-                ocr_text=item.ocr_text,
-                page=item.page,
-                figure_id=item.figure_id,
-            )
-            for item in parsed.figures
-        ]
+        # 视觉模型描述优先；Alt Text 实测多是素材名
+        figures = figure_inputs_from_parsed(
+            parsed.figures,
+            data_dir=runtime.settings.data_dir,
+            assets_dir=assets_dir,
+            captions=captions,
+        )
         tables = [
             TableInput(
                 body=item.body,
@@ -499,21 +498,15 @@ async def run_forever(runtime: Runtime) -> None:
                 except Exception as exc:  # noqa: BLE001 - compaction 失败不影响入库
                     log.warning("segmented_compact_failed", error=str(exc)[:200])
                 last_compact = time.monotonic()
-            try:
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=IDLE_SLEEP_SECONDS)
-            except asyncio.TimeoutError:
-                pass
 
 
 def _release_worker_lock(lock_fh: TextIO) -> None:
-    try:
+    with contextlib.suppress(OSError):
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        pass
-    try:
+    with contextlib.suppress(OSError):
         lock_fh.close()
-    except OSError:
-        pass
 
 
 def main(argv: list[str] | None = None) -> int:

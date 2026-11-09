@@ -138,7 +138,7 @@ class FigureIndex:
         scores, labels = self.index.search(query, min(int(top_k), int(self.index.ntotal)))
         return [
             (int(label), float(score))
-            for label, score in zip(labels[0], scores[0])
+            for label, score in zip(labels[0], scores[0], strict=False)
             if int(label) >= 0
         ]
 

@@ -190,10 +190,7 @@ def claim_supported(claim: str, evidence: str) -> bool:
     hay_nocomma = hay.replace(",", "")
     if compact != needle and compact in hay_nocomma:
         return True
-    for core in numeric_cores(claim):
-        if core in hay_nocomma:
-            return True
-    return False
+    return any(core in hay_nocomma for core in numeric_cores(claim))
 
 
 #: 编号类整词（与 FTS 自动词典同口径）：答案里出现时是**强证据线索**

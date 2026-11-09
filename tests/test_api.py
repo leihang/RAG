@@ -23,12 +23,11 @@ async def client(seeded):
     runtime, _summary = seeded
     app = create_app(runtime.settings)
     # httpx 的 ASGITransport 不会自动执行 lifespan，这里显式跑
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as instance:
-            instance.app = app  # type: ignore[attr-defined]
-            yield instance
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as instance:
+        instance.app = app  # type: ignore[attr-defined]
+        yield instance
 
 
 @pytest.fixture

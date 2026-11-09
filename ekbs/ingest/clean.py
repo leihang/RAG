@@ -500,9 +500,7 @@ def is_low_quality_figure_caption(text: str) -> bool:
         return True
     if mark_hits >= 2 and (len(lines) - boilerplate) <= 3 and len(blob) <= 280:
         return True
-    if "物业巡检水印" in blob and len(blob) <= 120:
-        return True
-    return False
+    return bool("物业巡检水印" in blob and len(blob) <= 120)
 
 
 def clean_figure_text(text: str) -> str:
@@ -532,9 +530,14 @@ def clean_figure_text(text: str) -> str:
         else:
             cleaned = "[签署/盖章区]"
     # 签署页图：公司名被印章撕成碎片时整段降级
-    if cleaned and len(cleaned) < 60 and re.search(r"市棉|股份有限\s*$|理工程技术", cleaned):
-        if "甲方" not in cleaned and "乙方" not in cleaned:
-            cleaned = "[签署/盖章区]"
+    if (
+        cleaned
+        and len(cleaned) < 60
+        and re.search(r"市棉|股份有限\s*$|理工程技术", cleaned)
+        and "甲方" not in cleaned
+        and "乙方" not in cleaned
+    ):
+        cleaned = "[签署/盖章区]"
     # 手写表 / 水印相机壳：降成短占位，避免进稠密/BM25 后抢走幻灯正文
     if cleaned and is_low_quality_figure_caption(cleaned):
         if any(m in cleaned for m in _HANDWRITE_OCR_MARKERS) or cleaned.count("正常") >= 5:

@@ -372,9 +372,7 @@ def is_stated_value_extract_intent(question: str) -> bool:
     """纯数字取值才走 extract；夹带方案描述时交给 prose 读正文。"""
     if not is_document_stated_value_intent(question):
         return False
-    if wants_document_prose(question):
-        return False
-    return True
+    return not wants_document_prose(question)
 
 
 def is_numeric_calc_intent(question: str) -> bool:
@@ -412,14 +410,8 @@ def is_numeric_calc_intent(question: str) -> bool:
             h in text for h in _STRONG_AGG_HINTS
         ):
             return False
-        if year_only and metric is None and not any(
-            h in text for h in ("用电", "用水", "用气", "能耗", "明细", "合计", "多少")
-        ):
-            return False
-        return True
-    if _metric_from_question(text) and re.search(r"(多少|合计|总计|累计|明细)", text):
-        return True
-    return False
+        return not (year_only and metric is None and not any(h in text for h in ("用电", "用水", "用气", "能耗", "明细", "合计", "多少")))
+    return bool(_metric_from_question(text) and re.search(r"(多少|合计|总计|累计|明细)", text))
 
 
 def is_structured_query_intent(question: str) -> bool:
@@ -447,9 +439,7 @@ def is_structured_query_intent(question: str) -> bool:
     ):
         return True
     # 「用电量是多少」类：有白名单指标 + 多少，即可进结构化（缺实体仍会 underspecified）
-    if _metric_from_question(text) and re.search(r"(多少|合计|总计|累计)", text):
-        return True
-    return False
+    return bool(_metric_from_question(text) and re.search(r"(多少|合计|总计|累计)", text))
 
 
 def resolve_structured_op(question: str) -> AggOp:
@@ -899,9 +889,7 @@ def _entity_from_question(question: str) -> str | None:
             return False
         if _YEAR_LIKE_ENTITY_RE.fullmatch(name):
             return False
-        if name in _ENTITY_METRIC_BLOCKLIST or name.lstrip("的") in _ENTITY_METRIC_BLOCKLIST:
-            return False
-        return True
+        return not (name in _ENTITY_METRIC_BLOCKLIST or name.lstrip("的") in _ENTITY_METRIC_BLOCKLIST)
 
     # 「一共有多少台变压器」优先于 bare：否则 entity=None 会扫全库行数
     unit = _UNIT_COUNT_ENTITY_RE.search(text)

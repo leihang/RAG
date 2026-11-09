@@ -214,25 +214,17 @@ def policy_view(settings: Settings, rel: str) -> dict[str, Any]:
     }
 
 
-def _safe_upload_rel(filename: str) -> str:
-    parts: list[str] = []
-    for raw in str(filename or "").replace("\\", "/").split("/"):
-        seg = raw.strip()
-        if not seg or seg in {".", ".."} or seg.startswith("."):
-            continue
-        parts.append(seg)
-    return "/".join(parts) or "未命名"
-
-
 def policy_for_upload(settings: Settings, kb_code: str, filename: str) -> dict[str, Any] | None:
     """上传文件的生效权限。密级受上级文件夹限制，部门只用本层。
 
     个人库不读这份文件。
     """
+    from ekbs.ingest.path_sanitize import safe_upload_relative
+
     code = str(kb_code or "").strip().strip("/")
     if not code or personal_user_id_from_code(code) is not None:
         return None
-    policy, refuse = effective_folder_policy(settings, f"{code}/{_safe_upload_rel(filename)}")
+    policy, refuse = effective_folder_policy(settings, f"{code}/{safe_upload_relative(filename)}")
     if refuse:
         raise ConfigError(refuse)
     return policy

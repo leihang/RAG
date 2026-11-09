@@ -444,10 +444,11 @@ def _observations_meter_reading(
 
     out: list[TableObservation] = []
     for row_idx, row in enumerate(data_rows):
-        def cell(idx: int | None) -> str:
-            if idx is None or idx >= len(row):
+        # 默认参数绑定当前行，避免闭包捕获循环变量（B023）
+        def cell(idx: int | None, bound_row: Sequence[Any] = row) -> str:
+            if idx is None or idx >= len(bound_row):
                 return ""
-            return str(row[idx]).strip()
+            return str(bound_row[idx]).strip()
 
         bearer = cell(bearer_col)
         usage_raw = cell(usage_col)
@@ -551,10 +552,10 @@ def _observations_fee_detail(
 
     out: list[TableObservation] = []
     for row_idx, row in enumerate(data_rows):
-        def cell(idx: int | None) -> str:
-            if idx is None or idx >= len(row):
+        def cell(idx: int | None, bound_row: Sequence[Any] = row) -> str:
+            if idx is None or idx >= len(bound_row):
                 return ""
-            return str(row[idx]).strip()
+            return str(bound_row[idx]).strip()
 
         account = cell(account_col) or cell(0)
         period = normalize_header_period(cell(period_col))

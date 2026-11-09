@@ -98,7 +98,7 @@ def test_spec_role_matrix_matches_catalog_for_first_phase() -> None:
     for code, *marks in rows:
         if code not in phase1:
             continue  # 只校验首期口径
-        for role, mark in zip(roles, marks):
+        for role, mark in zip(roles, marks, strict=False):
             if role == "super_admin":
                 continue  # 超管由通配兜底，不在 ROLE_GRANTS 里逐条列
             granted = code in ROLE_GRANTS.get(role, ())

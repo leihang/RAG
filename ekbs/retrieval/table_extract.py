@@ -230,12 +230,11 @@ def _row_matches(
     filters: Sequence[str],
 ) -> bool:
     blob = " ".join(f"{k}={v}" for k, v in row.items())
-    if attrs_contains:
-        # 类别=公共 或任意字段含关键字
-        if attrs_contains not in blob and not any(
-            attrs_contains in v for v in row.values()
-        ):
-            return False
+    # 类别=公共 或任意字段含关键字
+    if attrs_contains and attrs_contains not in blob and not any(
+        attrs_contains in v for v in row.values()
+    ):
+        return False
     if entity:
         from ekbs.retrieval.structured_query import entity_match_variants
 
@@ -264,14 +263,17 @@ def _row_matches(
             row
         ):
             return False
-    if metric:
-        if metric not in blob and not _metric_compatible(row, metric):
-            # 用电量 ↔ 用量
-            if not (
-                ("用电" in metric and _has_usage_like(row))
-                or ("金额" in metric and any("金额" in k for k in row))
-            ):
-                return False
+    # 用电量 ↔ 用量
+    if (  # noqa: SIM103 — 保留分支可读性，避免双重否定一行式
+        metric
+        and metric not in blob
+        and not _metric_compatible(row, metric)
+        and not (
+            ("用电" in metric and _has_usage_like(row))
+            or ("金额" in metric and any("金额" in k for k in row))
+        )
+    ):
+        return False
     return True
 
 
@@ -295,9 +297,7 @@ def _metric_compatible(row: dict[str, str], metric: str) -> bool:
     if any(metric in k or metric in v for k, v in row.items()):
         return True
     # 「变压器损耗」问句 ↔ 行内「损耗」列
-    if "损耗" in metric and any("损耗" in k for k in row):
-        return True
-    return False
+    return bool("损耗" in metric and any("损耗" in k for k in row))
 
 
 def _dedupe_by_project(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -477,7 +477,7 @@ def _first_number_field(row: dict[str, Any]) -> float | None:
 def _row_surface_and_value(row: dict[str, Any]) -> tuple[str, float | int | str]:
     label = str(row.get("项目") or "")
     # 方案 KPI 行（改造预算/节约/回收期）无「项目」列：拼全量键值，避免只露第一个数
-    data_keys = [k for k in row.keys() if k not in {"项目", "类别"}]
+    data_keys = [k for k in row if k not in {"项目", "类别"}]
     if len(data_keys) > 1 and not label:
         parts = [
             f"{k}={_fmt(v) if isinstance(v, (int, float)) else v}"

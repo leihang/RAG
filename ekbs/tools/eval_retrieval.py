@@ -119,7 +119,7 @@ def _match_rank(
             return idx, "contain"
     # 文档命中但片段要求未满足：若仅要求文档，上面已返回；若要求片段，再扫一遍只看文档
     if needle_doc and needle_text:
-        for idx, chunk in enumerate(chunks[:k], start=1):
+        for _idx, chunk in enumerate(chunks[:k], start=1):
             if str(getattr(chunk, "doc_title", "") or "") == needle_doc:
                 return None, "doc_only_miss_contain"
     return None, ""
@@ -274,9 +274,8 @@ async def _amain(argv: list[str] | None = None) -> int:
         mrr=report.mrr,
         errors=report.errors,
     )
-    if args.fail_under is not None:
-        if report.hit_at_k is None or report.hit_at_k < float(args.fail_under):
-            return 1
+    if args.fail_under is not None and (report.hit_at_k is None or report.hit_at_k < float(args.fail_under)):
+        return 1
     return 0 if report.errors == 0 else 1
 
 

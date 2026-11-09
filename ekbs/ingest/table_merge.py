@@ -324,9 +324,7 @@ def _looks_like_continuation(
     if _is_data_row(right_rows[0]):
         return True
     # 表头单独落在上一页（工作内容|频次|备注），下一页直接是数据行
-    if _is_header_only(left_rows) and _row_has_body_cell(right_rows[0]):
-        return True
-    return False
+    return bool(_is_header_only(left_rows) and _row_has_body_cell(right_rows[0]))
 
 
 def _pages_compatible(a: int | None, b: int | None) -> bool:
@@ -508,9 +506,7 @@ def _is_data_row(row: Sequence[str]) -> bool:
     cells = [str(cell).strip() for cell in row if str(cell).strip()]
     if not cells:
         return False
-    if any(_VALUE_CELL.fullmatch(cell) for cell in cells):
-        return True
-    return False
+    return bool(any(_VALUE_CELL.fullmatch(cell) for cell in cells))
 
 
 def _norm_row(row: Sequence[str]) -> tuple[str, ...]:

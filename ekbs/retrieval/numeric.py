@@ -276,7 +276,7 @@ def _literal_surfaces(text: str) -> list[tuple[str, float]]:
     return found
 
 
-def _normalize_for_match(text: str) -> str:
+def _normalize_for_numeric_quote(text: str) -> str:
     """抄写校验的归一化：只抹掉排版分隔符，不改数字/文字。
 
     Excel 行级表格序列化成 ``单价（元）=3.456``；模型常写成
@@ -295,7 +295,7 @@ def _quote_matches_chunk(
     """第一轮：``quote`` 整段出现在某分块里，且该分块有等值数字。"""
     surfaces = _literal_surfaces(answer.quote)
     for index, chunk in enumerate(chunks, start=1):
-        content = _normalize_for_match(str(getattr(chunk, "content", "") or ""))
+        content = _normalize_for_numeric_quote(str(getattr(chunk, "content", "") or ""))
         if not content or quote_key not in content:
             continue
         for surface, literal in surfaces:
@@ -322,11 +322,11 @@ def _line_label_candidates(answer: NumericAnswer, value: float, rel_tol: float) 
     """行标签候选：数值前的内容 + 首个空白 token（模型常把整行抄进来）。"""
     raw_quote = re.sub(r"\s+", "", answer.quote or "")
     picked = _picked_number(raw_quote, value, rel_tol)
-    label = _normalize_for_match(raw_quote[: picked.start()]) if picked else ""
+    label = _normalize_for_numeric_quote(raw_quote[: picked.start()]) if picked else ""
     label = re.sub(r"[:：=＝]+$", "", label)
     candidates = [label] if len(label) >= 2 else []
     first_token = re.split(r"\s+", (answer.quote or "").strip())[0] if (answer.quote or "").strip() else ""
-    token_label = re.sub(r"[:：=＝]+$", "", _normalize_for_match(first_token))
+    token_label = re.sub(r"[:：=＝]+$", "", _normalize_for_numeric_quote(first_token))
     if len(token_label) >= 2 and token_label not in candidates:
         candidates.append(token_label)
     return candidates
@@ -339,7 +339,7 @@ def _match_by_line_label(
     for label_text in candidates:
         for index, chunk in enumerate(chunks, start=1):
             for line in str(getattr(chunk, "content", "") or "").splitlines():
-                line_norm = _normalize_for_match(line)
+                line_norm = _normalize_for_numeric_quote(line)
                 if label_text not in line_norm:
                     continue
                 for surface, literal in _literal_surfaces(line):
@@ -362,7 +362,7 @@ def verify_copied(
     """
     if answer.is_na:
         return False, None
-    quote_key = _normalize_for_match(answer.quote or "")
+    quote_key = _normalize_for_numeric_quote(answer.quote or "")
     if not quote_key:
         return False, None
     value = float(answer.value)
@@ -407,11 +407,11 @@ def verify_scope(answer: NumericAnswer, chunks: Sequence[Any], cite_index: int |
     if cite_index is None or cite_index < 1 or cite_index > len(chunks):
         return False
     target = chunks[cite_index - 1]
-    content = _normalize_for_match(str(getattr(target, "content", "") or ""))
+    content = _normalize_for_numeric_quote(str(getattr(target, "content", "") or ""))
     extra = " ".join(
         str(getattr(target, attr, "") or "") for attr in ("doc_title", "heading_path")
     )
-    extra = _normalize_for_match(extra)
+    extra = _normalize_for_numeric_quote(extra)
     if not content and not extra:
         return False
     # 先把页码从整段口径里剥掉，再按空白拆段；否则 "第 8 页" 会被空格拆成
@@ -422,7 +422,7 @@ def verify_scope(answer: NumericAnswer, chunks: Sequence[Any], cite_index: int |
         return True
 
     def _part_matches(part: str) -> bool:
-        key = _normalize_for_match(part)
+        key = _normalize_for_numeric_quote(part)
         if not key:
             return True
         return key in content or key in extra
@@ -486,7 +486,7 @@ def find_scope_alternatives(
     label = label[-24:]  # 取尾部，避免把整段前缀当标签
     found: dict[str, dict[str, Any]] = {}
     for chunk in chunks:
-        content = _normalize_for_match(str(getattr(chunk, "content", "") or ""))
+        content = _normalize_for_numeric_quote(str(getattr(chunk, "content", "") or ""))
         if not content:
             continue
         for match in re.finditer(re.escape(label) + r"[:：=＝]?([0-9][0-9,]*(?:\.\d+)?)", content):

@@ -142,7 +142,6 @@ _QUERY_STOP_TOKENS = frozenset(
         "还",
         "又",
         "而",
-        "与",
         "什么",
         "怎么",
         "如何",

@@ -89,10 +89,7 @@ def assert_path_within_raw(settings: Settings, path: str | Path) -> Path:
     root = raw_root(settings).resolve()
     root.mkdir(parents=True, exist_ok=True)
     candidate = Path(path)
-    if candidate.is_absolute():
-        target = candidate.resolve()
-    else:
-        target = (root / candidate).resolve()
+    target = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
     if target != root and root not in target.parents:
         raise ImportPathError("路径超出 raw 目录范围（不允许 .. 或指向外部的软链接）")
     return target
@@ -100,14 +97,16 @@ def assert_path_within_raw(settings: Settings, path: str | Path) -> Path:
 
 def to_rel(settings: Settings, path: Path) -> str:
     """把 raw 下的真实路径还原成网页端使用的相对路径（空串表示 raw 根）。"""
+    from ekbs.ingest.path_sanitize import relative_under
+
     root = raw_root(settings).resolve()
     resolved = path.resolve()
     if resolved == root:
         return ""
-    try:
-        return resolved.relative_to(root).as_posix()
-    except ValueError as exc:  # pragma: no cover - 由 resolve_within_raw 先挡住
-        raise ImportPathError(f"路径不在 raw 目录内：{path}") from exc
+    rel = relative_under(resolved, root)
+    if rel is None:  # pragma: no cover - 由 resolve_within_raw 先挡住
+        raise ImportPathError(f"路径不在 raw 目录内：{path}")
+    return rel.as_posix()
 
 
 def ensure_import_dir(settings: Settings, rel: str) -> tuple[str, bool]:

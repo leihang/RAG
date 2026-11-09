@@ -371,7 +371,8 @@ async def export_chunks(
         for row in rows:
             writer.writerow({k: row[k] for k in writer.fieldnames})
         return PlainTextResponse(buffer.getvalue(), media_type="text/csv")
-    lines = [json.dumps({k: row[k] for k in row.keys()}, ensure_ascii=False) for row in rows]
+    # sqlite3.Row 迭代的是值不是列名
+    lines = [json.dumps({k: row[k] for k in row.keys()}, ensure_ascii=False) for row in rows]  # noqa: SIM118
     return PlainTextResponse("\n".join(lines), media_type="application/x-ndjson")
 
 

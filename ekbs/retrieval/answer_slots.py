@@ -395,9 +395,12 @@ def merge_slot_hits(
             # 叙述命中：挂上 prefer 文档内首个有正文的块作溯源
             for chunk in chunks:
                 doc_id = getattr(chunk, "doc_id", None)
-                if prefer_doc_ids and doc_id is not None:
-                    if int(doc_id) not in {int(d) for d in prefer_doc_ids}:
-                        continue
+                if (
+                    prefer_doc_ids
+                    and doc_id is not None
+                    and int(doc_id) not in {int(d) for d in prefer_doc_ids}
+                ):
+                    continue
                 if str(getattr(chunk, "content", "") or "").strip():
                     cid = getattr(chunk, "chunk_id", None)
                     if cid is not None:

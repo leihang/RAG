@@ -44,7 +44,8 @@ class DocumentFacts:
 
     @classmethod
     def from_row(cls, row: Any) -> "DocumentFacts":
-        raw_depts = row["visible_dept_ids"] if "visible_dept_ids" in row.keys() else "[]"
+        # sqlite3.Row 无 dict.get；必须用 keys() 判列（SIM118 不适用）
+        raw_depts = row["visible_dept_ids"] if "visible_dept_ids" in row.keys() else "[]"  # noqa: SIM118
         if raw_depts is None:
             raw_depts = "[]"
         if isinstance(raw_depts, (list, tuple)):
@@ -335,9 +336,9 @@ class DocumentGate:
             title = str(row["title"] or "").strip()
             if not title:
                 continue
-            if int(row["level"]) > perm.clearance:
-                titles.append(title)
-            elif row["shard_id"] and str(row["shard_id"]) not in visible:
+            if int(row["level"]) > perm.clearance or (
+                row["shard_id"] and str(row["shard_id"]) not in visible
+            ):
                 titles.append(title)
         return titles
 

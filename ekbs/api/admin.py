@@ -41,6 +41,7 @@ from ekbs.ingest.office_preview import OfficePreviewError, render_office_preview
 from ekbs.logging import get_logger
 from ekbs.permission.console import is_console_role, widen_for_console
 from ekbs.observability.alerts import ALERT_RULES, evaluate_all
+import contextlib
 
 router = APIRouter(tags=["admin"])
 log = get_logger(component="api.admin")
@@ -708,10 +709,8 @@ async def get_document(
     import json as _json
 
     item = dict(row)
-    try:
+    with contextlib.suppress(ValueError):
         item["visible_dept_ids"] = _json.loads(item.get("visible_dept_ids") or "[]")
-    except ValueError:
-        pass
     from ekbs.personal import attach_personal_owners
 
     with runtime.db.sync_connect() as conn:
@@ -723,18 +722,18 @@ async def get_document(
 
 def _source_under_allowed(runtime: Any, source: str) -> Path | None:
     """原件必须落在 ``raw`` / ``trash`` 内；越界返回 None（调用方统一 404）。"""
+    from ekbs.ingest.path_sanitize import relative_under
+
     if not source or source.startswith("demo://"):
         return None
     try:
         resolved = Path(source).resolve()
-    except Exception:
+    except OSError:
         return None
     paths = runtime.settings.data_paths()
     for name in ("raw", "trash"):
         root = Path(paths[name]).resolve()
-        try:
-            resolved.relative_to(root)
-        except ValueError:
+        if relative_under(resolved, root) is None:
             continue
         if resolved.is_file():
             return resolved

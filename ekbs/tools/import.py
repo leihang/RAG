@@ -48,7 +48,8 @@ from typing import Any, Sequence
 from ekbs.config import Settings, load_settings
 from ekbs.errors import ConfigError, EkbsError
 from ekbs.index.shard import parse_shard_id, resolve_shard_for_document
-from ekbs.ingest.chunker import FigureInput, TableInput
+from ekbs.ingest.chunker import TableInput
+from ekbs.ingest.figure_input import figure_inputs_from_parsed
 from ekbs.ingest.parser import ParserUnavailable, parse_file
 from ekbs.ingest.dir_import import (
     checksum_of,
@@ -321,16 +322,11 @@ async def _import_one(
     except ParserUnavailable as exc:
         return ImportItem(str(path), "failed", error=str(exc))
 
-    figures = [
-        FigureInput(
-            image_path=str((assets_dir / item.name).relative_to(runtime.settings.data_dir)),
-            caption=item.caption,
-            ocr_text=item.ocr_text,
-            page=item.page,
-            figure_id=item.figure_id,
-        )
-        for item in parsed.figures
-    ]
+    figures = figure_inputs_from_parsed(
+        parsed.figures,
+        data_dir=runtime.settings.data_dir,
+        assets_dir=assets_dir,
+    )
     tables = [
         TableInput(
             body=item.body,

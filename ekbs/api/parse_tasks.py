@@ -376,7 +376,7 @@ def _resolve_figure_kind(
     for cand in candidates:
         try:
             cand.relative_to(parse_root)
-        except Exception:
+        except ValueError:
             continue
         if cand.is_file():
             if kind != "handwriting":

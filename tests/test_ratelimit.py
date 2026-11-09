@@ -111,17 +111,16 @@ async def test_api_returns_429_when_user_limit_hit(seeded, monkeypatch) -> None:
         "X-Internal-Token": TEST_INTERNAL_TOKEN,
         "X-Internal-User-Id": str(alice_id),
     }
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as client:
-            first = await client.post(
-                "/api/v1/qa/chat", json={"question": "年假有多少天"}, headers=headers
-            )
-            assert first.status_code == 200
-            second = await client.post(
-                "/api/v1/qa/chat", json={"question": "年假有多少天"}, headers=headers
-            )
-            assert second.status_code == 429
-            assert second.headers.get("Retry-After") == "1"
-            assert "user:" in second.json()["detail"]
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        first = await client.post(
+            "/api/v1/qa/chat", json={"question": "年假有多少天"}, headers=headers
+        )
+        assert first.status_code == 200
+        second = await client.post(
+            "/api/v1/qa/chat", json={"question": "年假有多少天"}, headers=headers
+        )
+        assert second.status_code == 429
+        assert second.headers.get("Retry-After") == "1"
+        assert "user:" in second.json()["detail"]

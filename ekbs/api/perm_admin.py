@@ -326,10 +326,9 @@ async def assign_role(
                 (user_id, role_id, payload.scope_type, int(payload.scope_id), principal.user_id),
             )
             granted += int(cursor.rowcount or 0)
-            if int(cursor.rowcount or 0):
-                # 该用户的权限上下文缓存立刻失效（04 §4.6：不能等 300s TTL）
-                if runtime.cache is not None:
-                    runtime.cache.invalidate(f"ekbs:perm:user:{user_id}")
+            # 该用户的权限上下文缓存立刻失效（04 §4.6：不能等 300s TTL）
+            if int(cursor.rowcount or 0) and runtime.cache is not None:
+                runtime.cache.invalidate(f"ekbs:perm:user:{user_id}")
         version = bump_policy_version(conn, reason=f"role_assign:{role_id}")
         conn.execute(
             "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "

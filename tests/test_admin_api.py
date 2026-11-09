@@ -46,12 +46,11 @@ def grant_role(runtime, dingtalk_userid: str, role_code: str) -> int:
 async def client(seeded):
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as instance:
-            instance.runtime = runtime  # type: ignore[attr-defined]
-            yield instance
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as instance:
+        instance.runtime = runtime  # type: ignore[attr-defined]
+        yield instance
 
 
 def headers_for(user_id: int) -> dict[str, str]:

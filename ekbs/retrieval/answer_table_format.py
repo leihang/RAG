@@ -125,7 +125,7 @@ def _normalize_table_block(rows: list[str]) -> tuple[list[str], list[int]]:
 
     out_rows: list[str] = []
     data_iter = iter(data_rows)
-    for index, row in enumerate(parsed):
+    for index, _row in enumerate(parsed):
         if index in sep_indexes:
             out_rows.append(rows[index].strip() if rows[index].strip() else _sep_line(width))
             continue

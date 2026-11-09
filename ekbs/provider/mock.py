@@ -134,10 +134,7 @@ class MockRerankProvider(RerankProvider):
         results: list[RerankResult] = []
         for doc in docs:
             doc_tokens = set(_tokenize(doc.text))
-            if not query_tokens:
-                coverage = 0.0
-            else:
-                coverage = len(query_tokens & doc_tokens) / len(query_tokens)
+            coverage = 0.0 if not query_tokens else len(query_tokens & doc_tokens) / len(query_tokens)
             bonus = 0.0
             if normalized_query and normalized_query in "".join((doc.text or "").split()):
                 bonus = 0.25
