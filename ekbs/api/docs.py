@@ -1150,7 +1150,7 @@ async def upload_init(
                        f"可用格式：{'、'.join(sorted(whitelist))}）",
             )
         raise HTTPException(status_code=422, detail=f"不支持的文件类型：.{extension}")
-    max_mb = float((settings.limits or {}).get("max_file_size_mb", 500) or 500)
+    max_mb = float((settings.limits or {}).get("max_file_size_mb", 100) or 100)
     if payload.size_bytes > max_mb * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"文件超过 {max_mb:g} MB 上限")
 

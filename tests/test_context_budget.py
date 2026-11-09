@@ -15,7 +15,7 @@ RAG 的"记忆"是**把资料 + 多轮历史 + 问题一起塞给模型**，而�
 
 * `session.context_ttl_seconds` 2 小时 → **7 天**（604800）：跨天追问还能用上上下文
 * `session.context_max_turns` 6 → **10 轮**：满足"至少 10 轮"的要求
-* `models.llm.max_input_tokens`：**200000**（20 万）。主模型已切 deepseek-v4.1-flash
+* `models.llm.max_input_tokens`：**200000**（20 万）。主模型已切 deepseek-flash
   （窗口约 1M）；预算须低于窗口并给输出/本地计数偏差留余量
 
 裁剪**牺牲顺序**：① 最旧轮次 → ② 排名最低的块 → ③ 截断最后一块。
@@ -46,7 +46,7 @@ def test_shipped_configs_meet_the_new_policy() -> None:
         assert int(settings.session["context_ttl_seconds"]) >= 7 * 24 * 3600, path
         assert int(settings.session["context_max_turns"]) == 10, path
         assert int(settings.models.llm.max_input_tokens) >= 200000, path
-        # 上限必须**低于**主模型窗口（deepseek-v4.1-flash ≈ 1M），且留出偏差余量
+        # 上限必须**低于**主模型窗口（deepseek-flash ≈ 1M），且留出偏差余量
         assert settings.models.llm.max_input_tokens * 1.25 < 1_000_000, path
 
 

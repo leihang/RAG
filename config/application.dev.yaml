@@ -197,8 +197,8 @@ limits:
   per_user_qps: 2
   per_conversation_qps: 3
   max_question_chars: 2000
-  max_file_size_mb: 500
-  personal_storage_mb: 1024
+  max_file_size_mb: 100
+  personal_storage_mb: 500
   file_ext_whitelist: [pdf, docx, doc, pptx, ppt, xlsx, xls, txt, md, html, png, jpg, jpeg]
 
 security:

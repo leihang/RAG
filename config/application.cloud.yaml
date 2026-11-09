@@ -120,8 +120,8 @@ retrieval:
   query_rewrite:
     strategy: llm
     # model: qwen-plus   # 可选：单独指定改写模型
-    # 扩写与作答同系 DeepSeek；原 qwen-turbo 易 429，空跑拖慢整问
-    expand_model: deepseek-v4.1-flash
+    # 扩写与作答同系：DeepSeek 官方 API（DEEPSEEK_API_KEY）
+    expand_model: deepseek-flash
     expand_timeout_s: 8
     expand_max_tokens: 64
   cache:
@@ -159,17 +159,19 @@ models:
     dim: 1152
     timeout_s: 60
   llm:
-    provider: dashscope
-    # 2026-11-06 切换：DeepSeek V4.1 Flash（DashScope 兼容端点）。
-    # A/B 实测 p50 ~1.97s vs qwen-max ~4.19s；生产 key 用 DASHSCOPE_API_KEY。
-    model: deepseek-v4.1-flash
+    # 直连 DeepSeek 官方 API（不用百炼上的 DeepSeek / 不用 Qwen 作答）。
+    # 嵌入/精排/看图仍走 DashScope（DASHSCOPE_API_KEY）；问答密钥用 DEEPSEEK_API_KEY。
+    provider: deepseek
+    base_url: https://api.deepseek.com
+    # 官方现用名 deepseek-flash（背后 DeepSeek-V4.1-Flash）；勿写百炼名 deepseek-v4.1-flash。
+    model: deepseek-flash
     # 关闭思考：默认思考模式会显著拉长首 token，且长答案易撞 max_tokens 被截断。
     reasoning_effort: none
     temperature: 0.1
     top_p: 0.8
     # 2048 偏紧：预算明细/多表对照答案易被 length 截断；DeepSeek 输出上限远高于此。
     max_tokens: 8192
-    # 输入上限：deepseek-v4.1-flash 窗口约 1M；取 20 万，给输出/偏差留余量。
+    # 输入上限：deepseek-flash 窗口约 1M；取 20 万，给输出/偏差留余量。
     # 超预算裁剪：最旧轮次 → 排名最低的块 → 截断最后一块。
     max_input_tokens: 200000
     timeout_s: 120
@@ -284,9 +286,9 @@ limits:
   per_user_qps: 2
   per_conversation_qps: 3
   max_question_chars: 2000
-  max_file_size_mb: 500
+  max_file_size_mb: 100
   # 每个钉钉用户私有库的总容量（已入库且未删除的文件字节相加）
-  personal_storage_mb: 1024
+  personal_storage_mb: 500
   file_ext_whitelist: [pdf, docx, doc, pptx, ppt, xlsx, xls, txt, md, html, png, jpg, jpeg]
 
 security:

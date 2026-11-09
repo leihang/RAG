@@ -258,19 +258,19 @@ def test_purge_removes_demo_people_and_empty_demo_departments(seeded) -> None:
 
 
 def test_personal_upload_limit_matches_admin_config(seeded) -> None:
-    """钉钉单聊入库与管理台上传共用 limits.max_file_size_mb，缺省 500。"""
+    """钉钉单聊入库与管理台上传共用 limits.max_file_size_mb，缺省 100。"""
     runtime, _ = seeded
-    assert runtime.settings.limits["max_file_size_mb"] == 500
-    assert personal_max_file_mb(runtime.settings) == 500
-    limit = 500 * 1024 * 1024
+    assert runtime.settings.limits["max_file_size_mb"] == 100
+    assert personal_max_file_mb(runtime.settings) == 100
+    limit = 100 * 1024 * 1024
     assert personal_upload_exceeds(limit, runtime.settings) is False
     assert personal_upload_exceeds(limit + 1, runtime.settings) is True
-    assert personal_upload_reject_text(runtime.settings) == "文件超过 500 MB，私有库暂不接收"
+    assert personal_upload_reject_text(runtime.settings) == "文件超过 100 MB，私有库暂不接收"
 
     missing = dict(runtime.settings.limits)
     missing.pop("max_file_size_mb", None)
     runtime.settings.limits = missing
-    assert personal_max_file_mb(runtime.settings) == 500
+    assert personal_max_file_mb(runtime.settings) == 100
 
     runtime.settings.limits = {**missing, "max_file_size_mb": 1}
     alice = user_id_of(runtime.db, "demo_alice")
@@ -288,14 +288,14 @@ def test_personal_upload_limit_matches_admin_config(seeded) -> None:
 
 
 def test_personal_storage_cap_blocks_the_next_file_and_frees_on_delete(seeded) -> None:
-    """每人私有库总容量默认 1 GB；用满后再传会被拒，删掉后额度退回。"""
+    """每人私有库总容量默认 500 MB；用满后再传会被拒，删掉后额度退回。"""
     runtime, _ = seeded
     missing = dict(runtime.settings.limits)
     missing.pop("personal_storage_mb", None)
     runtime.settings.limits = missing
-    assert personal_storage_limit_bytes(runtime.settings) == 1024 * 1024 * 1024
+    assert personal_storage_limit_bytes(runtime.settings) == 500 * 1024 * 1024
 
-    runtime.settings.limits = {**missing, "personal_storage_mb": 2, "max_file_size_mb": 500}
+    runtime.settings.limits = {**missing, "personal_storage_mb": 2, "max_file_size_mb": 100}
     alice = user_id_of(runtime.db, "demo_alice")
     one_mb = b"a" * (1 * 1024 * 1024)
     first = register_personal_upload(

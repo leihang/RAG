@@ -28,9 +28,9 @@ export const UPLOAD_ACCEPT_EXTS = [
 export const UPLOAD_ACCEPT_ATTR = UPLOAD_ACCEPT_EXTS.map((e) => `.${e}`).join(',')
 
 /**
- * 单文件上限（方案 §6.5 / 后端 ``limits.max_file_size_mb``，现已对齐为 500）。
+ * 单文件上限（与后端 ``limits.max_file_size_mb`` 对齐，现为 100）。
  */
-export const MAX_FILE_SIZE_MB = 500
+export const MAX_FILE_SIZE_MB = 100
 export const MAX_FILE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 /** 取小写后缀（不含点）；没有后缀返回空串。 */

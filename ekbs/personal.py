@@ -34,8 +34,8 @@ _DEMO_DEPT_IDS = {"102", "103"}
 
 
 def personal_max_file_mb(settings: Settings) -> float:
-    """与管理台上传同一配置 ``limits.max_file_size_mb``，缺省 500。"""
-    return float((settings.limits or {}).get("max_file_size_mb", 500) or 500)
+    """与管理台上传同一配置 ``limits.max_file_size_mb``，缺省 100。"""
+    return float((settings.limits or {}).get("max_file_size_mb", 100) or 100)
 
 
 def personal_upload_exceeds(size: int, settings: Settings) -> bool:
@@ -47,8 +47,8 @@ def personal_upload_reject_text(settings: Settings) -> str:
 
 
 def personal_storage_limit_bytes(settings: Settings) -> int:
-    """每人私有库的总容量。``limits.personal_storage_mb``，缺省 1024（1 GB）。"""
-    mb = float((settings.limits or {}).get("personal_storage_mb", 1024) or 1024)
+    """每人私有库的总容量。``limits.personal_storage_mb``，缺省 500（MB）。"""
+    mb = float((settings.limits or {}).get("personal_storage_mb", 500) or 500)
     return int(mb * 1024 * 1024)
 
 

@@ -58,7 +58,7 @@ describe('上传准入（§4.4 边界）', () => {
     expect(rejectReason({ name: 'a.pdf', size: 1024 })).toBeNull()
     expect(rejectReason({ name: 'a.exe', size: 1024 })).toContain('不支持 .exe 类型')
     expect(rejectReason({ name: 'a.pdf', size: 0 })).toContain('空文件')
-    expect(rejectReason({ name: 'a.pdf', size: MAX_FILE_BYTES + 1 })).toContain('超出单文件限制 500 MB')
+    expect(rejectReason({ name: 'a.pdf', size: MAX_FILE_BYTES + 1 })).toContain('超出单文件限制 100 MB')
     expect(rejectReason({ name: 'a.pdf', size: MAX_FILE_BYTES })).toBeNull()
   })
 

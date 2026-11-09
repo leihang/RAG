@@ -64,13 +64,24 @@ def embed_max_batch(model: str) -> int:
     """该模型的单请求嵌入条数上限。"""
     return EMBED_MAX_BATCH_BY_MODEL.get(model, EMBED_MAX_BATCH)
 
-#: 兼容模式的路径前缀
+#: 兼容模式的路径前缀（阿里云百炼 OpenAI 兼容）
 COMPATIBLE_PATH = "/compatible-mode/v1"
+
+#: DeepSeek 官方 OpenAI 兼容前缀（``https://api.deepseek.com/v1/chat/completions``）
+DEEPSEEK_COMPATIBLE_PATH = "/v1"
 
 #: 原生协议的 rerank 路径
 RERANK_PATH = "/api/v1/services/rerank/text-rerank/text-rerank"
 
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+
+def chat_compat_path(provider: str) -> str:
+    """对话补全路径前缀：百炼用 ``/compatible-mode/v1``，DeepSeek 官方用 ``/v1``。"""
+    if str(provider or "").strip().lower() == "deepseek":
+        return DEEPSEEK_COMPATIBLE_PATH
+    return COMPATIBLE_PATH
 
 
 def _auth_headers(api_key: str) -> dict[str, str]:
@@ -414,7 +425,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                     self.fallback["model"],
                     resolve_base_url(
                         self.fallback.get("base_url"),
-                        "https://api.deepseek.com" if self.fallback["provider"] == "deepseek"
+                        DEEPSEEK_BASE_URL if self.fallback["provider"] == "deepseek"
                         else DEFAULT_BASE_URL,
                     ),
                     self.fallback.get("api_key", ""),
@@ -450,7 +461,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         stream: bool,
         response_format: dict[str, Any] | None = None,
     ) -> LLMResult:
-        url = f"{base_url}{COMPATIBLE_PATH}/chat/completions"
+        url = f"{base_url}{chat_compat_path(provider)}/chat/completions"
         client = self._client or httpx.AsyncClient(timeout=self.timeout_s)
         owned = self._client is None
         try:
@@ -493,7 +504,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         首字延迟（TTFT）是 SLO 指标（`00` §4：P95 ≤5s），因此流式是**必需**而非优化。
         主模型在**首字前**失败才切 fallback：已经吐字后再切会让用户看到两段拼接的答案。
         """
-        url = f"{self.base_url}{COMPATIBLE_PATH}/chat/completions"
+        url = f"{self.base_url}{chat_compat_path(self.ref.provider)}/chat/completions"
         body = self._body(messages, stream=True, model=self.ref.model)
         timeout = httpx.Timeout(self.timeout_s, connect=10.0, read=self.timeout_s)
         async with httpx.AsyncClient(timeout=timeout) as client, client.stream(

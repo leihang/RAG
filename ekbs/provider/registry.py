@@ -147,7 +147,18 @@ def _build_compatible_llm(cfg, secrets: Secrets, *, what: str) -> LLMProvider:
     if cfg.provider in {"dashscope", "deepseek"}:
         key_name = "DASHSCOPE_API_KEY" if cfg.provider == "dashscope" else "DEEPSEEK_API_KEY"
         secrets.require(key_name)
-        from ekbs.provider.dashscope import OpenAICompatibleLLMProvider
+        from ekbs.provider.dashscope import (
+            DEEPSEEK_BASE_URL,
+            OpenAICompatibleLLMProvider,
+        )
+
+        # LLMCfg 默认 base_url 是百炼；切 deepseek 时若未改 yaml，强制官方域名，避免
+        # 用 DEEPSEEK_API_KEY 去打 dashscope.aliyuncs.com。
+        base_url = str(cfg.base_url or "").strip()
+        if cfg.provider == "deepseek" and (
+            not base_url or "dashscope" in base_url.lower()
+        ):
+            base_url = DEEPSEEK_BASE_URL
 
         fallback = None
         if cfg.fallback.provider:
@@ -164,7 +175,7 @@ def _build_compatible_llm(cfg, secrets: Secrets, *, what: str) -> LLMProvider:
         return OpenAICompatibleLLMProvider(
             ref=ref,
             api_key=secrets.get(key_name),
-            base_url=cfg.base_url,
+            base_url=base_url,
             temperature=cfg.temperature,
             top_p=cfg.top_p,
             max_tokens=cfg.max_tokens,

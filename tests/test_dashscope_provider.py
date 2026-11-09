@@ -21,11 +21,13 @@ from ekbs.errors import EmbeddingUnavailable, ModelUnavailable, RerankUnavailabl
 from ekbs.provider.base import RerankDoc, model_ref
 from ekbs.provider.dashscope import (
     COMPATIBLE_PATH,
+    DEEPSEEK_COMPATIBLE_PATH,
     EMBED_MAX_BATCH,
     RERANK_PATH,
     DashScopeEmbeddingProvider,
     DashScopeRerankProvider,
     OpenAICompatibleLLMProvider,
+    chat_compat_path,
 )
 
 BASE = "https://dashscope.aliyuncs.com"
@@ -311,13 +313,43 @@ async def test_llm_success_parses_usage() -> None:
     assert result.fallback_used is False
 
 
+def test_chat_compat_path_differs_for_deepseek_vs_dashscope() -> None:
+    assert chat_compat_path("dashscope") == COMPATIBLE_PATH
+    assert chat_compat_path("deepseek") == DEEPSEEK_COMPATIBLE_PATH
+
+
+@respx.mock
+async def test_llm_deepseek_primary_hits_official_v1_path() -> None:
+    """主模型 provider=deepseek 时打官方 ``/v1/chat/completions``，不是百炼 compatible-mode。"""
+    url = f"https://api.deepseek.com{DEEPSEEK_COMPATIBLE_PATH}/chat/completions"
+    respx.post(url).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "model": "deepseek-flash",
+                "choices": [{"message": {"content": "官方直连"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            },
+        )
+    )
+    provider = OpenAICompatibleLLMProvider(
+        ref=model_ref("deepseek", "deepseek-flash"),
+        api_key="sk-deepseek",
+        base_url="https://api.deepseek.com",
+        max_retries=0,
+    )
+    result = await provider.generate([{"role": "user", "content": "hi"}])
+    assert result.text == "官方直连"
+    assert result.fallback_used is False
+
+
 @respx.mock
 async def test_llm_falls_back_to_secondary_provider() -> None:
     """主模型连续失败 → 切 fallback（00 §2.3：用户无感，响应稍慢）。"""
     respx.post(CHAT_URL).mock(
         return_value=httpx.Response(500, json={"code": "InternalError", "message": "boom"})
     )
-    deepseek_url = "https://api.deepseek.com/compatible-mode/v1/chat/completions"
+    deepseek_url = "https://api.deepseek.com/v1/chat/completions"
     respx.post(deepseek_url).mock(
         return_value=httpx.Response(
             200,
