@@ -73,7 +73,8 @@ retrieval:
   query_rewrite:
     strategy: llm
     # model: qwen-plus   # 可选：单独指定改写模型
-    expand_model: qwen-turbo
+    # 扩写与作答同系 DeepSeek；原 qwen-turbo 易 429，空跑拖慢整问
+    expand_model: deepseek-v4.1-flash
     expand_timeout_s: 8
     expand_max_tokens: 64
   # 融合：rrf | alpha（α·向量+(1-α)·BM25）。**原来这里没有这个键**，会落到配置类默认的 rrf，

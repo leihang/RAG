@@ -817,17 +817,25 @@ def _perform_delete(
                 runtime, doc_row, doc_id, image_paths=image_paths, purge_raw=True,
             )
         with runtime.db.sync_connect() as conn:
-            # doc_recommend 建表时未带 ON DELETE CASCADE（存量库改不了 FK），硬删前先清。
-            conn.execute("DELETE FROM ekbs_doc_recommend WHERE doc_id = ?", (doc_id,))
-            conn.execute("DELETE FROM ekbs_document WHERE doc_id = ?", (doc_id,))
-            conn.execute(
-                "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, change_type, "
-                "field, old_value, new_value, reason) "
-                "VALUES (?, 'document', ?, 'delete', 'deleted', 'present', 'absent', ?)",
-                (user_id, str(doc_id), reason or "api:hard_delete"),
-            )
-            version = bump_policy_version(conn, reason=f"api:hard_delete:doc={doc_id}")
-            conn.commit()
+            # sync_connect 是 isolation_level=None（autocommit）：必须显式 BEGIN，
+            # 否则「先清 recommend、再删文档」中间失败会留下半截状态。
+            # 存量库 ekbs_doc_recommend 的 FK 常是 ON DELETE NO ACTION（CREATE IF NOT
+            # EXISTS 改不了已有表），不先清行会 FOREIGN KEY constraint failed。
+            conn.execute("BEGIN")
+            try:
+                conn.execute("DELETE FROM ekbs_doc_recommend WHERE doc_id = ?", (doc_id,))
+                conn.execute("DELETE FROM ekbs_document WHERE doc_id = ?", (doc_id,))
+                conn.execute(
+                    "INSERT INTO ekbs_perm_change_log(operator_id, object_type, object_id, "
+                    "change_type, field, old_value, new_value, reason) "
+                    "VALUES (?, 'document', ?, 'delete', 'deleted', 'present', 'absent', ?)",
+                    (user_id, str(doc_id), reason or "api:hard_delete"),
+                )
+                version = bump_policy_version(conn, reason=f"api:hard_delete:doc={doc_id}")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         mode = "hard"
         hint = (
             "已物理删除文档行"
