@@ -195,27 +195,34 @@ async def test_expand_bound_figures_without_parent_is_noop(seeded) -> None:
 
 
 async def test_expand_bound_figures_via_compat_aliases(seeded) -> None:
-    """旧 expand_page/doc 入口转发到 parent 绑定展开。"""
+    """旧 expand_page/doc 入口转发到 parent 绑定展开。
+
+    无页码时须章节 heading 命中问句主题（否则同 parent≈整篇，会乱挂封面图）。
+    """
     runtime, _ = seeded
     alice = await runtime.perm_context(user_id_of(runtime.db, "demo_alice"))
     doc_id, shard = _visible_doc(runtime)
     parent_id = _add_chunk(
         runtime, doc_id, shard, seq=910, content="无页码父块", chunk_type="parent",
+        heading_path="计量表更换",
     )
     body_id = _add_chunk(
         runtime, doc_id, shard, seq=911, content="无页码正文", parent_id=parent_id,
+        heading_path="计量表更换",
     )
     fig_id = _add_chunk(
         runtime, doc_id, shard, seq=912, content="[图片]", chunk_type="figure",
         figure_id="fig-doc", image_path="parse/x/qr.png", parent_id=parent_id,
+        heading_path="计量表更换流程",
     )
     anchor = RetrievedChunk(
         chunk_id=body_id, doc_id=doc_id, shard_id=shard, content="无页码正文",
-        parent_chunk_id=parent_id,
+        parent_chunk_id=parent_id, heading_path="计量表更换",
     )
-    out = runtime.pipeline._expand_doc_figures([anchor], alice)
+    query = "计量表更换要照片"
+    out = runtime.pipeline._expand_doc_figures([anchor], alice, query=query)
     assert fig_id in [chunk.chunk_id for chunk in out]
-    out2 = runtime.pipeline._expand_page_figures([anchor], alice)
+    out2 = runtime.pipeline._expand_page_figures([anchor], alice, query=query)
     assert fig_id in [chunk.chunk_id for chunk in out2]
 
 

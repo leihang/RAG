@@ -302,7 +302,12 @@ async def qa_chat(
         "mode": payload.mode,
         "mode_used": answer.mode_used,
         "intent": answer.intent,
-        "figure_attachments": list(answer.figure_attachments or []),
+        "available_figures": list(
+            answer.available_figures or answer.figure_attachments or []
+        ),
+        "figure_attachments": list(
+            answer.available_figures or answer.figure_attachments or []
+        ),
         "perm_fingerprint": perm.fingerprint,
         "visible_shard_count": len(perm.visible_shard_ids),
         "warnings": list(perm.warnings),

@@ -63,9 +63,10 @@ async def test_figure_intent_refusal_corrected(seeded) -> None:
     runtime.pipeline._apply_figure_adjustments(
         result, result.retrieval, intent="figure", question="把电表照片发我"
     )
-    assert result.figure_attachments, "应筛出电表照片"
+    assert result.available_figures, "应筛出电表照片清单"
     assert result.refused is False
     assert "已找到相关图片" in result.answer
+    assert "可提取" in result.answer or "发1张" in result.answer
     assert result.citations, "无引用时应补最小引用，便于调试台/钉钉对齐"
 
 
@@ -77,7 +78,7 @@ async def test_figure_intent_drops_junk_figure(seeded) -> None:
     runtime.pipeline._apply_figure_adjustments(
         result, result.retrieval, intent="figure", question="把电表照片发我"
     )
-    assert result.figure_attachments == []
+    assert result.available_figures == []
     assert result.refused is True
 
 
@@ -149,16 +150,17 @@ def test_figure_is_junk_detects_ppt_photo_captions() -> None:
     assert not RetrievalPipeline._figure_is_junk("电表照片 DT862 读数 10544.9 kWh")
 
 
-async def test_factual_intent_attaches_bound_figures(seeded) -> None:
-    """非找图意图：文字命中后展开的绑定 figure 仍进入 figure_attachments。"""
+async def test_factual_intent_lists_figures_but_hints_only(seeded) -> None:
+    """发图闸门：事实问答收集可提取清单并提示张数，由通道按「发N张」再推。"""
     runtime, _ = seeded
     result = _result([_body(), _figure()], [], refused=False)
     result.intent = "factual"
     runtime.pipeline._apply_figure_adjustments(
         result, result.retrieval, intent="factual", question="设备运维干了什么"
     )
-    assert result.figure_attachments
-    assert result.figure_attachments[0]["chunk_id"] == 11
+    assert result.available_figures
+    assert result.available_figures[0]["chunk_id"] == 11
+    assert "可提取图片" in result.answer
 
 
 async def test_figure_attachments_lock_to_text_hit_page(seeded) -> None:
@@ -209,16 +211,16 @@ async def test_figure_attachments_lock_to_text_hit_page(seeded) -> None:
         ),
         model="mock",
         rewritten_query="工程部2026年10月工作汇报化粪池月度检查情况",
-        intent="factual",
+        intent="figure",
     )
     runtime.pipeline._apply_figure_adjustments(
         result,
         result.retrieval,
-        intent="factual",
-        question="工程部2026年10月工作汇报，化粪池月度检查情况",
+        intent="figure",
+        question="工程部2026年10月工作汇报，化粪池月度检查的图发我",
     )
-    assert [a["chunk_id"] for a in result.figure_attachments] == [301]
-    assert result.figure_attachments[0]["page_from"] == 30
+    assert [a["chunk_id"] for a in result.available_figures] == [301]
+    assert result.available_figures[0]["page_from"] == 30
 
 
 async def test_figure_attachments_cover_each_cited_page(seeded) -> None:
@@ -282,17 +284,17 @@ async def test_figure_attachments_cover_each_cited_page(seeded) -> None:
         ),
         model="mock",
         rewritten_query="2026年10月工程部汇报 创新突破工作内容",
-        intent="factual",
+        intent="figure",
     )
     runtime.pipeline._apply_figure_adjustments(
         result,
         result.retrieval,
-        intent="factual",
-        question="2026年10月工程部汇报ppt，创新突破有些什么工作内容",
+        intent="figure",
+        question="2026年10月工程部汇报ppt，创新突破相关图片发我",
     )
-    pages = sorted({int(a["page_from"]) for a in result.figure_attachments})
+    pages = sorted({int(a["page_from"]) for a in result.available_figures})
     assert pages == [27, 28, 29, 30, 31]
-    assert len(result.figure_attachments) == 10
+    assert len(result.available_figures) == 10
 
 
 async def test_figure_attachments_follow_model_citation_not_rerank_mix(seeded) -> None:
@@ -369,13 +371,127 @@ async def test_figure_attachments_follow_model_citation_not_rerank_mix(seeded) -
         ),
         model="mock",
         rewritten_query="工程部2026年10月工作汇报小广告清除内容",
-        intent="factual",
+        intent="figure",
     )
     runtime.pipeline._apply_figure_adjustments(
         result,
         result.retrieval,
-        intent="factual",
-        question="工程部2026年10月工作汇报，小广告清除内容",
+        intent="figure",
+        question="工程部2026年10月工作汇报，小广告清除相关图发我",
     )
-    assert [a["chunk_id"] for a in result.figure_attachments] == [301]
-    assert result.figure_attachments[0]["page_from"] == 30
+    assert [a["chunk_id"] for a in result.available_figures] == [301]
+    assert result.available_figures[0]["page_from"] == 30
+
+
+async def test_word_unpaged_cite_requires_section_aligned_figures(seeded) -> None:
+    """找图 + 无页码引用：只发章节与引用块对齐的图，同 parent 不等于整篇可发。"""
+    runtime, _ = seeded
+    parent_id = 116845
+    table = RetrievedChunk(
+        chunk_id=117308,
+        doc_id=240,
+        shard_id="kb_all_L1",
+        content="4#楼配电室 专配1B 电表编号 DT862",
+        chunk_type="table",
+        doc_title="熙街物业工程部工作手册2026.11.8",
+        heading_path="熙街物业工程部工作手册2026.11.8 > 6. 附件-6专配室回路清单 · 表 21",
+        parent_chunk_id=parent_id,
+        page_from=None,
+        page_to=None,
+    )
+    cover = RetrievedChunk(
+        chunk_id=116850,
+        doc_id=240,
+        shard_id="kb_all_L1",
+        content="[图片]",
+        chunk_type="figure",
+        doc_title="熙街物业工程部工作手册2026.11.8",
+        heading_path=(
+            "熙街物业工程部工作手册2026.11.8 · "
+            "重庆卓越城市运营服务有限责任公司熙街管理处 · 图1"
+        ),
+        figure_id="fig-116850",
+        image_path="parse/240/images/cover.png",
+        parent_chunk_id=parent_id,
+    )
+    route = RetrievedChunk(
+        chunk_id=116852,
+        doc_id=240,
+        shard_id="kb_all_L1",
+        content="[图片]",
+        chunk_type="figure",
+        doc_title="熙街物业工程部工作手册2026.11.8",
+        heading_path="熙街物业工程部工作手册2026.11.8 · 照明巡检路线图 · 图3",
+        figure_id="fig-116852",
+        image_path="parse/240/images/route.png",
+        parent_chunk_id=parent_id,
+    )
+    related = RetrievedChunk(
+        chunk_id=116900,
+        doc_id=240,
+        shard_id="kb_all_L1",
+        content="[图片]",
+        chunk_type="figure",
+        doc_title="熙街物业工程部工作手册2026.11.8",
+        heading_path="熙街物业工程部工作手册2026.11.8 · 附件-6专配室回路清单 · 图9",
+        figure_id="fig-116900",
+        image_path="parse/240/images/panel.png",
+        parent_chunk_id=parent_id,
+    )
+    result = AnswerResult(
+        answer="4号楼专配1B电表编号见附件-6[1]",
+        citations=[
+            Citation(
+                cite_index=1,
+                chunk_id=117308,
+                doc_id=240,
+                doc_title="熙街物业工程部工作手册2026.11.8",
+                doc_version="v1",
+                heading_path=table.heading_path,
+                page_from=None,
+                page_to=None,
+                rerank_score=0.9,
+                acl_result="pass",
+                page_check="pass",
+            )
+        ],
+        retrieval=RetrievalResult(
+            query="4号楼专配1B电表编号",
+            chunks=[table, cover, route, related],
+        ),
+        model="mock",
+        rewritten_query="4号楼专配1B电表编号",
+        intent="figure",
+    )
+    runtime.pipeline._apply_figure_adjustments(
+        result,
+        result.retrieval,
+        intent="figure",
+        question="4号楼专配1B电表相关图发我",
+    )
+    assert [a["chunk_id"] for a in result.available_figures] == [116900]
+    assert "可提取图片" in result.answer or "发1张" in result.answer
+
+    # 事实意图同样只给清单+提示，不改变「按需提取」协议
+    runtime.pipeline._apply_figure_adjustments(
+        result,
+        result.retrieval,
+        intent="factual",
+        question="4号楼专配1B电表编号",
+    )
+    assert result.available_figures
+    assert "可提取图片" in result.answer
+
+
+def test_figure_heading_matches_cites_requires_section_overlap() -> None:
+    from ekbs.retrieval.pipeline import RetrievalPipeline
+
+    cite = "熙街物业工程部工作手册2026.11.8 > 6. 附件-6专配室回路清单 · 表 21"
+    assert RetrievalPipeline._figure_heading_matches_cites(
+        "熙街物业工程部工作手册2026.11.8 · 附件-6专配室回路清单 · 图9",
+        [cite],
+    )
+    assert not RetrievalPipeline._figure_heading_matches_cites(
+        "熙街物业工程部工作手册2026.11.8 · 照明巡检路线图 · 图3",
+        [cite],
+    )

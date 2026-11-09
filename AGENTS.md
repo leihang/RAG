@@ -135,6 +135,24 @@ MinerU 进程内存峰值很高（`正式方案-v4/00-架构定稿与决策台�
 24 GB 机器上双 worker 双峰叠加实测耗尽内存）。
 `parse.worker_concurrency = 1` 是硬约束（"同一数据库只有一个 worker 进程"）。**不要为了并发调大。**
 
+### 5.5 图片清洗与回源挂图（规则，不是个案补丁）
+
+口径集中在 `ekbs/ingest/figure_quality.py`（入库）+ `RetrievalPipeline._collect_figure_attachments`
+（回源）。**禁止**为某一问句/某一文档写特判；新问题先改规则与单测。
+
+| 层 | 硬规则 | 实现锚点 |
+|---|---|---|
+| 入库 | 装饰小图（`max(边) < 120`）**无论有无题注**不进 figure | `should_drop_figure_bytes` → `_register_figure_blob` |
+| 入库 | 大面积近纯色壳页（封面底/分隔页）不进 figure | `is_near_blank_shell_raster` |
+| 入库 | 公章/扫描印章另走 `seal_filter`（不替代装饰/壳页规则） | `seal_filter_applies` |
+| 回源 | **发图闸门**：答案只告知可提取张数，不主动推图；用户「发N张/发全图」按序提取、计数、不重复 | `available_figures` + 钉钉 pending |
+| 回源 | 有文字引用时：优先同页；**无页码时同 parent 不够**，须章节题注与引用块对齐 | `_figure_in_citation_scope` + `_figure_heading_matches_cites` |
+| 回源 | 无页码展开绑图：heading 须命中问句主题，禁止按 seq 瞎取前 N | `_bound_figure_ids` |
+| 回源 | 旧索引残留的装饰小图路径再挡一层 | `is_decorative_image_path` |
+
+Word/长手册常见「一个大 parent 挂全文图表」——把「同 parent」当成挂图范围等于整篇可发，
+这是缺陷不是特性。
+
 ---
 
 ## 6. 硬约束（改这些算破坏红线）
@@ -147,11 +165,14 @@ MinerU 进程内存峰值很高（`正式方案-v4/00-架构定稿与决策台�
 | 4 | **`deploy/` 下的 launchd plist 改动需真人复核** | 影响生产自愈 |
 | 5 | **测试套件必须全绿**（当前 983 用例） | 提交前跑 `pytest tests/ -q` |
 | 6 | **不修改 `docs/spec/` 里的编号文档** | 它们是 `方案/` 的派生规格，不是需求源；有冲突以 `方案/`（现仓库为 `正式方案-v4/`）为准，改动先跟人确认 |
+| 7 | **回源图必须引用范围对齐；装饰/壳页图不得入库当正文 figure** | 见 §5.5；禁止「同文档/同 parent 即可发图」或「有题注就放行 logo」 |
 
 ---
 
 ## 7. 已知陷阱
 
+- **Word 长手册一个 parent 挂全文图表**：回源若只认 `parent_id` 会把封面/装饰/其它章节图一起发出；
+  必须走 §5.5 的章节对齐。旧索引里的装饰图需**重解析**才会从库里消失（回源侧仍有尺寸闸）。
 - **必须先 source secrets**：`dev_services.sh` 已自动处理；手工起服务时要 `set -a; source ~/.ekbs/secrets.env; set +a`。
   否则"生产能起、dev 起不来"。
 - **管理台改前端要重跑 build**：`npm run build`，服务不用重启。

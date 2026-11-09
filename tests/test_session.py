@@ -498,43 +498,42 @@ async def test_api_multi_turn_and_session_clear(seeded) -> None:
         "X-Internal-Token": TEST_INTERNAL_TOKEN,
         "X-Internal-User-Id": str(alice_id),
     }
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as client:
-            first = await client.post(
-                "/api/v1/qa/chat",
-                json={"question": "年假有多少天", "conversation_id": "conv-api"},
-                headers=headers,
-            )
-            assert first.status_code == 200
-            assert first.json()["rewritten_query"] == "年假有多少天"
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        first = await client.post(
+            "/api/v1/qa/chat",
+            json={"question": "年假有多少天", "conversation_id": "conv-api"},
+            headers=headers,
+        )
+        assert first.status_code == 200
+        assert first.json()["rewritten_query"] == "年假有多少天"
 
-            second = await client.post(
-                "/api/v1/qa/chat",
-                json={"question": "那它需要提前几天申请", "conversation_id": "conv-api"},
-                headers=headers,
-            )
-            body = second.json()
-            assert body["history_used"] is True
-            assert body["rewritten_query"].startswith("年假有多少天")
+        second = await client.post(
+            "/api/v1/qa/chat",
+            json={"question": "那它需要提前几天申请", "conversation_id": "conv-api"},
+            headers=headers,
+        )
+        body = second.json()
+        assert body["history_used"] is True
+        assert body["rewritten_query"].startswith("年假有多少天")
 
-            # 审计里同时留下原问题与改写后的查询（01 §5.4 的 rewritten_query）
-            with runtime.db.sync_connect() as conn:
-                audit = conn.execute(
-                    "SELECT question, rewritten_query FROM ekbs_qa_message "
-                    "WHERE rewritten_query != '' ORDER BY message_id DESC LIMIT 1"
-                ).fetchone()
-            assert audit is not None, "审计必须记录改写后的查询"
-            assert audit["question"] == "那它需要提前几天申请"
-            assert audit["rewritten_query"].startswith("年假有多少天")
+        # 审计里同时留下原问题与改写后的查询（01 §5.4 的 rewritten_query）
+        with runtime.db.sync_connect() as conn:
+            audit = conn.execute(
+                "SELECT question, rewritten_query FROM ekbs_qa_message "
+                "WHERE rewritten_query != '' ORDER BY message_id DESC LIMIT 1"
+            ).fetchone()
+        assert audit is not None, "审计必须记录改写后的查询"
+        assert audit["question"] == "那它需要提前几天申请"
+        assert audit["rewritten_query"].startswith("年假有多少天")
 
-            cleared = await client.post(
-                "/api/v1/qa/session/clear", params={"conversation_id": "conv-api"},
-                headers=headers,
-            )
-            assert cleared.status_code == 200
-            assert cleared.json()["removed"] >= 1
+        cleared = await client.post(
+            "/api/v1/qa/session/clear", params={"conversation_id": "conv-api"},
+            headers=headers,
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["removed"] >= 1
 
 
 async def test_same_conversation_reuses_one_audit_session(seeded) -> None:
@@ -547,22 +546,21 @@ async def test_same_conversation_reuses_one_audit_session(seeded) -> None:
     app = create_app(runtime.settings)
     alice_id = user_id_of(runtime.db, "demo_alice")
     headers = {"X-Internal-Token": TEST_INTERNAL_TOKEN, "X-Internal-User-Id": str(alice_id)}
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as client:
-            first = await client.post(
-                "/api/v1/qa/chat",
-                json={"question": "年假有多少天", "conversation_id": "conv-session"},
-                headers=headers,
-            )
-            second = await client.post(
-                "/api/v1/qa/chat",
-                json={"question": "那它需要提前几天申请", "conversation_id": "conv-session"},
-                headers=headers,
-            )
-            assert first.json()["session_id"] == second.json()["session_id"]
-            assert (first.json()["turn"], second.json()["turn"]) == (1, 2)
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        first = await client.post(
+            "/api/v1/qa/chat",
+            json={"question": "年假有多少天", "conversation_id": "conv-session"},
+            headers=headers,
+        )
+        second = await client.post(
+            "/api/v1/qa/chat",
+            json={"question": "那它需要提前几天申请", "conversation_id": "conv-session"},
+            headers=headers,
+        )
+        assert first.json()["session_id"] == second.json()["session_id"]
+        assert (first.json()["turn"], second.json()["turn"]) == (1, 2)
 
     with runtime.db.sync_connect() as conn:
         sessions = conn.execute(

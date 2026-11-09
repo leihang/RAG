@@ -24,6 +24,8 @@ from ekbs.discovery import (
     is_permission_command,
     is_personal_manage_command,
     is_send_all_figures_command,
+    is_send_figures_command,
+    parse_figure_send_count,
     is_send_source_command,
     display_doc_title,
     file_request_hint,
@@ -51,11 +53,10 @@ QA_URL = f"{API_BASE}/api/v1/qa/chat"
 async def client(seeded):
     runtime, _ = seeded
     app = create_app(runtime.settings)
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as instance:
-            yield instance
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as instance:
+        yield instance
 
 
 def headers_for(user_id: int) -> dict[str, str]:
@@ -530,9 +531,14 @@ def test_command_predicates() -> None:
     assert is_send_source_command("发原文")
     assert is_send_all_figures_command("发全图")
     assert is_send_all_figures_command("补发图片")
+    assert is_send_figures_command("发3张")
+    assert parse_figure_send_count("发3张") == 3
+    assert parse_figure_send_count("发图") == 1
+    assert parse_figure_send_count("发全图") == -1
     assert not is_permission_command("权限是什么")
     assert not is_example_command("举个例子说明")
     assert not is_send_all_figures_command("把图片发我看看有什么")
+    assert parse_figure_send_count("把图片发我看看有什么") is None
 
 
 def test_command_outputs_are_names_only() -> None:

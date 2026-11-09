@@ -476,87 +476,39 @@ def test_markdown_title_uses_first_line(handler) -> None:
 
 
 @respx.mock
-async def test_refused_still_sends_figure_attachments(handler, cards) -> None:
-    """拒答分支也要能发原图（模型说「资料无图」但 figure_attachments 仍在）。"""
+async def test_answer_hints_figure_count_without_autosend(handler, cards) -> None:
+    """问答只提示可提取张数，不主动推图；清单写入 pending。"""
     rel = "parse/68/images/qr.png"
     abs_path = handler.settings.data_dir / rel
     abs_path.parent.mkdir(parents=True, exist_ok=True)
     abs_path.write_bytes(
         b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-        b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx"
-        b"\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND"
+        b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x00IEND"
         b"\xaeB`\x82"
     )
     routes = mock_dingtalk(card_ok=False)
-    respx.post(f"{OAPI_BASE_URL}{MEDIA_UPLOAD_PATH}").mock(
-        return_value=httpx.Response(
-            200, json={"errcode": 0, "errmsg": "ok", "media_id": "media-qr"}
-        )
-    )
     body = answer_body(refused=True)
     body["answer"] = "未找到可靠依据。"
-    body["figure_attachments"] = [
+    body["available_figures"] = [
         {"chunk_id": 1, "figure_id": "img-qr", "image_path": rel, "doc_title": "熙物联"}
     ]
     respx.post(API_URL).mock(return_value=httpx.Response(200, json=body))
     code, _ = await handler.process({"data": payload(msg_id="msg-fig-refuse", text="二维码呢")})
     assert code == ACK_OK
+    text = oto_body(routes["oto"].calls[0])
+    assert "可提取图片 1 张" in text
     image_sends = [
         json.loads(call.request.content)
         for call in routes["oto"].calls
         if json.loads(call.request.content).get("msgKey") == MSG_KEY_IMAGE
     ]
-    assert len(image_sends) == 1
+    assert image_sends == []
 
 
 @respx.mock
-async def test_figure_attachments_trigger_image_reply(handler, cards) -> None:
-    """找图意图：文字卡片之后再 media/upload + sampleImageMsg 发原图。"""
-    rel = "parse/68/images/demo.png"
-    abs_path = handler.settings.data_dir / rel
-    abs_path.parent.mkdir(parents=True, exist_ok=True)
-    abs_path.write_bytes(
-        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-        b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx"
-        b"\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND"
-        b"\xaeB`\x82"
-    )
-    routes = mock_dingtalk()
-    media = respx.post(f"{OAPI_BASE_URL}{MEDIA_UPLOAD_PATH}").mock(
-        return_value=httpx.Response(
-            200, json={"errcode": 0, "errmsg": "ok", "media_id": "media-abc"}
-        )
-    )
-    body = answer_body()
-    body["figure_attachments"] = [
-        {
-            "chunk_id": 99,
-            "figure_id": "img-demo",
-            "image_path": rel,
-            "doc_title": "熙物联使用教程V4",
-        }
-    ]
-    respx.post(API_URL).mock(return_value=httpx.Response(200, json=body))
-
-    code, _ = await handler.process(
-        {"data": payload(msg_id="msg-fig-1", text="把图片发我")}
-    )
-    assert code == ACK_OK
-    assert media.call_count == 1
-    # 卡片成功后另发一条 sampleImageMsg
-    image_sends = [
-        json.loads(call.request.content)
-        for call in routes["oto"].calls
-        if json.loads(call.request.content).get("msgKey") == MSG_KEY_IMAGE
-    ]
-    assert len(image_sends) == 1
-    assert json.loads(image_sends[0]["msgParam"])["photoURL"] == "@media-abc"
-
-
-@respx.mock
-async def test_truncated_figures_hint_and_send_all(handler, cards, monkeypatch) -> None:
-    """首波超上限时提示「发全图」；用户回复后补发剩余。"""
-    monkeypatch.setattr(dingtalk_handler, "MAX_REPLY_IMAGES", 1)
+async def test_send_n_figures_sequential_no_dup(handler, cards, monkeypatch) -> None:
+    """答完缓存清单 → 发1张 → 发2张；按序计数，路径不重复。"""
+    monkeypatch.setattr(dingtalk_handler, "MAX_REPLY_IMAGES", 8)
     png = (
         b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
         b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx"
@@ -585,22 +537,26 @@ async def test_truncated_figures_hint_and_send_all(handler, cards, monkeypatch) 
         )
     )
     body = answer_body()
-    body["figure_attachments"] = figs
+    body["available_figures"] = figs
     respx.post(API_URL).mock(return_value=httpx.Response(200, json=body))
 
     code, _ = await handler.process(
-        {"data": payload(msg_id="msg-fig-trunc", text="创新突破有哪些")}
+        {"data": payload(msg_id="msg-fig-q", text="创新突破有哪些")}
     )
     assert code == ACK_OK
     text = oto_body(routes["oto"].calls[0])
-    assert "另有 2 张相关图片未发出" in text
-    assert "发全图" in text
-    image_sends = [
-        json.loads(call.request.content)
-        for call in routes["oto"].calls
-        if json.loads(call.request.content).get("msgKey") == MSG_KEY_IMAGE
-    ]
-    assert len(image_sends) == 1
+    assert "可提取图片 3 张" in text
+    assert not any(
+        json.loads(c.request.content).get("msgKey") == MSG_KEY_IMAGE
+        for c in routes["oto"].calls
+    )
+
+    def _image_count() -> int:
+        return sum(
+            1
+            for call in routes["oto"].calls
+            if json.loads(call.request.content).get("msgKey") == MSG_KEY_IMAGE
+        )
 
     def _text_bodies() -> list[str]:
         out = []
@@ -612,36 +568,24 @@ async def test_truncated_figures_hint_and_send_all(handler, cards, monkeypatch) 
         return out
 
     code, _ = await handler.process(
-        {"data": payload(msg_id="msg-fig-more", text="发全图")}
+        {"data": payload(msg_id="msg-fig-1", text="发1张")}
     )
     assert code == ACK_OK
-    image_sends = [
-        json.loads(call.request.content)
-        for call in routes["oto"].calls
-        if json.loads(call.request.content).get("msgKey") == MSG_KEY_IMAGE
-    ]
-    # 首波 1 + 补发 1（上限仍为 1），还剩 1 张
-    assert len(image_sends) == 2
-    follow = _text_bodies()[-1]
-    assert "还剩 1 张" in follow
+    assert _image_count() == 1
+    assert "累计 1/3" in _text_bodies()[-1]
 
     code, _ = await handler.process(
-        {"data": payload(msg_id="msg-fig-more-2", text="发全图")}
+        {"data": payload(msg_id="msg-fig-2", text="发2张")}
     )
     assert code == ACK_OK
-    image_sends = [
-        json.loads(call.request.content)
-        for call in routes["oto"].calls
-        if json.loads(call.request.content).get("msgKey") == MSG_KEY_IMAGE
-    ]
-    assert len(image_sends) == 3
+    assert _image_count() == 3
     done = _text_bodies()[-1]
-    assert "全部剩余" in done
+    assert "全部" in done and "3" in done
 
 
 @respx.mock
 async def test_send_all_figures_without_pending(handler) -> None:
-    """无待补发缓存时，发全图给友好提示，不进问答。"""
+    """无待提取缓存时，发全图给友好提示，不进问答。"""
     routes = mock_dingtalk(card_ok=False)
     qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
     code, _ = await handler.process(
@@ -776,6 +720,129 @@ async def test_group_file_is_ignored(handler) -> None:
     assert download.call_count == 0
     assert routes["group"].call_count == 0
     assert routes["oto"].call_count == 0
+
+
+@respx.mock
+async def test_audio_recognition_goes_to_qa_not_personal_library(handler) -> None:
+    """截图场景：语音带 recognition，应问答，绝不「未命名文件」入库。"""
+    routes = mock_dingtalk(card_ok=False)
+    download = respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(
+        return_value=httpx.Response(200, json={"downloadUrl": "https://files.example/voice.ogg"})
+    )
+    personal = respx.post(f"{API_BASE}/api/v1/personal/files").mock(
+        return_value=httpx.Response(200, json={"message": "不应入库"})
+    )
+    qa_payload = answer_body()
+    qa_payload["answer"] = "10 月总用电量见资料。"
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=qa_payload))
+    body = payload(msg_id="audio-asr", text="", msgtype="audio")
+    body["content"] = {
+        "downloadCode": "dc-audio",
+        "duration": 12000,
+        "recognition": "帮我查一下10月份期间的总用电量",
+    }
+    code, _ = await handler.process({"data": body})
+    assert code == ACK_OK
+    assert download.call_count == 0
+    assert personal.call_count == 0
+    assert qa.call_count == 1
+    asked = json.loads(qa.calls[0].request.content.decode())
+    assert "10月份期间的总用电量" in asked["question"]
+    texts = [oto_body(c) for c in routes["oto"].calls]
+    assert not any("放入私有库" in t or "未命名文件" in t for t in texts)
+    assert any("10 月总用电量见资料" in t for t in texts)
+
+
+@respx.mock
+async def test_audio_without_recognition_does_not_ingest(handler) -> None:
+    from ekbs.dingtalk.handler import AUDIO_NO_RECOGNITION_REPLY
+
+    routes = mock_dingtalk(card_ok=False)
+    download = respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(
+        return_value=httpx.Response(200, json={"downloadUrl": "https://files.example/voice.ogg"})
+    )
+    personal = respx.post(f"{API_BASE}/api/v1/personal/files").mock(
+        return_value=httpx.Response(200, json={"message": "不应入库"})
+    )
+    qa = respx.post(API_URL).mock(return_value=httpx.Response(200, json=answer_body()))
+    body = payload(msg_id="audio-empty", text="", msgtype="audio")
+    body["content"] = {"downloadCode": "dc-audio", "duration": 3}
+    code, _ = await handler.process({"data": body})
+    assert code == ACK_OK
+    assert download.call_count == 0
+    assert personal.call_count == 0
+    assert qa.call_count == 0
+    texts = [oto_body(c) for c in routes["oto"].calls]
+    assert any(AUDIO_NO_RECOGNITION_REPLY in t for t in texts)
+    assert not any("放入私有库" in t for t in texts)
+
+
+@respx.mock
+async def test_picture_with_download_code_does_not_enter_personal_library(handler) -> None:
+    """图片同理：有 downloadCode 也不进私有库。"""
+    from ekbs.dingtalk.handler import UNSUPPORTED_MEDIA_UPLOAD_REPLY
+
+    routes = mock_dingtalk(card_ok=False)
+    download = respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(
+        return_value=httpx.Response(200, json={"downloadUrl": "https://files.example/a.png"})
+    )
+    api = respx.post(f"{API_BASE}/api/v1/personal/files").mock(
+        return_value=httpx.Response(200, json={"message": "不应入库"})
+    )
+    body = payload(msg_id="pic-1", text="", msgtype="picture")
+    body["content"] = {"downloadCode": "dc-pic"}
+    code, _ = await handler.process({"data": body})
+    assert code == ACK_OK
+    assert download.call_count == 0
+    assert api.call_count == 0
+    texts = [oto_body(c) for c in routes["oto"].calls]
+    assert any(UNSUPPORTED_MEDIA_UPLOAD_REPLY in t for t in texts)
+    assert not any("放入私有库" in t for t in texts)
+
+
+@respx.mock
+async def test_media_file_suffix_does_not_enter_personal_library(handler) -> None:
+    """按「文件」发出的语音/图片也不入库（后缀判定，避免误判入库意图）。"""
+    from ekbs.dingtalk.handler import UNSUPPORTED_MEDIA_UPLOAD_REPLY
+
+    routes = mock_dingtalk(card_ok=False)
+    download = respx.post(f"{DING_BASE}/v1.0/robot/messageFiles/download").mock(
+        return_value=httpx.Response(200, json={"downloadUrl": "https://files.example/x"})
+    )
+    api = respx.post(f"{API_BASE}/api/v1/personal/files").mock(
+        return_value=httpx.Response(200, json={"message": "不应入库"})
+    )
+    for msg_id, name in (("media-amr", "留言.amr"), ("media-png", "截图.png"), ("media-mp4", "演示.mp4")):
+        body = payload(msg_id=msg_id, text="", msgtype="file")
+        body["content"] = {"downloadCode": f"dc-{msg_id}", "fileName": name}
+        code, _ = await handler.process({"data": body})
+        assert code == ACK_OK
+    assert download.call_count == 0
+    assert api.call_count == 0
+    texts = [oto_body(c) for c in routes["oto"].calls]
+    assert sum(1 for t in texts if UNSUPPORTED_MEDIA_UPLOAD_REPLY in t) >= 3
+    assert not any("放入私有库" in t for t in texts)
+
+
+def test_dingtalk_personal_document_helpers() -> None:
+    from ekbs.dingtalk.handler import (
+        is_dingtalk_media_payload,
+        is_dingtalk_personal_document,
+    )
+
+    assert is_dingtalk_personal_document(
+        msgtype="file", file_name="制度.pdf", download_code="dc"
+    )
+    assert not is_dingtalk_personal_document(
+        msgtype="file", file_name="拍立得.png", download_code="dc"
+    )
+    assert not is_dingtalk_personal_document(
+        msgtype="audio", file_name="", download_code="dc"
+    )
+    assert is_dingtalk_media_payload(msgtype="video", file_name="", download_code="dc")
+    assert is_dingtalk_media_payload(
+        msgtype="file", file_name="a.m4a", download_code="dc"
+    )
 
 
 @respx.mock

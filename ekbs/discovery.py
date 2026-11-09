@@ -257,7 +257,7 @@ _PERSONAL_MANAGE_COMMANDS = frozenset(
 _SEND_SOURCE_COMMANDS = frozenset(
     {"发原文", "我要原文", "怎么发原文", "发原文件", "原文怎么发"}
 )
-#: 上一轮因上限未发完的图片：用户主动要剩余原图
+#: 发剩余全部（按批上限）
 _SEND_ALL_FIGURES_COMMANDS = frozenset(
     {
         "发全图",
@@ -267,9 +267,30 @@ _SEND_ALL_FIGURES_COMMANDS = frozenset(
         "剩余图片",
         "补发图片",
         "补发图",
-        "继续发图",
         "发剩余图片",
+        "全部发来",
+        "发全部",
     }
+)
+#: 发下一张（计数 +1，不重复）
+_SEND_ONE_FIGURE_COMMANDS = frozenset(
+    {
+        "发图",
+        "发图片",
+        "发一张",
+        "发一张图",
+        "发1张",
+        "发1张图",
+        "再发一张",
+        "再发1张",
+        "继续发图",
+        "下一张图",
+        "再来一张",
+    }
+)
+#: 「发3张」「发送12张图」
+_SEND_N_FIGURES_RE = re.compile(
+    r"^(?:再)?发(?:送)?(?P<n>\d+)张(?:图|图片)?$"
 )
 
 
@@ -294,7 +315,32 @@ def is_send_source_command(text: str) -> bool:
 
 
 def is_send_all_figures_command(text: str) -> bool:
-    return _compact_command(text) in _SEND_ALL_FIGURES_COMMANDS
+    """兼容旧名：是否「发剩余全部」类指令。"""
+    return parse_figure_send_count(text) == -1
+
+
+def parse_figure_send_count(text: str) -> int | None:
+    """解析发图指令张数。
+
+    * ``None``：不是发图指令（应走正常问答）
+    * ``-1``：发剩余全部（通道按批上限切片）
+    * ``>0``：本次发 N 张（按序、跳过已发）
+    """
+    compact = _compact_command(text)
+    if not compact:
+        return None
+    if compact in _SEND_ALL_FIGURES_COMMANDS:
+        return -1
+    if compact in _SEND_ONE_FIGURE_COMMANDS:
+        return 1
+    match = _SEND_N_FIGURES_RE.fullmatch(compact)
+    if match:
+        return max(1, int(match.group("n")))
+    return None
+
+
+def is_send_figures_command(text: str) -> bool:
+    return parse_figure_send_count(text) is not None
 
 
 def friendly_title(title: str | None) -> str:

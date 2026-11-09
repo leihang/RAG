@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -61,11 +62,13 @@ from ekbs.discovery import (
     is_help_command,
     is_permission_command,
     is_personal_manage_command,
-    is_send_all_figures_command,
+    is_send_figures_command,
+    parse_figure_send_count,
     is_send_source_command,
     is_personal_list_command,
     personal_delete_title,
 )
+from ekbs.ingest.parser import SUFFIX_ENGINES, normalize_suffix
 from ekbs.personal import personal_upload_exceeds, personal_upload_reject_text
 from ekbs.ratelimit import RateLimiter
 
@@ -73,9 +76,9 @@ log = get_logger(component="dingtalk.handler")
 
 #: ACK 码：SDK 直接把它回发给钉钉
 ACK_OK = 200
-#: 每轮最多再发几张原图（超出缓存，提示用户「发全图」补发）
+#: 单次指令最多发几张原图（「发全图」也按此分批，避免钉钉刷屏）
 MAX_REPLY_IMAGES = 8
-#: 未发完图片在 ekbs_cache 里保留多久（秒）
+#: 可提取图片清单在 ekbs_cache 里保留多久（秒）
 PENDING_FIGURES_TTL_SECONDS = 2 * 3600
 PENDING_FIGURES_KEY_PREFIX = "ekbs:dt:pending_figs:"
 ACK_RETRY = 500
@@ -86,7 +89,78 @@ ERR_CODE_MESSAGE_QUOTA = "20001"
 USER_NOT_FOUND_REPLY = "未找到你的企业账号，请联系管理员同步组织架构后再试。"
 RATE_LIMITED_REPLY = "你的提问过于频繁，请稍后再试。"
 SERVICE_ERROR_REPLY = "知识库服务暂时不可用，请稍后重试。"
-NO_PENDING_FIGURES_REPLY = "当前没有待补发的图片。需要的话可以再问一次相关问题。"
+NO_PENDING_FIGURES_REPLY = (
+    "当前没有可提取的图片。请先问一个相关问题，系统会提示可提取张数。"
+)
+#: 私有库入库只认钉钉 ``msgtype=file``；audio/picture/video 也有 downloadCode，不能靠码判断。
+PERSONAL_FILE_MSGTYPE = "file"
+#: 原生媒体消息：一律不当「用户要入向量库」。
+_MEDIA_MSGTYPES = frozenset({"audio", "picture", "video"})
+#: 即便 msgtype=file，这些后缀也是媒体，禁止走私有库入库（png/jpg 虽在解析白名单，钉钉侧不收）。
+_MEDIA_FILE_SUFFIXES = frozenset(
+    {
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "webp",
+        "bmp",
+        "heic",
+        "tif",
+        "tiff",
+        "mp3",
+        "wav",
+        "amr",
+        "m4a",
+        "aac",
+        "ogg",
+        "flac",
+        "mp4",
+        "mov",
+        "avi",
+        "mkv",
+        "webm",
+        "m4v",
+        "3gp",
+    }
+)
+UNSUPPORTED_MEDIA_UPLOAD_REPLY = (
+    "私有库只接收文档（PDF / Word / Excel / PPT / 文本等），"
+    "语音、图片、视频不会入库。请发送文档文件，或用文字提问。"
+)
+AUDIO_NO_RECOGNITION_REPLY = (
+    "收到语音，但没识别出文字。请再说一次，或直接打字提问。"
+)
+
+
+def _dingtalk_personal_doc_suffixes() -> frozenset[str]:
+    """钉钉私有库可入库后缀：解析白名单减去图片（管理台仍可收图，单聊机器人不收）。"""
+    return frozenset(
+        suffix.lstrip(".").lower()
+        for suffix in SUFFIX_ENGINES
+        if suffix.lstrip(".").lower() not in _MEDIA_FILE_SUFFIXES
+    )
+
+
+def is_dingtalk_personal_document(*, msgtype: str, file_name: str, download_code: str) -> bool:
+    """是否判定为「用户要入私有向量库」：仅文档类 file 消息。"""
+    if str(msgtype or "") != PERSONAL_FILE_MSGTYPE or not str(download_code or "").strip():
+        return False
+    suffix = normalize_suffix(file_name or "")
+    if not suffix or suffix in _MEDIA_FILE_SUFFIXES:
+        return False
+    return suffix in _dingtalk_personal_doc_suffixes()
+
+
+def is_dingtalk_media_payload(*, msgtype: str, file_name: str, download_code: str) -> bool:
+    """原生语音/图/视频，或文件名是媒体后缀 —— 都不当入库意图。"""
+    kind = str(msgtype or "")
+    if kind in _MEDIA_MSGTYPES:
+        return True
+    if not str(download_code or "").strip():
+        return False
+    suffix = normalize_suffix(file_name or "")
+    return bool(suffix and suffix in _MEDIA_FILE_SUFFIXES)
 
 
 @dataclass
@@ -118,16 +192,23 @@ class InboundMessage:
                 content = {}
         download_code = ""
         file_name = ""
+        recognition = ""
         if isinstance(content, dict):
             download_code = str(content.get("downloadCode") or "")
             file_name = str(content.get("fileName") or content.get("file_name") or "")
+            # 语音 ASR：官方 content.recognition（见钉钉「接收消息」协议）
+            recognition = str(content.get("recognition") or "").strip()
+        msgtype = str(data.get("msgtype") or "")
+        text = str(text_block.get("content") or "") if isinstance(text_block, dict) else ""
+        if msgtype == "audio" and recognition or not text.strip() and recognition:
+            text = recognition
         return cls(
             msg_id=str(data.get("msgId") or ""),
             sender_staff_id=str(data.get("senderStaffId") or ""),
             conversation_id=str(data.get("conversationId") or ""),
             conversation_type=str(data.get("conversationType") or "1"),
-            msgtype=str(data.get("msgtype") or ""),
-            text=str(text_block.get("content") or "") if isinstance(text_block, dict) else "",
+            msgtype=msgtype,
+            text=text,
             download_code=download_code,
             file_name=file_name,
             session_webhook=str(data.get("sessionWebhook") or ""),
@@ -141,6 +222,24 @@ class InboundMessage:
     @property
     def is_group(self) -> bool:
         return self.conversation_type == "2"
+
+    @property
+    def is_personal_file(self) -> bool:
+        """单聊私有库入库入口：仅文档类 file（排除语音/图片/视频）。"""
+        return is_dingtalk_personal_document(
+            msgtype=self.msgtype,
+            file_name=self.file_name,
+            download_code=self.download_code,
+        )
+
+    @property
+    def is_media_payload(self) -> bool:
+        """语音/图片/视频（含按文件发来的媒体后缀）。"""
+        return is_dingtalk_media_payload(
+            msgtype=self.msgtype,
+            file_name=self.file_name,
+            download_code=self.download_code,
+        )
 
     @property
     def usable(self) -> bool:
@@ -304,7 +403,15 @@ class StreamMessageHandler:
             if intro:
                 await self._reply_text(message, intro)
 
-            if message.download_code:
+            if message.msgtype == "audio" and message.text.strip():
+                # 语音有 ASR：当提问继续往下走；二进制绝不入私有库。
+                log.info(
+                    "dingtalk_audio_as_question",
+                    msg_id=message.msg_id,
+                    text_len=len(message.text.strip()),
+                )
+
+            if message.is_personal_file:
                 filename = (message.file_name or "").strip() or "未命名文件"
                 await self._reply_text(
                     message,
@@ -313,6 +420,57 @@ class StreamMessageHandler:
                 )
                 pending_personal_upload = (message, user_id)
                 # 立刻出锁去做下载/登记，避免占住会话通道
+            elif message.msgtype == "audio" and not message.text.strip():
+                log.info("dingtalk_audio_no_recognition", msg_id=message.msg_id)
+                await self._reply_text(message, AUDIO_NO_RECOGNITION_REPLY)
+                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                return ReplyResult(
+                    True,
+                    replied=True,
+                    via="text",
+                    reason="audio_no_recognition",
+                    answer=AUDIO_NO_RECOGNITION_REPLY,
+                )
+            elif message.msgtype != "audio" and (
+                message.is_media_payload
+                or (
+                    message.download_code
+                    and message.msgtype != PERSONAL_FILE_MSGTYPE
+                )
+            ):
+                # 图片/视频等禁止误判为「要入向量库」（语音有 ASR 的已在上方放行）。
+                log.info(
+                    "dingtalk_media_not_ingest",
+                    msgtype=message.msgtype,
+                    file_name=message.file_name or "",
+                    msg_id=message.msg_id,
+                )
+                await self._reply_text(message, UNSUPPORTED_MEDIA_UPLOAD_REPLY)
+                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                return ReplyResult(
+                    True,
+                    replied=True,
+                    via="text",
+                    reason="unsupported_media",
+                    answer=UNSUPPORTED_MEDIA_UPLOAD_REPLY,
+                )
+            elif message.download_code and message.msgtype == PERSONAL_FILE_MSGTYPE:
+                # file 但后缀不在文档白名单（或空后缀）：也不走入库话术。
+                log.info(
+                    "dingtalk_non_doc_file_skipped",
+                    msgtype=message.msgtype,
+                    file_name=message.file_name or "",
+                    msg_id=message.msg_id,
+                )
+                await self._reply_text(message, UNSUPPORTED_MEDIA_UPLOAD_REPLY)
+                await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
+                return ReplyResult(
+                    True,
+                    replied=True,
+                    via="text",
+                    reason="unsupported_file_type",
+                    answer=UNSUPPORTED_MEDIA_UPLOAD_REPLY,
+                )
             elif is_greeting_command(message.text):
                 # P0：纯问候只回一句介绍；帮助/文档另行触发，不在首屏堆清单。
                 if not intro:
@@ -338,11 +496,12 @@ class StreamMessageHandler:
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(True, replied=True, via="text", reason="send_source_help", answer=reply)
 
-            elif is_send_all_figures_command(message.text):
-                reply = await self._reply_pending_figures(message)
+            elif is_send_figures_command(message.text):
+                count = parse_figure_send_count(message.text) or 1
+                reply = await self._reply_pending_figures(message, count=count)
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(
-                    True, replied=True, via="text", reason="send_all_figures", answer=reply
+                    True, replied=True, via="text", reason="send_figures", answer=reply
                 )
 
             elif is_permission_command(message.text):
@@ -507,7 +666,12 @@ class StreamMessageHandler:
 
                 answer = str(payload.get("answer") or "")
                 citations = payload.get("citations") or []
-                figure_attachments = payload.get("figure_attachments") or []
+                # 可提取清单：默认不推图，只缓存 + 文案提示张数；用户「发N张」再按序取
+                available = self._figure_image_candidates(
+                    citations,
+                    payload.get("available_figures") or payload.get("figure_attachments"),
+                )
+                self._save_pending_figures(message, available, total=len(available), sent=0)
                 if payload.get("refused"):
                     text = answer or "未找到可靠依据。"
                     # 后端已可能把 suggested_questions 拼进 answer；若只有结构化字段则补一段
@@ -518,28 +682,22 @@ class StreamMessageHandler:
                             for i, q in enumerate(list(hints)[:3], 1):
                                 lines.append(f"{i}. {q}")
                             text = text.rstrip() + "\n".join(lines)
-                    text = self._with_figure_remainder_hint(text, figure_attachments, citations)
+                    text = self._ensure_figure_inventory_hint(text, len(available))
                     await self._reply_text(message, text)
-                    # 拒答也可能带回源图（例如文字说「资料无图」但 figure 块其实在）
-                    await self._reply_cited_images(message, citations, figure_attachments)
                     await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                     return ReplyResult(True, replied=True, via="text", reason="refused", answer=text)
 
-                # ⑤ 回复：取数成功时答案已含「值+依据」；再附参考资料与 2~3 条推荐问；有图则再发原图
+                # ⑤ 回复：文字 + 可提取张数提示；图片不主动发
                 rendered = self._render_answer(answer, citations)
                 rendered = self._with_suggestions(
                     rendered, payload.get("suggested_questions") or []
                 )
-                rendered = self._with_figure_remainder_hint(
-                    rendered, figure_attachments, citations
-                )
+                rendered = self._ensure_figure_inventory_hint(rendered, len(available))
                 if await self._reply_with_card(message, rendered):
-                    await self._reply_cited_images(message, citations, figure_attachments)
                     await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                     return ReplyResult(True, replied=True, via="card", answer=rendered)
                 # 无 AI 卡片模板时：OTO 走 sampleMarkdown（接近管理台排版），失败再 sampleText
                 replied = await self._reply_text(message, rendered)
-                await self._reply_cited_images(message, citations, figure_attachments)
                 await asyncio.to_thread(self.inbox.mark_done, message.msg_id)
                 return ReplyResult(
                     True,
@@ -678,6 +836,8 @@ class StreamMessageHandler:
         """
         if message.is_group:
             return "私有库只收单聊文件。请打开和机器人的单独会话，再把文件发过来。"
+        if not message.is_personal_file:
+            return UNSUPPORTED_MEDIA_UPLOAD_REPLY
         if self.cards is None:
             return "文件通道未就绪，请稍后再发一次。"
         try:
@@ -846,10 +1006,8 @@ class StreamMessageHandler:
             return True
         except Exception as exc:
             log.warning("dingtalk_card_reply_failed", error=str(exc))
-            try:
+            with contextlib.suppress(Exception):  # pragma: no cover - 失败卡片也可能失败
                 await self.cards.fail_card(out_track_id, key)
-            except Exception:  # pragma: no cover - 失败卡片也可能失败
-                pass
             return False
 
     @staticmethod
@@ -934,7 +1092,7 @@ class StreamMessageHandler:
         citations: Sequence[dict[str, Any]],
         figure_attachments: Sequence[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        """去重后的待发图列表：优先后端 ``figure_attachments``，否则引用里的图。"""
+        """去重后的可提取图列表：优先后端清单，否则引用里的图。"""
         raw: list[dict[str, Any]] = list(figure_attachments or [])
         if not raw:
             raw = [
@@ -953,33 +1111,27 @@ class StreamMessageHandler:
         return out
 
     @staticmethod
-    def _figure_remainder_hint(remaining: int) -> str:
-        if remaining <= 0:
-            return ""
+    def _ensure_figure_inventory_hint(text: str, total: int) -> str:
+        """答案末尾补可提取张数（后端已写则不重复）。"""
+        if total <= 0:
+            return text or ""
+        body = (text or "").rstrip()
+        if "可提取图片" in body:
+            return body
         return (
-            f"\n\n另有 {remaining} 张相关图片未发出，"
-            "如需全部图片请回复「发全图」。"
+            f"{body}\n\n本回答可提取图片 {total} 张。"
+            "需要时回复「发1张」「发3张」或「发全图」（按序提取，不重复）。"
         )
-
-    def _with_figure_remainder_hint(
-        self,
-        text: str,
-        figure_attachments: Sequence[dict[str, Any]] | None,
-        citations: Sequence[dict[str, Any]],
-    ) -> str:
-        candidates = self._figure_image_candidates(citations, figure_attachments)
-        remaining = max(0, len(candidates) - MAX_REPLY_IMAGES)
-        hint = self._figure_remainder_hint(remaining)
-        if not hint:
-            return text
-        return (text or "").rstrip() + hint
 
     def _pending_figures_key(self, message: InboundMessage) -> str:
         conv = message.conversation_id or ""
         staff = message.sender_staff_id or ""
         return f"{PENDING_FIGURES_KEY_PREFIX}{conv}:{staff}"
 
-    def _load_pending_figures(self, message: InboundMessage) -> list[dict[str, Any]]:
+    def _load_pending_figures_state(
+        self, message: InboundMessage
+    ) -> tuple[list[dict[str, Any]], int, int]:
+        """返回 ``(剩余 items, 总张数, 已发张数)``。"""
         key = self._pending_figures_key(message)
         with self.db.sync_connect() as conn:
             row = conn.execute(
@@ -987,22 +1139,41 @@ class StreamMessageHandler:
                 (key,),
             ).fetchone()
         if row is None or int(row["expires_at"]) < int(time.time()):
-            return []
+            return [], 0, 0
         try:
             payload = json.loads(row["value"])
         except (TypeError, ValueError):
-            return []
-        items = payload.get("items") if isinstance(payload, dict) else payload
+            return [], 0, 0
+        if isinstance(payload, list):
+            items = payload
+            total = len(items)
+            sent = 0
+        elif isinstance(payload, dict):
+            items = payload.get("items") or []
+            total = int(payload.get("total") or len(items) or 0)
+            sent = int(payload.get("sent") or 0)
+        else:
+            return [], 0, 0
         if not isinstance(items, list):
-            return []
-        return [item for item in items if isinstance(item, dict) and item.get("image_path")]
+            return [], 0, 0
+        clean = [
+            item for item in items if isinstance(item, dict) and item.get("image_path")
+        ]
+        if total < sent + len(clean):
+            total = sent + len(clean)
+        return clean, total, sent
 
     def _save_pending_figures(
-        self, message: InboundMessage, items: Sequence[dict[str, Any]]
+        self,
+        message: InboundMessage,
+        items: Sequence[dict[str, Any]],
+        *,
+        total: int | None = None,
+        sent: int = 0,
     ) -> None:
         key = self._pending_figures_key(message)
         with self.db.sync_connect() as conn:
-            if not items:
+            if not items and sent <= 0:
                 conn.execute("DELETE FROM ekbs_cache WHERE cache_key = ?", (key,))
             else:
                 slim = [
@@ -1017,29 +1188,45 @@ class StreamMessageHandler:
                     for item in items
                     if str(item.get("image_path") or "").strip()
                 ]
+                eff_total = int(total if total is not None else sent + len(slim))
                 conn.execute(
                     "INSERT INTO ekbs_cache(cache_key, value, expires_at) VALUES (?, ?, ?) "
                     "ON CONFLICT(cache_key) DO UPDATE SET value = excluded.value, "
                     "expires_at = excluded.expires_at",
                     (
                         key,
-                        json.dumps({"items": slim}, ensure_ascii=False),
+                        json.dumps(
+                            {
+                                "items": slim,
+                                "total": eff_total,
+                                "sent": int(sent),
+                            },
+                            ensure_ascii=False,
+                        ),
                         int(time.time()) + PENDING_FIGURES_TTL_SECONDS,
                     ),
                 )
             conn.commit()
 
     async def _send_image_batch(
-        self, message: InboundMessage, items: Sequence[dict[str, Any]]
+        self,
+        message: InboundMessage,
+        items: Sequence[dict[str, Any]],
+        *,
+        limit: int | None = None,
     ) -> tuple[int, list[dict[str, Any]]]:
-        """按上限发送一批图片；返回 ``(已发送数, 仍未发出的列表)``。"""
-        if self.cards is None or not items:
+        """按序发送最多 ``limit`` 张；返回 ``(成功数, 仍未发出的列表)``。
+
+        已尝试过的路径不会回到 remaining（失败的除外，可下次重试）。
+        """
+        cap = MAX_REPLY_IMAGES if limit is None else max(0, int(limit))
+        if self.cards is None or not items or cap <= 0:
             return 0, list(items)
         data_dir = Path(self.settings.data_dir)
         sent = 0
         deferred: list[dict[str, Any]] = []
         idx = 0
-        while idx < len(items) and sent < MAX_REPLY_IMAGES:
+        while idx < len(items) and sent < cap:
             item = items[idx]
             idx += 1
             rel = str(item.get("image_path") or "").strip()
@@ -1069,55 +1256,43 @@ class StreamMessageHandler:
         remaining = deferred + list(items[idx:])
         return sent, remaining
 
-    async def _reply_cited_images(
-        self,
-        message: InboundMessage,
-        citations: Sequence[dict[str, Any]],
-        figure_attachments: Sequence[dict[str, Any]] | None = None,
-    ) -> int:
-        """把 figure 原图发到钉钉（先 media/upload，再 sampleImageMsg）。
-
-        优先 ``figure_attachments``；超出 ``MAX_REPLY_IMAGES`` 的写入待补发缓存。
-        """
-        candidates = self._figure_image_candidates(citations, figure_attachments)
-        if not candidates:
-            self._save_pending_figures(message, [])
-            return 0
-        sent, remaining = await self._send_image_batch(message, candidates)
-        self._save_pending_figures(message, remaining)
-        if sent:
-            log.info(
-                "dingtalk_images_replied",
-                count=sent,
-                remaining=len(remaining),
-                msg_id=message.msg_id,
-            )
-        return sent
-
-    async def _reply_pending_figures(self, message: InboundMessage) -> str:
-        """用户回复「发全图」：继续发上一轮未发完的图片。"""
-        pending = self._load_pending_figures(message)
+    async def _reply_pending_figures(
+        self, message: InboundMessage, *, count: int
+    ) -> str:
+        """按用户指定张数从缓存按序发图（``count=-1`` 表示本批发剩余，受 ``MAX_REPLY_IMAGES`` 限制）。"""
+        pending, total, already_sent = self._load_pending_figures_state(message)
         if not pending:
             await self._reply_text(message, NO_PENDING_FIGURES_REPLY)
             return NO_PENDING_FIGURES_REPLY
-        sent, remaining = await self._send_image_batch(message, pending)
-        self._save_pending_figures(message, remaining)
+        limit = min(len(pending), MAX_REPLY_IMAGES) if count < 0 else min(int(count), len(pending), MAX_REPLY_IMAGES)
+        sent, remaining = await self._send_image_batch(message, pending, limit=limit)
+        new_sent = already_sent + sent
+        self._save_pending_figures(
+            message, remaining, total=total or (new_sent + len(remaining)), sent=new_sent
+        )
         if sent == 0 and remaining:
-            reply = "图片补发失败，请稍后再试「发全图」。"
+            reply = "图片发送失败，请稍后再试「发1张」或「发全图」。"
             await self._reply_text(message, reply)
             return reply
         if remaining:
             reply = (
-                f"已补发 {sent} 张，还剩 {len(remaining)} 张。"
-                "继续回复「发全图」可再发一批。"
+                f"已发送 {sent} 张（累计 {new_sent}/{total or new_sent + len(remaining)}），"
+                f"还剩 {len(remaining)} 张。"
+                "可继续「发1张」「发3张」或「发全图」。"
             )
         else:
-            reply = f"已补发全部剩余图片（{sent} 张）。"
+            reply = (
+                f"已发送 {sent} 张，"
+                f"全部 {total or new_sent} 张可提取图片已发完（不重复）。"
+            )
         await self._reply_text(message, reply)
         log.info(
             "dingtalk_pending_figures_replied",
             sent=sent,
             remaining=len(remaining),
+            total=total,
+            cumulative=new_sent,
+            requested=count,
             msg_id=message.msg_id,
         )
         return reply

@@ -343,9 +343,7 @@ def _table_must_keep(chunk: RetrievedChunk, query: str) -> bool:
     if not topics or not _text_hits_topics(text, topics):
         return False
     months = _query_month_keys(query)
-    if months and not any(month in text for month in months):
-        return False
-    return True
+    return not (months and not any(month in text for month in months))
 
 
 def _rank_tables_by_query(
@@ -528,7 +526,7 @@ def _extract_metadata_person(query: str) -> str:
     return ""
 
 
-def _normalize_for_title_match(text: str) -> str:
+def _normalize_for_doc_title(text: str) -> str:
     """标题匹配归一化：小写 + 只留字母/数字/CJK（去空白与标点）。
 
     为什么不用 ``str.lower()`` 后直接比对：同一份文件在不同来源里会写成
@@ -560,9 +558,9 @@ def _title_match_keys(doc_title: str) -> tuple[str, str, str]:
         code = ""
         core = text
     return (
-        _normalize_for_title_match(text),
-        _normalize_for_title_match(core),
-        _normalize_for_title_match(code),
+        _normalize_for_doc_title(text),
+        _normalize_for_doc_title(core),
+        _normalize_for_doc_title(code),
     )
 
 
@@ -579,7 +577,7 @@ def _title_match_doc_ids(query: str, chunks: Sequence[RetrievedChunk]) -> set[in
     短标题（< 4）不参与匹配：两三个字的标题在长问句里几乎必然误命中。
     通用体裁词（见 ``_GENERIC_TITLE_KEYS``）同样不算被点名。
     """
-    query_key = _normalize_for_title_match(query)
+    query_key = _normalize_for_doc_title(query)
     if len(query_key) < 2:
         return set()
     keys_by_title: dict[str, tuple[str, str, str]] = {}
@@ -591,16 +589,12 @@ def _title_match_doc_ids(query: str, chunks: Sequence[RetrievedChunk]) -> set[in
             keys = _title_match_keys(title)
             keys_by_title[title] = keys
         display, core, code = keys
-        if display and len(display) >= 4 and display in query_key:
-            matched.add(int(chunk.doc_id))
-        elif (
+        if display and len(display) >= 4 and display in query_key or (
             core
             and len(core) >= 4
             and core not in _GENERIC_TITLE_KEYS
             and core in query_key
-        ):
-            matched.add(int(chunk.doc_id))
-        elif code and len(code) >= 4 and code in query_key:
+        ) or code and len(code) >= 4 and code in query_key:
             matched.add(int(chunk.doc_id))
     return matched
 
@@ -739,10 +733,14 @@ class AnswerResult:
     mode_used: str = MODE_PROSE
     #: 查询改写侧意图标签（factual / numeric / figure / procedure）
     intent: str = "factual"
-    #: 供钉钉/前端直接回源的图片附件（相对 data_dir 的 image_path）
+    #: 本回答可提取的图片清单（相对 data_dir）；**不主动推送**，由通道按「发N张」取用
+    available_figures: list[dict[str, Any]] = field(default_factory=list)
+    #: 兼容旧字段：与 ``available_figures`` 同内容；发送闸在通道侧（钉钉不自动发）
     figure_attachments: list[dict[str, Any]] = field(default_factory=list)
     ttft_ms: int = 0
     total_ms: int = 0
+    #: 端到端分阶段耗时（改写/检索各跳/生成/墙钟），管理台全过程监控用
+    pipeline_timings_ms: dict[str, float] = field(default_factory=dict)
     prompt_tokens: int = 0
     completion_tokens: int = 0
     #: 上下文预算裁剪痕迹（可观测性：丢了几块 / 几轮、是否截断）
@@ -1307,8 +1305,17 @@ class RetrievalPipeline:
                 "requested_top_n": params["rerank_top_n"],
                 "keep": params["rerank_keep"],
                 "min_score": params["rerank_min_score"],
+                # preview：管理台全过程折叠条目用，避免再回表；截断防爆 payload
                 "scores": [
-                    {"chunk_id": c.chunk_id, "rerank_score": c.rerank_score} for c in ranked
+                    {
+                        "chunk_id": c.chunk_id,
+                        "rerank_score": c.rerank_score,
+                        "doc_title": c.doc_title,
+                        "heading_path": c.heading_path,
+                        "chunk_type": c.chunk_type,
+                        "preview": (c.content or "").strip()[:280],
+                    }
+                    for c in ranked
                 ],
             }
 
@@ -2594,6 +2601,10 @@ class RetrievalPipeline:
                     )
                 if preferred_pages:
                     scored = [item for item in scored if item[0][1] >= 2]
+                else:
+                    # 无页码文档：同 parent 常等于整篇；无主题命中时按 seq 取前 N
+                    # 会把封面/装饰/无关章节图带进上下文。硬规则：必须 heading 主题命中。
+                    scored = [item for item in scored if item[0][0] >= 1]
                 scored.sort(key=lambda item: item[0], reverse=True)
                 per_container.append([cid for _, cid in scored[: int(max_per_anchor)]])
 
@@ -3207,9 +3218,7 @@ class RetrievalPipeline:
             return True
         if is_numeric_calc_intent(question):
             return True
-        if is_structured_query_intent(question):
-            return True
-        return False
+        return bool(is_structured_query_intent(question))
 
     @staticmethod
     def _chunk_has_substantive_prose(chunk: Any) -> bool:
@@ -4364,6 +4373,7 @@ class RetrievalPipeline:
 
         ``overrides`` / ``collect_debug``：检索调试台用；正式问答保持默认即可。
         """
+        wall_started = time.perf_counter()
         # ① 会话历史：调用方显式给了就用给的，否则按 (conversation_id, 用户) 取
         messages = list(history)
         if not messages and self.sessions is not None and conversation_id:
@@ -4379,7 +4389,9 @@ class RetrievalPipeline:
             messages = self._drop_repeated_question_history(messages, question)
 
         # ② 查询改写（00 §2.1 的第一步）；改写后的查询才是检索输入
+        rewrite_started = time.perf_counter()
         rewrite = await self._rewrite(question, messages)
+        rewrite_ms = _ms(rewrite_started)
         intent = str(getattr(rewrite, "intent", "factual") or "factual")
         auto_numeric = bool((getattr(self.settings, "qa", None) or {}).get("auto_numeric", True))
         mode_used = resolve_answer_mode(mode, intent, auto_numeric=auto_numeric)
@@ -4426,6 +4438,7 @@ class RetrievalPipeline:
             cached = await self.cache.get(cache_key)
         if cached:
             result = self._answer_from_cache(cached, rewrite, mode_used, intent)
+            self._stamp_pipeline_timings(result, rewrite_ms=rewrite_ms, wall_started=wall_started)
             # 命中缓存也要记这一轮上下文：否则多轮追问会丢掉这一轮（实测踩到）
             await self._remember_turn(conversation_id, perm, question, result)
             return result
@@ -4495,6 +4508,7 @@ class RetrievalPipeline:
         self._apply_figure_adjustments(result, retrieval, intent=intent, question=question)
         result = self._normalize_answer_tables(result)
         result = self._enforce_number_evidence(result, retrieval)
+        self._stamp_pipeline_timings(result, rewrite_ms=rewrite_ms, wall_started=wall_started)
 
         # ③ 写回上下文（群聊按用户隔离，见 session.py 的说明）
         await self._remember_turn(conversation_id, perm, question, result)
@@ -4506,6 +4520,29 @@ class RetrievalPipeline:
                 ttl=self.settings.retrieval.cache.answer_ttl,
             )
         return result
+
+    @staticmethod
+    def _stamp_pipeline_timings(
+        result: AnswerResult,
+        *,
+        rewrite_ms: float,
+        wall_started: float,
+    ) -> None:
+        """汇总「提问 → 出答案」各跳耗时，供管理台全过程监控。"""
+        retrieve = dict(getattr(result.retrieval, "timings_ms", None) or {})
+        wall_ms = _ms(wall_started)
+        result.pipeline_timings_ms = {
+            "rewrite": float(rewrite_ms),
+            "embed": float(retrieve.get("embed") or 0),
+            "recall": float(retrieve.get("recall") or 0),
+            "rerank": float(retrieve.get("rerank") or 0),
+            "expand": float(retrieve.get("expand") or 0),
+            "retrieve_total": float(retrieve.get("total") or 0),
+            # total_ms = 生成整段；ttft_ms = 首字（管理台可对照卡顿在首字还是续写）
+            "generate": float(result.total_ms or 0),
+            "ttft": float(result.ttft_ms or 0),
+            "wall": float(wall_ms),
+        }
 
     # ------------------------------------------------------------------
     # answer() 的后处理（缓存命中 / 结果标注 / 找图修正 / 缓存写回）
@@ -4532,7 +4569,16 @@ class RetrievalPipeline:
             numeric=cached.get("numeric"),
             mode_used=str(cached.get("mode_used") or mode_used),
             intent=str(cached.get("intent") or intent),
-            figure_attachments=list(cached.get("figure_attachments") or []),
+            available_figures=list(
+                cached.get("available_figures")
+                or cached.get("figure_attachments")
+                or []
+            ),
+            figure_attachments=list(
+                cached.get("available_figures")
+                or cached.get("figure_attachments")
+                or []
+            ),
             sub_questions=list(cached.get("sub_questions") or []),
             coverage=dict(cached.get("coverage") or {}),
             # 缓存只存 id、不存块内容（payload 里没有正文）：这样「这次喂了哪些块」在
@@ -4619,16 +4665,23 @@ class RetrievalPipeline:
     def _apply_figure_adjustments(
         self, result: AnswerResult, retrieval: RetrievalResult, *, intent: str, question: str
     ) -> None:
-        """找图意图的后处理：补/清洗引用，并把「资料区无像素」的口头拒答纠正为已找到原图。"""
-        result.figure_attachments = self._collect_figure_attachments(
+        """图片清单 + 发图闸门。
+
+        * 始终按引用/绑图规则收集 ``available_figures``（通道据此告知张数）；
+        * **不主动推图**：``figure_attachments`` 与清单同内容供调试台展示，
+          钉钉等通道须等用户「发N张 / 发全图」再按序提取；
+        * 找图意图下若模型口头拒答但清单非空，纠正为可提取提示。
+        """
+        inventory = self._collect_figure_attachments(
             retrieval.chunks,
             result.citations,
             intent=intent,
             query=result.rewritten_query or question,
         )
-        # 找图意图：引用里的空白垃圾图（空调合同扫描页等）不得留在答案卡片上
-        if intent == "figure" and result.figure_attachments:
-            keep_ids = {int(a["chunk_id"]) for a in result.figure_attachments}
+        result.available_figures = inventory
+        result.figure_attachments = list(inventory)
+        if intent == "figure" and inventory:
+            keep_ids = {int(a["chunk_id"]) for a in inventory}
             cleaned: list[Citation] = []
             for cite in result.citations:
                 is_fig = bool(cite.figure_id or cite.image_path)
@@ -4639,30 +4692,30 @@ class RetrievalPipeline:
                 for i, cite in enumerate(cleaned, 1):
                     cite.cite_index = i
                 result.citations = cleaned
-        # 找图意图且已筛出相关原图时：模型常因「资料区没有像素」口头拒答；
-        # 实际发图走 figure_attachments，不应再当成无依据拒答。
         if (
             intent == "figure"
-            and result.figure_attachments
+            and inventory
             and result.refused
             and result.refusal_reason in {REFUSE_NO_BASIS, REFUSE_EMPTY_ANSWER, ""}
         ):
             titles = sorted(
                 {
                     str(a.get("doc_title") or "").strip()
-                    for a in result.figure_attachments
+                    for a in inventory
                     if str(a.get("doc_title") or "").strip()
                 }
             )
             doc_hint = f"（来自{'、'.join(titles[:2])}）" if titles else ""
-            result.answer = f"已找到相关图片{doc_hint}，见下方原图。"
+            result.answer = (
+                f"已找到相关图片{doc_hint}共 {len(inventory)} 张。"
+                "需要时回复「发1张」「发3张」或「发全图」（按序提取，不重复）。"
+            )
             result.refused = False
             result.refusal_reason = ""
             if not result.citations:
-                # 用附件对应块补最小引用，便于调试台/钉钉对齐
                 by_id = {c.chunk_id: c for c in retrieval.chunks}
                 rebuilt: list[Citation] = []
-                for i, att in enumerate(result.figure_attachments, 1):
+                for i, att in enumerate(inventory, 1):
                     src = by_id.get(int(att.get("chunk_id") or 0))
                     if src is None:
                         continue
@@ -4685,10 +4738,25 @@ class RetrievalPipeline:
                         )
                     )
                 result.citations = rebuilt
+        result.answer = self._with_figure_inventory_hint(result.answer, len(inventory))
+
+    @staticmethod
+    def _with_figure_inventory_hint(answer: str, total: int) -> str:
+        """答案末尾告知可提取张数；已含同类提示则不重复追加。"""
+        if total <= 0:
+            return answer or ""
+        text = (answer or "").rstrip()
+        if "可提取图片" in text or "发全图" in text:
+            return text
+        return (
+            f"{text}\n\n本回答可提取图片 {total} 张。"
+            "需要时回复「发1张」「发3张」或「发全图」（按序提取，不重复）。"
+        )
 
     @staticmethod
     def _answer_cache_payload(result: AnswerResult, mode_used: str, intent: str) -> dict[str, Any]:
         """答案缓存落库载荷（字段变更需同步 ``_answer_from_cache``）。"""
+        inventory = list(result.available_figures or result.figure_attachments or [])
         return {
             "answer": result.answer,
             "model": result.model,
@@ -4698,7 +4766,8 @@ class RetrievalPipeline:
             "numeric": result.numeric,
             "mode_used": mode_used,
             "intent": intent,
-            "figure_attachments": result.figure_attachments,
+            "available_figures": inventory,
+            "figure_attachments": inventory,
             "rewritten_query": result.rewritten_query,
             "sub_questions": result.sub_questions,
             "coverage": result.coverage,
@@ -4758,8 +4827,8 @@ class RetrievalPipeline:
     def _citation_figure_scope(
         chunks: Sequence[RetrievedChunk],
         citations: Sequence[Citation],
-    ) -> tuple[dict[int, set[int]], set[int], bool]:
-        """从**模型文字引用**推导挂图范围：(doc→页码, parent_id 集合, 是否有文字引用)。
+    ) -> tuple[dict[int, set[int]], set[int], bool, list[str]]:
+        """从**模型文字引用**推导挂图范围：(doc→页码, parent_id, 是否有文字引用, 引用标题)。
 
         rerank 常混进语义相近的邻页（「小广告」↔「广告灯箱」）；回源必须以模型
         ``[n]`` 引用的块为准，不能把上下文里所有展开图都发出去。
@@ -4767,6 +4836,7 @@ class RetrievalPipeline:
         by_id = {c.chunk_id: c for c in chunks}
         pages: dict[int, set[int]] = {}
         parents: set[int] = set()
+        headings: list[str] = []
         has_text_cite = False
 
         def _add_pages(doc_id: int, lo: int | None, hi: int | None) -> None:
@@ -4787,13 +4857,68 @@ class RetrievalPipeline:
             lo = cite.page_from if cite.page_from is not None else (src.page_from if src else None)
             hi = cite.page_to if cite.page_to is not None else (src.page_to if src else None)
             _add_pages(doc_id, lo, hi)
+            heading = str(
+                getattr(cite, "heading_path", None)
+                or (src.heading_path if src else "")
+                or ""
+            ).strip()
+            if heading:
+                headings.append(heading)
             if src is None:
                 continue
             if src.chunk_type == "parent":
                 parents.add(int(src.chunk_id))
             elif src.parent_chunk_id:
                 parents.add(int(src.parent_chunk_id))
-        return pages, parents, has_text_cite
+        return pages, parents, has_text_cite, headings
+
+    @staticmethod
+    def _heading_tail(heading: str) -> str:
+        """去掉文档名前缀，只留章节尾巴（``手册 > 附件-6…`` → ``附件-6…``）。"""
+        h = (heading or "").strip()
+        for sep in (">", "·"):
+            if sep in h:
+                return sep.join(part.strip() for part in h.split(sep)[1:] if part.strip())
+        return h
+
+    @staticmethod
+    def _heading_section_tokens(heading: str) -> set[str]:
+        """章节片段 token（≥4 字，丢掉「图3/表21」）。"""
+        tokens: set[str] = set()
+        for piece in re.split(r"[>·|/／]", heading or ""):
+            raw = re.sub(r"\s+", "", (piece or "").strip())
+            if not raw or len(raw) < 4:
+                continue
+            if re.fullmatch(r"(?:图|表)\d+", raw):
+                continue
+            tokens.add(raw)
+        return tokens
+
+    @staticmethod
+    def _figure_heading_matches_cites(
+        figure_heading: str, cite_headings: Sequence[str]
+    ) -> bool:
+        """Word 无页码时：图题注须与引用块章节相交，不能只靠同 parent。"""
+        fig_toks = RetrievalPipeline._heading_section_tokens(
+            RetrievalPipeline._heading_tail(figure_heading)
+        )
+        if not fig_toks:
+            return False
+        for cite_h in cite_headings:
+            cite_toks = RetrievalPipeline._heading_section_tokens(
+                RetrievalPipeline._heading_tail(cite_h)
+            )
+            if not cite_toks:
+                continue
+            if fig_toks & cite_toks:
+                return True
+            for ft in fig_toks:
+                for ct in cite_toks:
+                    if len(ft) >= 4 and ft in ct:
+                        return True
+                    if len(ct) >= 4 and ct in ft:
+                        return True
+        return False
 
     @staticmethod
     def _figure_in_citation_scope(
@@ -4804,16 +4929,31 @@ class RetrievalPipeline:
         parent_id: int | None,
         cite_pages: dict[int, set[int]],
         cite_parents: set[int],
+        figure_heading: str = "",
+        cite_headings: Sequence[str] = (),
     ) -> bool:
-        """图是否落在模型引用的文字块范围内（同 parent 或同页）。"""
-        if parent_id is not None and int(parent_id) in cite_parents:
-            return True
+        """图是否落在模型引用的文字块范围内（同页；无页码时同 parent + 章节对齐）。"""
         doc_pages = cite_pages.get(int(doc_id or 0))
-        if not doc_pages or page_from is None:
-            return False
-        flo = int(page_from)
-        fhi = int(page_to if page_to is not None else page_from)
-        return bool(doc_pages & set(range(min(flo, fhi), max(flo, fhi) + 1)))
+        if doc_pages and page_from is not None:
+            flo = int(page_from)
+            fhi = int(page_to if page_to is not None else page_from)
+            # 有页码且页不对：即使同 parent 也不发（PPT 邻页混入）
+            return bool(doc_pages & set(range(min(flo, fhi), max(flo, fhi) + 1)))
+        if parent_id is not None and int(parent_id) in cite_parents:
+            # Word 手册大父块：同 parent 几乎等于「整篇」；必须章节标题对齐
+            if cite_headings:
+                return RetrievalPipeline._figure_heading_matches_cites(
+                    figure_heading, cite_headings
+                )
+            return True
+        return False
+
+    @staticmethod
+    def _figure_image_is_decorative(image_path: str) -> bool:
+        """已入库装饰小图回源再挡一层（口径同 ``ekbs.ingest.figure_quality``）。"""
+        from ekbs.ingest.figure_quality import is_decorative_image_path
+
+        return is_decorative_image_path(image_path)
 
     #: 多页引用时挂图硬上限（钉钉首波发不完会提示「发全图」补发）
     MAX_FIGURE_ATTACHMENTS = 16
@@ -4887,8 +5027,8 @@ class RetrievalPipeline:
             for c in chunks
             if c.chunk_type not in {"figure"} and not c.figure_id
         }
-        cite_pages, cite_parents, has_text_cite = RetrievalPipeline._citation_figure_scope(
-            chunks, citations
+        cite_pages, cite_parents, has_text_cite, cite_headings = (
+            RetrievalPipeline._citation_figure_scope(chunks, citations)
         )
         # 有模型引用时只认引用页；无引用（找图意图常见）才退回上下文正文页
         if has_text_cite:
@@ -4923,16 +5063,37 @@ class RetrievalPipeline:
         ) -> None:
             if not image_path or chunk_id in seen:
                 return
+            # 迷你 logo 即使旧索引未洗净也不回源
+            if RetrievalPipeline._figure_image_is_decorative(image_path):
+                return
             # 有文字引用时：未落入引用范围的展开图一律不发（避免 rerank 邻页混入）
-            if has_text_cite and not from_citation:
-                if not RetrievalPipeline._figure_in_citation_scope(
-                    doc_id=int(doc_id or 0),
-                    page_from=page_from,
-                    page_to=page_to,
-                    parent_id=parent_id,
-                    cite_pages=cite_pages,
-                    cite_parents=cite_parents,
-                ):
+            if has_text_cite and not from_citation and not RetrievalPipeline._figure_in_citation_scope(
+                doc_id=int(doc_id or 0),
+                page_from=page_from,
+                page_to=page_to,
+                parent_id=parent_id,
+                cite_pages=cite_pages,
+                cite_parents=cite_parents,
+                figure_heading=content,
+                cite_headings=cite_headings,
+            ):
+                return
+            # 无页码 + 非找图：同文档装饰图不得只靠「正文命中同 doc」混进回源
+            if (
+                intent != "figure"
+                and not from_citation
+                and page_from is None
+                and not hit_pages
+            ):
+                topics = _query_topic_keys(query)
+                heading_ok = bool(
+                    has_text_cite
+                    and RetrievalPipeline._figure_heading_matches_cites(
+                        content, cite_headings
+                    )
+                )
+                topic_ok = bool(topics) and _text_hits_topics(content, topics)
+                if not heading_ok and not topic_ok:
                     return
             seen.add(chunk_id)
             score = RetrievalPipeline._figure_query_score(
