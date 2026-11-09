@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ekbs-tool"
+version = "0.1.0"
+description = "EKBS enterprise knowledge base HTTP tool client (LangChain / LangGraph)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.27"]
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.3"]
+langgraph = ["langgraph>=0.2", "langchain-core>=0.3"]
+dev = ["pytest>=8"]
+
+# 目录本身即包体：pip install -e adapters/ekbs_tool 后 import ekbs_tool
+[tool.setuptools]
+packages = ["ekbs_tool"]
+
+[tool.setuptools.package-dir]
+"ekbs_tool" = "."

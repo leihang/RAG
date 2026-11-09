@@ -1,0 +1,38 @@
+{
+  "id": "ekbs-knowledge",
+  "name": "EKBS 企业知识库",
+  "description": "通过 EKBS /qa/chat 查询企业制度、手册与表格；尊重权限与拒答。",
+  "categories": ["knowledge", "rag"],
+  "contracts": {
+    "tools": ["ekbs_ask"]
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "EKBS API 前缀，默认 http://127.0.0.1:8000/api/v1"
+      },
+      "internalToken": {
+        "type": "string",
+        "description": "与 ~/.ekbs/secrets.env 中 EKBS_INTERNAL_TOKEN 一致"
+      },
+      "userId": {
+        "type": "integer",
+        "description": "默认查询身份（ACL）；生产应按真实用户覆盖"
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "description": "HTTP 超时毫秒，默认 120000"
+      },
+      "channel": {
+        "type": "string",
+        "description": "审计 channel，默认 openclaw"
+      }
+    }
+  }
+}
